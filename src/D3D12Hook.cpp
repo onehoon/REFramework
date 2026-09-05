@@ -340,7 +340,6 @@ HRESULT WINAPI D3D12Hook::create_xefg_swapchain(IDXGIFactory2* factory, IUnknown
 
 void D3D12Hook::publish_xefg_candidate() {
     PendingXefgBinding pending{};
-    D3D12Hook* hook = nullptr;
     const char* reject_reason = nullptr;
 
     {
@@ -373,7 +372,6 @@ void D3D12Hook::publish_xefg_candidate() {
                 reject_reason = "device_mismatch";
             } else {
                 pending = { candidate.Get(), transaction.command_queue, transaction.hwnd };
-                hook = g_d3d12_hook;
             }
         }
 
@@ -390,17 +388,19 @@ void D3D12Hook::publish_xefg_candidate() {
         return;
     }
 
-    if (hook != nullptr) {
-        std::unique_lock<std::recursive_mutex> framework_lock{};
-        if (g_framework != nullptr) {
-            framework_lock = std::unique_lock<std::recursive_mutex>{g_framework->get_hook_monitor_mutex()};
-        }
+    if (g_framework != nullptr) {
+        std::unique_lock<std::recursive_mutex> framework_lock{g_framework->get_hook_monitor_mutex()};
 
-        if (!hook->bind_external_swapchain(pending.swapchain, pending.command_queue, SwapchainSource::XeFGInternal)) {
-            spdlog::warn("[XeFG][Bind] candidate = 0x{:x}, accepted = false, reason = external_bind_failed",
-                reinterpret_cast<uintptr_t>(pending.swapchain));
+        // Hook-monitor recovery destroys and replaces D3D12Hook under this same
+        // mutex. Read the current object only after acquiring it so a XeFG init
+        // cannot bind through a pointer retained from before that replacement.
+        if (auto* hook = g_d3d12_hook; hook != nullptr) {
+            if (!hook->bind_external_swapchain(pending.swapchain, pending.command_queue, SwapchainSource::XeFGInternal)) {
+                spdlog::warn("[XeFG][Bind] candidate = 0x{:x}, accepted = false, reason = external_bind_failed",
+                    reinterpret_cast<uintptr_t>(pending.swapchain));
+            }
+            return;
         }
-        return;
     }
 
     std::scoped_lock lock{g_xefg_state_mutex};
@@ -1113,6 +1113,12 @@ bool D3D12Hook::unhook() {
     }
 
     std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
+
+    // Invalidate before the early return so no XeFG transaction can retain a
+    // hook object while hook-monitor recovery destroys or replaces it.
+    if (g_d3d12_hook == this) {
+        g_d3d12_hook = nullptr;
+    }
 
     if (!m_hooked) {
         return true;
