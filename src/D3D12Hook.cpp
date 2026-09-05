@@ -395,6 +395,25 @@ void D3D12Hook::publish_xefg_candidate() {
         // mutex. Read the current object only after acquiring it so a XeFG init
         // cannot bind through a pointer retained from before that replacement.
         if (auto* hook = g_d3d12_hook; hook != nullptr) {
+            if (hook->is_hooked()
+                && hook->get_swap_chain() != nullptr
+                && hook->get_swapchain_source() == SwapchainSource::XeFGInternal
+                && hook->get_swap_chain() != pending.swapchain) {
+                // Full XeFG swapchain recreation/rebind is P3 work. Do not
+                // silently replace a working XeFG binding in this P2 path.
+                spdlog::warn("[XeFG][Bind] candidate = 0x{:x}, accepted = false, reason = p3_rebind_deferred",
+                    reinterpret_cast<uintptr_t>(pending.swapchain));
+                return;
+            }
+
+            const auto replacing_active_non_xefg = hook->is_hooked()
+                && hook->get_swap_chain() != nullptr
+                && hook->get_swapchain_source() != SwapchainSource::XeFGInternal;
+            if (replacing_active_non_xefg) {
+                spdlog::info("[XeFG][Bind] resetting active D3D12 renderer before XeFG bind");
+                g_framework->on_reset();
+            }
+
             if (!hook->bind_external_swapchain(pending.swapchain, pending.command_queue, SwapchainSource::XeFGInternal)) {
                 spdlog::warn("[XeFG][Bind] candidate = 0x{:x}, accepted = false, reason = external_bind_failed",
                     reinterpret_cast<uintptr_t>(pending.swapchain));
