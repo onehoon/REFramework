@@ -336,10 +336,8 @@ HRESULT WINAPI D3D12Hook::create_swapchain(IDXGIFactory4* factory, IUnknown* dev
             spdlog::info("[D3D12][SwapchainCandidate] classification = streamline_interposer");
         } else if (type_name.find("FrameInterpolationSwapChain") != std::string::npos) {
             spdlog::info("[D3D12][SwapchainCandidate] classification = frame_interpolation_swapchain");
-        } else if (type_name == "unknown") {
-            spdlog::info("[D3D12][SwapchainCandidate] classification = unknown_wrapper");
         } else {
-            spdlog::info("[D3D12][SwapchainCandidate] classification = native");
+            spdlog::info("[D3D12][SwapchainCandidate] classification = unclassified");
         }
     }
 
@@ -794,8 +792,10 @@ void D3D12Hook::hook_impl() {
     auto& present_fn = s_swapchain_vtable[8]; // Present
     m_present_hook = std::make_unique<PointerHook>(&present_fn, &D3D12Hook::present);
 
+    const auto original_present = m_present_hook->get_original<decltype(D3D12Hook::present)*>();
+
     spdlog::info("[D3D12][HookInstall] phase = phase1, slot = Present[8], target = 0x{:x}, target_owner = {}, destination = D3D12Hook::present",
-        reinterpret_cast<uintptr_t>(present_fn), describe_address(present_fn));
+        reinterpret_cast<uintptr_t>(original_present), describe_address(reinterpret_cast<void*>(original_present)));
 
     if (s_create_swapchain_hook == nullptr) {
         auto& create_swapchain_fn = s_factory_vtable[15]; // CreateSwapChainForHwnd
