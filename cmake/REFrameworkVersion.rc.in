@@ -1,0 +1,35 @@
+#include <winresrc.h>
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION @REFRAMEWORK_FILE_VERSION_COMMAS@
+ PRODUCTVERSION @REFRAMEWORK_FILE_VERSION_COMMAS@
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_DLL
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "onehoon\0"
+            VALUE "FileDescription", "REFramework for Intel XeFG\0"
+            VALUE "FileVersion", "@REFRAMEWORK_FILE_VERSION_STRING@\0"
+            VALUE "InternalName", "dinput8\0"
+            VALUE "LegalCopyright", "Copyright (c) 2019 praydog; fork changes Copyright (c) 2026 onehoon\0"
+            VALUE "OriginalFilename", "dinput8.dll\0"
+            VALUE "ProductName", "REFramework\0"
+            VALUE "ProductVersion", "@REFRAMEWORK_PRODUCT_VERSION_STRING@\0"
+            VALUE "Comments", "@REFRAMEWORK_BUILD_COMMENT@\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
