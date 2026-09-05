@@ -92,6 +92,10 @@ void REFramework::hook_monitor() {
     auto& d3d11 = get_d3d11_hook();
     auto& d3d12 = get_d3d12_hook();
 
+    if (d3d12 != nullptr) {
+        D3D12Hook::process_pending_xefg_probe();
+    }
+
     const auto renderer_type = get_renderer_type();
 
     if (d3d11 == nullptr || d3d12 == nullptr 
@@ -107,10 +111,17 @@ void REFramework::hook_monitor() {
                 m_last_chance_time = now;
 
                 spdlog::info("Last chance encountered for hooking");
+                if (renderer_type == REFramework::RendererType::D3D12 && d3d12 != nullptr) {
+                    d3d12->log_hook_monitor_snapshot("last_chance");
+                }
             }
 
             if (!m_has_last_chance && now - m_last_chance_time > std::chrono::seconds(1)) {
                 spdlog::info("Sending rehook request for D3D");
+                if (renderer_type == REFramework::RendererType::D3D12 && d3d12 != nullptr) {
+                    d3d12->log_hook_monitor_snapshot("rehook_request");
+                    spdlog::info("[D3D12][HookLifecycle] action = hook, reason = hook_monitor_recovery");
+                }
 
                 // hook_d3d12 always gets called first.
                 if (m_is_d3d11) {
@@ -221,10 +232,14 @@ try {
     // so we're good.
     if (NotificationReason == LDR_DLL_NOTIFICATION_REASON_LOADED) {
         if (NotificationData->Loaded.BaseDllName != nullptr && NotificationData->Loaded.BaseDllName->Buffer != nullptr) {
-            std::wstring base_dll_name = NotificationData->Loaded.BaseDllName->Buffer;
+            std::wstring base_dll_name{NotificationData->Loaded.BaseDllName->Buffer, NotificationData->Loaded.BaseDllName->Length / sizeof(wchar_t)};
             std::wstring lower_base_dll_name = base_dll_name;
             std::transform(lower_base_dll_name.begin(), lower_base_dll_name.end(), lower_base_dll_name.begin(), ::towlower);
             spdlog::info("LdrRegisterDllNotification: Loaded: {}", utility::narrow(base_dll_name));
+
+            if (lower_base_dll_name == L"libxess_fg.dll") {
+                D3D12Hook::mark_xefg_probe_pending();
+            }
 
             if (lower_base_dll_name.find(L"sl.dlss_g.dll") != std::wstring::npos) {
                 spdlog::info("LdrRegisterDllNotification: Detected DLSS DLL loaded");
