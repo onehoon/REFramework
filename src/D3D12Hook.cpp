@@ -211,6 +211,21 @@ void D3D12Hook::notify_xefg_module_loaded(HMODULE module, std::wstring_view base
         reinterpret_cast<uintptr_t>(get_swap_chain_ptr), get_swap_chain_ptr != nullptr ? "present" : "missing");
 }
 
+void D3D12Hook::process_pending_xefg_probe() {
+    if (!s_xefg_probe_pending.exchange(false, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    const auto module = GetModuleHandleW(L"libxess_fg.dll");
+    if (module == nullptr) {
+        return;
+    }
+
+    wchar_t path[MAX_PATH]{};
+    const auto path_length = GetModuleFileNameW(module, path, ARRAYSIZE(path));
+    notify_xefg_module_loaded(module, L"libxess_fg.dll", std::wstring_view{path, path_length});
+}
+
 int64_t D3D12Hook::get_last_present_age_ms() const {
     if (m_last_present_entry_time.time_since_epoch().count() == 0) {
         return -1;

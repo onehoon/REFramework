@@ -92,6 +92,10 @@ void REFramework::hook_monitor() {
     auto& d3d11 = get_d3d11_hook();
     auto& d3d12 = get_d3d12_hook();
 
+    if (d3d12 != nullptr) {
+        D3D12Hook::process_pending_xefg_probe();
+    }
+
     const auto renderer_type = get_renderer_type();
 
     if (d3d11 == nullptr || d3d12 == nullptr 
@@ -234,10 +238,7 @@ try {
             spdlog::info("LdrRegisterDllNotification: Loaded: {}", utility::narrow(base_dll_name));
 
             if (lower_base_dll_name == L"libxess_fg.dll") {
-                const std::wstring full_dll_name = NotificationData->Loaded.FullDllName != nullptr && NotificationData->Loaded.FullDllName->Buffer != nullptr
-                    ? std::wstring{NotificationData->Loaded.FullDllName->Buffer, NotificationData->Loaded.FullDllName->Length / sizeof(wchar_t)}
-                    : std::wstring{};
-                D3D12Hook::notify_xefg_module_loaded((HMODULE)NotificationData->Loaded.DllBase, base_dll_name, full_dll_name);
+                D3D12Hook::mark_xefg_probe_pending();
             }
 
             if (lower_base_dll_name.find(L"sl.dlss_g.dll") != std::wstring::npos) {

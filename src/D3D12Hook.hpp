@@ -102,6 +102,12 @@ public:
 
     void log_hook_monitor_snapshot(std::string_view event) const;
 
+    static void mark_xefg_probe_pending() noexcept {
+        s_xefg_probe_pending.store(true, std::memory_order_release);
+    }
+
+    static void process_pending_xefg_probe();
+
     static void notify_xefg_module_loaded(HMODULE module, std::wstring_view base_name, std::wstring_view full_path);
 
     static bool is_xefg_module_loaded() {
@@ -169,6 +175,7 @@ protected:
     static inline void** s_factory_vtable{ nullptr };
     static inline void** s_swapchain_vtable{ nullptr };
     static inline std::atomic<bool> s_xefg_module_loaded{false};
+    static inline std::atomic<bool> s_xefg_probe_pending{false};
     static inline std::atomic<int64_t> s_xefg_first_seen_ms{-1};
     
     OnPresentFn m_on_present{ nullptr };
