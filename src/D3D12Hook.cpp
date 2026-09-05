@@ -28,10 +28,20 @@ namespace {
 
 constexpr int32_t kXefgSuccess = 0;
 
+enum class XefgQueueRelation {
+    SameComIdentity,
+    DistinctSameDevice,
+    DeviceMismatch,
+    InitQueueUnavailable,
+    PresentationQueueUnavailable,
+    PresentationQueueNotDirect,
+};
+
 struct XefgInitTransaction {
     void* context{};
     HWND hwnd{};
-    ID3D12CommandQueue* command_queue{};
+    ID3D12CommandQueue* init_queue{};
+    ID3D12CommandQueue* presentation_queue{};
     IDXGIFactory2* factory{};
     IDXGISwapChain1* candidate{};
     bool factory_create_succeeded{ false };
@@ -40,11 +50,22 @@ struct XefgInitTransaction {
 
 struct PendingXefgBinding {
     IDXGISwapChain3* swapchain{};
-    ID3D12CommandQueue* command_queue{};
+    ID3D12CommandQueue* selected_queue{};
     HWND hwnd{};
+    XefgQueueRelation relation{ XefgQueueRelation::InitQueueUnavailable };
+    bool observe_only{ true };
     bool valid() const {
-        return swapchain != nullptr && command_queue != nullptr;
+        return swapchain != nullptr && selected_queue != nullptr;
     }
+};
+
+struct QueueIdentitySnapshot {
+    ID3D12CommandQueue* queue{};
+    void* com_identity{};
+    void* device_identity{};
+    D3D12_COMMAND_QUEUE_DESC desc{};
+    bool device_available{ false };
+    bool valid{ false };
 };
 
 std::mutex g_xefg_state_mutex{};
@@ -55,6 +76,79 @@ std::unique_ptr<FunctionHook> g_xefg_init_hook{};
 std::unique_ptr<FunctionHook> g_xefg_get_swapchain_hook{};
 
 const auto g_diagnostic_start_time = std::chrono::steady_clock::now();
+
+const char* queue_relation_name(XefgQueueRelation relation) {
+    switch (relation) {
+    case XefgQueueRelation::SameComIdentity: return "same_com_identity";
+    case XefgQueueRelation::DistinctSameDevice: return "distinct_same_device";
+    case XefgQueueRelation::DeviceMismatch: return "device_mismatch";
+    case XefgQueueRelation::InitQueueUnavailable: return "init_queue_unavailable";
+    case XefgQueueRelation::PresentationQueueUnavailable: return "presentation_queue_unavailable";
+    case XefgQueueRelation::PresentationQueueNotDirect: return "presentation_queue_not_direct";
+    default: return "unknown";
+    }
+}
+
+const char* queue_type_name(D3D12_COMMAND_LIST_TYPE type) {
+    switch (type) {
+    case D3D12_COMMAND_LIST_TYPE_DIRECT: return "direct";
+    case D3D12_COMMAND_LIST_TYPE_BUNDLE: return "bundle";
+    case D3D12_COMMAND_LIST_TYPE_COMPUTE: return "compute";
+    case D3D12_COMMAND_LIST_TYPE_COPY: return "copy";
+    case D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE: return "video_decode";
+    case D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS: return "video_process";
+    case D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE: return "video_encode";
+    default: return "unknown";
+    }
+}
+
+QueueIdentitySnapshot capture_queue_identity(ID3D12CommandQueue* queue) {
+    QueueIdentitySnapshot snapshot{};
+    snapshot.queue = queue;
+    if (queue == nullptr) {
+        return snapshot;
+    }
+
+    Microsoft::WRL::ComPtr<IUnknown> queue_identity;
+    Microsoft::WRL::ComPtr<ID3D12Device> device;
+    Microsoft::WRL::ComPtr<IUnknown> device_identity;
+    if (FAILED(queue->GetDevice(IID_PPV_ARGS(&device)))) {
+        return snapshot;
+    }
+
+    snapshot.device_available = true;
+    if (FAILED(queue->QueryInterface(IID_PPV_ARGS(&queue_identity)))
+        || FAILED(device.As(&device_identity))) {
+        return snapshot;
+    }
+
+    snapshot.com_identity = queue_identity.Get();
+    snapshot.device_identity = device_identity.Get();
+    snapshot.desc = queue->GetDesc();
+    snapshot.valid = true;
+    return snapshot;
+}
+
+void log_xefg_queue_identity(void* context, IDXGISwapChain3* swapchain, const QueueIdentitySnapshot& init, const QueueIdentitySnapshot& presentation, XefgQueueRelation relation) {
+    spdlog::info("[XeFG][QueueIdentity] context = 0x{:x}, swapchain = 0x{:x}, init_queue = 0x{:x}, init_identity = 0x{:x}, init_device_identity = 0x{:x}, init_type = {}, init_priority = {}, init_flags = 0x{:x}, init_node_mask = {}, presentation_queue = 0x{:x}, presentation_identity = 0x{:x}, presentation_device_identity = 0x{:x}, presentation_type = {}, presentation_priority = {}, presentation_flags = 0x{:x}, presentation_node_mask = {}, relation = {}",
+        reinterpret_cast<uintptr_t>(context),
+        reinterpret_cast<uintptr_t>(swapchain),
+        reinterpret_cast<uintptr_t>(init.queue),
+        reinterpret_cast<uintptr_t>(init.com_identity),
+        reinterpret_cast<uintptr_t>(init.device_identity),
+        queue_type_name(init.desc.Type),
+        init.desc.Priority,
+        static_cast<uint32_t>(init.desc.Flags),
+        init.desc.NodeMask,
+        reinterpret_cast<uintptr_t>(presentation.queue),
+        reinterpret_cast<uintptr_t>(presentation.com_identity),
+        reinterpret_cast<uintptr_t>(presentation.device_identity),
+        queue_type_name(presentation.desc.Type),
+        presentation.desc.Priority,
+        static_cast<uint32_t>(presentation.desc.Flags),
+        presentation.desc.NodeMask,
+        queue_relation_name(relation));
+}
 
 struct SwapchainVtableSnapshot {
     void* object{};
@@ -257,7 +351,7 @@ int32_t D3D12Hook::xefg_init_from_swapchain_desc(void* context, HWND hwnd, const
     XefgInitTransaction transaction{};
     transaction.context = context;
     transaction.hwnd = hwnd;
-    transaction.command_queue = command_queue;
+    transaction.init_queue = command_queue;
     transaction.factory = factory;
 
     {
@@ -329,10 +423,17 @@ HRESULT WINAPI D3D12Hook::create_xefg_swapchain(IDXGIFactory2* factory, IUnknown
     const auto result = original(factory, device, hwnd, desc, fullscreen_desc, restrict_to_output, swap_chain);
 
     if (SUCCEEDED(result) && swap_chain != nullptr && *swap_chain != nullptr) {
+        Microsoft::WRL::ComPtr<ID3D12CommandQueue> presentation_queue;
+        if (device != nullptr && SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&presentation_queue)))) {
+            g_xefg_transaction.presentation_queue = presentation_queue.Get();
+        }
+
         g_xefg_transaction.candidate = *swap_chain;
         g_xefg_transaction.factory_create_succeeded = true;
-        spdlog::info("[XeFG][InternalSwapchain] context = 0x{:x}, candidate = 0x{:x}, provisional = true",
-            reinterpret_cast<uintptr_t>(g_xefg_transaction.context), reinterpret_cast<uintptr_t>(*swap_chain));
+        spdlog::info("[XeFG][InternalSwapchain] context = 0x{:x}, candidate = 0x{:x}, presentation_queue = 0x{:x}, provisional = true",
+            reinterpret_cast<uintptr_t>(g_xefg_transaction.context),
+            reinterpret_cast<uintptr_t>(*swap_chain),
+            reinterpret_cast<uintptr_t>(g_xefg_transaction.presentation_queue));
     }
 
     return result;
@@ -341,6 +442,8 @@ HRESULT WINAPI D3D12Hook::create_xefg_swapchain(IDXGIFactory2* factory, IUnknown
 void D3D12Hook::publish_xefg_candidate() {
     PendingXefgBinding pending{};
     const char* reject_reason = nullptr;
+    const char* bind_reason = "init_success";
+    const char* probe_reason = "distinct_same_device";
 
     {
         std::scoped_lock lock{g_xefg_state_mutex};
@@ -350,14 +453,12 @@ void D3D12Hook::publish_xefg_candidate() {
             reject_reason = "init_failed";
         } else if (!transaction.factory_create_succeeded || transaction.candidate == nullptr) {
             reject_reason = "no_candidate";
-        } else if (transaction.command_queue == nullptr) {
+        } else if (transaction.init_queue == nullptr) {
             reject_reason = "queue_device_unavailable";
         } else {
             Microsoft::WRL::ComPtr<IDXGISwapChain3> candidate;
             Microsoft::WRL::ComPtr<ID3D12Device> candidate_device;
-            Microsoft::WRL::ComPtr<ID3D12Device> queue_device;
             Microsoft::WRL::ComPtr<IUnknown> candidate_identity;
-            Microsoft::WRL::ComPtr<IUnknown> queue_identity;
             HWND candidate_hwnd{};
 
             if (FAILED(transaction.candidate->QueryInterface(IID_PPV_ARGS(&candidate)))) {
@@ -366,12 +467,62 @@ void D3D12Hook::publish_xefg_candidate() {
                 reject_reason = "hwnd_mismatch";
             } else if (FAILED(candidate->GetDevice(IID_PPV_ARGS(&candidate_device)))) {
                 reject_reason = "candidate_device_unavailable";
-            } else if (FAILED(transaction.command_queue->GetDevice(IID_PPV_ARGS(&queue_device)))) {
-                reject_reason = "queue_device_unavailable";
-            } else if (FAILED(candidate_device.As(&candidate_identity)) || FAILED(queue_device.As(&queue_identity)) || candidate_identity.Get() != queue_identity.Get()) {
-                reject_reason = "device_mismatch";
+            } else if (FAILED(candidate_device.As(&candidate_identity))) {
+                reject_reason = "candidate_device_unavailable";
             } else {
-                pending = { candidate.Get(), transaction.command_queue, transaction.hwnd };
+                const auto init_queue = capture_queue_identity(transaction.init_queue);
+                const auto presentation_queue = capture_queue_identity(transaction.presentation_queue);
+                auto relation = XefgQueueRelation::InitQueueUnavailable;
+
+                if (!init_queue.valid) {
+                    relation = XefgQueueRelation::InitQueueUnavailable;
+                } else if (!presentation_queue.valid) {
+                    relation = XefgQueueRelation::PresentationQueueUnavailable;
+                } else if (init_queue.device_identity != presentation_queue.device_identity) {
+                    relation = XefgQueueRelation::DeviceMismatch;
+                } else if (presentation_queue.desc.Type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+                    relation = XefgQueueRelation::PresentationQueueNotDirect;
+                } else if (init_queue.com_identity == presentation_queue.com_identity) {
+                    relation = XefgQueueRelation::SameComIdentity;
+                } else {
+                    relation = XefgQueueRelation::DistinctSameDevice;
+                }
+
+                log_xefg_queue_identity(transaction.context, candidate.Get(), init_queue, presentation_queue, relation);
+
+                if (!init_queue.valid) {
+                    reject_reason = "queue_device_unavailable";
+                } else if (candidate_identity.Get() != init_queue.device_identity) {
+                    reject_reason = "device_mismatch";
+                } else if (relation == XefgQueueRelation::DistinctSameDevice) {
+                    pending = { candidate.Get(), presentation_queue.queue, transaction.hwnd, relation, false };
+                } else {
+                    // Preserve liveness and the original Present/Present1 calls, but
+                    // do not submit overlay work through an unproven XeFG queue path.
+                    pending = { candidate.Get(), init_queue.queue, transaction.hwnd, relation, true };
+                    bind_reason = "init_success_observe_only";
+                    switch (relation) {
+                    case XefgQueueRelation::SameComIdentity:
+                        probe_reason = "same_com_identity";
+                        break;
+                    case XefgQueueRelation::PresentationQueueUnavailable:
+                        probe_reason = transaction.presentation_queue == nullptr
+                            ? "presentation_queue_unavailable"
+                            : !presentation_queue.device_available
+                                ? "presentation_queue_device_unavailable"
+                                : "presentation_queue_unavailable";
+                        break;
+                    case XefgQueueRelation::DeviceMismatch:
+                        probe_reason = "presentation_queue_device_mismatch";
+                        break;
+                    case XefgQueueRelation::PresentationQueueNotDirect:
+                        probe_reason = "presentation_queue_not_direct";
+                        break;
+                    default:
+                        probe_reason = "presentation_queue_unavailable";
+                        break;
+                    }
+                }
             }
         }
 
@@ -379,8 +530,13 @@ void D3D12Hook::publish_xefg_candidate() {
             spdlog::warn("[XeFG][Bind] candidate = 0x{:x}, accepted = false, reason = {}",
                 reinterpret_cast<uintptr_t>(transaction.candidate), reject_reason);
         } else {
-            spdlog::info("[XeFG][Bind] candidate = 0x{:x}, accepted = true, reason = init_success",
-                reinterpret_cast<uintptr_t>(pending.swapchain));
+            spdlog::info("[XeFG][Bind] candidate = 0x{:x}, accepted = true, reason = {}",
+                reinterpret_cast<uintptr_t>(pending.swapchain), bind_reason);
+            spdlog::info("[XeFG][P2.1Probe] mode = {}, selected_queue = 0x{:x}, render_callbacks = {}, reason = {}",
+                pending.observe_only ? (pending.relation == XefgQueueRelation::SameComIdentity ? "observe_only_same_queue" : "observe_only_invalid_presentation_queue") : "presentation_queue_render",
+                reinterpret_cast<uintptr_t>(pending.selected_queue),
+                !pending.observe_only,
+                probe_reason);
         }
     }
 
@@ -414,7 +570,7 @@ void D3D12Hook::publish_xefg_candidate() {
                 g_framework->on_reset();
             }
 
-            if (!hook->bind_external_swapchain(pending.swapchain, pending.command_queue, SwapchainSource::XeFGInternal)) {
+            if (!hook->bind_external_swapchain(pending.swapchain, pending.selected_queue, SwapchainSource::XeFGInternal, pending.observe_only)) {
                 spdlog::warn("[XeFG][Bind] candidate = 0x{:x}, accepted = false, reason = external_bind_failed",
                     reinterpret_cast<uintptr_t>(pending.swapchain));
             }
@@ -442,10 +598,10 @@ bool D3D12Hook::consume_pending_xefg_binding(D3D12Hook& hook) {
         g_pending_xefg_binding.reset();
     }
 
-    return pending.has_value() && hook.bind_external_swapchain(pending->swapchain, pending->command_queue, SwapchainSource::XeFGInternal);
+    return pending.has_value() && hook.bind_external_swapchain(pending->swapchain, pending->selected_queue, SwapchainSource::XeFGInternal, pending->observe_only);
 }
 
-bool D3D12Hook::bind_external_swapchain(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source) {
+bool D3D12Hook::bind_external_swapchain(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source, bool xefg_p21_observe_only) {
     if (swapchain == nullptr || command_queue == nullptr) {
         return false;
     }
@@ -465,6 +621,8 @@ bool D3D12Hook::bind_external_swapchain(IDXGISwapChain3* swapchain, ID3D12Comman
     m_command_queue = command_queue;
     m_device = device.Get();
     m_swapchain_source = source;
+    m_xefg_p21_observe_only = source == SwapchainSource::XeFGInternal && xefg_p21_observe_only;
+    m_xefg_p21_render_boundary_logged = false;
     m_is_phase_1 = false;
 
     m_swapchain_hook = std::make_unique<VtableHook>(Address{swapchain});
@@ -1440,8 +1598,24 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
         return result;
     }
 
-    if (d3d12->m_on_present) {
+    const auto suppress_render_callbacks = d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
+        && d3d12->m_xefg_p21_observe_only;
+    const auto log_render_boundary = d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
+        && !suppress_render_callbacks
+        && d3d12->m_on_present
+        && !d3d12->m_xefg_p21_render_boundary_logged;
+
+    if (log_render_boundary) {
+        spdlog::info("[XeFG][P2.1Probe] render_callback = enter, present_call = {}", present_call);
+    }
+
+    if (!suppress_render_callbacks && d3d12->m_on_present) {
         d3d12->m_on_present(*d3d12);
+
+        if (log_render_boundary) {
+            spdlog::info("[XeFG][P2.1Probe] render_callback = returned, present_call = {}", present_call);
+            d3d12->m_xefg_p21_render_boundary_logged = true;
+        }
     }
 
     ++g_present_depth;
@@ -1456,7 +1630,17 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
     }
     --g_present_depth;
 
-    if (d3d12->m_on_post_present) {
+    if (d3d12->m_swapchain_source == SwapchainSource::XeFGInternal && result == DXGI_ERROR_DEVICE_REMOVED) {
+        const auto device_removed_reason = d3d12->m_device != nullptr ? d3d12->m_device->GetDeviceRemovedReason() : E_FAIL;
+        spdlog::error("[XeFG][P2.1Probe] present_result = 0x{:08x}, device_removed_reason = 0x{:08x}",
+            static_cast<uint32_t>(result), static_cast<uint32_t>(device_removed_reason));
+    }
+
+    if (suppress_render_callbacks) {
+        // present_common already holds hook_monitor_mutex. Keep the monitor
+        // alive without running renderer, GPU commit, or mod callbacks.
+        g_framework->note_present_activity();
+    } else if (d3d12->m_on_post_present) {
         d3d12->m_on_post_present(*d3d12);
     }
 

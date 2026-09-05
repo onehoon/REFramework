@@ -77,6 +77,7 @@ public:
     void on_post_present_d3d11();
     void on_frame_d3d12();
     void on_post_present_d3d12();
+    void note_present_activity();
     void on_reset();
 
     void patch_set_cursor_pos();

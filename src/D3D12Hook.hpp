@@ -39,7 +39,7 @@ public:
 	bool unhook();
 
 	static void install_xefg_api_hooks_if_available();
-	bool bind_external_swapchain(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source);
+	bool bind_external_swapchain(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source, bool xefg_p21_observe_only = false);
 
     bool is_hooked() {
         return m_hooked;
@@ -166,6 +166,8 @@ protected:
     bool m_using_proton_swapchain{ false };
     bool m_using_frame_generation_swapchain{ false };
 	SwapchainSource m_swapchain_source{ SwapchainSource::Native };
+	bool m_xefg_p21_observe_only{ false };
+	bool m_xefg_p21_render_boundary_logged{ false };
     bool m_hooked{ false };
     bool m_is_phase_1{ true };
     bool m_inside_present{false};
