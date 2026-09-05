@@ -630,15 +630,23 @@ bool D3D12Hook::bind_external_swapchain(IDXGISwapChain3* swapchain, ID3D12Comman
     m_swapchain_hook->hook_method(22, Address{reinterpret_cast<void*>(&D3D12Hook::present1)});
     m_swapchain_hook->hook_method(13, Address{reinterpret_cast<void*>(&D3D12Hook::resize_buffers)});
     m_swapchain_hook->hook_method(14, Address{reinterpret_cast<void*>(&D3D12Hook::resize_target)});
+
+    void* resize_buffers1_original = nullptr;
+    if (source == SwapchainSource::XeFGInternal) {
+        m_swapchain_hook->hook_method(39, Address{reinterpret_cast<void*>(&D3D12Hook::resize_buffers1)});
+        resize_buffers1_original = reinterpret_cast<void*>(m_swapchain_hook->get_method<decltype(D3D12Hook::resize_buffers1)*>(39));
+    }
+
     m_hooked = true;
 
-    spdlog::info("[D3D12][ExternalBind] source = {}, swapchain = 0x{:x}, queue = 0x{:x}, device = 0x{:x}, Present[8].original = 0x{:x}, Present1[22].original = 0x{:x}",
+    spdlog::info("[D3D12][ExternalBind] source = {}, swapchain = 0x{:x}, queue = 0x{:x}, device = 0x{:x}, Present[8].original = 0x{:x}, Present1[22].original = 0x{:x}, ResizeBuffers1[39].original = 0x{:x}",
         source == SwapchainSource::XeFGInternal ? "xefg_internal" : "native",
         reinterpret_cast<uintptr_t>(swapchain),
         reinterpret_cast<uintptr_t>(command_queue),
         reinterpret_cast<uintptr_t>(m_device),
         reinterpret_cast<uintptr_t>(m_swapchain_hook->get_method(8).ptr()),
-        reinterpret_cast<uintptr_t>(m_swapchain_hook->get_method(22).ptr()));
+        reinterpret_cast<uintptr_t>(m_swapchain_hook->get_method(22).ptr()),
+        reinterpret_cast<uintptr_t>(resize_buffers1_original));
 
     return true;
 }
@@ -1761,6 +1769,65 @@ HRESULT WINAPI D3D12Hook::resize_buffers(IDXGISwapChain3* swap_chain, UINT buffe
 
     --g_resize_buffers_depth;
 
+    return result;
+}
+
+thread_local int32_t g_resize_buffers1_depth = 0;
+
+HRESULT WINAPI D3D12Hook::resize_buffers1(IDXGISwapChain3* swap_chain, UINT buffer_count, UINT width, UINT height, DXGI_FORMAT new_format, UINT swap_chain_flags, const UINT* creation_node_mask, IUnknown* const* present_queues) {
+    while (g_framework == nullptr) {
+        std::this_thread::yield();
+    }
+
+    std::scoped_lock lifecycle_lock{g_framework->get_hook_monitor_mutex()};
+
+    auto* d3d12 = g_d3d12_hook;
+    if (d3d12 == nullptr || d3d12->m_swapchain_hook == nullptr || swap_chain == nullptr) {
+        return E_FAIL;
+    }
+
+    using ResizeBuffers1Fn = decltype(D3D12Hook::resize_buffers1)*;
+    const auto original = d3d12->m_swapchain_hook->get_method<ResizeBuffers1Fn>(39);
+    const auto is_tracked_instance = swap_chain == d3d12->m_swapchain_hook->get_instance();
+    const auto is_xefg_internal = d3d12->m_swapchain_source == SwapchainSource::XeFGInternal;
+
+    if (!is_tracked_instance || !is_xefg_internal) {
+        return original(swap_chain, buffer_count, width, height, new_format, swap_chain_flags, creation_node_mask, present_queues);
+    }
+
+    if (g_resize_buffers1_depth > 0) {
+        ++g_resize_buffers1_depth;
+        const auto nested_result = original(swap_chain, buffer_count, width, height, new_format, swap_chain_flags, creation_node_mask, present_queues);
+        --g_resize_buffers1_depth;
+        return nested_result;
+    }
+
+    d3d12->m_display_width = width;
+    d3d12->m_display_height = height;
+
+    const auto should_reset_renderer = !d3d12->m_xefg_p21_observe_only && static_cast<bool>(d3d12->m_on_resize_buffers);
+    spdlog::info("[XeFG][ResizeBuffers1] stage = enter, swapchain = 0x{:x}, buffer_count = {}, width = {}, height = {}, format = {}, flags = 0x{:x}, creation_node_mask = 0x{:x}, present_queues = 0x{:x}, pre_reset = {}",
+        reinterpret_cast<uintptr_t>(swap_chain),
+        buffer_count,
+        width,
+        height,
+        static_cast<uint32_t>(new_format),
+        swap_chain_flags,
+        reinterpret_cast<uintptr_t>(creation_node_mask),
+        reinterpret_cast<uintptr_t>(present_queues),
+        should_reset_renderer);
+
+    if (should_reset_renderer) {
+        spdlog::info("[XeFG][ResizeBuffers1] stage = pre_reset_begin");
+        d3d12->m_on_resize_buffers(*d3d12);
+        spdlog::info("[XeFG][ResizeBuffers1] stage = pre_reset_end");
+    }
+
+    ++g_resize_buffers1_depth;
+    const auto result = original(swap_chain, buffer_count, width, height, new_format, swap_chain_flags, creation_node_mask, present_queues);
+    --g_resize_buffers1_depth;
+
+    spdlog::info("[XeFG][ResizeBuffers1] stage = original_return, result = 0x{:08x}", static_cast<uint32_t>(result));
     return result;
 }
 
