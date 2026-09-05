@@ -1602,15 +1602,20 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
         && d3d12->m_xefg_p21_observe_only;
     const auto log_render_boundary = d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
         && !suppress_render_callbacks
+        && d3d12->m_on_present
         && !d3d12->m_xefg_p21_render_boundary_logged;
 
     if (log_render_boundary) {
-        d3d12->m_xefg_p21_render_boundary_logged = true;
         spdlog::info("[XeFG][P2.1Probe] render_callback = enter, present_call = {}", present_call);
     }
 
     if (!suppress_render_callbacks && d3d12->m_on_present) {
         d3d12->m_on_present(*d3d12);
+
+        if (log_render_boundary) {
+            spdlog::info("[XeFG][P2.1Probe] render_callback = returned, present_call = {}", present_call);
+            d3d12->m_xefg_p21_render_boundary_logged = true;
+        }
     }
 
     ++g_present_depth;
@@ -1633,10 +1638,6 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
 
     if (!suppress_render_callbacks && d3d12->m_on_post_present) {
         d3d12->m_on_post_present(*d3d12);
-    }
-
-    if (log_render_boundary) {
-        spdlog::info("[XeFG][P2.1Probe] render_callback = returned, present_call = {}", present_call);
     }
 
     d3d12->m_inside_present = false;
