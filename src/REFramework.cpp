@@ -469,6 +469,10 @@ REFramework::REFramework(HMODULE reframework_module)
         spdlog::info("ntdll.dll not found");
     }
 
+    // Install the XeFG public API hook at a normal execution point, before the
+    // D3D12 dummy-swapchain path can miss the game's initial XeFG transaction.
+    D3D12Hook::install_xefg_api_hooks_if_available();
+
     // wait for the game to load (WTF MHRISE??)
     // once this is done, we can assume the process is unpacked.
     if (gi.is_reengine_packed()) {

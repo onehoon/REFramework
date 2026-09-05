@@ -490,6 +490,7 @@ If validation fails, do not bind. Record one structured reject reason, such as:
 init_failed
 no_candidate
 no_idxgi_swapchain3
+hwnd_mismatch
 queue_device_unavailable
 device_mismatch
 ```
@@ -838,7 +839,7 @@ After the outer init returns, log the final decision:
 [XeFG][Bind]
 candidate = ...
 accepted = true | false
-reason = init_success | init_failed | no_candidate | no_idxgi_swapchain3 | queue_device_unavailable | device_mismatch
+reason = init_success | init_failed | no_candidate | no_idxgi_swapchain3 | hwnd_mismatch | queue_device_unavailable | device_mismatch
 ```
 
 ### 15.4 Public proxy capture

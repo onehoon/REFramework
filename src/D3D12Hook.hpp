@@ -4,6 +4,8 @@
 #include <functional>
 #include <atomic>
 #include <chrono>
+#include <mutex>
+#include <optional>
 #include <string_view>
 
 #pragma comment(lib, "d3d12.lib")
@@ -20,6 +22,11 @@
 class D3D12Hook
 {
 public:
+	enum class SwapchainSource : uint8_t {
+		Native,
+		XeFGInternal,
+	};
+
 	typedef std::function<void(D3D12Hook&)> OnPresentFn;
 	typedef std::function<void(D3D12Hook&)> OnResizeBuffersFn;
     typedef std::function<void(D3D12Hook&)> OnResizeTargetFn;
@@ -30,6 +37,9 @@ public:
 
 	bool hook();
 	bool unhook();
+
+	static void install_xefg_api_hooks_if_available();
+	bool bind_external_swapchain(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source);
 
     bool is_hooked() {
         return m_hooked;
@@ -120,6 +130,10 @@ public:
         return m_using_frame_generation_swapchain;
     }
 
+	SwapchainSource get_swapchain_source() const {
+		return m_swapchain_source;
+	}
+
     void ignore_next_present() {
         m_ignore_next_present = true;
     }
@@ -128,6 +142,13 @@ public:
 
 protected:
     void hook_impl();
+	static bool consume_pending_xefg_binding(D3D12Hook& hook);
+	static int32_t WINAPI xefg_init_from_swapchain_desc(void* context, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* swap_chain_desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc, ID3D12CommandQueue* command_queue, IDXGIFactory2* factory, const void* init_params);
+	static int32_t WINAPI xefg_get_swapchain_ptr(void* context, REFIID riid, void** swap_chain);
+	static HRESULT WINAPI create_xefg_swapchain(IDXGIFactory2* factory, IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc, IDXGIOutput* restrict_to_output, IDXGISwapChain1** swap_chain);
+	static HRESULT WINAPI present1(IDXGISwapChain1* swap_chain, UINT sync_interval, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters);
+    static HRESULT present_common(IDXGISwapChain3* swap_chain, const char* kind, void* original_present, std::function<HRESULT()> original_call, bool allow_phase_transition);
+	static void publish_xefg_candidate();
     
     ID3D12Device4* m_device{ nullptr };
     IDXGISwapChain3* m_swap_chain{ nullptr };
@@ -144,6 +165,7 @@ protected:
 
     bool m_using_proton_swapchain{ false };
     bool m_using_frame_generation_swapchain{ false };
+	SwapchainSource m_swapchain_source{ SwapchainSource::Native };
     bool m_hooked{ false };
     bool m_is_phase_1{ true };
     bool m_inside_present{false};
