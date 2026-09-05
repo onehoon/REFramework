@@ -1,0 +1,61 @@
+name: Release
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          submodules: recursive
+
+      - name: Audit direct struct field access
+        run: |
+          pip install libclang
+          python dev/audit_direct_access_clang.py
+
+      - name: Configure CMake
+        run: cmake -S ${{github.workspace}} -B ${{github.workspace}}/build -G "Visual Studio 18 2026" -A x64 -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DDEVELOPER_MODE=ON "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+
+      - name: Build REFramework
+        run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target REFramework
+
+      - name: Upload dinput8.dll artifact
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
+        with:
+          name: dinput8.dll
+          path: ${{github.workspace}}/build/bin/REFramework/dinput8.dll
+          if-no-files-found: error
+
+  publish:
+    runs-on: windows-latest
+    needs: build
+    if: github.ref == 'refs/heads/master'
+    permissions:
+      contents: write
+    steps:
+      - name: Download dinput8.dll
+        uses: actions/download-artifact@c850b930e6ba138125429b7e5c93fc707a7f8427
+        with:
+          name: dinput8.dll
+          path: ${{github.workspace}}/artifact
+
+      - name: Create fork release
+        uses: ncipollo/release-action@6c75be85e571768fa31b40abf38de58ba0397db5
+        with:
+          token: ${{ github.token }}
+          name: ${{format('REFramework Fork Release {0} ({1})', github.run_number, github.sha)}}
+          tag: ${{format('fork-release-{0}-{1}', github.run_number, github.sha)}}
+          artifacts: ${{github.workspace}}/artifact/dinput8.dll
+          makeLatest: false
+          allowUpdates: false
