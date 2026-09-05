@@ -1,5 +1,7 @@
 name: Dev Release
 on: [push, workflow_dispatch]
+permissions:
+  contents: read
 env:
   BUILD_TYPE: Release
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -93,6 +95,8 @@ jobs:
     runs-on: windows-latest
     needs: [dev-release, csharp-release]
     if: github.ref == 'refs/heads/master'
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -113,12 +117,10 @@ jobs:
       - name: Create Release
         uses: ncipollo/release-action@6c75be85e571768fa31b40abf38de58ba0397db5
         with:
-          repo: REFramework-nightly
-          owner: praydog
-          token: ${{ secrets.REPO_TOKEN }}
-          name: ${{format('REF Nightly {0} ({1})', env.RUN_NUMBER, github.sha)}}
-          tag: ${{format('nightly-{0}-{1}', env.RUN_NUMBER, github.sha)}}
+          token: ${{ github.token }}
+          name: ${{format('REFramework Fork Nightly {0} ({1})', env.RUN_NUMBER, github.sha)}}
+          tag: ${{format('fork-nightly-{0}-{1}', env.RUN_NUMBER, github.sha)}}
           artifacts: ${{github.workspace}}/artifacts/**/*.zip
-          makeLatest: true
+          makeLatest: false
           bodyFile: ${{github.workspace}}/nightly-body.md
           allowUpdates: true
