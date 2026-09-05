@@ -1446,6 +1446,15 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
 }
 
 HRESULT WINAPI D3D12Hook::present1(IDXGISwapChain1* swap_chain, UINT sync_interval, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters) {
+    while (g_framework == nullptr) {
+        std::this_thread::yield();
+    }
+
+    // Hook-monitor recovery and swapchain recreation reset or destroy the active
+    // D3D12Hook under this mutex. Keep it while reading both the hook object and
+    // its vtable hook, then let present_common re-enter it recursively.
+    std::scoped_lock lifecycle_lock{g_framework->get_hook_monitor_mutex()};
+
     auto d3d12 = g_d3d12_hook;
     if (d3d12 == nullptr || d3d12->m_swapchain_hook == nullptr || swap_chain == nullptr) {
         return E_FAIL;
