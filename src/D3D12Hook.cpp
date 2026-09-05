@@ -295,7 +295,7 @@ void* D3D12Hook::Streamline::link_swapchain_to_cmd_queue(void* rcx, void* rdx, v
     return result;
 }
 
-HRESULT WINAPI D3D12Hook::create_swapchain(IDXGIFactory4* factory, IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* p_fullscreen_desc, IDXGIOutput* p_restrict_to_output, IDXGISwapChain** swap_chain) {
+HRESULT WINAPI D3D12Hook::create_swapchain(IDXGIFactory4* factory, IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* p_fullscreen_desc, IDXGIOutput* p_restrict_to_output, IDXGISwapChain1** swap_chain) {
     auto create_swap_chain_fn = s_create_swapchain_hook->get_original<decltype(D3D12Hook::create_swapchain)*>();
 
     if (g_inside_d3d12_hook) {
@@ -341,10 +341,10 @@ HRESULT WINAPI D3D12Hook::create_swapchain(IDXGIFactory4* factory, IUnknown* dev
             reinterpret_cast<uintptr_t>(factory),
             reinterpret_cast<uintptr_t>(device),
             reinterpret_cast<uintptr_t>(hwnd),
-            desc != nullptr ? desc->BufferDesc.Width : 0,
-            desc != nullptr ? desc->BufferDesc.Height : 0,
-            desc != nullptr ? desc->BufferDesc.Format : DXGI_FORMAT_UNKNOWN,
-            desc != nullptr ? format_name(desc->BufferDesc.Format) : "unknown",
+            desc != nullptr ? desc->Width : 0,
+            desc != nullptr ? desc->Height : 0,
+            desc != nullptr ? desc->Format : DXGI_FORMAT_UNKNOWN,
+            desc != nullptr ? format_name(desc->Format) : "unknown",
             desc != nullptr ? desc->BufferCount : 0,
             desc != nullptr ? desc->SwapEffect : DXGI_SWAP_EFFECT_DISCARD,
             desc != nullptr ? swap_effect_name(desc->SwapEffect) : "unknown",
