@@ -443,9 +443,15 @@ During the `InitFromSwapChainDesc` detour:
 2. install a temporary `VtableHook` on the supplied factory instance,
 3. hook `CreateSwapChainForHwnd[15]`,
 4. call the original XeFG `InitFromSwapChainDesc`,
-5. capture the successfully returned swapchain from the factory detour,
+5. capture a successful factory result as a **provisional candidate only**,
 6. remove the temporary factory hook before returning to OptiScaler,
-7. publish the captured swapchain + exact queue as the XeFG internal binding candidate.
+7. inspect the outer `InitFromSwapChainDesc` result,
+8. only when the outer init succeeds, validate and publish the provisional candidate + exact queue,
+9. bind only after that final validation succeeds.
+
+`CreateSwapChainForHwnd` is an intermediate step in the XeFG transaction. Its successful
+return must never bind REFramework by itself. The outer XeFG init result is the final
+commit point for the candidate.
 
 Use RAII / `ScopeGuard` so the temporary hook is always removed.
 
@@ -465,14 +471,28 @@ The returned object observed by P1.1 is expected to be the OptiScaler presentati
 
 Accept a candidate only when:
 
+- outer `InitFromSwapChainDesc` returned `XEFG_SWAPCHAIN_RESULT_SUCCESS`,
 - original `CreateSwapChainForHwnd` returned success,
 - output pointer is non-null,
 - candidate supports at least `IDXGISwapChain3`,
 - HWND matches the active XeFG init transaction,
 - `GetDevice` succeeds with a D3D12 device,
-- the supplied command queue is non-null.
+- the supplied command queue is non-null,
+- `ID3D12CommandQueue::GetDevice` succeeds, and
+- the candidate device and command-queue device resolve to the same D3D12 device identity.
 
-Where practical, compare the queue device and swapchain device COM identity for diagnostics.
+Use temporary `ComPtr`/`QueryInterface` results for the device checks. Do not retain those
+references as a swapchain lifetime strategy.
+
+If validation fails, do not bind. Record one structured reject reason, such as:
+
+```text
+init_failed
+no_candidate
+no_idxgi_swapchain3
+queue_device_unavailable
+device_mismatch
+```
 
 Do not require:
 
@@ -793,9 +813,13 @@ height = ...
 format = ...
 buffer_count = ...
 flags = ...
+result = XEFG_SWAPCHAIN_RESULT_SUCCESS | ...
 ```
 
 ### 15.3 Internal presentation capture
+
+The factory callback must log capture separately from acceptance. Capture is provisional
+until the outer init result and device/queue validation have completed.
 
 ```text
 [XeFG][InternalSwapchain]
@@ -805,6 +829,16 @@ vtable = ...
 Present[8] owner = ...
 Present1[22] owner = ...
 queue = ...
+provisional = true
+```
+
+After the outer init returns, log the final decision:
+
+```text
+[XeFG][Bind]
+candidate = ...
+accepted = true | false
+reason = init_success | init_failed | no_candidate | no_idxgi_swapchain3 | queue_device_unavailable | device_mismatch
 ```
 
 ### 15.4 Public proxy capture
@@ -1063,6 +1097,9 @@ Before marking the PR ready:
 - [ ] `libxess_fg.dll` is the public API hook point.
 - [ ] No functional dependency on `igxess_fg.dll` ownership.
 - [ ] Exact XeFG command queue comes from `InitFromSwapChainDesc`.
+- [ ] `CreateSwapChainForHwnd` captures only a provisional candidate.
+- [ ] Outer `InitFromSwapChainDesc` success is the final candidate commit point.
+- [ ] Candidate and command-queue devices are both available and match.
 - [ ] Temporary factory hook is removed after init.
 - [ ] Existing Opti/DXGI factory chain is preserved.
 - [ ] Internal presentation swapchain, not public XeFG proxy, is the render target.
