@@ -2,6 +2,9 @@
 #include <future>
 #include <unordered_set>
 #include <stacktrace>
+#include <algorithm>
+#include <optional>
+#include <string>
 #include <wrl/client.h>
 
 #include <spdlog/spdlog.h>
@@ -21,8 +24,213 @@
 static D3D12Hook* g_d3d12_hook = nullptr;
 thread_local bool g_inside_d3d12_hook = false;
 
+namespace {
+
+const auto g_diagnostic_start_time = std::chrono::steady_clock::now();
+
+struct SwapchainVtableSnapshot {
+    void* object{};
+    void** vtable{};
+    void* present{};
+    void* resize_buffers{};
+    void* resize_target{};
+    void* present1{};
+    void* resize_buffers1{};
+};
+
+bool is_readable(const void* address, size_t size) {
+    if (address == nullptr || size == 0) {
+        return false;
+    }
+
+    auto current = reinterpret_cast<uintptr_t>(address);
+    const auto end = current + size;
+    if (end < current) {
+        return false;
+    }
+
+    while (current < end) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<const void*>(current), &mbi, sizeof(mbi)) != sizeof(mbi)
+            || mbi.State != MEM_COMMIT
+            || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+            return false;
+        }
+
+        const auto region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        if (region_end <= current) {
+            return false;
+        }
+
+        current = (std::min)(region_end, end);
+    }
+
+    return true;
+}
+
+void* read_vtable_slot(void** vtable, size_t slot) {
+    if (vtable == nullptr || !is_readable(vtable, (slot + 1) * sizeof(void*))) {
+        return nullptr;
+    }
+
+    return vtable[slot];
+}
+
+std::string describe_address(void* address) {
+    if (address == nullptr) {
+        return "unknown";
+    }
+
+    try {
+        const auto module = utility::get_module_within(address);
+        if (!module) {
+            return "unknown";
+        }
+
+        const auto path = utility::get_module_pathw(*module);
+        if (!path) {
+            return fmt::format("0x{:x}", reinterpret_cast<uintptr_t>(*module));
+        }
+
+        return fmt::format("0x{:x} [{}]", reinterpret_cast<uintptr_t>(*module), utility::narrow(*path));
+    } catch (...) {
+        return "unknown";
+    }
+}
+
+std::optional<SwapchainVtableSnapshot> snapshot_swapchain(IUnknown* object) {
+    if (object == nullptr) {
+        return std::nullopt;
+    }
+
+    Microsoft::WRL::ComPtr<IDXGISwapChain4> swapchain;
+    if (FAILED(object->QueryInterface(IID_PPV_ARGS(&swapchain))) || swapchain == nullptr) {
+        return std::nullopt;
+    }
+
+    if (!is_readable(swapchain.Get(), sizeof(void*))) {
+        return std::nullopt;
+    }
+
+    auto vtable = *reinterpret_cast<void***>(swapchain.Get());
+    if (!is_readable(vtable, sizeof(void*))) {
+        return std::nullopt;
+    }
+
+    return SwapchainVtableSnapshot{
+        .object = swapchain.Get(),
+        .vtable = vtable,
+        .present = read_vtable_slot(vtable, 8),
+        .resize_buffers = read_vtable_slot(vtable, 13),
+        .resize_target = read_vtable_slot(vtable, 14),
+        .present1 = read_vtable_slot(vtable, 22),
+        .resize_buffers1 = read_vtable_slot(vtable, 39),
+    };
+}
+
+void log_swapchain_vtable(std::string_view prefix, const SwapchainVtableSnapshot& snapshot) {
+    spdlog::info("{} object = 0x{:x}, vtable = 0x{:x}", prefix, reinterpret_cast<uintptr_t>(snapshot.object), reinterpret_cast<uintptr_t>(snapshot.vtable));
+    spdlog::info("{} Present[8] = 0x{:x}, owner = {}", prefix, reinterpret_cast<uintptr_t>(snapshot.present), describe_address(snapshot.present));
+    spdlog::info("{} ResizeBuffers[13] = 0x{:x}, owner = {}", prefix, reinterpret_cast<uintptr_t>(snapshot.resize_buffers), describe_address(snapshot.resize_buffers));
+    spdlog::info("{} ResizeTarget[14] = 0x{:x}, owner = {}", prefix, reinterpret_cast<uintptr_t>(snapshot.resize_target), describe_address(snapshot.resize_target));
+    spdlog::info("{} Present1[22] = 0x{:x}, owner = {}", prefix, reinterpret_cast<uintptr_t>(snapshot.present1), describe_address(snapshot.present1));
+    spdlog::info("{} ResizeBuffers1[39] = 0x{:x}, owner = {}", prefix, reinterpret_cast<uintptr_t>(snapshot.resize_buffers1), describe_address(snapshot.resize_buffers1));
+}
+
+const char* format_name(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM: return "R8G8B8A8_UNORM";
+    case DXGI_FORMAT_B8G8R8A8_UNORM: return "B8G8R8A8_UNORM";
+    case DXGI_FORMAT_R10G10B10A2_UNORM: return "R10G10B10A2_UNORM";
+    default: return "unknown";
+    }
+}
+
+const char* swap_effect_name(DXGI_SWAP_EFFECT effect) {
+    switch (effect) {
+    case DXGI_SWAP_EFFECT_DISCARD: return "DISCARD";
+    case DXGI_SWAP_EFFECT_SEQUENTIAL: return "SEQUENTIAL";
+    case DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL: return "FLIP_SEQUENTIAL";
+    case DXGI_SWAP_EFFECT_FLIP_DISCARD: return "FLIP_DISCARD";
+    default: return "unknown";
+    }
+}
+
+void log_discovery_snapshot(IUnknown* dummy_swapchain, void** swapchain_vtable, IDXGIFactory4* factory, void** factory_vtable, ID3D12CommandQueue* command_queue) {
+    spdlog::info("[D3D12][Discovery] dummy_swapchain = 0x{:x}, dummy_vtable = 0x{:x}, factory = 0x{:x}, factory_vtable = 0x{:x}, command_queue = 0x{:x}, command_queue_offset = 0x{:x}",
+        reinterpret_cast<uintptr_t>(dummy_swapchain),
+        reinterpret_cast<uintptr_t>(swapchain_vtable),
+        reinterpret_cast<uintptr_t>(factory),
+        reinterpret_cast<uintptr_t>(factory_vtable),
+        reinterpret_cast<uintptr_t>(command_queue),
+        D3D12Hook::get_command_queue_offset_for_diagnostics());
+
+    if (dummy_swapchain != nullptr) {
+        if (const auto snapshot = snapshot_swapchain(dummy_swapchain)) {
+            log_swapchain_vtable("[D3D12][Discovery]", *snapshot);
+        } else {
+            spdlog::info("[D3D12][Discovery] swapchain interface = unavailable");
+        }
+    } else if (swapchain_vtable != nullptr) {
+        spdlog::info("[D3D12][Discovery] Present[8] = 0x{:x}, owner = {}", reinterpret_cast<uintptr_t>(read_vtable_slot(swapchain_vtable, 8)), describe_address(read_vtable_slot(swapchain_vtable, 8)));
+        spdlog::info("[D3D12][Discovery] ResizeBuffers[13] = 0x{:x}, owner = {}", reinterpret_cast<uintptr_t>(read_vtable_slot(swapchain_vtable, 13)), describe_address(read_vtable_slot(swapchain_vtable, 13)));
+        spdlog::info("[D3D12][Discovery] ResizeTarget[14] = 0x{:x}, owner = {}", reinterpret_cast<uintptr_t>(read_vtable_slot(swapchain_vtable, 14)), describe_address(read_vtable_slot(swapchain_vtable, 14)));
+        spdlog::info("[D3D12][Discovery] Present1[22] = 0x{:x}, owner = {}", reinterpret_cast<uintptr_t>(read_vtable_slot(swapchain_vtable, 22)), describe_address(read_vtable_slot(swapchain_vtable, 22)));
+        spdlog::info("[D3D12][Discovery] ResizeBuffers1[39] = 0x{:x}, owner = {}", reinterpret_cast<uintptr_t>(read_vtable_slot(swapchain_vtable, 39)), describe_address(read_vtable_slot(swapchain_vtable, 39)));
+    }
+
+    if (factory_vtable != nullptr) {
+        const auto create_swapchain = read_vtable_slot(factory_vtable, 15);
+        spdlog::info("[D3D12][Discovery] CreateSwapChainForHwnd[15] = 0x{:x}, owner = {}", reinterpret_cast<uintptr_t>(create_swapchain), describe_address(create_swapchain));
+    }
+}
+
+} // namespace
+
 D3D12Hook::~D3D12Hook() {
     unhook();
+}
+
+void D3D12Hook::notify_xefg_module_loaded(HMODULE module, std::wstring_view base_name, std::wstring_view full_path) {
+    s_xefg_module_loaded.store(true, std::memory_order_relaxed);
+
+    const auto observed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_diagnostic_start_time).count();
+    int64_t expected = -1;
+    s_xefg_first_seen_ms.compare_exchange_strong(expected, observed_ms, std::memory_order_relaxed);
+
+    spdlog::info("[XeFG][Module] name = {}, base = 0x{:x}, full_path = {}, first_seen_ms = {}",
+        utility::narrow(std::wstring{base_name}), reinterpret_cast<uintptr_t>(module), utility::narrow(std::wstring{full_path}), s_xefg_first_seen_ms.load(std::memory_order_relaxed));
+
+    const auto init_from_swap_chain = GetProcAddress(module, "xefgSwapChainD3D12InitFromSwapChain");
+    const auto init_from_swap_chain_desc = GetProcAddress(module, "xefgSwapChainD3D12InitFromSwapChainDesc");
+    const auto get_swap_chain_ptr = GetProcAddress(module, "xefgSwapChainD3D12GetSwapChainPtr");
+
+    spdlog::info("[XeFG][Exports] InitFromSwapChain = 0x{:x} / {}, InitFromSwapChainDesc = 0x{:x} / {}, GetSwapChainPtr = 0x{:x} / {}",
+        reinterpret_cast<uintptr_t>(init_from_swap_chain), init_from_swap_chain != nullptr ? "present" : "missing",
+        reinterpret_cast<uintptr_t>(init_from_swap_chain_desc), init_from_swap_chain_desc != nullptr ? "present" : "missing",
+        reinterpret_cast<uintptr_t>(get_swap_chain_ptr), get_swap_chain_ptr != nullptr ? "present" : "missing");
+}
+
+int64_t D3D12Hook::get_last_present_age_ms() const {
+    if (m_last_present_entry_time.time_since_epoch().count() == 0) {
+        return -1;
+    }
+
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - m_last_present_entry_time).count();
+}
+
+void D3D12Hook::log_hook_monitor_snapshot(std::string_view event) const {
+    spdlog::info("[D3D12][HookMonitor] event = {}, is_hooked = {}, is_phase_1 = {}, inside_present = {}, active_swapchain = 0x{:x}, active_device = 0x{:x}, active_command_queue = 0x{:x}, present_entry_count = {}, xefg_module_loaded = {}, last_present_entry_age_ms = {}",
+        event,
+        m_hooked,
+        m_is_phase_1,
+        m_inside_present,
+        reinterpret_cast<uintptr_t>(m_swap_chain),
+        reinterpret_cast<uintptr_t>(m_device),
+        reinterpret_cast<uintptr_t>(m_command_queue),
+        m_present_entry_count.load(std::memory_order_relaxed),
+        is_xefg_module_loaded(),
+        get_last_present_age_ms());
 }
 
 void* D3D12Hook::Streamline::link_swapchain_to_cmd_queue(void* rcx, void* rdx, void* r8, void* r9) {
@@ -80,11 +288,60 @@ HRESULT WINAPI D3D12Hook::create_swapchain(IDXGIFactory4* factory, IUnknown* dev
     bool hook_was_nullptr = g_d3d12_hook == nullptr;
 
     if (g_d3d12_hook != nullptr && g_framework->get_d3d12_hook() != nullptr) {
+        spdlog::info("[D3D12][HookLifecycle] action = unhook, reason = swapchain_reset_recreate");
         g_framework->on_reset(); // Needed to prevent a crash due to resources hanging around
         g_d3d12_hook->unhook(); // Removes all vtable hooks
     }
 
     const auto result = create_swap_chain_fn(factory, device, hwnd, desc, p_fullscreen_desc, p_restrict_to_output, swap_chain);
+
+    if (SUCCEEDED(result) && swap_chain != nullptr && *swap_chain != nullptr) {
+        static std::atomic<uint64_t> candidate_sequence{0};
+        const auto sequence = candidate_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+
+        std::string type_name = "unknown";
+        try {
+            const auto type_info = utility::rtti::get_type_info(*swap_chain);
+            if (type_info != nullptr && type_info->name() != nullptr) {
+                type_name = type_info->name();
+            }
+        } catch (...) {
+            type_name = "unknown";
+        }
+
+        spdlog::info("[D3D12][SwapchainCandidate] sequence = {}, swapchain = 0x{:x}, factory = 0x{:x}, device_or_queue_arg = 0x{:x}, hwnd = 0x{:x}, width = {}, height = {}, format = {} ({}), buffer_count = {}, swap_effect = {} ({}), flags = 0x{:x}, type_name = {}, xefg_module_loaded = {}",
+            sequence,
+            reinterpret_cast<uintptr_t>(*swap_chain),
+            reinterpret_cast<uintptr_t>(factory),
+            reinterpret_cast<uintptr_t>(device),
+            reinterpret_cast<uintptr_t>(hwnd),
+            desc != nullptr ? desc->BufferDesc.Width : 0,
+            desc != nullptr ? desc->BufferDesc.Height : 0,
+            desc != nullptr ? desc->BufferDesc.Format : DXGI_FORMAT_UNKNOWN,
+            desc != nullptr ? format_name(desc->BufferDesc.Format) : "unknown",
+            desc != nullptr ? desc->BufferCount : 0,
+            desc != nullptr ? desc->SwapEffect : DXGI_SWAP_EFFECT_DISCARD,
+            desc != nullptr ? swap_effect_name(desc->SwapEffect) : "unknown",
+            desc != nullptr ? desc->Flags : 0,
+            type_name,
+            D3D12Hook::is_xefg_module_loaded());
+
+        if (const auto snapshot = snapshot_swapchain(*swap_chain)) {
+            log_swapchain_vtable("[D3D12][SwapchainCandidate]", *snapshot);
+        } else {
+            spdlog::info("[D3D12][SwapchainCandidate] swapchain interface = unavailable");
+        }
+
+        if (type_name.find("interposer::DXGISwapChain") != std::string::npos) {
+            spdlog::info("[D3D12][SwapchainCandidate] classification = streamline_interposer");
+        } else if (type_name.find("FrameInterpolationSwapChain") != std::string::npos) {
+            spdlog::info("[D3D12][SwapchainCandidate] classification = frame_interpolation_swapchain");
+        } else if (type_name == "unknown") {
+            spdlog::info("[D3D12][SwapchainCandidate] classification = unknown_wrapper");
+        } else {
+            spdlog::info("[D3D12][SwapchainCandidate] classification = native");
+        }
+    }
 
     // rather than waiting on the hook monitor to notice the hook isn't working
     if (!hook_was_nullptr) {
@@ -152,6 +409,15 @@ void D3D12Hook::hook_streamline(HMODULE dlssg_module) try {
 
 bool D3D12Hook::hook() {
     spdlog::info("Hooking D3D12");
+    spdlog::info("[D3D12][HookLifecycle] action = hook, reason = initial_or_reinitialize");
+
+    if (!is_xefg_module_loaded()) {
+        if (const auto xefg_module = GetModuleHandleW(L"libxess_fg.dll")) {
+            wchar_t path[MAX_PATH]{};
+            const auto path_length = GetModuleFileNameW(xefg_module, path, ARRAYSIZE(path));
+            notify_xefg_module_loaded(xefg_module, L"libxess_fg.dll", std::wstring_view{path, path_length});
+        }
+    }
 
     g_d3d12_hook = this;
     g_inside_d3d12_hook = true;
@@ -488,6 +754,8 @@ bool D3D12Hook::hook() {
         s_swapchain_vtable = *(void***)target_swapchain;
         s_factory_vtable = *(void***)factory;
 
+        log_discovery_snapshot(swap_chain1, s_swapchain_vtable, factory, s_factory_vtable, command_queue);
+
         hook_impl();
     } catch (const std::exception& e) {
         spdlog::error("Failed to initialize hooks: {}", e.what());
@@ -525,6 +793,9 @@ void D3D12Hook::hook_impl() {
 
     auto& present_fn = s_swapchain_vtable[8]; // Present
     m_present_hook = std::make_unique<PointerHook>(&present_fn, &D3D12Hook::present);
+
+    spdlog::info("[D3D12][HookInstall] phase = phase1, slot = Present[8], target = 0x{:x}, target_owner = {}, destination = D3D12Hook::present",
+        reinterpret_cast<uintptr_t>(present_fn), describe_address(present_fn));
 
     if (s_create_swapchain_hook == nullptr) {
         auto& create_swapchain_fn = s_factory_vtable[15]; // CreateSwapChainForHwnd
@@ -578,6 +849,40 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
     HWND swapchain_wnd{nullptr};
     swap_chain->GetHwnd(&swapchain_wnd);
 
+    const auto present_call = d3d12->m_present_entry_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    d3d12->m_last_present_entry_time = std::chrono::steady_clock::now();
+
+    const auto xefg_loaded = D3D12Hook::is_xefg_module_loaded();
+    const auto should_log_present = present_call <= 10
+        || d3d12->m_last_logged_present_swapchain != swap_chain
+        || d3d12->m_last_logged_present_target != reinterpret_cast<void*>(present_fn)
+        || d3d12->m_last_logged_present_phase_1 != d3d12->m_is_phase_1
+        || d3d12->m_last_logged_present_xefg != xefg_loaded;
+
+    if (should_log_present) {
+        void* present_vtable = nullptr;
+        if (const auto snapshot = snapshot_swapchain(swap_chain)) {
+            present_vtable = snapshot->vtable;
+        }
+
+        spdlog::info("[D3D12][PresentEntry] call = {}, phase = {}, swapchain = 0x{:x}, vtable = 0x{:x}, hwnd = 0x{:x}, tracked_swapchain = 0x{:x}, original_present = 0x{:x}, original_owner = {}, thread_id = {}, xefg_module_loaded = {}",
+            present_call,
+            d3d12->m_is_phase_1 ? "phase1" : "instance",
+            reinterpret_cast<uintptr_t>(swap_chain),
+            reinterpret_cast<uintptr_t>(present_vtable),
+            reinterpret_cast<uintptr_t>(swapchain_wnd),
+            reinterpret_cast<uintptr_t>(d3d12->m_swap_chain),
+            reinterpret_cast<uintptr_t>(present_fn),
+            describe_address(reinterpret_cast<void*>(present_fn)),
+            GetCurrentThreadId(),
+            xefg_loaded);
+
+        d3d12->m_last_logged_present_swapchain = swap_chain;
+        d3d12->m_last_logged_present_target = reinterpret_cast<void*>(present_fn);
+        d3d12->m_last_logged_present_phase_1 = d3d12->m_is_phase_1;
+        d3d12->m_last_logged_present_xefg = xefg_loaded;
+    }
+
     if (d3d12->m_is_phase_1 && WindowFilter::get().is_filtered(swapchain_wnd)) {
         //present_fn = d3d12->m_present_hook->get_original<decltype(D3D12Hook::present)*>();
         return present_fn(swap_chain, sync_interval, flags, r9);
@@ -604,7 +909,26 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
         d3d12->m_swapchain_hook->hook_method(8, (uintptr_t)&D3D12Hook::present);
         d3d12->m_swapchain_hook->hook_method(13, (uintptr_t)&D3D12Hook::resize_buffers);
         d3d12->m_swapchain_hook->hook_method(14, (uintptr_t)&D3D12Hook::resize_target);
+
+        void* instance_vtable = nullptr;
+        if (const auto snapshot = snapshot_swapchain(swap_chain)) {
+            instance_vtable = snapshot->vtable;
+            const auto instance_present_original = d3d12->m_swapchain_hook->get_method<decltype(D3D12Hook::present)*>(8);
+            spdlog::info("[D3D12][HookInstall] phase = instance, swapchain = 0x{:x}, vtable = 0x{:x}, Present[8].original = 0x{:x}, Present[8].owner = {}, ResizeBuffers[13] = 0x{:x}, ResizeTarget[14] = 0x{:x}",
+                reinterpret_cast<uintptr_t>(swap_chain),
+                reinterpret_cast<uintptr_t>(snapshot->vtable),
+                reinterpret_cast<uintptr_t>(instance_present_original),
+                describe_address(reinterpret_cast<void*>(instance_present_original)),
+                reinterpret_cast<uintptr_t>(snapshot->resize_buffers),
+                reinterpret_cast<uintptr_t>(snapshot->resize_target));
+        }
+
         d3d12->m_is_phase_1 = false;
+
+        spdlog::info("[D3D12][PhaseTransition] phase1 -> instance, swapchain = 0x{:x}, vtable = 0x{:x}, xefg_module_loaded = {}",
+            reinterpret_cast<uintptr_t>(swap_chain),
+            reinterpret_cast<uintptr_t>(instance_vtable),
+            D3D12Hook::is_xefg_module_loaded());
 
         present_fn = d3d12->m_swapchain_hook->get_method<decltype(D3D12Hook::present)*>(8);
     }

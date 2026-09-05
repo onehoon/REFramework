@@ -2,12 +2,16 @@
 
 #include <iostream>
 #include <functional>
+#include <atomic>
+#include <chrono>
+#include <string_view>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi")
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#include <dxgi1_5.h>
 
 #include "utility/PointerHook.hpp"
 #include "utility/FunctionHook.hpp"
@@ -86,6 +90,24 @@ public:
         return m_inside_present;
     }
 
+    uint64_t get_present_entry_count() const {
+        return m_present_entry_count.load(std::memory_order_relaxed);
+    }
+
+    int64_t get_last_present_age_ms() const;
+
+    static uint32_t get_command_queue_offset_for_diagnostics() {
+        return s_command_queue_offset;
+    }
+
+    void log_hook_monitor_snapshot(std::string_view event) const;
+
+    static void notify_xefg_module_loaded(HMODULE module, std::wstring_view base_name, std::wstring_view full_path);
+
+    static bool is_xefg_module_loaded() {
+        return s_xefg_module_loaded.load(std::memory_order_relaxed);
+    }
+
     bool is_proton_swapchain() const {
         return m_using_proton_swapchain;
     }
@@ -122,6 +144,12 @@ protected:
     bool m_is_phase_1{ true };
     bool m_inside_present{false};
     bool m_ignore_next_present{false};
+    std::atomic<uint64_t> m_present_entry_count{0};
+    std::chrono::steady_clock::time_point m_last_present_entry_time{};
+    void* m_last_logged_present_swapchain{ nullptr };
+    void* m_last_logged_present_target{ nullptr };
+    bool m_last_logged_present_phase_1{ true };
+    bool m_last_logged_present_xefg{ false };
 
     std::unique_ptr<PointerHook> m_present_hook{};
     std::unique_ptr<VtableHook> m_swapchain_hook{};
@@ -140,6 +168,8 @@ protected:
     static inline std::unique_ptr<PointerHook> s_create_swapchain_hook{};
     static inline void** s_factory_vtable{ nullptr };
     static inline void** s_swapchain_vtable{ nullptr };
+    static inline std::atomic<bool> s_xefg_module_loaded{false};
+    static inline std::atomic<int64_t> s_xefg_first_seen_ms{-1};
     
     OnPresentFn m_on_present{ nullptr };
     OnPresentFn m_on_post_present{ nullptr };
