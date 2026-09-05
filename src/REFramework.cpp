@@ -111,22 +111,25 @@ void REFramework::hook_monitor() {
                 m_last_chance_time = now;
 
                 spdlog::info("Last chance encountered for hooking");
-                if (renderer_type == REFramework::RendererType::D3D12 && d3d12 != nullptr) {
+                if (d3d12 != nullptr) {
                     d3d12->log_hook_monitor_snapshot("last_chance");
                 }
             }
 
             if (!m_has_last_chance && now - m_last_chance_time > std::chrono::seconds(1)) {
                 spdlog::info("Sending rehook request for D3D");
-                if (renderer_type == REFramework::RendererType::D3D12 && d3d12 != nullptr) {
+                if (d3d12 != nullptr) {
                     d3d12->log_hook_monitor_snapshot("rehook_request");
-                    spdlog::info("[D3D12][HookLifecycle] action = hook, reason = hook_monitor_recovery");
                 }
 
                 // hook_d3d12 always gets called first.
                 if (m_is_d3d11) {
                     hook_d3d11();
                 } else {
+                    if (d3d12 != nullptr) {
+                        spdlog::info("[D3D12][HookLifecycle] action = hook, reason = hook_monitor_recovery");
+                    }
+
                     hook_d3d12();
                 }
 
