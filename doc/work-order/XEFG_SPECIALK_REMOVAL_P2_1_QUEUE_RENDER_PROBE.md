@@ -4,18 +4,30 @@
 
 P2 solved the original REFramework starvation problem under Intel XeFG: REFramework now captures the XeFG-created presentation path, binds the captured swapchain, and receives `Present1[22]` callbacks without Special K.
 
-The first Intel Dragon's Dogma 2 P2 runtime, however, crashes shortly after REFramework initializes its D3D12 renderer and starts drawing through the captured XeFG path.
+The first Intel Dragon's Dogma 2 P2 runtime crashes shortly after REFramework initializes its D3D12 renderer and starts drawing through the captured XeFG path.
 
-This P2.1 work order is a **targeted root-cause / corrective probe** for that failure.
+This P2.1 work order is **code-change only**.
 
-The immediate question is:
+Codex must:
+
+```text
+modify the code
+add the required diagnostics / queue selection logic
+build and run static validation
+produce the PR / artifact
+stop
+```
+
+Codex must **not** run Dragon's Dogma 2 or Monster Hunter Wilds, must not classify the runtime result, and must not decide the next architecture step from simulated or CI evidence.
+
+The user will run the resulting build on real Intel hardware and provide the logs separately for analysis.
+
+The immediate technical question P2.1 prepares evidence for is:
 
 ```text
 Is REFramework submitting overlay work to the wrong D3D12 command queue,
 or is direct rendering into the XeFG internal presentation backbuffer itself invalid?
 ```
-
-P2.1 must answer that question with minimal code and produce a runtime result that directly determines the next implementation step.
 
 Do not turn this PR into P3 swapchain lifecycle work.
 
@@ -54,7 +66,7 @@ Keep the implementation comfortably below ~500 LOC if practical.
 
 ## 3. Scope
 
-Only this runtime is in scope:
+Only this runtime is in scope conceptually:
 
 ```text
 REFramework fork = dinput8.dll
@@ -64,19 +76,19 @@ Special K        = absent
 D3D12 RE Engine games
 ```
 
-Primary runtime target:
+The user's hardware validation will be performed after the PR is built, primarily with:
 
 ```text
 Intel GPU + Dragon's Dogma 2
 ```
 
-Secondary confirmation target:
+and later, if useful:
 
 ```text
 Intel GPU + Monster Hunter Wilds
 ```
 
-MHW already shows the same user-visible D3D failure popup under P2. Do not spend time analyzing the old MHW P2 log before implementing this probe. Use MHW only after DD2 gives a clear P2.1 result.
+Codex does not perform either runtime test.
 
 Explicitly out of scope:
 
@@ -137,11 +149,9 @@ phase = instance
 swapchain = 0x2a2e917a550
 ```
 
-The first ten logged Present1 entries all used the same bound swapchain.
-
 This means P2 solved the original P1 starvation failure. Do not redesign API interception or Present1 capture in P2.1.
 
-### 4.2 Failure begins only after REFramework D3D12 rendering initializes
+### 4.2 Failure begins after REFramework D3D12 rendering initializes
 
 The same run remained alive through the initial XeFG Present1 callbacks, then REFramework initialized its D3D12 renderer:
 
@@ -169,18 +179,18 @@ DXGI_ERROR_DEVICE_REMOVED (0x887A0005)
 DeviceRemovedReason(0x887A002B)
 ```
 
-Therefore the leading fault boundary is no longer "Present1 hook not reached". It is now the transition from **observing the XeFG Present1 path** to **submitting REFramework D3D12 overlay work into that path**.
+The leading fault boundary is therefore the transition from observing the XeFG Present1 path to submitting REFramework D3D12 overlay work into that path.
 
-### 4.3 A previously invisible queue difference was observed
+### 4.3 A queue difference was observed
 
-The P2 binding uses the queue passed to the outer public XeFG init:
+P2 currently binds the queue passed to outer public XeFG init:
 
 ```text
 InitFromSwapChainDesc queue
 = 0x2A2D2CCF630
 ```
 
-But OptiScaler logged the queue-like `pDevice` argument used for the actual `CreateSwapChainForHwnd` transaction that produced the captured wrapper:
+But the actual `CreateSwapChainForHwnd` transaction that produced the captured internal wrapper received:
 
 ```text
 WrappedIDXGISwapChain4 = 0x2A2E917A550
@@ -188,42 +198,19 @@ pDevice                = 0x2A2CB938010
 real swapchain          = 0x2A2F37E46D0
 ```
 
-These raw queue pointers differ:
+The raw pointers differ:
 
 ```text
 0x2A2D2CCF630 != 0x2A2CB938010
 ```
 
-Current P2 validation only proves that the captured swapchain device and the **outer Init queue device** resolve to the same D3D12 device. That does not prove that the outer Init queue is the queue that owns/serializes presentation work for the internal swapchain.
+Current P2 validation proves only that the captured swapchain device and the outer-init queue device resolve to the same D3D12 device. It does not prove that the outer-init queue is the correct queue for submitting work associated with the internal presentation swapchain.
 
-This is the primary P2.1 hypothesis.
-
----
-
-## 5. Important Runtime-Build Caveat
-
-The captured DD2 P2 log reports:
-
-```text
-Commit hash: b2de58aa4652652bd96705096bccb9a3330d2c41
-Branch: refactor/xefg-p2-init-commit-gate
-```
-
-while final P2 was later squash-merged as:
-
-```text
-f207f131540d8e7b4c8c815143711cb4290f8f4c
-```
-
-The failing binary clearly contains the direct XeFG capture/bind/Present1 implementation, so the queue/render failure evidence is valid for designing P2.1. However, **P2.1 runtime acceptance must use a fresh build from final P2 master (`f207f131...`) plus the P2.1 commit.**
-
-Do not use an older PR artifact for final P2.1 conclusions.
-
-The runtime log must identify the P2.1 commit unambiguously.
+P2.1 must expose and distinguish these queues explicitly.
 
 ---
 
-## 6. Current Code Assumption to Revisit
+## 5. Current Code Assumption to Revisit
 
 Current `XefgInitTransaction` retains only the public-init queue:
 
@@ -231,7 +218,7 @@ Current `XefgInitTransaction` retains only the public-init queue:
 ID3D12CommandQueue* command_queue{};
 ```
 
-Current `create_xefg_swapchain()` receives this DXGI parameter:
+Current `create_xefg_swapchain()` receives:
 
 ```cpp
 IUnknown* device
@@ -239,17 +226,9 @@ IUnknown* device
 
 but only captures the returned swapchain.
 
-For D3D12 `CreateSwapChainForHwnd`, that `IUnknown*` is expected to represent the D3D12 command queue used for swapchain creation.
+For D3D12 `CreateSwapChainForHwnd`, this `IUnknown*` should resolve to the command queue supplied for swapchain creation.
 
-Current publish logic then validates only:
-
-```text
-candidate device
-vs
-outer InitFromSwapChainDesc command queue device
-```
-
-and publishes:
+Current publish logic then publishes the outer-init queue:
 
 ```cpp
 pending = {
@@ -259,19 +238,19 @@ pending = {
 };
 ```
 
-Finally `bind_external_swapchain()` makes that outer Init queue authoritative:
+and `bind_external_swapchain()` makes that queue authoritative:
 
 ```cpp
 m_command_queue = command_queue;
 ```
 
-P2.1 must distinguish the two queues explicitly.
+P2.1 must distinguish the outer-init queue from the queue observed during actual internal swapchain creation.
 
 ---
 
-## 7. Capture the Actual Presentation-Creation Queue
+## 6. Required Code Change — Capture the Presentation-Creation Queue
 
-Extend the XeFG init transaction with a non-owning pointer for the queue observed in `CreateSwapChainForHwnd`.
+Extend the XeFG init transaction with a separate non-owning pointer.
 
 Suggested minimal shape:
 
@@ -280,11 +259,7 @@ struct XefgInitTransaction {
     void* context{};
     HWND hwnd{};
 
-    // Public XeFG InitFromSwapChainDesc argument.
     ID3D12CommandQueue* init_queue{};
-
-    // ID3D12CommandQueue observed as the D3D12 CreateSwapChainForHwnd
-    // pDevice argument for the successful internal presentation candidate.
     ID3D12CommandQueue* presentation_queue{};
 
     IDXGIFactory2* factory{};
@@ -294,21 +269,17 @@ struct XefgInitTransaction {
 };
 ```
 
-Naming may differ, but do not keep calling both values simply `command_queue` after this PR.
-
-### 7.1 Capture rule
+Naming may differ, but the two queue roles must remain explicit.
 
 Inside `create_xefg_swapchain()`:
 
 1. call the preserved original `CreateSwapChainForHwnd` exactly as P2 does now,
 2. only for the successful candidate transaction, `QueryInterface` the incoming `IUnknown* device` to `ID3D12CommandQueue`,
-3. record the resulting queue pointer as the presentation-creation queue,
-4. do not reinterpret-cast an arbitrary `IUnknown*` without QI,
-5. do not permanently AddRef the queue merely for diagnostics.
+3. record that queue as `presentation_queue`,
+4. do not reinterpret-cast arbitrary `IUnknown*`,
+5. do not add a permanent artificial COM reference as a lifetime workaround.
 
-Temporary `ComPtr` use is fine.
-
-Example shape:
+Example:
 
 ```cpp
 Microsoft::WRL::ComPtr<ID3D12CommandQueue> presentation_queue;
@@ -320,17 +291,15 @@ if (device != nullptr &&
 }
 ```
 
-The stored pointer remains non-owning, consistent with the existing P2 queue model.
-
-Do not alter the existing OptiScaler / DXGI call chain.
+Keep the existing OptiScaler / DXGI call chain unchanged.
 
 ---
 
-## 8. Compare COM Identity, Not Raw Pointer Only
+## 7. Required Code Change — Compare COM Identity
 
-Raw pointer inequality alone is not enough. P2.1 must determine whether the two queue interfaces resolve to the same COM identity.
+Raw pointer inequality is diagnostic only. Compare canonical COM identity for both queues.
 
-For both:
+For:
 
 ```text
 init_queue
@@ -351,14 +320,14 @@ At minimum log:
 ```text
 queue pointer
 IUnknown identity
+device identity
 queue type
 priority
 flags
 node mask
-device identity
 ```
 
-Suggested helper concept:
+A compact helper is acceptable, for example:
 
 ```cpp
 struct QueueIdentitySnapshot {
@@ -370,11 +339,9 @@ struct QueueIdentitySnapshot {
 };
 ```
 
-Do not retain `ComPtr` references in this diagnostic snapshot beyond the local comparison.
+Do not retain diagnostic `ComPtr` references after the comparison.
 
-### 8.1 Required relation classification
-
-Classify the queues into one of these states:
+Classify the relation with machine-readable values:
 
 ```text
 same_com_identity
@@ -393,21 +360,9 @@ AND
 IUnknown(init_queue.device) == IUnknown(presentation_queue.device)
 ```
 
-This is the important case for the current DD2 hypothesis.
-
-### 8.2 Queue type guard
-
-Before any experimental rendering through the captured presentation queue, require:
-
-```cpp
-presentation_queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT
-```
-
-If not, do not submit REFramework overlay work through it.
-
 ---
 
-## 9. Strengthen Candidate Validation
+## 8. Required Code Change — Strengthen Candidate Validation
 
 Keep every existing P2 acceptance condition:
 
@@ -418,22 +373,20 @@ candidate != null
 candidate supports IDXGISwapChain3
 candidate HWND matches transaction HWND
 candidate GetDevice succeeds
-outer init queue GetDevice succeeds
-candidate device == outer init queue device identity
+init queue GetDevice succeeds
+candidate device == init queue device identity
 ```
 
-Add the presentation-queue checks:
+Add:
 
 ```text
-presentation queue was captured successfully
+presentation queue captured successfully
 presentation queue GetDevice succeeds
 candidate device == presentation queue device identity
-presentation queue type == DIRECT
+presentation queue type == D3D12_COMMAND_LIST_TYPE_DIRECT
 ```
 
-If presentation queue validation fails, do not experimentally render through it.
-
-Use explicit reject reasons such as:
+Use explicit reject reasons where appropriate:
 
 ```text
 presentation_queue_unavailable
@@ -442,91 +395,58 @@ presentation_queue_device_mismatch
 presentation_queue_not_direct
 ```
 
-Do not weaken the outer XeFG Init success commit gate added in P1/P2 review.
+Do not weaken the outer XeFG Init success commit gate.
 
 ---
 
-## 10. P2.1 Automatic Probe Policy
+## 9. Required Code Change — Produce One Diagnostic Build
 
-Do not add a permanent user-facing configuration option.
+P2.1 must produce **one build**, not several runtime variants.
 
-Use the measured queue relation to choose one of two diagnostic runtime paths automatically.
+The build behavior should be deterministic from the measured queue relation.
 
-### Case A — `distinct_same_device`
+### 9.1 If relation is `distinct_same_device`
 
-This is the leading DD2 hypothesis.
-
-Publish/bind the captured swapchain using the **presentation-creation queue**, not the outer public-init queue:
+Use the validated `presentation_queue` as the authoritative queue for the XeFG internal binding:
 
 ```text
-selected queue = presentation_queue
-render callbacks = enabled
-probe mode = presentation_queue_render
-```
-
-The outer init queue is still retained in diagnostic state/logs for comparison, but is not authoritative for REFramework overlay submission in this probe mode.
-
-Expected structured log:
-
-```text
-[XeFG][QueueIdentity]
-relation = distinct_same_device
-init_queue = 0x...
-init_identity = 0x...
-presentation_queue = 0x...
-presentation_identity = 0x...
-device_identity = 0x...
-
-[XeFG][P2.1Probe]
+selected_queue = presentation_queue
+render_callbacks = enabled
 mode = presentation_queue_render
-selected_queue = 0x...
-render_callbacks = true
 ```
 
-### Case B — `same_com_identity`
+This is the leading hypothesis test and requires no second compile-time variant.
 
-If both raw interfaces resolve to the same canonical COM identity, changing queue pointers is not a meaningful fix test.
+### 9.2 If relation is `same_com_identity`
 
-In that case automatically run **observe-only**:
-
-```text
-selected queue = existing validated queue
-render callbacks = disabled
-original Present / Present1 = still called
-probe mode = observe_only_same_queue
-```
-
-Expected log:
+Do not pretend that changing raw interface pointers is a meaningful test. Keep the existing validated queue but suppress REFramework render callbacks for this XeFG path:
 
 ```text
-[XeFG][QueueIdentity]
-relation = same_com_identity
-
-[XeFG][P2.1Probe]
+selected_queue = validated existing queue
+render_callbacks = disabled
 mode = observe_only_same_queue
-render_callbacks = false
 ```
 
-If the game remains stable in this mode, the evidence shifts strongly toward direct XeFG backbuffer rendering being the invalid operation.
+Original `Present` / `Present1` must still be called normally.
 
-### Case C — invalid presentation queue
+### 9.3 If presentation queue validation fails
 
-If presentation queue validation fails:
+Use observe-only:
 
 ```text
-render callbacks = disabled
-probe mode = observe_only_invalid_presentation_queue
+render_callbacks = disabled
+mode = observe_only_invalid_presentation_queue
 ```
 
-Do not fall back to the known-crashing P2 render path merely to keep the overlay enabled.
+Do not fall back to the known-crashing P2 render path.
+
+Do not add a user-facing toggle or multiple build flavors.
 
 ---
 
-## 11. Implement Observe-Only Without Breaking Present Accounting
+## 10. Required Code Change — Observe-Only Must Preserve Hook Liveness
 
-The observe-only path must preserve the successful P2 hook mechanics.
-
-It must still perform:
+Observe-only must preserve:
 
 ```text
 PresentEntry accounting
@@ -539,7 +459,7 @@ original return value propagation
 hook-monitor liveness
 ```
 
-It must skip REFramework renderer work:
+It must skip only REFramework render callbacks:
 
 ```text
 m_on_present
@@ -548,7 +468,7 @@ m_on_post_present
 
 for the XeFG P2.1 observe-only mode.
 
-Recommended structure inside `present_common()`:
+Recommended shape inside `present_common()`:
 
 ```cpp
 const bool suppress_render_callbacks =
@@ -568,19 +488,83 @@ if (!suppress_render_callbacks && d3d12->m_on_post_present) {
 }
 ```
 
-Preserve existing `m_ignore_next_present`, recursion, mutex, and error paths.
+Preserve existing `m_ignore_next_present`, recursion, mutex, and error behavior.
 
 Do not bypass `Present1` itself.
 
-Observe-only success is intentionally expected to show **no REFramework overlay**. It is a control mode, not a final product state.
+---
+
+## 11. Required Logs
+
+The resulting build must emit enough information for later analysis from user-provided runtime logs.
+
+Required queue block:
+
+```text
+[XeFG][QueueIdentity]
+context = 0x...
+swapchain = 0x...
+init_queue = 0x...
+init_identity = 0x...
+init_device_identity = 0x...
+init_type = ...
+init_priority = ...
+init_flags = ...
+init_node_mask = ...
+presentation_queue = 0x...
+presentation_identity = 0x...
+presentation_device_identity = 0x...
+presentation_type = ...
+presentation_priority = ...
+presentation_flags = ...
+presentation_node_mask = ...
+relation = same_com_identity | distinct_same_device | ...
+```
+
+Required selected-mode block:
+
+```text
+[XeFG][P2.1Probe]
+mode = presentation_queue_render | observe_only_same_queue | observe_only_invalid_presentation_queue
+selected_queue = 0x...
+render_callbacks = true | false
+```
+
+Existing P2 logs must remain available:
+
+```text
+[XeFG][InitDesc] result = 0
+[XeFG][Bind] accepted = true
+[D3D12][ExternalBind] source = xefg_internal
+[D3D12][PresentEntry] kind = Present1
+```
+
+For the render-enabled path, add one-time first-render boundary logs:
+
+```text
+[XeFG][P2.1Probe] render_callback = enter, present_call = ...
+[XeFG][P2.1Probe] render_callback = returned, present_call = ...
+```
+
+Do not log this every frame.
+
+If original Present/Present1 returns `DXGI_ERROR_DEVICE_REMOVED`, log the active device removed reason directly:
+
+```text
+[XeFG][P2.1Probe]
+present_result = 0x887A0005
+device_removed_reason = 0x...
+```
+
+Do not add DRED collection in this PR.
 
 ---
 
-## 12. Bind the Selected Queue Explicitly
+## 12. Binding State
 
-Extend `PendingXefgBinding` only as much as necessary to retain the distinction.
+Extend `PendingXefgBinding` only as much as required to carry the selected queue and observe-only state.
 
-Suggested shape:
+For example:
 
 ```cpp
 struct PendingXefgBinding {
@@ -596,204 +580,25 @@ struct PendingXefgBinding {
 
 Equivalent compact state is acceptable.
 
-`bind_external_swapchain()` may continue to receive a single authoritative queue, but for P2.1 that queue must be `selected_queue`, not blindly the original outer-init queue.
-
-Add a diagnostic field/state so `present_common()` knows whether this binding is observe-only.
+`bind_external_swapchain()` may continue to receive one authoritative queue, but for P2.1 it must receive `selected_queue` rather than blindly receiving the outer-init queue.
 
 Do not change native binding semantics.
 
 ---
 
-## 13. Add First-Render Boundary Diagnostics
-
-The DD2 failure occurs immediately after the REFramework D3D12 renderer starts using the bound swapchain.
-
-For the XeFG `presentation_queue_render` probe, add concise one-time diagnostics around the first actual render callback boundary.
-
-Example:
-
-```text
-[XeFG][P2.1Probe] render_callback = enter, present_call = ...
-[XeFG][P2.1Probe] render_callback = returned, present_call = ...
-```
-
-Do not log this every frame.
-
-If the following original Present/Present1 returns `DXGI_ERROR_DEVICE_REMOVED`, also log the D3D12 device removed reason directly from the active device:
-
-```text
-[XeFG][P2.1Probe]
-present_result = 0x887A0005
-device_removed_reason = 0x887A002B
-```
-
-This removes dependence on the game crash reporter for the decisive boundary.
-
-Do not add DRED collection in this PR unless it is already trivially available. P2.1 should remain small.
-
----
-
-## 14. Required Logs
-
-A successful diagnostic build must emit a compact block similar to:
-
-```text
-[XeFG][QueueIdentity]
-context = 0x...
-swapchain = 0x...
-init_queue = 0x...
-init_identity = 0x...
-init_device_identity = 0x...
-init_type = DIRECT
-init_priority = ...
-init_flags = ...
-init_node_mask = ...
-presentation_queue = 0x...
-presentation_identity = 0x...
-presentation_device_identity = 0x...
-presentation_type = DIRECT
-presentation_priority = ...
-presentation_flags = ...
-presentation_node_mask = ...
-relation = same_com_identity | distinct_same_device | ...
-```
-
-Then:
-
-```text
-[XeFG][P2.1Probe]
-mode = presentation_queue_render | observe_only_same_queue | observe_only_invalid_presentation_queue
-selected_queue = 0x...
-render_callbacks = true | false
-```
-
-And existing P2 logs must still show:
-
-```text
-[XeFG][InitDesc] result = 0
-[XeFG][Bind] accepted = true
-[D3D12][ExternalBind] source = xefg_internal
-[D3D12][PresentEntry] kind = Present1
-```
-
----
-
-## 15. DD2 Runtime Decision Tree
-
-Run **Intel DD2 first** with a fresh P2.1 build.
-
-### Outcome A — queues are distinct and presentation-queue rendering is stable
-
-Evidence:
-
-```text
-relation = distinct_same_device
-mode = presentation_queue_render
-REFramework overlay appears
-XeFG remains active
-Present1 continues
-no DXGI_ERROR_DEVICE_REMOVED
-no 0x887A002B
-```
-
-Conclusion:
-
-```text
-P2 root cause = wrong authoritative queue.
-```
-
-Then retain the presentation-creation queue as the XeFG internal swapchain authoritative queue and proceed to MHW confirmation before P3.
-
-### Outcome B — queues are distinct but device removal still occurs immediately after render callback
-
-Evidence:
-
-```text
-relation = distinct_same_device
-mode = presentation_queue_render
-render_callback returned
-next/original Present1 -> DXGI_ERROR_DEVICE_REMOVED
-```
-
-Conclusion:
-
-```text
-Queue mismatch was real but not sufficient.
-Direct rendering to the captured XeFG internal backbuffer is likely invalid.
-```
-
-Stop P2.1 there.
-
-Do **not** try random resource-state transitions, forced barriers, extra AddRef/Release loops, or public-proxy rendering in the same PR.
-
-The next work item should be a dedicated P2.2 architecture investigation of where the overlay must be composited relative to XeFG.
-
-### Outcome C — queues resolve to the same COM identity
-
-Expected P2.1 behavior:
-
-```text
-mode = observe_only_same_queue
-```
-
-If DD2 remains stable with continuous Present1 callbacks:
-
-```text
-wrong-queue hypothesis = rejected
-render-side/backbuffer hypothesis = strengthened
-```
-
-Proceed to P2.2 rather than forcing another queue pointer.
-
-### Outcome D — observe-only itself crashes
-
-If REFramework render callbacks are disabled and the same device removal still occurs:
-
-```text
-P2 hook/binding path itself remains suspect.
-```
-
-Capture the exact first failing Present1 sequence before any further rendering changes.
-
-This would invalidate the current assumption that renderer submission is the trigger.
-
----
-
-## 16. MHW Secondary Validation
-
-Do not gate implementation on historical MHW P2 logs.
-
-After DD2 produces one of the clear outcomes above, run the same P2.1 build on Intel MHW.
-
-Required checks:
-
-```text
-queue relation classification
-selected probe mode
-Present1 continuity
-renderer initialization boundary
-DXGI_ERROR_DEVICE_REMOVED occurrence or absence
-```
-
-Remember that MHW previously showed more Streamline / DXGI proxy reuse and recreation than DD2. Do not implement the P3 rebind state machine here if MHW later exposes a different swapchain identity.
-
-If the current P2 guard reports:
-
-```text
-reason = p3_rebind_deferred
-```
-
-record it and leave it for P3.
-
----
-
-## 17. Do Not Do These Things
+## 13. Do Not Do These Things
 
 Do not:
 
 ```text
+run DD2
+run MHW
+claim runtime success
+classify the final runtime cause inside the PR
+create A/B/C/D runtime test variants
+create multiple diagnostic builds
 reintroduce Special K
-bind REFramework rendering to public XefgInterpolationSwapChain
+bind rendering to public XefgInterpolationSwapChain
 hard-code Intel driver DLL addresses
 hard-code queue addresses from the DD2 log
 use private Intel object offsets
@@ -807,13 +612,13 @@ retain artificial COM references as a lifetime fix
 suppress DXGI_ERROR_DEVICE_REMOVED and continue
 ```
 
-Do not expand testing to native/no-FG or FSRFG.
+Do not expand validation to native/no-FG or FSRFG.
 
 ---
 
-## 18. Build / Static Validation
+## 14. Build / Static Validation Only
 
-Required before producing the runtime artifact:
+Codex must perform only local build/static validation:
 
 ```text
 cmake --preset vs2022
@@ -828,76 +633,55 @@ The Release output must produce:
 build/bin/REFramework/dinput8.dll
 ```
 
-The runtime log must clearly identify the P2.1 commit/build.
+Do not substitute CI/build success for runtime evidence.
 
-Do not claim runtime success from CI alone.
+Do not launch a game as part of this work order.
 
 ---
 
-## 19. Acceptance Criteria
+## 15. Acceptance Criteria for Codex
 
-P2.1 is complete when all of the following are true:
+Codex's work is complete when all of the following are true:
 
 - [ ] Based on current `master` containing merged P2 (`f207f131...` or later).
 - [ ] `CreateSwapChainForHwnd` D3D12 `pDevice` is explicitly QI'd/captured as `ID3D12CommandQueue`.
-- [ ] Outer XeFG Init queue and presentation-creation queue are tracked separately.
+- [ ] Outer XeFG init queue and presentation-creation queue are tracked separately.
 - [ ] Raw pointer and canonical COM identity are logged for both queues.
 - [ ] Queue D3D12 device identities are compared.
 - [ ] Queue desc/type is logged and presentation rendering requires a DIRECT queue.
-- [ ] Existing P2 outer-init success gate remains intact.
-- [ ] Candidate device matches both validated queues before any experimental render path.
-- [ ] `distinct_same_device` selects presentation-creation queue for the XeFG render probe.
-- [ ] `same_com_identity` automatically selects observe-only rather than pretending the raw pointer change is meaningful.
-- [ ] Invalid presentation queue also selects observe-only.
-- [ ] Observe-only preserves Present1/original call/liveness accounting while skipping REFramework render callbacks.
-- [ ] First render callback boundary is logged once.
-- [ ] `DXGI_ERROR_DEVICE_REMOVED` logs `GetDeviceRemovedReason()` from REFramework when encountered.
+- [ ] Existing outer XeFG Init success gate remains intact.
+- [ ] Candidate device matches both validated queues before render-enabled binding.
+- [ ] `distinct_same_device` selects the presentation-creation queue.
+- [ ] `same_com_identity` selects observe-only.
+- [ ] Invalid presentation queue selects observe-only.
+- [ ] Observe-only preserves Present1/original-call/liveness accounting while skipping REFramework render callbacks.
+- [ ] First render callback boundary is logged once on the render-enabled path.
+- [ ] `DXGI_ERROR_DEVICE_REMOVED` logs `GetDeviceRemovedReason()` when encountered.
 - [ ] No P3 recreation/ResizeBuffers1 state machine is added.
 - [ ] Release build passes.
-- [ ] Intel DD2 runtime produces a decisive queue relation + probe result.
-- [ ] Intel MHW is tested only after DD2 has classified the result.
+- [ ] Static validation passes.
+- [ ] Exactly one P2.1 diagnostic build/artifact is produced.
+- [ ] No DD2/MHW runtime execution is performed by Codex.
+
+Runtime stability and root-cause determination are **not** Codex acceptance criteria.
 
 ---
 
-## 20. Expected Final Report
+## 16. Final PR Report
 
-The implementing PR final report must state exactly one DD2 classification:
-
-```text
-A. Wrong authoritative queue confirmed; presentation queue rendering is stable.
-B. Queues are distinct, but presentation queue rendering still device-removes; direct backbuffer rendering remains suspect.
-C. Queues are the same COM identity; wrong-queue hypothesis rejected; observe-only stable/unstable result recorded.
-D. Observe-only itself fails; P2 hook/binding path must be revisited.
-```
-
-Include the observed queue identities and device identities in the report.
-
-Do not claim the Special K removal project is solved until the REFramework overlay actually renders stably with XeFG.
-
----
-
-## 21. Working Hypothesis
-
-The leading hypothesis entering P2.1 is:
+The implementing PR final report should contain only implementation/build facts:
 
 ```text
-P2 captured the correct XeFG internal presentation swapchain
-and successfully hooked its Present1 path,
-
-but REFramework selected the outer public XeFG Init queue as authoritative,
-while the actual CreateSwapChainForHwnd transaction used a different queue.
-
-REFramework renderer initialization then submitted overlay work through the wrong queue,
-causing the subsequent Present1 to return DXGI_ERROR_DEVICE_REMOVED / 0x887A002B.
+- files changed
+- queue identity/capture logic added
+- selected-queue / observe-only behavior implemented
+- diagnostic log points added
+- build/static validation results
+- produced dinput8.dll path/artifact
 ```
 
-P2.1 must **prove or reject** that hypothesis rather than assume it.
+Do not include a DD2/MHW runtime classification unless the user explicitly supplies runtime logs later.
 
-If it is rejected, the next hypothesis is:
+Do not claim the Special K removal project is solved.
 
-```text
-The XeFG internal presentation backbuffers are not a valid direct REFramework overlay render target,
-even when the correct presentation queue is used.
-```
-
-That second hypothesis belongs to the next architecture step, not to speculative fixes inside P2.1.
+After merge/build, the user will test the artifact on Intel hardware and provide `re2_framework_log.txt`, `OptiScaler.log`, and crash information if applicable. Those logs will be analyzed separately before the next work order is defined.
