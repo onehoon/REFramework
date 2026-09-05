@@ -1286,6 +1286,13 @@ void REFramework::on_post_present_d3d12() {
     }
 }
 
+void REFramework::note_present_activity() {
+    const auto now = std::chrono::steady_clock::now();
+    if (m_last_present_time <= now) {
+        m_last_present_time = now;
+    }
+}
+
 void REFramework::on_reset() {
     std::scoped_lock _{ m_imgui_mtx };
 

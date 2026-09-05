@@ -1636,7 +1636,11 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
             static_cast<uint32_t>(result), static_cast<uint32_t>(device_removed_reason));
     }
 
-    if (!suppress_render_callbacks && d3d12->m_on_post_present) {
+    if (suppress_render_callbacks) {
+        // present_common already holds hook_monitor_mutex. Keep the monitor
+        // alive without running renderer, GPU commit, or mod callbacks.
+        g_framework->note_present_activity();
+    } else if (d3d12->m_on_post_present) {
         d3d12->m_on_post_present(*d3d12);
     }
 
