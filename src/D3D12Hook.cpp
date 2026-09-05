@@ -26,6 +26,34 @@ thread_local bool g_inside_d3d12_hook = false;
 
 namespace {
 
+constexpr int32_t kXefgSuccess = 0;
+
+struct XefgInitTransaction {
+    void* context{};
+    HWND hwnd{};
+    ID3D12CommandQueue* command_queue{};
+    IDXGIFactory2* factory{};
+    IDXGISwapChain1* candidate{};
+    bool factory_create_succeeded{ false };
+    int32_t init_result{ -1 };
+};
+
+struct PendingXefgBinding {
+    IDXGISwapChain3* swapchain{};
+    ID3D12CommandQueue* command_queue{};
+    HWND hwnd{};
+    bool valid() const {
+        return swapchain != nullptr && command_queue != nullptr;
+    }
+};
+
+std::mutex g_xefg_state_mutex{};
+XefgInitTransaction g_xefg_transaction{};
+std::optional<PendingXefgBinding> g_pending_xefg_binding{};
+std::unique_ptr<VtableHook> g_xefg_factory_hook{};
+std::unique_ptr<FunctionHook> g_xefg_init_hook{};
+std::unique_ptr<FunctionHook> g_xefg_get_swapchain_hook{};
+
 const auto g_diagnostic_start_time = std::chrono::steady_clock::now();
 
 struct SwapchainVtableSnapshot {
@@ -191,6 +219,272 @@ D3D12Hook::~D3D12Hook() {
     unhook();
 }
 
+void D3D12Hook::install_xefg_api_hooks_if_available() {
+    std::scoped_lock lock{g_xefg_state_mutex};
+
+    const auto module = GetModuleHandleW(L"libxess_fg.dll");
+    if (module == nullptr) {
+        return;
+    }
+
+    const auto init_export = GetProcAddress(module, "xefgSwapChainD3D12InitFromSwapChainDesc");
+    if (init_export != nullptr && g_xefg_init_hook == nullptr) {
+        auto hook = std::make_unique<FunctionHook>(Address{reinterpret_cast<void*>(init_export)}, reinterpret_cast<void*>(&D3D12Hook::xefg_init_from_swapchain_desc));
+        if (hook->create()) {
+            g_xefg_init_hook = std::move(hook);
+            spdlog::info("[XeFG][ApiHook] InitFromSwapChainDesc = 0x{:x}", reinterpret_cast<uintptr_t>(init_export));
+        } else {
+            spdlog::error("[XeFG][ApiHook] Failed to hook InitFromSwapChainDesc");
+        }
+    }
+
+    const auto get_swapchain_export = GetProcAddress(module, "xefgSwapChainD3D12GetSwapChainPtr");
+    if (get_swapchain_export != nullptr && g_xefg_get_swapchain_hook == nullptr) {
+        auto hook = std::make_unique<FunctionHook>(Address{reinterpret_cast<void*>(get_swapchain_export)}, reinterpret_cast<void*>(&D3D12Hook::xefg_get_swapchain_ptr));
+        if (hook->create()) {
+            g_xefg_get_swapchain_hook = std::move(hook);
+            spdlog::info("[XeFG][ApiHook] GetSwapChainPtr = 0x{:x}", reinterpret_cast<uintptr_t>(get_swapchain_export));
+        } else {
+            spdlog::error("[XeFG][ApiHook] Failed to hook GetSwapChainPtr");
+        }
+    }
+}
+
+int32_t D3D12Hook::xefg_init_from_swapchain_desc(void* context, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* swap_chain_desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc, ID3D12CommandQueue* command_queue, IDXGIFactory2* factory, const void* init_params) {
+    using XefgInitFn = int32_t (WINAPI*)(void*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, ID3D12CommandQueue*, IDXGIFactory2*, const void*);
+    const auto original = reinterpret_cast<XefgInitFn>(g_xefg_init_hook->get_original());
+
+    XefgInitTransaction transaction{};
+    transaction.context = context;
+    transaction.hwnd = hwnd;
+    transaction.command_queue = command_queue;
+    transaction.factory = factory;
+
+    {
+        std::scoped_lock lock{g_xefg_state_mutex};
+        g_xefg_transaction = transaction;
+        g_xefg_factory_hook.reset();
+
+        if (factory != nullptr) {
+            try {
+                g_xefg_factory_hook = std::make_unique<VtableHook>(Address{factory});
+                const auto hooked = g_xefg_factory_hook->hook_method(15, Address{reinterpret_cast<void*>(&D3D12Hook::create_xefg_swapchain)});
+                if (!hooked) {
+                    g_xefg_factory_hook.reset();
+                }
+            } catch (...) {
+                g_xefg_factory_hook.reset();
+            }
+        }
+    }
+
+    const auto result = original(context, hwnd, swap_chain_desc, fullscreen_desc, command_queue, factory, init_params);
+
+    {
+        std::scoped_lock lock{g_xefg_state_mutex};
+        g_xefg_transaction.init_result = result;
+        spdlog::info("[XeFG][InitDesc] context = 0x{:x}, hwnd = 0x{:x}, queue = 0x{:x}, factory = 0x{:x}, width = {}, height = {}, format = {}, buffer_count = {}, flags = 0x{:x}, result = {}",
+            reinterpret_cast<uintptr_t>(context),
+            reinterpret_cast<uintptr_t>(hwnd),
+            reinterpret_cast<uintptr_t>(command_queue),
+            reinterpret_cast<uintptr_t>(factory),
+            swap_chain_desc != nullptr ? swap_chain_desc->Width : 0,
+            swap_chain_desc != nullptr ? swap_chain_desc->Height : 0,
+            swap_chain_desc != nullptr ? swap_chain_desc->Format : DXGI_FORMAT_UNKNOWN,
+            swap_chain_desc != nullptr ? swap_chain_desc->BufferCount : 0,
+            swap_chain_desc != nullptr ? swap_chain_desc->Flags : 0,
+            result);
+        g_xefg_factory_hook.reset();
+    }
+
+    publish_xefg_candidate();
+    return result;
+}
+
+int32_t D3D12Hook::xefg_get_swapchain_ptr(void* context, REFIID riid, void** swap_chain) {
+    using XefgGetSwapchainFn = int32_t (WINAPI*)(void*, REFIID, void**);
+    const auto original = reinterpret_cast<XefgGetSwapchainFn>(g_xefg_get_swapchain_hook->get_original());
+    const auto result = original(context, riid, swap_chain);
+
+    if (result == kXefgSuccess && swap_chain != nullptr && *swap_chain != nullptr) {
+        std::scoped_lock lock{g_xefg_state_mutex};
+        const auto internal_candidate = g_xefg_transaction.candidate;
+        spdlog::info("[XeFG][PublicProxy] context = 0x{:x}, swapchain = 0x{:x}, internal_same = {}",
+            reinterpret_cast<uintptr_t>(context),
+            reinterpret_cast<uintptr_t>(*swap_chain),
+            *swap_chain == internal_candidate);
+    }
+
+    return result;
+}
+
+HRESULT WINAPI D3D12Hook::create_xefg_swapchain(IDXGIFactory2* factory, IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc, IDXGIOutput* restrict_to_output, IDXGISwapChain1** swap_chain) {
+    std::unique_ptr<VtableHook>* factory_hook = &g_xefg_factory_hook;
+    if (*factory_hook == nullptr) {
+        return E_FAIL;
+    }
+
+    using CreateSwapchainFn = HRESULT (WINAPI*)(IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
+    const auto original = (*factory_hook)->get_method<CreateSwapchainFn>(15);
+    const auto result = original(factory, device, hwnd, desc, fullscreen_desc, restrict_to_output, swap_chain);
+
+    if (SUCCEEDED(result) && swap_chain != nullptr && *swap_chain != nullptr) {
+        g_xefg_transaction.candidate = *swap_chain;
+        g_xefg_transaction.factory_create_succeeded = true;
+        spdlog::info("[XeFG][InternalSwapchain] context = 0x{:x}, candidate = 0x{:x}, provisional = true",
+            reinterpret_cast<uintptr_t>(g_xefg_transaction.context), reinterpret_cast<uintptr_t>(*swap_chain));
+    }
+
+    return result;
+}
+
+void D3D12Hook::publish_xefg_candidate() {
+    PendingXefgBinding pending{};
+    const char* reject_reason = nullptr;
+
+    {
+        std::scoped_lock lock{g_xefg_state_mutex};
+        const auto& transaction = g_xefg_transaction;
+
+        if (transaction.init_result != kXefgSuccess) {
+            reject_reason = "init_failed";
+        } else if (!transaction.factory_create_succeeded || transaction.candidate == nullptr) {
+            reject_reason = "no_candidate";
+        } else if (transaction.command_queue == nullptr) {
+            reject_reason = "queue_device_unavailable";
+        } else {
+            Microsoft::WRL::ComPtr<IDXGISwapChain3> candidate;
+            Microsoft::WRL::ComPtr<ID3D12Device> candidate_device;
+            Microsoft::WRL::ComPtr<ID3D12Device> queue_device;
+            Microsoft::WRL::ComPtr<IUnknown> candidate_identity;
+            Microsoft::WRL::ComPtr<IUnknown> queue_identity;
+            HWND candidate_hwnd{};
+
+            if (FAILED(transaction.candidate->QueryInterface(IID_PPV_ARGS(&candidate)))) {
+                reject_reason = "no_idxgi_swapchain3";
+            } else if (FAILED(candidate->GetHwnd(&candidate_hwnd)) || candidate_hwnd != transaction.hwnd) {
+                reject_reason = "hwnd_mismatch";
+            } else if (FAILED(candidate->GetDevice(IID_PPV_ARGS(&candidate_device)))) {
+                reject_reason = "candidate_device_unavailable";
+            } else if (FAILED(transaction.command_queue->GetDevice(IID_PPV_ARGS(&queue_device)))) {
+                reject_reason = "queue_device_unavailable";
+            } else if (FAILED(candidate_device.As(&candidate_identity)) || FAILED(queue_device.As(&queue_identity)) || candidate_identity.Get() != queue_identity.Get()) {
+                reject_reason = "device_mismatch";
+            } else {
+                pending = { candidate.Get(), transaction.command_queue, transaction.hwnd };
+            }
+        }
+
+        if (reject_reason != nullptr) {
+            spdlog::warn("[XeFG][Bind] candidate = 0x{:x}, accepted = false, reason = {}",
+                reinterpret_cast<uintptr_t>(transaction.candidate), reject_reason);
+        } else {
+            spdlog::info("[XeFG][Bind] candidate = 0x{:x}, accepted = true, reason = init_success",
+                reinterpret_cast<uintptr_t>(pending.swapchain));
+        }
+    }
+
+    if (reject_reason != nullptr) {
+        return;
+    }
+
+    if (g_framework != nullptr) {
+        std::unique_lock<std::recursive_mutex> framework_lock{g_framework->get_hook_monitor_mutex()};
+
+        // Hook-monitor recovery destroys and replaces D3D12Hook under this same
+        // mutex. Read the current object only after acquiring it so a XeFG init
+        // cannot bind through a pointer retained from before that replacement.
+        if (auto* hook = g_d3d12_hook; hook != nullptr) {
+            if (hook->is_hooked()
+                && hook->get_swap_chain() != nullptr
+                && hook->get_swapchain_source() == SwapchainSource::XeFGInternal
+                && hook->get_swap_chain() != pending.swapchain) {
+                // Full XeFG swapchain recreation/rebind is P3 work. Do not
+                // silently replace a working XeFG binding in this P2 path.
+                spdlog::warn("[XeFG][Bind] candidate = 0x{:x}, accepted = false, reason = p3_rebind_deferred",
+                    reinterpret_cast<uintptr_t>(pending.swapchain));
+                return;
+            }
+
+            const auto replacing_active_non_xefg = hook->is_hooked()
+                && hook->get_swap_chain() != nullptr
+                && hook->get_swapchain_source() != SwapchainSource::XeFGInternal;
+            if (replacing_active_non_xefg) {
+                spdlog::info("[XeFG][Bind] resetting active D3D12 renderer before XeFG bind");
+                g_framework->on_reset();
+            }
+
+            if (!hook->bind_external_swapchain(pending.swapchain, pending.command_queue, SwapchainSource::XeFGInternal)) {
+                spdlog::warn("[XeFG][Bind] candidate = 0x{:x}, accepted = false, reason = external_bind_failed",
+                    reinterpret_cast<uintptr_t>(pending.swapchain));
+            }
+            return;
+        }
+
+        // Publish before releasing the lifecycle mutex. D3D12Hook::hook() runs
+        // under the same mutex, so a newly created hook cannot consume an empty
+        // slot and then miss this capture-before-hook XeFG binding.
+        std::scoped_lock state_lock{g_xefg_state_mutex};
+        g_pending_xefg_binding = pending;
+        return;
+    }
+
+    // Constructor-time fallback before REFramework publishes its lifecycle mutex.
+    std::scoped_lock lock{g_xefg_state_mutex};
+    g_pending_xefg_binding = pending;
+}
+
+bool D3D12Hook::consume_pending_xefg_binding(D3D12Hook& hook) {
+    std::optional<PendingXefgBinding> pending{};
+    {
+        std::scoped_lock lock{g_xefg_state_mutex};
+        pending = g_pending_xefg_binding;
+        g_pending_xefg_binding.reset();
+    }
+
+    return pending.has_value() && hook.bind_external_swapchain(pending->swapchain, pending->command_queue, SwapchainSource::XeFGInternal);
+}
+
+bool D3D12Hook::bind_external_swapchain(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source) {
+    if (swapchain == nullptr || command_queue == nullptr) {
+        return false;
+    }
+
+    if (m_swapchain_source == source && m_swap_chain == swapchain && m_command_queue == command_queue && m_swapchain_hook != nullptr && m_hooked) {
+        return true;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D12Device4> device;
+    if (FAILED(swapchain->GetDevice(IID_PPV_ARGS(&device)))) {
+        return false;
+    }
+
+    m_present_hook.reset();
+    m_swapchain_hook.reset();
+    m_swap_chain = swapchain;
+    m_command_queue = command_queue;
+    m_device = device.Get();
+    m_swapchain_source = source;
+    m_is_phase_1 = false;
+
+    m_swapchain_hook = std::make_unique<VtableHook>(Address{swapchain});
+    m_swapchain_hook->hook_method(8, Address{reinterpret_cast<void*>(&D3D12Hook::present)});
+    m_swapchain_hook->hook_method(22, Address{reinterpret_cast<void*>(&D3D12Hook::present1)});
+    m_swapchain_hook->hook_method(13, Address{reinterpret_cast<void*>(&D3D12Hook::resize_buffers)});
+    m_swapchain_hook->hook_method(14, Address{reinterpret_cast<void*>(&D3D12Hook::resize_target)});
+    m_hooked = true;
+
+    spdlog::info("[D3D12][ExternalBind] source = {}, swapchain = 0x{:x}, queue = 0x{:x}, device = 0x{:x}, Present[8].original = 0x{:x}, Present1[22].original = 0x{:x}",
+        source == SwapchainSource::XeFGInternal ? "xefg_internal" : "native",
+        reinterpret_cast<uintptr_t>(swapchain),
+        reinterpret_cast<uintptr_t>(command_queue),
+        reinterpret_cast<uintptr_t>(m_device),
+        reinterpret_cast<uintptr_t>(m_swapchain_hook->get_method(8).ptr()),
+        reinterpret_cast<uintptr_t>(m_swapchain_hook->get_method(22).ptr()));
+
+    return true;
+}
+
 void D3D12Hook::mark_xefg_probe_pending() noexcept {
     s_xefg_module_loaded.store(true, std::memory_order_release);
 
@@ -220,6 +514,8 @@ void D3D12Hook::notify_xefg_module_loaded(HMODULE module, std::wstring_view base
         reinterpret_cast<uintptr_t>(init_from_swap_chain), init_from_swap_chain != nullptr ? "present" : "missing",
         reinterpret_cast<uintptr_t>(init_from_swap_chain_desc), init_from_swap_chain_desc != nullptr ? "present" : "missing",
         reinterpret_cast<uintptr_t>(get_swap_chain_ptr), get_swap_chain_ptr != nullptr ? "present" : "missing");
+
+    install_xefg_api_hooks_if_available();
 }
 
 void D3D12Hook::process_pending_xefg_probe() {
@@ -435,6 +731,8 @@ bool D3D12Hook::hook() {
     spdlog::info("Hooking D3D12");
     spdlog::info("[D3D12][HookLifecycle] action = hook, reason = initial_or_reinitialize");
 
+    install_xefg_api_hooks_if_available();
+
     if (!is_xefg_module_loaded()) {
         if (const auto xefg_module = GetModuleHandleW(L"libxess_fg.dll")) {
             wchar_t path[MAX_PATH]{};
@@ -449,6 +747,11 @@ bool D3D12Hook::hook() {
     utility::ScopeGuard guard{[]() {
         g_inside_d3d12_hook = false;
     }};
+
+    if (consume_pending_xefg_binding(*this)) {
+        spdlog::info("Hooked DirectX 12 through pending XeFG binding");
+        return true;
+    }
 
     if (s_command_queue_offset != 0 && s_swapchain_vtable != nullptr && s_factory_vtable != nullptr) {
         spdlog::info("Reinitializing D3D12Hook via known pointers");
@@ -838,6 +1141,12 @@ bool D3D12Hook::unhook() {
 
     std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
 
+    // Invalidate before the early return so no XeFG transaction can retain a
+    // hook object while hook-monitor recovery destroys or replaces it.
+    if (g_d3d12_hook == this) {
+        g_d3d12_hook = nullptr;
+    }
+
     if (!m_hooked) {
         return true;
     }
@@ -863,6 +1172,16 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
     std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
 
     auto d3d12 = g_d3d12_hook;
+
+    // XeFG Present and Present1 share the direct-binding lifecycle. Keep the
+    // established native phase-1/instance path below unchanged.
+    if (d3d12 != nullptr && !d3d12->m_is_phase_1 && d3d12->m_swapchain_source == SwapchainSource::XeFGInternal && d3d12->m_swapchain_hook != nullptr) {
+        using PresentFn = decltype(D3D12Hook::present)*;
+        const auto present_fn = d3d12->m_swapchain_hook->get_method<PresentFn>(8);
+        return present_common(swap_chain, "Present", reinterpret_cast<void*>(present_fn), [swap_chain, sync_interval, flags, r9, present_fn]() {
+            return present_fn(swap_chain, sync_interval, flags, r9);
+        }, false);
+    }
 
     decltype(D3D12Hook::present)* present_fn{nullptr};
 
@@ -933,6 +1252,7 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
         d3d12->m_swapchain_hook = std::make_unique<VtableHook>(swap_chain);
         //d3d12->m_swapchain_hook->hook_method(2, (uintptr_t)&D3D12Hook::release);
         d3d12->m_swapchain_hook->hook_method(8, (uintptr_t)&D3D12Hook::present);
+        d3d12->m_swapchain_hook->hook_method(22, (uintptr_t)&D3D12Hook::present1);
         d3d12->m_swapchain_hook->hook_method(13, (uintptr_t)&D3D12Hook::resize_buffers);
         d3d12->m_swapchain_hook->hook_method(14, (uintptr_t)&D3D12Hook::resize_target);
 
@@ -968,11 +1288,13 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
         d3d12->m_device = temp_device.Get();
     }
 
-    if (d3d12->m_using_proton_swapchain) {
-        const auto real_swapchain = *(uintptr_t*)((uintptr_t)swap_chain + d3d12->s_proton_swapchain_offset);
-        d3d12->m_command_queue = *(ID3D12CommandQueue**)(real_swapchain + d3d12->s_command_queue_offset);
-    } else {
-        d3d12->m_command_queue = *(ID3D12CommandQueue**)((uintptr_t)swap_chain + d3d12->s_command_queue_offset);
+    if (d3d12->m_swapchain_source != SwapchainSource::XeFGInternal) {
+        if (d3d12->m_using_proton_swapchain) {
+            const auto real_swapchain = *(uintptr_t*)((uintptr_t)swap_chain + d3d12->s_proton_swapchain_offset);
+            d3d12->m_command_queue = *(ID3D12CommandQueue**)(real_swapchain + d3d12->s_command_queue_offset);
+        } else {
+            d3d12->m_command_queue = *(ID3D12CommandQueue**)((uintptr_t)swap_chain + d3d12->s_command_queue_offset);
+        }
     }
 
     if (d3d12->m_swapchain_0 == nullptr) {
@@ -1040,6 +1362,133 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
     d3d12->m_inside_present = false;
     
     return result;
+}
+
+HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind, void* original_present, std::function<HRESULT()> original_call, bool allow_phase_transition) {
+    while (g_framework == nullptr) {
+        std::this_thread::yield();
+    }
+
+    std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
+    auto d3d12 = g_d3d12_hook;
+    if (d3d12 == nullptr || swap_chain == nullptr || !original_call) {
+        return E_FAIL;
+    }
+
+    if (allow_phase_transition && d3d12->m_is_phase_1) {
+        return E_FAIL;
+    }
+
+    if (!d3d12->m_is_phase_1 && (d3d12->m_swapchain_hook == nullptr || swap_chain != d3d12->m_swapchain_hook->get_instance())) {
+        return original_call();
+    }
+
+    HWND swapchain_wnd{nullptr};
+    swap_chain->GetHwnd(&swapchain_wnd);
+    const auto present_call = d3d12->m_present_entry_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    d3d12->m_last_present_entry_time = std::chrono::steady_clock::now();
+
+    const auto should_log_present = present_call <= 10
+        || d3d12->m_last_logged_present_swapchain != swap_chain
+        || d3d12->m_last_logged_present_target != original_present
+        || d3d12->m_last_logged_present_phase_1 != d3d12->m_is_phase_1;
+
+    if (should_log_present) {
+        void* present_vtable = nullptr;
+        if (const auto snapshot = snapshot_swapchain(swap_chain)) {
+            present_vtable = snapshot->vtable;
+        }
+
+        spdlog::info("[D3D12][PresentEntry] call = {}, kind = {}, source = {}, phase = instance, swapchain = 0x{:x}, vtable = 0x{:x}, hwnd = 0x{:x}, tracked_swapchain = 0x{:x}, original_present = 0x{:x}, original_owner = {}, thread_id = {}",
+            present_call,
+            kind,
+            d3d12->m_swapchain_source == SwapchainSource::XeFGInternal ? "xefg_internal" : "native",
+            reinterpret_cast<uintptr_t>(swap_chain),
+            reinterpret_cast<uintptr_t>(present_vtable),
+            reinterpret_cast<uintptr_t>(swapchain_wnd),
+            reinterpret_cast<uintptr_t>(d3d12->m_swap_chain),
+            reinterpret_cast<uintptr_t>(original_present),
+            describe_address(original_present),
+            GetCurrentThreadId());
+
+        d3d12->m_last_logged_present_swapchain = swap_chain;
+        d3d12->m_last_logged_present_target = original_present;
+        d3d12->m_last_logged_present_phase_1 = d3d12->m_is_phase_1;
+    }
+
+    d3d12->m_inside_present = true;
+    d3d12->m_swap_chain = swap_chain;
+    Microsoft::WRL::ComPtr<ID3D12Device4> temp_device{};
+    if (SUCCEEDED(swap_chain->GetDevice(IID_PPV_ARGS(&temp_device)))) {
+        d3d12->m_device = temp_device.Get();
+    }
+
+    if (d3d12->m_swapchain_source != SwapchainSource::XeFGInternal) {
+        if (d3d12->m_using_proton_swapchain) {
+            const auto real_swapchain = *(uintptr_t*)((uintptr_t)swap_chain + d3d12->s_proton_swapchain_offset);
+            d3d12->m_command_queue = *(ID3D12CommandQueue**)(real_swapchain + d3d12->s_command_queue_offset);
+        } else {
+            d3d12->m_command_queue = *(ID3D12CommandQueue**)((uintptr_t)swap_chain + d3d12->s_command_queue_offset);
+        }
+    }
+
+    if (g_present_depth > 0) {
+        ++g_present_depth;
+        const auto result = original_call();
+        --g_present_depth;
+        d3d12->m_inside_present = false;
+        return result;
+    }
+
+    if (d3d12->m_on_present) {
+        d3d12->m_on_present(*d3d12);
+    }
+
+    ++g_present_depth;
+    HRESULT result = S_OK;
+    if (!d3d12->m_ignore_next_present) {
+        result = original_call();
+        if (result != S_OK) {
+            spdlog::error("{} failed: {:x}", kind, result);
+        }
+    } else {
+        d3d12->m_ignore_next_present = false;
+    }
+    --g_present_depth;
+
+    if (d3d12->m_on_post_present) {
+        d3d12->m_on_post_present(*d3d12);
+    }
+
+    d3d12->m_inside_present = false;
+    return result;
+}
+
+HRESULT WINAPI D3D12Hook::present1(IDXGISwapChain1* swap_chain, UINT sync_interval, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters) {
+    while (g_framework == nullptr) {
+        std::this_thread::yield();
+    }
+
+    // Hook-monitor recovery and swapchain recreation reset or destroy the active
+    // D3D12Hook under this mutex. Keep it while reading both the hook object and
+    // its vtable hook, then let present_common re-enter it recursively.
+    std::scoped_lock lifecycle_lock{g_framework->get_hook_monitor_mutex()};
+
+    auto d3d12 = g_d3d12_hook;
+    if (d3d12 == nullptr || d3d12->m_swapchain_hook == nullptr || swap_chain == nullptr) {
+        return E_FAIL;
+    }
+
+    using Present1Fn = decltype(D3D12Hook::present1)*;
+    const auto original = d3d12->m_swapchain_hook->get_method<Present1Fn>(22);
+    Microsoft::WRL::ComPtr<IDXGISwapChain3> swap_chain3;
+    if (FAILED(swap_chain->QueryInterface(IID_PPV_ARGS(&swap_chain3)))) {
+        return original(swap_chain, sync_interval, flags, parameters);
+    }
+
+    return present_common(swap_chain3.Get(), "Present1", reinterpret_cast<void*>(original), [swap_chain, sync_interval, flags, parameters, original]() {
+        return original(swap_chain, sync_interval, flags, parameters);
+    }, false);
 }
 
 thread_local int32_t g_resize_buffers_depth = 0;

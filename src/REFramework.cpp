@@ -219,11 +219,80 @@ using LdrRegisterDllNotification_t = NTSTATUS (*) (
     PVOID                          *Cookie
 );
 
+using LdrLoadDllFn = NTSTATUS NTAPI (
+    PWSTR            SearchPath,
+    PULONG           LoadFlags,
+    PUNICODE_STRING  Name,
+    PHANDLE          Module
+);
+
+using LdrLoadDll_t = LdrLoadDllFn*;
+
 #define LDR_DLL_NOTIFICATION_REASON_LOADED 1
 #define LDR_DLL_NOTIFICATION_REASON_UNLOADED 2
 
 std::optional<std::filesystem::path> g_current_game_path{};
 bool g_success_made_ldr_notification{false};
+std::unique_ptr<FunctionHook> g_ldr_load_dll_hook{};
+
+bool is_libxess_fg_dll(const PUNICODE_STRING name) {
+    if (name == nullptr || name->Buffer == nullptr || name->Length == 0) {
+        return false;
+    }
+
+    const std::wstring_view module_name{name->Buffer, name->Length / sizeof(wchar_t)};
+    const auto filename_start = module_name.find_last_of(L"\\/");
+    const auto filename = filename_start == std::wstring_view::npos ? module_name : module_name.substr(filename_start + 1);
+    return _wcsicmp(std::wstring{filename}.c_str(), L"libxess_fg.dll") == 0;
+}
+
+NTSTATUS NTAPI ldr_load_dll_hook(PWSTR search_path, PULONG load_flags, PUNICODE_STRING name, PHANDLE module) {
+    const auto original = g_ldr_load_dll_hook->get_original<LdrLoadDllFn>();
+    const auto result = original(search_path, load_flags, name, module);
+
+    // LdrLoadDll has returned to its caller at this point, so the loader-notification
+    // callback is no longer running under the loader lock. Complete the XeFG export
+    // hooks before the caller can resolve and invoke the newly loaded public API.
+    if (NT_SUCCESS(result) && module != nullptr && *module != nullptr && is_libxess_fg_dll(name)) try {
+        const auto xefg_module = static_cast<HMODULE>(*module);
+        wchar_t path[MAX_PATH]{};
+        const auto path_length = GetModuleFileNameW(xefg_module, path, ARRAYSIZE(path));
+
+        spdlog::info("[XeFG][LoaderHandoff] module = 0x{:x}, action = install_api_hooks_before_load_return",
+            reinterpret_cast<uintptr_t>(xefg_module));
+        D3D12Hook::notify_xefg_module_loaded(xefg_module, L"libxess_fg.dll", std::wstring_view{path, path_length});
+    } catch (const std::exception& e) {
+        spdlog::error("[XeFG][LoaderHandoff] Failed to install API hooks: {}", e.what());
+    } catch (...) {
+        spdlog::error("[XeFG][LoaderHandoff] Failed to install API hooks: unknown exception");
+    }
+
+    return result;
+}
+
+bool setup_ldr_load_dll_hook(HMODULE ntdll) {
+    if (g_ldr_load_dll_hook != nullptr) {
+        return true;
+    }
+
+    const auto ldr_load_dll = GetProcAddress(ntdll, "LdrLoadDll");
+    if (ldr_load_dll == nullptr) {
+        spdlog::error("[XeFG][LoaderHandoff] LdrLoadDll not found");
+        return false;
+    }
+
+    auto hook = std::make_unique<FunctionHook>(Address{reinterpret_cast<void*>(ldr_load_dll)}, reinterpret_cast<void*>(&ldr_load_dll_hook));
+    g_ldr_load_dll_hook = std::move(hook);
+
+    if (!g_ldr_load_dll_hook->create()) {
+        spdlog::error("[XeFG][LoaderHandoff] Failed to hook LdrLoadDll");
+        g_ldr_load_dll_hook.reset();
+        return false;
+    }
+
+    spdlog::info("[XeFG][LoaderHandoff] Hooked LdrLoadDll");
+    return true;
+}
 
 void CALLBACK ldr_notification_callback(
     ULONG                       NotificationReason,
@@ -465,9 +534,15 @@ REFramework::REFramework(HMODULE reframework_module)
         } else {
             spdlog::info("LdrRegisterDllNotification not found");
         }
+
+        setup_ldr_load_dll_hook(ntdll);
     } else {
         spdlog::info("ntdll.dll not found");
     }
+
+    // Install the XeFG public API hook at a normal execution point, before the
+    // D3D12 dummy-swapchain path can miss the game's initial XeFG transaction.
+    D3D12Hook::install_xefg_api_hooks_if_available();
 
     // wait for the game to load (WTF MHRISE??)
     // once this is done, we can assume the process is unpacked.
