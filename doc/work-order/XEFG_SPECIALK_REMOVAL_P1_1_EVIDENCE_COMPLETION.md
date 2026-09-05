@@ -20,7 +20,7 @@ The goals are:
 1. make the hook-monitor state snapshot appear in the exact failing pre-Present state,
 2. preserve the already-proven P1 behavior and evidence,
 3. document the Intel XeFG DLL roles correctly,
-4. collect the final no-FG / FSRFG control evidence needed for Q7,
+4. collect the final native/no-FG control evidence needed for Q7,
 5. close Q6 and Q7 before the P2 architecture is implemented.
 
 The target runtime topology remains:
@@ -33,6 +33,14 @@ FG Output    = XeFG
 GPU          = Intel
 Game         = Dragon's Dogma 2
 ```
+
+### Scope clarification
+
+The project acceptance target is **XeFG compatibility only**.
+
+FSRFG support is explicitly out of scope for this project phase. It does not need to be validated, preserved as a compatibility target, or used as a control case. Do not spend implementation or test effort on FSRFG.
+
+Native/no-FG remains useful only as a minimal control proving that REFramework's existing D3D12 phase-1 discovery path can still reach `D3D12Hook::present()` and transition to an instance hook when XeFG is not in the path.
 
 ---
 
@@ -497,7 +505,8 @@ P1.1 must not:
 - add Intel driver offsets or pattern scans,
 - hardcode `igxess_fg.dll` as the universal XeFG detection mechanism,
 - add NVIDIA/MHW resize/refcount workarounds,
-- add Requiem-specific fixes.
+- add Requiem-specific fixes,
+- add or validate FSRFG compatibility.
 
 P2 remains the first functional XeFG compatibility phase.
 
@@ -550,7 +559,7 @@ Required evidence:
 
 ### Test B — Intel DD2 native/no-FG control
 
-Preferred mandatory control:
+Required minimal control:
 
 ```text
 same game / GPU / REFramework P1.1 build
@@ -569,23 +578,9 @@ Required evidence:
 - REFramework overlay works,
 - recurring hook-monitor recovery does not continue after successful binding.
 
-This is the primary Q7 control.
+This is the sole Q7 control for P1.1.
 
-### Test C — FSRFG control, if practical
-
-Recommended but not required if Test B already provides a clean successful control.
-
-Use the same game/GPU/P1.1 build with FSRFG instead of XeFG.
-
-Capture:
-
-- candidate type/classification,
-- Present entry path,
-- phase transition,
-- instance hook installation,
-- hook-monitor behavior.
-
-This is useful because it compares XeFG against another FG topology rather than only against no-FG.
+There is **no FSRFG test requirement**.
 
 ---
 
@@ -646,12 +641,12 @@ Do not infer or manually substitute expected values.
 
 ### Q7 — control difference
 
-Must be filled from Test B and optionally Test C.
+Must be filled from Test B.
 
 At minimum explain:
 
 ```text
-successful control:
+native/no-FG control:
   phase-1 Present callback is reached
   -> phase1 -> instance transition occurs
   -> renderer/ImGui initializes
@@ -673,7 +668,7 @@ Use the actual control log to name the candidate/owner path rather than assuming
 Do not start P2 until:
 
 - Q6 is captured directly from the P1.1 log,
-- Q7 has a successful control log,
+- Q7 has the native/no-FG successful control log,
 - Q1-Q7 can all be answered from runtime evidence.
 
 Once this gate is satisfied, P2 may implement the first functional XeFG path.
@@ -686,7 +681,7 @@ Current evidence already strongly supports the following P2 direction, but **P1.
 3. support Present1 as a first-class presentation callback,
 4. avoid relying on the dummy native DXGI Present[8] discovery path after XeFG becomes active,
 5. avoid hardcoding the Intel driver implementation DLL name,
-6. preserve native D3D12 / D3D11 / Streamline / FSRFG behavior.
+6. keep unrelated native D3D12 / D3D11 / Streamline paths unchanged where practical, but do not gate XeFG success on FSRFG compatibility.
 ```
 
 The P2 work order should be written only after P1.1 runtime evidence is reviewed.
@@ -705,7 +700,7 @@ P1.1 is complete when all of the following are true:
 - build succeeds,
 - Intel DD2 no-SK XeFG reproduces the same behavior with Q6 now visible,
 - native/no-FG control succeeds and supplies Q7,
-- optional FSRFG control is captured if practical,
+- no FSRFG validation is required,
 - the final Q1-Q7 evidence summary is complete,
 - `libxess_fg.dll` and `igxess_fg.dll` roles are described correctly.
 
