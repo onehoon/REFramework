@@ -401,8 +401,16 @@ void D3D12Hook::publish_xefg_candidate() {
             }
             return;
         }
+
+        // Publish before releasing the lifecycle mutex. D3D12Hook::hook() runs
+        // under the same mutex, so a newly created hook cannot consume an empty
+        // slot and then miss this capture-before-hook XeFG binding.
+        std::scoped_lock state_lock{g_xefg_state_mutex};
+        g_pending_xefg_binding = pending;
+        return;
     }
 
+    // Constructor-time fallback before REFramework publishes its lifecycle mutex.
     std::scoped_lock lock{g_xefg_state_mutex};
     g_pending_xefg_binding = pending;
 }
