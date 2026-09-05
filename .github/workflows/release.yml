@@ -24,7 +24,7 @@ jobs:
           python dev/audit_direct_access_clang.py
 
       - name: Configure CMake
-        run: cmake -S ${{github.workspace}} -B ${{github.workspace}}/build -G "Visual Studio 18 2026" -A x64 -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DDEVELOPER_MODE=ON "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+        run: cmake -S ${{github.workspace}} -B ${{github.workspace}}/build -G "Visual Studio 18 2026" -A x64 -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DDEVELOPER_MODE=ON -DREFRAMEWORK_BUILD_NUMBER=${{ github.run_number }} -DREFRAMEWORK_BUILD_SHA=${{ github.sha }} "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
 
       - name: Build REFramework
         run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target REFramework
