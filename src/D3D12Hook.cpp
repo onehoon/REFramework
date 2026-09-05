@@ -191,6 +191,17 @@ D3D12Hook::~D3D12Hook() {
     unhook();
 }
 
+void D3D12Hook::mark_xefg_probe_pending() noexcept {
+    s_xefg_module_loaded.store(true, std::memory_order_release);
+
+    const auto observed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - g_diagnostic_start_time).count();
+    int64_t expected = -1;
+    s_xefg_first_seen_ms.compare_exchange_strong(expected, observed_ms, std::memory_order_relaxed);
+
+    s_xefg_probe_pending.store(true, std::memory_order_release);
+}
+
 void D3D12Hook::notify_xefg_module_loaded(HMODULE module, std::wstring_view base_name, std::wstring_view full_path) {
     s_xefg_module_loaded.store(true, std::memory_order_relaxed);
 
@@ -767,7 +778,7 @@ bool D3D12Hook::hook() {
         s_swapchain_vtable = *(void***)target_swapchain;
         s_factory_vtable = *(void***)factory;
 
-        log_discovery_snapshot(swap_chain1, s_swapchain_vtable, factory, s_factory_vtable, command_queue);
+        log_discovery_snapshot(target_swapchain, s_swapchain_vtable, factory, s_factory_vtable, command_queue);
 
         hook_impl();
     } catch (const std::exception& e) {

@@ -102,9 +102,7 @@ public:
 
     void log_hook_monitor_snapshot(std::string_view event) const;
 
-    static void mark_xefg_probe_pending() noexcept {
-        s_xefg_probe_pending.store(true, std::memory_order_release);
-    }
+    static void mark_xefg_probe_pending() noexcept;
 
     static void process_pending_xefg_probe();
 
