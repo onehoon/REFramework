@@ -1,5 +1,15 @@
 name: Build PR
-on: [pull_request, workflow_dispatch]
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 env:
   BUILD_TYPE: Release
 jobs:
@@ -19,10 +29,10 @@ jobs:
       - name: Configure CMake
         run: cmake -S ${{github.workspace}} -B ${{github.workspace}}/build -G "Visual Studio 18 2026" -A x64 -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DDEVELOPER_MODE=ON "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
 
-      - name: Build
+      - name: Build REFramework
         run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target REFramework
 
-      - name: Upload artifacts
+      - name: Upload dinput8.dll
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
         with:
           name: REFramework
