@@ -55,6 +55,7 @@ jobs:
         uses: ncipollo/release-action@6c75be85e571768fa31b40abf38de58ba0397db5
         with:
           token: ${{ github.token }}
+          commit: ${{ github.sha }}
           name: ${{format('REFramework Fork Release {0} ({1})', github.run_number, github.sha)}}
           tag: ${{format('fork-release-{0}-{1}', github.run_number, github.sha)}}
           artifacts: ${{github.workspace}}/artifact/dinput8.dll
