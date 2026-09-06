@@ -7,6 +7,7 @@
 #include <mutex>
 #include <optional>
 #include <string_view>
+#include <wrl/client.h>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi")
@@ -134,6 +135,10 @@ public:
 		return m_swapchain_source;
 	}
 
+    bool is_xefg_observe_only() const {
+        return m_xefg_p21_observe_only;
+    }
+
     void ignore_next_present() {
         m_ignore_next_present = true;
     }
@@ -149,12 +154,16 @@ protected:
 	static HRESULT WINAPI present1(IDXGISwapChain1* swap_chain, UINT sync_interval, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters);
     static HRESULT present_common(IDXGISwapChain3* swap_chain, const char* kind, void* original_present, std::function<HRESULT()> original_call, bool allow_phase_transition);
 	static void publish_xefg_candidate();
+    bool external_binding_matches(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source, bool xefg_observe_only) const;
     
     ID3D12Device4* m_device{ nullptr };
     IDXGISwapChain3* m_swap_chain{ nullptr };
     IDXGISwapChain3* m_swapchain_0{};
     IDXGISwapChain3* m_swapchain_1{};
     ID3D12CommandQueue* m_command_queue{ nullptr };
+    Microsoft::WRL::ComPtr<IDXGISwapChain3> m_xefg_bound_swapchain{};
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_xefg_bound_queue{};
+    Microsoft::WRL::ComPtr<ID3D12Device4> m_xefg_bound_device{};
     UINT m_display_width{ NULL };
     UINT m_display_height{ NULL };
     UINT m_render_width{ NULL };
