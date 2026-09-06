@@ -4,6 +4,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 env:
   BUILD_TYPE: Release
@@ -23,8 +24,33 @@ jobs:
           pip install libclang
           python dev/audit_direct_access_clang.py
 
+      - name: Resolve latest merged PR number
+        id: merged-pr
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $headers = @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $uri = "https://api.github.com/repos/${{ github.repository }}/pulls?state=closed&base=master&sort=updated&direction=desc&per_page=100"
+          $prs = Invoke-RestMethod -Uri $uri -Headers $headers
+          $pr = @($prs) |
+            Where-Object { $_.merged_at } |
+            Sort-Object { [DateTimeOffset]$_.merged_at } -Descending |
+            Select-Object -First 1
+
+          if (-not $pr) {
+            throw "No merged PR found for master."
+          }
+
+          Write-Host "Using merged PR #$($pr.number) for file version."
+          "number=$($pr.number)" >> $env:GITHUB_OUTPUT
+
       - name: Configure CMake
-        run: cmake -S ${{github.workspace}} -B ${{github.workspace}}/build -G "Visual Studio 18 2026" -A x64 -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DDEVELOPER_MODE=ON -DREFRAMEWORK_BUILD_NUMBER=${{ github.run_number }} -DREFRAMEWORK_BUILD_SHA=${{ github.sha }} "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+        run: cmake -S ${{github.workspace}} -B ${{github.workspace}}/build -G "Visual Studio 18 2026" -A x64 -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DDEVELOPER_MODE=ON -DREFRAMEWORK_BUILD_NUMBER=${{ steps.merged-pr.outputs.number }} -DREFRAMEWORK_BUILD_SHA=${{ github.sha }} "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
 
       - name: Build REFramework
         run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target REFramework
