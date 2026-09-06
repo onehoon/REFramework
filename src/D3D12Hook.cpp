@@ -24,6 +24,7 @@
 #include "D3D12Hook.hpp"
 #include "compatibility/xefg/XeFGCompatibility.hpp"
 #include "compatibility/xefg/XeFGRuntimeRegistry.hpp"
+#include <sdk/GameIdentity.hpp>
 
 static D3D12Hook* g_d3d12_hook = nullptr;
 thread_local bool g_inside_d3d12_hook = false;
@@ -2321,7 +2322,10 @@ HRESULT WINAPI D3D12Hook::resize_target(IDXGISwapChain3* swap_chain, const DXGI_
         }
     }
 
-    if (event_id != 0 && renderer_reset_performed && !d3d12->m_xefg_p21_observe_only) {
+    if (event_id != 0
+        && renderer_reset_performed
+        && !d3d12->m_xefg_p21_observe_only
+        && sdk::GameIdentity::get().is_mhwilds()) {
         d3d12->arm_xefg_resize_transition_hold(event_id);
     }
 
