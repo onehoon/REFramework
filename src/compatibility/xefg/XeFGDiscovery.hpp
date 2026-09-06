@@ -1,14 +1,50 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <utility>
+#include <wrl/client.h>
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
 
 #include "utility/VtableHook.hpp"
+
+enum class XeFGQueueRelation : uint8_t {
+    SameComIdentity,
+    DistinctSameDevice,
+    DeviceMismatch,
+    InitQueueUnavailable,
+    PresentationQueueUnavailable,
+    PresentationQueueNotDirect,
+};
+
+struct XeFGBindingCandidate {
+    Microsoft::WRL::ComPtr<IDXGISwapChain3> swapchain{};
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> selected_queue{};
+    Microsoft::WRL::ComPtr<ID3D12Device4> device{};
+    HWND hwnd{};
+    XeFGQueueRelation relation{XeFGQueueRelation::InitQueueUnavailable};
+    bool observe_only{true};
+
+    bool valid() const noexcept {
+        return swapchain != nullptr && selected_queue != nullptr && device != nullptr;
+    }
+};
+
+struct XeFGBindingCandidateResult {
+    std::optional<XeFGBindingCandidate> candidate{};
+    const char* reject_reason{};
+    const char* bind_reason{"init_success"};
+    const char* probe_reason{"distinct_same_device"};
+
+    bool accepted() const noexcept {
+        return candidate.has_value();
+    }
+};
 
 class XeFGDiscovery {
 public:
@@ -53,6 +89,7 @@ public:
         const void* init_params);
 
     static IDXGISwapChain1* current_internal_swapchain_for_diagnostics() noexcept;
+    static XeFGBindingCandidateResult build_binding_candidate(const Observation& observation);
 
 private:
     struct ActiveTransaction {

@@ -34,20 +34,11 @@ namespace {
 
 constexpr int32_t kXefgSuccess = 0;
 
-enum class XefgQueueRelation {
-    SameComIdentity,
-    DistinctSameDevice,
-    DeviceMismatch,
-    InitQueueUnavailable,
-    PresentationQueueUnavailable,
-    PresentationQueueNotDirect,
-};
-
 struct PendingXefgBinding {
     Microsoft::WRL::ComPtr<IDXGISwapChain3> swapchain{};
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> selected_queue{};
     HWND hwnd{};
-    XefgQueueRelation relation{ XefgQueueRelation::InitQueueUnavailable };
+    XeFGQueueRelation relation{ XeFGQueueRelation::InitQueueUnavailable };
     bool observe_only{ true };
     bool valid() const {
         return swapchain != nullptr && selected_queue != nullptr;
@@ -87,93 +78,11 @@ void log_xefg_rebind(std::string_view stage, const char* reason, uint64_t genera
         new_observe_only);
 }
 
-struct QueueIdentitySnapshot {
-    ID3D12CommandQueue* queue{};
-    void* com_identity{};
-    void* device_identity{};
-    D3D12_COMMAND_QUEUE_DESC desc{};
-    bool device_available{ false };
-    bool valid{ false };
-};
-
 std::mutex g_xefg_state_mutex{};
 std::optional<PendingXefgBinding> g_pending_xefg_binding{};
 
 using XefgInitFn = int32_t (WINAPI*)(void*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, ID3D12CommandQueue*, IDXGIFactory2*, const void*);
 using XefgGetSwapchainFn = int32_t (WINAPI*)(void*, REFIID, void**);
-
-const char* queue_relation_name(XefgQueueRelation relation) {
-    switch (relation) {
-    case XefgQueueRelation::SameComIdentity: return "same_com_identity";
-    case XefgQueueRelation::DistinctSameDevice: return "distinct_same_device";
-    case XefgQueueRelation::DeviceMismatch: return "device_mismatch";
-    case XefgQueueRelation::InitQueueUnavailable: return "init_queue_unavailable";
-    case XefgQueueRelation::PresentationQueueUnavailable: return "presentation_queue_unavailable";
-    case XefgQueueRelation::PresentationQueueNotDirect: return "presentation_queue_not_direct";
-    default: return "unknown";
-    }
-}
-
-const char* queue_type_name(D3D12_COMMAND_LIST_TYPE type) {
-    switch (type) {
-    case D3D12_COMMAND_LIST_TYPE_DIRECT: return "direct";
-    case D3D12_COMMAND_LIST_TYPE_BUNDLE: return "bundle";
-    case D3D12_COMMAND_LIST_TYPE_COMPUTE: return "compute";
-    case D3D12_COMMAND_LIST_TYPE_COPY: return "copy";
-    case D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE: return "video_decode";
-    case D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS: return "video_process";
-    case D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE: return "video_encode";
-    default: return "unknown";
-    }
-}
-
-QueueIdentitySnapshot capture_queue_identity(ID3D12CommandQueue* queue) {
-    QueueIdentitySnapshot snapshot{};
-    snapshot.queue = queue;
-    if (queue == nullptr) {
-        return snapshot;
-    }
-
-    Microsoft::WRL::ComPtr<IUnknown> queue_identity;
-    Microsoft::WRL::ComPtr<ID3D12Device> device;
-    Microsoft::WRL::ComPtr<IUnknown> device_identity;
-    if (FAILED(queue->GetDevice(IID_PPV_ARGS(&device)))) {
-        return snapshot;
-    }
-
-    snapshot.device_available = true;
-    if (FAILED(queue->QueryInterface(IID_PPV_ARGS(&queue_identity)))
-        || FAILED(device.As(&device_identity))) {
-        return snapshot;
-    }
-
-    snapshot.com_identity = queue_identity.Get();
-    snapshot.device_identity = device_identity.Get();
-    snapshot.desc = queue->GetDesc();
-    snapshot.valid = true;
-    return snapshot;
-}
-
-void log_xefg_queue_identity(void* context, IDXGISwapChain3* swapchain, const QueueIdentitySnapshot& init, const QueueIdentitySnapshot& presentation, XefgQueueRelation relation) {
-    spdlog::info("[XeFG][QueueIdentity] context = 0x{:x}, swapchain = 0x{:x}, init_queue = 0x{:x}, init_identity = 0x{:x}, init_device_identity = 0x{:x}, init_type = {}, init_priority = {}, init_flags = 0x{:x}, init_node_mask = {}, presentation_queue = 0x{:x}, presentation_identity = 0x{:x}, presentation_device_identity = 0x{:x}, presentation_type = {}, presentation_priority = {}, presentation_flags = 0x{:x}, presentation_node_mask = {}, relation = {}",
-        reinterpret_cast<uintptr_t>(context),
-        reinterpret_cast<uintptr_t>(swapchain),
-        reinterpret_cast<uintptr_t>(init.queue),
-        reinterpret_cast<uintptr_t>(init.com_identity),
-        reinterpret_cast<uintptr_t>(init.device_identity),
-        queue_type_name(init.desc.Type),
-        init.desc.Priority,
-        static_cast<uint32_t>(init.desc.Flags),
-        init.desc.NodeMask,
-        reinterpret_cast<uintptr_t>(presentation.queue),
-        reinterpret_cast<uintptr_t>(presentation.com_identity),
-        reinterpret_cast<uintptr_t>(presentation.device_identity),
-        queue_type_name(presentation.desc.Type),
-        presentation.desc.Priority,
-        static_cast<uint32_t>(presentation.desc.Flags),
-        presentation.desc.NodeMask,
-        queue_relation_name(relation));
-}
 
 struct SwapchainVtableSnapshot {
     void* object{};
@@ -419,116 +328,35 @@ int32_t D3D12Hook::xefg_get_swapchain_dispatch(size_t slot, void* context, REFII
 
 void D3D12Hook::publish_xefg_candidate(const XeFGDiscovery::Observation& observation) {
     PendingXefgBinding pending{};
-    const char* reject_reason = nullptr;
-    const char* bind_reason = "init_success";
-    const char* probe_reason = "distinct_same_device";
-
+    XeFGBindingCandidateResult decision{};
     {
         std::scoped_lock lock{g_xefg_state_mutex};
-        const auto& transaction = observation;
-
-        if (transaction.init_result != kXefgSuccess) {
-            reject_reason = "init_failed";
-        } else if (!transaction.factory_create_succeeded || transaction.internal_swapchain == nullptr) {
-            reject_reason = "no_candidate";
-        } else if (transaction.init_queue == nullptr) {
-            reject_reason = "queue_device_unavailable";
-        } else {
-            Microsoft::WRL::ComPtr<IDXGISwapChain3> candidate;
-            Microsoft::WRL::ComPtr<ID3D12Device> candidate_device;
-            Microsoft::WRL::ComPtr<IUnknown> candidate_identity;
-            HWND candidate_hwnd{};
-
-            if (FAILED(transaction.internal_swapchain->QueryInterface(IID_PPV_ARGS(&candidate)))) {
-                reject_reason = "no_idxgi_swapchain3";
-            } else if (FAILED(candidate->GetHwnd(&candidate_hwnd)) || candidate_hwnd != transaction.hwnd) {
-                reject_reason = "hwnd_mismatch";
-            } else if (FAILED(candidate->GetDevice(IID_PPV_ARGS(&candidate_device)))) {
-                reject_reason = "candidate_device_unavailable";
-            } else if (FAILED(candidate_device.As(&candidate_identity))) {
-                reject_reason = "candidate_device_unavailable";
-            } else {
-                const auto init_queue = capture_queue_identity(transaction.init_queue);
-                const auto presentation_queue = capture_queue_identity(transaction.presentation_queue);
-                auto relation = XefgQueueRelation::InitQueueUnavailable;
-
-                if (!init_queue.valid) {
-                    relation = XefgQueueRelation::InitQueueUnavailable;
-                } else if (!presentation_queue.valid) {
-                    relation = XefgQueueRelation::PresentationQueueUnavailable;
-                } else if (init_queue.device_identity != presentation_queue.device_identity) {
-                    relation = XefgQueueRelation::DeviceMismatch;
-                } else if (presentation_queue.desc.Type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
-                    relation = XefgQueueRelation::PresentationQueueNotDirect;
-                } else if (init_queue.com_identity == presentation_queue.com_identity) {
-                    relation = XefgQueueRelation::SameComIdentity;
-                } else {
-                    relation = XefgQueueRelation::DistinctSameDevice;
-                }
-
-                log_xefg_queue_identity(transaction.context, candidate.Get(), init_queue, presentation_queue, relation);
-
-                if (!init_queue.valid) {
-                    reject_reason = "queue_device_unavailable";
-                } else if (candidate_identity.Get() != init_queue.device_identity) {
-                    reject_reason = "device_mismatch";
-                } else if (relation == XefgQueueRelation::DistinctSameDevice) {
-                    pending.swapchain = candidate;
-                    pending.selected_queue = presentation_queue.queue;
-                    pending.hwnd = transaction.hwnd;
-                    pending.relation = relation;
-                    pending.observe_only = false;
-                } else {
-                    // Preserve liveness and the original Present/Present1 calls, but
-                    // do not submit overlay work through an unproven XeFG queue path.
-                    pending.swapchain = candidate;
-                    pending.selected_queue = init_queue.queue;
-                    pending.hwnd = transaction.hwnd;
-                    pending.relation = relation;
-                    pending.observe_only = true;
-                    bind_reason = "init_success_observe_only";
-                    switch (relation) {
-                    case XefgQueueRelation::SameComIdentity:
-                        probe_reason = "same_com_identity";
-                        break;
-                    case XefgQueueRelation::PresentationQueueUnavailable:
-                        probe_reason = transaction.presentation_queue == nullptr
-                            ? "presentation_queue_unavailable"
-                            : !presentation_queue.device_available
-                                ? "presentation_queue_device_unavailable"
-                                : "presentation_queue_unavailable";
-                        break;
-                    case XefgQueueRelation::DeviceMismatch:
-                        probe_reason = "presentation_queue_device_mismatch";
-                        break;
-                    case XefgQueueRelation::PresentationQueueNotDirect:
-                        probe_reason = "presentation_queue_not_direct";
-                        break;
-                    default:
-                        probe_reason = "presentation_queue_unavailable";
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (reject_reason != nullptr) {
+        decision = XeFGDiscovery::build_binding_candidate(observation);
+        if (!decision.accepted()) {
             spdlog::warn("[XeFG][Bind] candidate = 0x{:x}, accepted = false, reason = {}",
-                reinterpret_cast<uintptr_t>(transaction.internal_swapchain), reject_reason);
+                reinterpret_cast<uintptr_t>(observation.internal_swapchain), decision.reject_reason);
         } else {
+            const auto& candidate = *decision.candidate;
             spdlog::info("[XeFG][Bind] candidate = 0x{:x}, accepted = true, reason = {}",
-                reinterpret_cast<uintptr_t>(pending.swapchain.Get()), bind_reason);
+                reinterpret_cast<uintptr_t>(candidate.swapchain.Get()), decision.bind_reason);
             spdlog::info("[XeFG][P2.1Probe] mode = {}, selected_queue = 0x{:x}, render_callbacks = {}, reason = {}",
-                pending.observe_only ? (pending.relation == XefgQueueRelation::SameComIdentity ? "observe_only_same_queue" : "observe_only_invalid_presentation_queue") : "presentation_queue_render",
-                reinterpret_cast<uintptr_t>(pending.selected_queue.Get()),
-                !pending.observe_only,
-                probe_reason);
+                candidate.observe_only ? (candidate.relation == XeFGQueueRelation::SameComIdentity ? "observe_only_same_queue" : "observe_only_invalid_presentation_queue") : "presentation_queue_render",
+                reinterpret_cast<uintptr_t>(candidate.selected_queue.Get()),
+                !candidate.observe_only,
+                decision.probe_reason);
         }
     }
 
-    if (reject_reason != nullptr) {
+    if (!decision.accepted()) {
         return;
     }
+
+    const auto& candidate = *decision.candidate;
+    pending.swapchain = candidate.swapchain;
+    pending.selected_queue = candidate.selected_queue;
+    pending.hwnd = candidate.hwnd;
+    pending.relation = candidate.relation;
+    pending.observe_only = candidate.observe_only;
 
     if (g_framework != nullptr) {
         std::unique_lock<std::recursive_mutex> framework_lock{g_framework->get_hook_monitor_mutex()};
