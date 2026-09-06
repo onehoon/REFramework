@@ -253,6 +253,15 @@ std::string describe_address(void* address) {
     }
 }
 
+const char* resize_kind_name(D3D12Hook::XefgResizeEventKind kind) {
+    switch (kind) {
+    case D3D12Hook::XefgResizeEventKind::ResizeTarget: return "ResizeTarget";
+    case D3D12Hook::XefgResizeEventKind::ResizeBuffers: return "ResizeBuffers";
+    case D3D12Hook::XefgResizeEventKind::ResizeBuffers1: return "ResizeBuffers1";
+    default: return "None";
+    }
+}
+
 std::optional<SwapchainVtableSnapshot> snapshot_swapchain(IUnknown* object) {
     if (object == nullptr) {
         return std::nullopt;
@@ -1809,6 +1818,12 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
 
     const auto suppress_render_callbacks = d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
         && d3d12->m_xefg_p21_observe_only;
+    const auto post_resize_ordinal = d3d12->m_xefg_post_resize_present_budget > 0
+        ? d3d12->m_xefg_post_resize_present_ordinal + 1
+        : 0;
+    if (d3d12->m_swapchain_source == SwapchainSource::XeFGInternal && post_resize_ordinal > 0) {
+        d3d12->log_xefg_post_resize_present(swap_chain, kind, original_present);
+    }
     const auto log_render_boundary = d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
         && !suppress_render_callbacks
         && d3d12->m_on_present
@@ -1819,7 +1834,14 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
     }
 
     if (!suppress_render_callbacks && d3d12->m_on_present) {
+        if (post_resize_ordinal == 1 && g_framework != nullptr) {
+            g_framework->log_d3d12_resize_snapshot("present_pre_render_callback", d3d12->m_xefg_resize_event_id);
+        }
         d3d12->m_on_present(*d3d12);
+
+        if (post_resize_ordinal == 1 && g_framework != nullptr) {
+            g_framework->log_d3d12_resize_snapshot("present_post_render_callback", d3d12->m_xefg_resize_event_id);
+        }
 
         if (log_render_boundary) {
             spdlog::info("[XeFG][P2.1Probe] render_callback = returned, present_call = {}", present_call);
@@ -1855,6 +1877,74 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
 
     d3d12->m_inside_present = false;
     return result;
+}
+
+uint64_t D3D12Hook::begin_xefg_resize_event(XefgResizeEventKind kind) {
+    m_xefg_resize_event_id++;
+    m_xefg_last_resize_kind = kind;
+    m_xefg_last_resize_event_time = std::chrono::steady_clock::now();
+    m_xefg_post_resize_present_budget = 3;
+    m_xefg_post_resize_present_ordinal = 0;
+    return m_xefg_resize_event_id;
+}
+
+const char* D3D12Hook::get_xefg_last_resize_kind() const {
+    return resize_kind_name(m_xefg_last_resize_kind);
+}
+
+void D3D12Hook::log_xefg_resize_event(uint64_t event_id, XefgResizeEventKind kind, const char* stage,
+    IDXGISwapChain3* swap_chain, void* original_fn, HRESULT result, bool has_result) const {
+    Microsoft::WRL::ComPtr<IUnknown> identity{};
+    if (swap_chain != nullptr) {
+        swap_chain->QueryInterface(IID_PPV_ARGS(&identity));
+    }
+
+    const auto hook_instance = m_swapchain_hook != nullptr ? m_swapchain_hook->get_instance().ptr() : nullptr;
+    const auto owner = describe_address(original_fn);
+    if (has_result) {
+        spdlog::info("[XeFG][ResizeLifecycle] event_id = {}, kind = {}, stage = {}, thread_id = {}, swapchain = 0x{:x}, swapchain_identity = 0x{:x}, tracked_swapchain = 0x{:x}, hook_instance = 0x{:x}, owned_swapchain = 0x{:x}, binding_generation = {}, command_queue = 0x{:x}, device = 0x{:x}, observe_only = {}, original_fn = 0x{:x}, original_owner = {}, result = 0x{:08x}",
+            event_id, resize_kind_name(kind), stage, GetCurrentThreadId(),
+            reinterpret_cast<uintptr_t>(swap_chain), reinterpret_cast<uintptr_t>(identity.Get()),
+        reinterpret_cast<uintptr_t>(m_swap_chain), reinterpret_cast<uintptr_t>(hook_instance),
+            reinterpret_cast<uintptr_t>(m_xefg_bound_swapchain.Get()), m_xefg_binding_generation,
+            reinterpret_cast<uintptr_t>(m_command_queue), reinterpret_cast<uintptr_t>(m_device),
+            m_xefg_p21_observe_only, reinterpret_cast<uintptr_t>(original_fn), owner,
+            static_cast<uint32_t>(result));
+    } else {
+        spdlog::info("[XeFG][ResizeLifecycle] event_id = {}, kind = {}, stage = {}, thread_id = {}, swapchain = 0x{:x}, swapchain_identity = 0x{:x}, tracked_swapchain = 0x{:x}, hook_instance = 0x{:x}, owned_swapchain = 0x{:x}, binding_generation = {}, command_queue = 0x{:x}, device = 0x{:x}, observe_only = {}, original_fn = 0x{:x}, original_owner = {}",
+            event_id, resize_kind_name(kind), stage, GetCurrentThreadId(),
+            reinterpret_cast<uintptr_t>(swap_chain), reinterpret_cast<uintptr_t>(identity.Get()),
+        reinterpret_cast<uintptr_t>(m_swap_chain), reinterpret_cast<uintptr_t>(hook_instance),
+            reinterpret_cast<uintptr_t>(m_xefg_bound_swapchain.Get()), m_xefg_binding_generation,
+            reinterpret_cast<uintptr_t>(m_command_queue), reinterpret_cast<uintptr_t>(m_device),
+            m_xefg_p21_observe_only, reinterpret_cast<uintptr_t>(original_fn), owner);
+    }
+}
+
+void D3D12Hook::log_xefg_post_resize_present(IDXGISwapChain3* swap_chain, const char* kind, void* original_fn) {
+    if (m_xefg_post_resize_present_budget == 0) {
+        return;
+    }
+
+    --m_xefg_post_resize_present_budget;
+    const auto ordinal = ++m_xefg_post_resize_present_ordinal;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - m_xefg_last_resize_event_time).count();
+    spdlog::info("[XeFG][ResizeLifecycle] event_id = {}, kind = {}, stage = present_after_resize, present_ordinal = {}, elapsed_ms_since_resize = {}, thread_id = {}, swapchain = 0x{:x}, tracked_swapchain = 0x{:x}, hook_instance = 0x{:x}, owned_swapchain = 0x{:x}, binding_generation = {}, command_queue = 0x{:x}, device = 0x{:x}, original_fn = 0x{:x}, original_owner = {}",
+        m_xefg_resize_event_id,
+        kind,
+        ordinal,
+        elapsed,
+        GetCurrentThreadId(),
+        reinterpret_cast<uintptr_t>(swap_chain),
+        reinterpret_cast<uintptr_t>(m_swap_chain),
+        reinterpret_cast<uintptr_t>(m_swapchain_hook != nullptr ? m_swapchain_hook->get_instance().ptr() : nullptr),
+        reinterpret_cast<uintptr_t>(m_xefg_bound_swapchain.Get()),
+        m_xefg_binding_generation,
+        reinterpret_cast<uintptr_t>(m_command_queue),
+        reinterpret_cast<uintptr_t>(m_device),
+        reinterpret_cast<uintptr_t>(original_fn),
+        describe_address(original_fn));
 }
 
 HRESULT WINAPI D3D12Hook::present1(IDXGISwapChain1* swap_chain, UINT sync_interval, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters) {
@@ -1923,6 +2013,20 @@ HRESULT WINAPI D3D12Hook::resize_buffers(IDXGISwapChain3* swap_chain, UINT buffe
     }*/
 
     auto resize_buffers_fn = d3d12->m_swapchain_hook->get_method<decltype(D3D12Hook::resize_buffers)*>(13);
+    const auto resize_buffers_original = reinterpret_cast<void*>(resize_buffers_fn);
+
+    const auto is_xefg_internal = d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
+        && swap_chain == d3d12->m_swapchain_hook->get_instance();
+    const auto is_top_level = g_resize_buffers_depth == 0;
+    const auto event_id = is_xefg_internal && is_top_level
+        ? d3d12->begin_xefg_resize_event(D3D12Hook::XefgResizeEventKind::ResizeBuffers)
+        : 0;
+    if (event_id != 0) {
+        d3d12->log_xefg_resize_event(event_id, D3D12Hook::XefgResizeEventKind::ResizeBuffers, "enter",
+            swap_chain, resize_buffers_original);
+        spdlog::info("[XeFG][ResizeLifecycle] event_id = {}, kind = ResizeBuffers, buffer_count = {}, width = {}, height = {}, format = {}, flags = 0x{:x}",
+            event_id, buffer_count, width, height, static_cast<uint32_t>(new_format), swap_chain_flags);
+    }
 
     d3d12->m_display_width = width;
     d3d12->m_display_height = height;
@@ -1957,7 +2061,17 @@ HRESULT WINAPI D3D12Hook::resize_buffers(IDXGISwapChain3* swap_chain, UINT buffe
     }
 
     if (d3d12->m_on_resize_buffers) {
+        if (event_id != 0) {
+            d3d12->log_xefg_resize_event(event_id, D3D12Hook::XefgResizeEventKind::ResizeBuffers, "pre_reset",
+                swap_chain, resize_buffers_original);
+            g_framework->log_d3d12_resize_snapshot("resize_buffers_pre_reset", event_id);
+        }
         d3d12->m_on_resize_buffers(*d3d12);
+        if (event_id != 0) {
+            d3d12->log_xefg_resize_event(event_id, D3D12Hook::XefgResizeEventKind::ResizeBuffers, "post_reset",
+                swap_chain, resize_buffers_original);
+            g_framework->log_d3d12_resize_snapshot("resize_buffers_post_reset", event_id);
+        }
     }
 
     ++g_resize_buffers_depth;
@@ -1969,6 +2083,11 @@ HRESULT WINAPI D3D12Hook::resize_buffers(IDXGISwapChain3* swap_chain, UINT buffe
     }
 
     --g_resize_buffers_depth;
+
+    if (event_id != 0) {
+        d3d12->log_xefg_resize_event(event_id, D3D12Hook::XefgResizeEventKind::ResizeBuffers, "original_return",
+            swap_chain, resize_buffers_original, result, true);
+    }
 
     return result;
 }
@@ -1989,6 +2108,7 @@ HRESULT WINAPI D3D12Hook::resize_buffers1(IDXGISwapChain3* swap_chain, UINT buff
 
     using ResizeBuffers1Fn = decltype(D3D12Hook::resize_buffers1)*;
     const auto original = d3d12->m_swapchain_hook->get_method<ResizeBuffers1Fn>(39);
+    const auto resize_buffers1_original = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(original));
     const auto is_tracked_instance = swap_chain == d3d12->m_swapchain_hook->get_instance();
     const auto is_xefg_internal = d3d12->m_swapchain_source == SwapchainSource::XeFGInternal;
 
@@ -2002,6 +2122,14 @@ HRESULT WINAPI D3D12Hook::resize_buffers1(IDXGISwapChain3* swap_chain, UINT buff
         --g_resize_buffers1_depth;
         return nested_result;
     }
+
+    const auto event_id = d3d12->begin_xefg_resize_event(D3D12Hook::XefgResizeEventKind::ResizeBuffers1);
+    d3d12->log_xefg_resize_event(event_id, D3D12Hook::XefgResizeEventKind::ResizeBuffers1, "enter",
+        swap_chain, resize_buffers1_original);
+    spdlog::info("[XeFG][ResizeLifecycle] event_id = {}, kind = ResizeBuffers1, buffer_count = {}, width = {}, height = {}, format = {}, flags = 0x{:x}, creation_node_mask = 0x{:x}, present_queues = 0x{:x}",
+        event_id, buffer_count, width, height, static_cast<uint32_t>(new_format), swap_chain_flags,
+        creation_node_mask != nullptr ? *creation_node_mask : 0,
+        reinterpret_cast<uintptr_t>(present_queues));
 
     d3d12->m_display_width = width;
     d3d12->m_display_height = height;
@@ -2020,8 +2148,14 @@ HRESULT WINAPI D3D12Hook::resize_buffers1(IDXGISwapChain3* swap_chain, UINT buff
 
     if (should_reset_renderer) {
         spdlog::info("[XeFG][ResizeBuffers1] stage = pre_reset_begin");
+        d3d12->log_xefg_resize_event(event_id, D3D12Hook::XefgResizeEventKind::ResizeBuffers1, "pre_reset",
+            swap_chain, resize_buffers1_original);
+        g_framework->log_d3d12_resize_snapshot("resize_buffers1_pre_reset", event_id);
         d3d12->m_on_resize_buffers(*d3d12);
         spdlog::info("[XeFG][ResizeBuffers1] stage = pre_reset_end");
+        d3d12->log_xefg_resize_event(event_id, D3D12Hook::XefgResizeEventKind::ResizeBuffers1, "post_reset",
+            swap_chain, reinterpret_cast<void*>(original));
+        g_framework->log_d3d12_resize_snapshot("resize_buffers1_post_reset", event_id);
     }
 
     ++g_resize_buffers1_depth;
@@ -2029,6 +2163,8 @@ HRESULT WINAPI D3D12Hook::resize_buffers1(IDXGISwapChain3* swap_chain, UINT buff
     --g_resize_buffers1_depth;
 
     spdlog::info("[XeFG][ResizeBuffers1] stage = original_return, result = 0x{:08x}", static_cast<uint32_t>(result));
+    d3d12->log_xefg_resize_event(event_id, D3D12Hook::XefgResizeEventKind::ResizeBuffers1, "original_return",
+            swap_chain, resize_buffers1_original, result, true);
     return result;
 }
 
@@ -2070,9 +2206,34 @@ HRESULT WINAPI D3D12Hook::resize_target(IDXGISwapChain3* swap_chain, const DXGI_
     }*/
 
     auto resize_target_fn = d3d12->m_swapchain_hook->get_method<decltype(D3D12Hook::resize_target)*>(14);
+    const auto resize_target_original = reinterpret_cast<void*>(resize_target_fn);
 
-    d3d12->m_render_width = new_target_parameters->Width;
-    d3d12->m_render_height = new_target_parameters->Height;
+    const auto is_xefg_internal = d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
+        && swap_chain == d3d12->m_swapchain_hook->get_instance();
+    const auto is_top_level = g_resize_target_depth == 0;
+    const auto event_id = is_xefg_internal && is_top_level
+        ? d3d12->begin_xefg_resize_event(D3D12Hook::XefgResizeEventKind::ResizeTarget)
+        : 0;
+
+    if (new_target_parameters != nullptr) {
+        d3d12->m_render_width = new_target_parameters->Width;
+        d3d12->m_render_height = new_target_parameters->Height;
+    }
+
+    if (event_id != 0) {
+        d3d12->log_xefg_resize_event(event_id, D3D12Hook::XefgResizeEventKind::ResizeTarget, "enter",
+            swap_chain, resize_target_original);
+        spdlog::info("[XeFG][ResizeLifecycle] event_id = {}, kind = ResizeTarget, dimensions = {}x{}, refresh = {}/{}, format = {}, scanline_ordering = {}, scaling = {}, target_parameters = 0x{:x}",
+            event_id,
+            new_target_parameters != nullptr ? new_target_parameters->Width : 0,
+            new_target_parameters != nullptr ? new_target_parameters->Height : 0,
+            new_target_parameters != nullptr ? new_target_parameters->RefreshRate.Numerator : 0,
+            new_target_parameters != nullptr ? new_target_parameters->RefreshRate.Denominator : 0,
+            new_target_parameters != nullptr ? static_cast<uint32_t>(new_target_parameters->Format) : 0,
+            new_target_parameters != nullptr ? static_cast<uint32_t>(new_target_parameters->ScanlineOrdering) : 0,
+            new_target_parameters != nullptr ? static_cast<uint32_t>(new_target_parameters->Scaling) : 0,
+            reinterpret_cast<uintptr_t>(new_target_parameters));
+    }
 
     // Restore the original code to the resize_buffers function.
     if (g_resize_target_depth > 0) {
@@ -2105,7 +2266,17 @@ HRESULT WINAPI D3D12Hook::resize_target(IDXGISwapChain3* swap_chain, const DXGI_
     }
 
     if (d3d12->m_on_resize_target) {
+        if (event_id != 0) {
+            d3d12->log_xefg_resize_event(event_id, D3D12Hook::XefgResizeEventKind::ResizeTarget, "pre_reset",
+                swap_chain, resize_target_original);
+            g_framework->log_d3d12_resize_snapshot("resize_target_pre_reset", event_id);
+        }
         d3d12->m_on_resize_target(*d3d12);
+        if (event_id != 0) {
+            d3d12->log_xefg_resize_event(event_id, D3D12Hook::XefgResizeEventKind::ResizeTarget, "post_reset",
+                swap_chain, resize_target_original);
+            g_framework->log_d3d12_resize_snapshot("resize_target_post_reset", event_id);
+        }
     }
 
     ++g_resize_target_depth;
@@ -2117,6 +2288,11 @@ HRESULT WINAPI D3D12Hook::resize_target(IDXGISwapChain3* swap_chain, const DXGI_
     }
 
     --g_resize_target_depth;
+
+    if (event_id != 0) {
+        d3d12->log_xefg_resize_event(event_id, D3D12Hook::XefgResizeEventKind::ResizeTarget, "original_return",
+            swap_chain, resize_target_original, result, true);
+    }
 
     return result;
 }

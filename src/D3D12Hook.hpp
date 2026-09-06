@@ -107,6 +107,10 @@ public:
 
     int64_t get_last_present_age_ms() const;
 
+    uint64_t get_xefg_last_resize_event_id() const { return m_xefg_resize_event_id; }
+    uint64_t get_xefg_binding_generation() const { return m_xefg_binding_generation; }
+    const char* get_xefg_last_resize_kind() const;
+
     static uint32_t get_command_queue_offset_for_diagnostics() {
         return s_command_queue_offset;
     }
@@ -145,6 +149,13 @@ public:
 
     static void hook_streamline(HMODULE dlssg_module = nullptr);
 
+    enum class XefgResizeEventKind : uint8_t {
+        None,
+        ResizeTarget,
+        ResizeBuffers,
+        ResizeBuffers1,
+    };
+
 protected:
     void hook_impl();
 	static bool consume_pending_xefg_binding(D3D12Hook& hook);
@@ -153,7 +164,10 @@ protected:
 	static HRESULT WINAPI create_xefg_swapchain(IDXGIFactory2* factory, IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc, IDXGIOutput* restrict_to_output, IDXGISwapChain1** swap_chain);
 	static HRESULT WINAPI present1(IDXGISwapChain1* swap_chain, UINT sync_interval, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters);
     static HRESULT present_common(IDXGISwapChain3* swap_chain, const char* kind, void* original_present, std::function<HRESULT()> original_call, bool allow_phase_transition);
-	static void publish_xefg_candidate();
+    static void publish_xefg_candidate();
+    uint64_t begin_xefg_resize_event(XefgResizeEventKind kind);
+    void log_xefg_resize_event(uint64_t event_id, XefgResizeEventKind kind, const char* stage, IDXGISwapChain3* swap_chain, void* original_fn, HRESULT result = S_OK, bool has_result = false) const;
+    void log_xefg_post_resize_present(IDXGISwapChain3* swap_chain, const char* kind, void* original_fn);
     bool external_binding_matches(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source, bool xefg_observe_only) const;
     bool replace_xefg_binding(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, bool observe_only, const char* reason);
     
@@ -166,6 +180,11 @@ protected:
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_xefg_bound_queue{};
     Microsoft::WRL::ComPtr<ID3D12Device4> m_xefg_bound_device{};
     uint64_t m_xefg_binding_generation{ 0 };
+    uint64_t m_xefg_resize_event_id{ 0 };
+    XefgResizeEventKind m_xefg_last_resize_kind{ XefgResizeEventKind::None };
+    std::chrono::steady_clock::time_point m_xefg_last_resize_event_time{};
+    uint32_t m_xefg_post_resize_present_budget{ 0 };
+    uint32_t m_xefg_post_resize_present_ordinal{ 0 };
     UINT m_display_width{ NULL };
     UINT m_display_height{ NULL };
     UINT m_render_width{ NULL };
