@@ -265,8 +265,10 @@ NTSTATUS NTAPI ldr_load_dll_hook(PWSTR search_path, PULONG load_flags, PUNICODE_
         wchar_t path[MAX_PATH]{};
         const auto path_length = GetModuleFileNameW(xefg_module, path, ARRAYSIZE(path));
 
-        spdlog::info("[XeFG][LoaderHandoff] module = 0x{:x}, action = install_api_hooks_before_load_return",
-            reinterpret_cast<uintptr_t>(xefg_module));
+        if (XeFGCompatibility::is_debug_log_enabled()) {
+            spdlog::info("[XeFG][LoaderHandoff] module = 0x{:x}, action = install_api_hooks_before_load_return",
+                reinterpret_cast<uintptr_t>(xefg_module));
+        }
         XeFGCompatibility::on_module_loaded(xefg_module, L"libxess_fg.dll", std::wstring_view{path, path_length});
     } catch (const std::exception& e) {
         spdlog::error("[XeFG][LoaderHandoff] Failed to install API hooks: {}", e.what());

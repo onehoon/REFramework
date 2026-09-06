@@ -16,6 +16,18 @@ namespace {
 const auto g_diagnostic_start_time = std::chrono::steady_clock::now();
 constexpr int32_t kXefgSuccess = 0;
 std::mutex g_xefg_state_mutex{};
+
+const char* queue_relation_name(XeFGQueueRelation relation) noexcept {
+    switch (relation) {
+    case XeFGQueueRelation::SameComIdentity: return "same_com_identity";
+    case XeFGQueueRelation::DistinctSameDevice: return "distinct_same_device";
+    case XeFGQueueRelation::DeviceMismatch: return "device_mismatch";
+    case XeFGQueueRelation::InitQueueUnavailable: return "init_queue_unavailable";
+    case XeFGQueueRelation::PresentationQueueUnavailable: return "presentation_queue_unavailable";
+    case XeFGQueueRelation::PresentationQueueNotDirect: return "presentation_queue_not_direct";
+    default: return "unknown";
+    }
+}
 }
 
 std::atomic<bool> XeFGCompatibility::s_module_loaded{false};
@@ -155,8 +167,7 @@ int32_t XeFGCompatibility::dispatch_init_desc(size_t slot, void* context, HWND h
             spdlog::info("[XeFG][Bind] accepted = true, reason = {}, mode = {}, queue_relation = {}",
                 decision.bind_reason,
                 candidate.observe_only ? "observe_only" : "render",
-                candidate.relation == XeFGQueueRelation::DistinctSameDevice ? "distinct_same_device"
-                    : candidate.relation == XeFGQueueRelation::SameComIdentity ? "same_com_identity" : "unknown");
+                queue_relation_name(candidate.relation));
             if (is_debug_log_enabled()) spdlog::info("[XeFG][P2.1Probe] mode = {}, selected_queue = 0x{:x}, render_callbacks = {}, reason = {}",
                 candidate.observe_only ? (candidate.relation == XeFGQueueRelation::SameComIdentity ? "observe_only_same_queue" : "observe_only_invalid_presentation_queue") : "presentation_queue_render",
                 reinterpret_cast<uintptr_t>(candidate.selected_queue.Get()), !candidate.observe_only, decision.probe_reason);

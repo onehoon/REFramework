@@ -1497,10 +1497,13 @@ void D3D12Hook::arm_xefg_resize_transition_hold(uint64_t event_id) {
 
     spdlog::info(
         "[XeFG][ResizeHold] action = arm, trigger_event_id = {}, "
-        "binding_generation = {}, swapchain = 0x{:x}",
+        "binding_generation = {}",
         event_id,
-        m_xefg_binding.generation(),
-        reinterpret_cast<uintptr_t>(m_swap_chain));
+        m_xefg_binding.generation());
+    if (XeFGCompatibility::is_debug_log_enabled()) {
+        spdlog::info("[XeFG][ResizeHold] action = arm_debug, trigger_event_id = {}, swapchain = 0x{:x}",
+            event_id, reinterpret_cast<uintptr_t>(m_swap_chain));
+    }
 }
 
 void D3D12Hook::complete_xefg_resize_transition_hold(uint64_t completion_event_id, XefgResizeEventKind completion_kind, HRESULT result) {
