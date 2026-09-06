@@ -186,6 +186,9 @@ protected:
     static HRESULT present_common(IDXGISwapChain3* swap_chain, const char* kind, void* original_present, std::function<HRESULT()> original_call, bool allow_phase_transition);
     static void publish_xefg_candidate();
     uint64_t begin_xefg_resize_event(XefgResizeEventKind kind);
+    void arm_xefg_resize_transition_hold(uint64_t event_id);
+    void complete_xefg_resize_transition_hold(uint64_t completion_event_id, XefgResizeEventKind completion_kind, HRESULT result);
+    void clear_xefg_resize_transition_hold(const char* reason);
     void log_xefg_resize_event(uint64_t event_id, XefgResizeEventKind kind, const char* stage, IDXGISwapChain3* swap_chain, void* original_fn, HRESULT result = S_OK, bool has_result = false) const;
     void log_xefg_post_resize_present(IDXGISwapChain3* swap_chain, const char* kind, void* original_fn);
     bool external_binding_matches(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source, bool xefg_observe_only) const;
@@ -201,6 +204,9 @@ protected:
     Microsoft::WRL::ComPtr<ID3D12Device4> m_xefg_bound_device{};
     uint64_t m_xefg_binding_generation{ 0 };
     uint64_t m_xefg_resize_event_id{ 0 };
+    bool m_xefg_resize_transition_hold{ false };
+    uint64_t m_xefg_resize_transition_hold_event_id{ 0 };
+    uint32_t m_xefg_resize_transition_suppressed_present_count{ 0 };
     XefgResizeEventKind m_xefg_last_resize_kind{ XefgResizeEventKind::None };
     std::chrono::steady_clock::time_point m_xefg_last_resize_event_time{};
     uint32_t m_xefg_post_resize_present_budget{ 0 };
