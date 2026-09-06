@@ -117,20 +117,35 @@ void REFramework::hook_monitor() {
             }
 
             if (!m_has_last_chance && now - m_last_chance_time > std::chrono::seconds(1)) {
-                spdlog::info("Sending rehook request for D3D");
-                if (d3d12 != nullptr) {
-                    d3d12->log_hook_monitor_snapshot("rehook_request");
-                }
+                const bool preserve_xefg_binding = !m_is_d3d11
+                    && d3d12 != nullptr
+                    && d3d12->has_active_xefg_instance_binding();
 
-                // hook_d3d12 always gets called first.
-                if (m_is_d3d11) {
-                    hook_d3d11();
+                if (preserve_xefg_binding) {
+                    spdlog::info(
+                        "[XeFG][HookMonitor] action = preserve_binding, "
+                        "reason = present_timeout, generation = {}, "
+                        "swapchain = 0x{:x}, queue = 0x{:x}",
+                        d3d12->get_xefg_binding_generation(),
+                        reinterpret_cast<uintptr_t>(d3d12->get_swap_chain()),
+                        reinterpret_cast<uintptr_t>(d3d12->get_command_queue()));
+                    d3d12->log_hook_monitor_snapshot("xefg_rehook_suppressed");
                 } else {
+                    spdlog::info("Sending rehook request for D3D");
                     if (d3d12 != nullptr) {
-                        spdlog::info("[D3D12][HookLifecycle] action = hook, reason = hook_monitor_recovery");
+                        d3d12->log_hook_monitor_snapshot("rehook_request");
                     }
 
-                    hook_d3d12();
+                    // hook_d3d12 always gets called first.
+                    if (m_is_d3d11) {
+                        hook_d3d11();
+                    } else {
+                        if (d3d12 != nullptr) {
+                            spdlog::info("[D3D12][HookLifecycle] action = hook, reason = hook_monitor_recovery");
+                        }
+
+                        hook_d3d12();
+                    }
                 }
 
                 // so we don't immediately go and hook it again
