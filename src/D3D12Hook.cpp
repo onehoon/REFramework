@@ -457,7 +457,11 @@ bool D3D12Hook::bind_external_swapchain(IDXGISwapChain3* swapchain, ID3D12Comman
         }
 
         // Destructive work begins only after all five hooks are prepared.
-        if (m_hooked && m_swapchain_source != SwapchainSource::XeFGInternal && g_framework != nullptr) {
+        const bool replacing_active_non_xefg =
+            m_hooked
+            && m_swap_chain != nullptr
+            && m_swapchain_source != SwapchainSource::XeFGInternal;
+        if (replacing_active_non_xefg && g_framework != nullptr) {
             spdlog::info("[XeFG][Bind] stage = old_renderer_reset, reason = non_xefg_to_xefg");
             g_framework->on_reset();
         }
