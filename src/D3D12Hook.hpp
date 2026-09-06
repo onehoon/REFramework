@@ -19,6 +19,7 @@
 #include "utility/PointerHook.hpp"
 #include "utility/FunctionHook.hpp"
 #include "utility/VtableHook.hpp"
+#include "compatibility/xefg/XeFGDiscovery.hpp"
 
 class D3D12Hook
 {
@@ -169,10 +170,9 @@ protected:
     void hook_impl();
 	static bool consume_pending_xefg_binding(D3D12Hook& hook);
 	static int32_t xefg_init_desc_common(size_t slot, HMODULE module, XefgInitFn original, void* context, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* swap_chain_desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc, ID3D12CommandQueue* command_queue, IDXGIFactory2* factory, const void* init_params);
-	static HRESULT WINAPI create_xefg_swapchain(IDXGIFactory2* factory, IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc, IDXGIOutput* restrict_to_output, IDXGISwapChain1** swap_chain);
 	static HRESULT WINAPI present1(IDXGISwapChain1* swap_chain, UINT sync_interval, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters);
     static HRESULT present_common(IDXGISwapChain3* swap_chain, const char* kind, void* original_present, std::function<HRESULT()> original_call, bool allow_phase_transition);
-    static void publish_xefg_candidate();
+    static void publish_xefg_candidate(const XeFGDiscovery::Observation& observation);
     uint64_t begin_xefg_resize_event(XefgResizeEventKind kind);
     void arm_xefg_resize_transition_hold(uint64_t event_id);
     void complete_xefg_resize_transition_hold(uint64_t completion_event_id, XefgResizeEventKind completion_kind, HRESULT result);
