@@ -7,7 +7,6 @@
 #include <array>
 #include <string>
 #include <windows.h>
-#include <tlhelp32.h>
 #include <wrl/client.h>
 
 #include <spdlog/spdlog.h>
@@ -23,6 +22,7 @@
 #include "WindowFilter.hpp"
 
 #include "D3D12Hook.hpp"
+#include "compatibility/xefg/XeFGCompatibility.hpp"
 #include "compatibility/xefg/XeFGRuntimeRegistry.hpp"
 
 static D3D12Hook* g_d3d12_hook = nullptr;
@@ -113,8 +113,6 @@ std::unique_ptr<VtableHook> g_xefg_factory_hook{};
 
 using XefgInitFn = int32_t (WINAPI*)(void*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, ID3D12CommandQueue*, IDXGIFactory2*, const void*);
 using XefgGetSwapchainFn = int32_t (WINAPI*)(void*, REFIID, void**);
-
-const auto g_diagnostic_start_time = std::chrono::steady_clock::now();
 
 const char* queue_relation_name(XefgQueueRelation relation) {
     switch (relation) {
@@ -359,29 +357,6 @@ void log_discovery_snapshot(IUnknown* dummy_swapchain, void** swapchain_vtable, 
 
 D3D12Hook::~D3D12Hook() {
     unhook();
-}
-
-void D3D12Hook::install_xefg_api_hooks_if_available() {
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        spdlog::warn("[XeFG][RuntimeRegistry] module enumeration failed, error = {}", GetLastError());
-        return;
-    }
-
-    MODULEENTRY32W entry{};
-    entry.dwSize = sizeof(entry);
-    if (Module32FirstW(snapshot, &entry)) {
-        do {
-            if (_wcsicmp(entry.szModule, L"libxess_fg.dll") == 0) {
-                notify_xefg_module_loaded(entry.hModule, std::wstring_view{entry.szModule}, std::wstring_view{entry.szExePath});
-            }
-        } while (Module32NextW(snapshot, &entry));
-    }
-    CloseHandle(snapshot);
-}
-
-void D3D12Hook::install_xefg_api_hooks_for_module(HMODULE module, std::wstring_view full_path) {
-    XeFGRuntimeRegistry::instance().install_for_module(module, full_path);
 }
 
 int32_t D3D12Hook::xefg_init_desc_dispatch(size_t slot, void* context, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* swap_chain_desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc, ID3D12CommandQueue* command_queue, IDXGIFactory2* factory, const void* init_params) {
@@ -872,47 +847,6 @@ bool D3D12Hook::bind_external_swapchain(IDXGISwapChain3* swapchain, ID3D12Comman
     return true;
 }
 
-void D3D12Hook::mark_xefg_probe_pending() noexcept {
-    s_xefg_module_loaded.store(true, std::memory_order_release);
-
-    const auto observed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - g_diagnostic_start_time).count();
-    int64_t expected = -1;
-    s_xefg_first_seen_ms.compare_exchange_strong(expected, observed_ms, std::memory_order_relaxed);
-
-    s_xefg_probe_pending.store(true, std::memory_order_release);
-}
-
-void D3D12Hook::notify_xefg_module_loaded(HMODULE module, std::wstring_view base_name, std::wstring_view full_path) {
-    s_xefg_module_loaded.store(true, std::memory_order_relaxed);
-
-    const auto observed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_diagnostic_start_time).count();
-    int64_t expected = -1;
-    s_xefg_first_seen_ms.compare_exchange_strong(expected, observed_ms, std::memory_order_relaxed);
-
-    spdlog::info("[XeFG][Module] name = {}, base = 0x{:x}, full_path = {}, first_seen_ms = {}",
-        utility::narrow(std::wstring{base_name}), reinterpret_cast<uintptr_t>(module), utility::narrow(std::wstring{full_path}), s_xefg_first_seen_ms.load(std::memory_order_relaxed));
-
-    const auto init_from_swap_chain = GetProcAddress(module, "xefgSwapChainD3D12InitFromSwapChain");
-    const auto init_from_swap_chain_desc = GetProcAddress(module, "xefgSwapChainD3D12InitFromSwapChainDesc");
-    const auto get_swap_chain_ptr = GetProcAddress(module, "xefgSwapChainD3D12GetSwapChainPtr");
-
-    spdlog::info("[XeFG][Exports] InitFromSwapChain = 0x{:x} / {}, InitFromSwapChainDesc = 0x{:x} / {}, GetSwapChainPtr = 0x{:x} / {}",
-        reinterpret_cast<uintptr_t>(init_from_swap_chain), init_from_swap_chain != nullptr ? "present" : "missing",
-        reinterpret_cast<uintptr_t>(init_from_swap_chain_desc), init_from_swap_chain_desc != nullptr ? "present" : "missing",
-        reinterpret_cast<uintptr_t>(get_swap_chain_ptr), get_swap_chain_ptr != nullptr ? "present" : "missing");
-
-    install_xefg_api_hooks_for_module(module, full_path);
-}
-
-void D3D12Hook::process_pending_xefg_probe() {
-    if (!s_xefg_probe_pending.exchange(false, std::memory_order_acq_rel)) {
-        return;
-    }
-
-    install_xefg_api_hooks_if_available();
-}
-
 int64_t D3D12Hook::get_last_present_age_ms() const {
     if (m_last_present_entry_time.time_since_epoch().count() == 0) {
         return -1;
@@ -931,7 +865,7 @@ void D3D12Hook::log_hook_monitor_snapshot(std::string_view event) const {
         reinterpret_cast<uintptr_t>(m_device),
         reinterpret_cast<uintptr_t>(m_command_queue),
         m_present_entry_count.load(std::memory_order_relaxed),
-        is_xefg_module_loaded(),
+        XeFGCompatibility::is_module_loaded(),
         get_last_present_age_ms());
 }
 
@@ -1026,7 +960,7 @@ HRESULT WINAPI D3D12Hook::create_swapchain(IDXGIFactory4* factory, IUnknown* dev
             desc != nullptr ? swap_effect_name(desc->SwapEffect) : "unknown",
             desc != nullptr ? desc->Flags : 0,
             type_name,
-            D3D12Hook::is_xefg_module_loaded());
+            XeFGCompatibility::is_module_loaded());
 
         if (const auto snapshot = snapshot_swapchain(*swap_chain)) {
             log_swapchain_vtable("[D3D12][SwapchainCandidate]", *snapshot);
@@ -1111,7 +1045,7 @@ bool D3D12Hook::hook() {
     spdlog::info("Hooking D3D12");
     spdlog::info("[D3D12][HookLifecycle] action = hook, reason = initial_or_reinitialize");
 
-    install_xefg_api_hooks_if_available();
+    XeFGCompatibility::install_already_loaded_runtimes();
 
     g_d3d12_hook = this;
     g_inside_d3d12_hook = true;
@@ -1592,7 +1526,7 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
     const auto present_call = d3d12->m_present_entry_count.fetch_add(1, std::memory_order_relaxed) + 1;
     d3d12->m_last_present_entry_time = std::chrono::steady_clock::now();
 
-    const auto xefg_loaded = D3D12Hook::is_xefg_module_loaded();
+    const auto xefg_loaded = XeFGCompatibility::is_module_loaded();
     const auto should_log_present = present_call <= 10
         || d3d12->m_last_logged_present_swapchain != swap_chain
         || d3d12->m_last_logged_present_target != reinterpret_cast<void*>(present_fn)
@@ -1669,7 +1603,7 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
         spdlog::info("[D3D12][PhaseTransition] phase1 -> instance, swapchain = 0x{:x}, vtable = 0x{:x}, xefg_module_loaded = {}",
             reinterpret_cast<uintptr_t>(swap_chain),
             reinterpret_cast<uintptr_t>(instance_vtable),
-            D3D12Hook::is_xefg_module_loaded());
+            XeFGCompatibility::is_module_loaded());
 
         present_fn = d3d12->m_swapchain_hook->get_method<decltype(D3D12Hook::present)*>(8);
     }
