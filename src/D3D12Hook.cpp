@@ -23,6 +23,7 @@
 #include "WindowFilter.hpp"
 
 #include "D3D12Hook.hpp"
+#include "compatibility/xefg/XeFGRuntimeRegistry.hpp"
 
 static D3D12Hook* g_d3d12_hook = nullptr;
 thread_local bool g_inside_d3d12_hook = false;
@@ -112,72 +113,6 @@ std::unique_ptr<VtableHook> g_xefg_factory_hook{};
 
 using XefgInitFn = int32_t (WINAPI*)(void*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, ID3D12CommandQueue*, IDXGIFactory2*, const void*);
 using XefgGetSwapchainFn = int32_t (WINAPI*)(void*, REFIID, void**);
-
-constexpr size_t kMaxXefgRuntimes = 8;
-
-enum class XefgRuntimeInstallState : uint8_t {
-    Empty,
-    Installing,
-    Active,
-};
-
-struct XefgRuntimeHook {
-    HMODULE module{};
-    std::wstring path{};
-    size_t slot{};
-    FARPROC init_desc_export{};
-    FARPROC get_swapchain_export{};
-    std::unique_ptr<FunctionHook> init_desc_hook{};
-    std::unique_ptr<FunctionHook> get_swapchain_hook{};
-    XefgRuntimeInstallState state{ XefgRuntimeInstallState::Empty };
-};
-
-std::array<std::optional<XefgRuntimeHook>, kMaxXefgRuntimes> g_xefg_runtimes{};
-
-template <size_t Slot>
-int32_t WINAPI xefg_init_desc_thunk(void* context, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* swap_chain_desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc, ID3D12CommandQueue* command_queue, IDXGIFactory2* factory, const void* init_params) {
-    return D3D12Hook::xefg_init_desc_dispatch(Slot, context, hwnd, swap_chain_desc, fullscreen_desc, command_queue, factory, init_params);
-}
-
-template <size_t Slot>
-int32_t WINAPI xefg_get_swapchain_thunk(void* context, REFIID riid, void** swap_chain) {
-    return D3D12Hook::xefg_get_swapchain_dispatch(Slot, context, riid, swap_chain);
-}
-
-constexpr std::array<XefgInitFn, kMaxXefgRuntimes> g_xefg_init_thunks{
-    &xefg_init_desc_thunk<0>, &xefg_init_desc_thunk<1>, &xefg_init_desc_thunk<2>, &xefg_init_desc_thunk<3>,
-    &xefg_init_desc_thunk<4>, &xefg_init_desc_thunk<5>, &xefg_init_desc_thunk<6>, &xefg_init_desc_thunk<7>,
-};
-
-constexpr std::array<XefgGetSwapchainFn, kMaxXefgRuntimes> g_xefg_get_swapchain_thunks{
-    &xefg_get_swapchain_thunk<0>, &xefg_get_swapchain_thunk<1>, &xefg_get_swapchain_thunk<2>, &xefg_get_swapchain_thunk<3>,
-    &xefg_get_swapchain_thunk<4>, &xefg_get_swapchain_thunk<5>, &xefg_get_swapchain_thunk<6>, &xefg_get_swapchain_thunk<7>,
-};
-
-XefgRuntimeHook* find_xefg_runtime(HMODULE module) {
-    for (auto& entry : g_xefg_runtimes) {
-        if (entry && entry->module == module) {
-            return &*entry;
-        }
-    }
-    return nullptr;
-}
-
-XefgRuntimeHook* get_xefg_runtime_by_slot(size_t slot) {
-    if (slot >= g_xefg_runtimes.size() || !g_xefg_runtimes[slot]) {
-        return nullptr;
-    }
-    return &*g_xefg_runtimes[slot];
-}
-
-std::optional<size_t> allocate_xefg_runtime_slot() {
-    for (size_t slot = 0; slot < g_xefg_runtimes.size(); ++slot) {
-        if (!g_xefg_runtimes[slot]) {
-            return slot;
-        }
-    }
-    return std::nullopt;
-}
 
 const auto g_diagnostic_start_time = std::chrono::steady_clock::now();
 
@@ -446,78 +381,20 @@ void D3D12Hook::install_xefg_api_hooks_if_available() {
 }
 
 void D3D12Hook::install_xefg_api_hooks_for_module(HMODULE module, std::wstring_view full_path) {
-    if (module == nullptr) {
-        return;
-    }
-
-    std::scoped_lock lock{g_xefg_state_mutex};
-    if (find_xefg_runtime(module) != nullptr) {
-        spdlog::info("[XeFG][RuntimeRegistry] action = duplicate, module = 0x{:x}, path = {}",
-            reinterpret_cast<uintptr_t>(module), utility::narrow(std::wstring{full_path}));
-        return;
-    }
-
-    const auto init_export = GetProcAddress(module, "xefgSwapChainD3D12InitFromSwapChainDesc");
-    if (init_export == nullptr) {
-        spdlog::warn("[XeFG][RuntimeRegistry] action = rejected, module = 0x{:x}, path = {}, reason = init_desc_missing",
-            reinterpret_cast<uintptr_t>(module), utility::narrow(std::wstring{full_path}));
-        return;
-    }
-
-    const auto slot = allocate_xefg_runtime_slot();
-    if (!slot) {
-        spdlog::error("[XeFG][RuntimeRegistry] action = rejected, module = 0x{:x}, reason = capacity_exceeded, capacity = {}",
-            reinterpret_cast<uintptr_t>(module), kMaxXefgRuntimes);
-        return;
-    }
-
-    auto& runtime = g_xefg_runtimes[*slot].emplace();
-    runtime.module = module;
-    runtime.path = std::wstring{full_path};
-    runtime.slot = *slot;
-    runtime.init_desc_export = init_export;
-    runtime.get_swapchain_export = GetProcAddress(module, "xefgSwapChainD3D12GetSwapChainPtr");
-    runtime.state = XefgRuntimeInstallState::Installing;
-
-    runtime.init_desc_hook = std::make_unique<FunctionHook>(
-        Address{reinterpret_cast<void*>(init_export)},
-        Address{reinterpret_cast<void*>(g_xefg_init_thunks[*slot])});
-    if (!runtime.init_desc_hook->create()) {
-        spdlog::error("[XeFG][RuntimeRegistry] action = rejected, slot = {}, module = 0x{:x}, reason = init_hook_failed",
-            *slot, reinterpret_cast<uintptr_t>(module));
-        g_xefg_runtimes[*slot].reset();
-        return;
-    }
-
-    if (runtime.get_swapchain_export != nullptr) {
-        runtime.get_swapchain_hook = std::make_unique<FunctionHook>(
-            Address{reinterpret_cast<void*>(runtime.get_swapchain_export)},
-            Address{reinterpret_cast<void*>(g_xefg_get_swapchain_thunks[*slot])});
-        if (!runtime.get_swapchain_hook->create()) {
-            spdlog::warn("[XeFG][RuntimeRegistry] api = GetSwapChainPtr, action = optional_hook_failed, slot = {}, module = 0x{:x}",
-                *slot, reinterpret_cast<uintptr_t>(module));
-            runtime.get_swapchain_hook.reset();
-        }
-    }
-
-    runtime.state = XefgRuntimeInstallState::Active;
-    spdlog::info("[XeFG][RuntimeRegistry] action = installed, slot = {}, module = 0x{:x}, path = {}, init_desc = 0x{:x}, get_swapchain = 0x{:x}",
-        *slot, reinterpret_cast<uintptr_t>(module), utility::narrow(runtime.path),
-        reinterpret_cast<uintptr_t>(runtime.init_desc_export), reinterpret_cast<uintptr_t>(runtime.get_swapchain_export));
+    XeFGRuntimeRegistry::instance().install_for_module(module, full_path);
 }
 
 int32_t D3D12Hook::xefg_init_desc_dispatch(size_t slot, void* context, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* swap_chain_desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc, ID3D12CommandQueue* command_queue, IDXGIFactory2* factory, const void* init_params) {
-    XefgInitFn original{};
+    XeFGRuntimeRegistry::InitFn original{};
     HMODULE module{};
     {
-        std::scoped_lock lock{g_xefg_state_mutex};
-        const auto runtime = get_xefg_runtime_by_slot(slot);
-        if (runtime == nullptr || runtime->state != XefgRuntimeInstallState::Active || runtime->init_desc_hook == nullptr) {
+        const auto target = XeFGRuntimeRegistry::instance().resolve_init(slot);
+        if (!target) {
             spdlog::error("[XeFG][RuntimeDispatch] api = InitFromSwapChainDesc, slot = {}, action = fail, reason = runtime_not_active", slot);
             return -1;
         }
-        original = reinterpret_cast<XefgInitFn>(runtime->init_desc_hook->get_original());
-        module = runtime->module;
+        original = target->original;
+        module = target->module;
     }
 
     spdlog::info("[XeFG][RuntimeDispatch] api = InitFromSwapChainDesc, slot = {}, module = 0x{:x}, context = 0x{:x}",
@@ -578,17 +455,16 @@ int32_t D3D12Hook::xefg_init_desc_common(size_t slot, HMODULE module, XefgInitFn
 }
 
 int32_t D3D12Hook::xefg_get_swapchain_dispatch(size_t slot, void* context, REFIID riid, void** swap_chain) {
-    XefgGetSwapchainFn original{};
+    XeFGRuntimeRegistry::GetSwapchainFn original{};
     HMODULE module{};
     {
-        std::scoped_lock lock{g_xefg_state_mutex};
-        const auto runtime = get_xefg_runtime_by_slot(slot);
-        if (runtime == nullptr || runtime->state != XefgRuntimeInstallState::Active || runtime->get_swapchain_hook == nullptr) {
+        const auto target = XeFGRuntimeRegistry::instance().resolve_get_swapchain(slot);
+        if (!target) {
             spdlog::error("[XeFG][RuntimeDispatch] api = GetSwapChainPtr, slot = {}, action = fail, reason = runtime_not_active", slot);
             return -1;
         }
-        original = reinterpret_cast<XefgGetSwapchainFn>(runtime->get_swapchain_hook->get_original());
-        module = runtime->module;
+        original = target->original;
+        module = target->module;
     }
     const auto result = original(context, riid, swap_chain);
 
