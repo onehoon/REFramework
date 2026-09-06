@@ -171,6 +171,7 @@ protected:
 	static HRESULT WINAPI present1(IDXGISwapChain1* swap_chain, UINT sync_interval, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters);
     static HRESULT present_common(IDXGISwapChain3* swap_chain, const char* kind, void* original_present, std::function<HRESULT()> original_call, bool allow_phase_transition);
     static void publish_xefg_candidate(const XeFGDiscovery::Observation& observation);
+    bool apply_xefg_candidate(const XeFGBindingCandidate& candidate);
     static D3D12Hook* current_xefg_handoff_target() noexcept;
     uint64_t begin_xefg_resize_event(XefgResizeEventKind kind);
     void arm_xefg_resize_transition_hold(uint64_t event_id);
