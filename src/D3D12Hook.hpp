@@ -20,6 +20,7 @@
 #include "utility/FunctionHook.hpp"
 #include "utility/VtableHook.hpp"
 #include "compatibility/xefg/XeFGDiscovery.hpp"
+#include "compatibility/xefg/XeFGBinding.hpp"
 
 class XeFGCandidateHandoff;
 
@@ -59,14 +60,9 @@ public:
         return m_hooked
             && !m_is_phase_1
             && m_swapchain_source == SwapchainSource::XeFGInternal
-            && m_xefg_binding_generation != 0
+            && m_xefg_binding.active()
             && m_swapchain_hook != nullptr
-            && m_xefg_bound_swapchain != nullptr
-            && m_xefg_bound_queue != nullptr
-            && m_xefg_bound_device != nullptr
-            && m_swap_chain == m_xefg_bound_swapchain.Get()
-            && m_command_queue == m_xefg_bound_queue.Get()
-            && m_device == m_xefg_bound_device.Get();
+            && m_xefg_binding.aliases_match(m_swap_chain, m_command_queue, m_device);
     }
 
     void on_present(OnPresentFn fn) {
@@ -131,7 +127,7 @@ public:
     int64_t get_last_present_age_ms() const;
 
     uint64_t get_xefg_last_resize_event_id() const { return m_xefg_resize_event_id; }
-    uint64_t get_xefg_binding_generation() const { return m_xefg_binding_generation; }
+    uint64_t get_xefg_binding_generation() const { return m_xefg_binding.generation(); }
     const char* get_xefg_last_resize_kind() const;
 
     static uint32_t get_command_queue_offset_for_diagnostics() {
@@ -153,7 +149,7 @@ public:
 	}
 
     bool is_xefg_observe_only() const {
-        return m_xefg_p21_observe_only;
+        return m_xefg_binding.observe_only();
     }
 
     void ignore_next_present() {
@@ -184,16 +180,14 @@ protected:
     void log_xefg_post_resize_present(IDXGISwapChain3* swap_chain, const char* kind, void* original_fn);
     bool external_binding_matches(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source, bool xefg_observe_only) const;
     bool replace_xefg_binding(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, bool observe_only, const char* reason);
+    void sync_xefg_binding_aliases() noexcept;
     
     ID3D12Device4* m_device{ nullptr };
     IDXGISwapChain3* m_swap_chain{ nullptr };
     IDXGISwapChain3* m_swapchain_0{};
     IDXGISwapChain3* m_swapchain_1{};
     ID3D12CommandQueue* m_command_queue{ nullptr };
-    Microsoft::WRL::ComPtr<IDXGISwapChain3> m_xefg_bound_swapchain{};
-    Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_xefg_bound_queue{};
-    Microsoft::WRL::ComPtr<ID3D12Device4> m_xefg_bound_device{};
-    uint64_t m_xefg_binding_generation{ 0 };
+    XeFGBinding m_xefg_binding{};
     uint64_t m_xefg_resize_event_id{ 0 };
     bool m_xefg_resize_transition_hold{ false };
     uint64_t m_xefg_resize_transition_hold_event_id{ 0 };
@@ -213,7 +207,6 @@ protected:
     bool m_using_proton_swapchain{ false };
     bool m_using_frame_generation_swapchain{ false };
 	SwapchainSource m_swapchain_source{ SwapchainSource::Native };
-	bool m_xefg_p21_observe_only{ false };
 	bool m_xefg_p21_render_boundary_logged{ false };
     bool m_hooked{ false };
     bool m_is_phase_1{ true };
