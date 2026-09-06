@@ -2,6 +2,10 @@
 
 #include "REFrameworkConfig.hpp"
 
+namespace {
+constexpr auto STARTUP_MENU_AUTO_HIDE_DELAY = std::chrono::seconds{3};
+}
+
 std::shared_ptr<REFrameworkConfig>& REFrameworkConfig::get() {
      static std::shared_ptr<REFrameworkConfig> instance{std::make_shared<REFrameworkConfig>()};
      return instance;
@@ -76,6 +80,26 @@ void REFrameworkConfig::on_draw_ui() {
 void REFrameworkConfig::on_frame() {
     if (m_show_cursor_key->is_key_down_once()) {
         m_always_show_cursor->toggle();
+    }
+
+    if (m_startup_menu_auto_hide_done) {
+        return;
+    }
+
+    if (m_remember_menu_state->value() || !g_framework->is_drawing_ui()) {
+        m_startup_menu_auto_hide_done = true;
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (m_startup_menu_open_time == std::chrono::steady_clock::time_point{}) {
+        m_startup_menu_open_time = now;
+        return;
+    }
+
+    if (now - m_startup_menu_open_time >= STARTUP_MENU_AUTO_HIDE_DELAY) {
+        m_startup_menu_auto_hide_done = true;
+        g_framework->set_draw_ui(false, false);
     }
 }
 
