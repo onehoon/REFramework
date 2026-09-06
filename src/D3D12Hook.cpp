@@ -49,8 +49,8 @@ struct XefgInitTransaction {
 };
 
 struct PendingXefgBinding {
-    IDXGISwapChain3* swapchain{};
-    ID3D12CommandQueue* selected_queue{};
+    Microsoft::WRL::ComPtr<IDXGISwapChain3> swapchain{};
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> selected_queue{};
     HWND hwnd{};
     XefgQueueRelation relation{ XefgQueueRelation::InitQueueUnavailable };
     bool observe_only{ true };
@@ -58,6 +58,26 @@ struct PendingXefgBinding {
         return swapchain != nullptr && selected_queue != nullptr;
     }
 };
+
+const char* binding_change_reason(bool swapchain_changed, bool queue_changed, bool mode_changed) {
+    const auto change_count = static_cast<int>(swapchain_changed)
+        + static_cast<int>(queue_changed)
+        + static_cast<int>(mode_changed);
+
+    if (change_count > 1) {
+        return "multiple_fields_changed";
+    }
+    if (swapchain_changed) {
+        return "swapchain_changed";
+    }
+    if (queue_changed) {
+        return "queue_changed";
+    }
+    if (mode_changed) {
+        return "mode_changed";
+    }
+    return "identical";
+}
 
 struct QueueIdentitySnapshot {
     ID3D12CommandQueue* queue{};
@@ -495,11 +515,19 @@ void D3D12Hook::publish_xefg_candidate() {
                 } else if (candidate_identity.Get() != init_queue.device_identity) {
                     reject_reason = "device_mismatch";
                 } else if (relation == XefgQueueRelation::DistinctSameDevice) {
-                    pending = { candidate.Get(), presentation_queue.queue, transaction.hwnd, relation, false };
+                    pending.swapchain = candidate;
+                    pending.selected_queue = presentation_queue.queue;
+                    pending.hwnd = transaction.hwnd;
+                    pending.relation = relation;
+                    pending.observe_only = false;
                 } else {
                     // Preserve liveness and the original Present/Present1 calls, but
                     // do not submit overlay work through an unproven XeFG queue path.
-                    pending = { candidate.Get(), init_queue.queue, transaction.hwnd, relation, true };
+                    pending.swapchain = candidate;
+                    pending.selected_queue = init_queue.queue;
+                    pending.hwnd = transaction.hwnd;
+                    pending.relation = relation;
+                    pending.observe_only = true;
                     bind_reason = "init_success_observe_only";
                     switch (relation) {
                     case XefgQueueRelation::SameComIdentity:
@@ -531,10 +559,10 @@ void D3D12Hook::publish_xefg_candidate() {
                 reinterpret_cast<uintptr_t>(transaction.candidate), reject_reason);
         } else {
             spdlog::info("[XeFG][Bind] candidate = 0x{:x}, accepted = true, reason = {}",
-                reinterpret_cast<uintptr_t>(pending.swapchain), bind_reason);
+                reinterpret_cast<uintptr_t>(pending.swapchain.Get()), bind_reason);
             spdlog::info("[XeFG][P2.1Probe] mode = {}, selected_queue = 0x{:x}, render_callbacks = {}, reason = {}",
                 pending.observe_only ? (pending.relation == XefgQueueRelation::SameComIdentity ? "observe_only_same_queue" : "observe_only_invalid_presentation_queue") : "presentation_queue_render",
-                reinterpret_cast<uintptr_t>(pending.selected_queue),
+                reinterpret_cast<uintptr_t>(pending.selected_queue.Get()),
                 !pending.observe_only,
                 probe_reason);
         }
@@ -551,14 +579,27 @@ void D3D12Hook::publish_xefg_candidate() {
         // mutex. Read the current object only after acquiring it so a XeFG init
         // cannot bind through a pointer retained from before that replacement.
         if (auto* hook = g_d3d12_hook; hook != nullptr) {
-            if (hook->is_hooked()
+            const auto has_active_xefg = hook->is_hooked()
                 && hook->get_swap_chain() != nullptr
-                && hook->get_swapchain_source() == SwapchainSource::XeFGInternal
-                && hook->get_swap_chain() != pending.swapchain) {
-                // Full XeFG swapchain recreation/rebind is P3 work. Do not
-                // silently replace a working XeFG binding in this P2 path.
-                spdlog::warn("[XeFG][Bind] candidate = 0x{:x}, accepted = false, reason = p3_rebind_deferred",
-                    reinterpret_cast<uintptr_t>(pending.swapchain));
+                && hook->get_swapchain_source() == SwapchainSource::XeFGInternal;
+            if (has_active_xefg) {
+                const auto swapchain_changed = hook->get_swap_chain() != pending.swapchain.Get();
+                const auto queue_changed = hook->get_command_queue() != pending.selected_queue.Get();
+                const auto mode_changed = hook->is_xefg_observe_only() != pending.observe_only;
+                const auto changed = swapchain_changed || queue_changed || mode_changed;
+                const auto reason = binding_change_reason(swapchain_changed, queue_changed, mode_changed);
+
+                spdlog::info("[XeFG][BindingGate] action = {}, reason = {}, old_swapchain = 0x{:x}, new_swapchain = 0x{:x}, old_queue = 0x{:x}, new_queue = 0x{:x}, old_observe_only = {}, new_observe_only = {}",
+                    changed ? "defer" : "unchanged",
+                    reason,
+                    reinterpret_cast<uintptr_t>(hook->get_swap_chain()),
+                    reinterpret_cast<uintptr_t>(pending.swapchain.Get()),
+                    reinterpret_cast<uintptr_t>(hook->get_command_queue()),
+                    reinterpret_cast<uintptr_t>(pending.selected_queue.Get()),
+                    hook->is_xefg_observe_only(),
+                    pending.observe_only);
+
+                // P3.1 intentionally leaves every active XeFG binding untouched.
                 return;
             }
 
@@ -570,9 +611,9 @@ void D3D12Hook::publish_xefg_candidate() {
                 g_framework->on_reset();
             }
 
-            if (!hook->bind_external_swapchain(pending.swapchain, pending.selected_queue, SwapchainSource::XeFGInternal, pending.observe_only)) {
+            if (!hook->bind_external_swapchain(pending.swapchain.Get(), pending.selected_queue.Get(), SwapchainSource::XeFGInternal, pending.observe_only)) {
                 spdlog::warn("[XeFG][Bind] candidate = 0x{:x}, accepted = false, reason = external_bind_failed",
-                    reinterpret_cast<uintptr_t>(pending.swapchain));
+                    reinterpret_cast<uintptr_t>(pending.swapchain.Get()));
             }
             return;
         }
@@ -598,7 +639,21 @@ bool D3D12Hook::consume_pending_xefg_binding(D3D12Hook& hook) {
         g_pending_xefg_binding.reset();
     }
 
-    return pending.has_value() && hook.bind_external_swapchain(pending->swapchain, pending->selected_queue, SwapchainSource::XeFGInternal, pending->observe_only);
+    return pending.has_value() && hook.bind_external_swapchain(pending->swapchain.Get(), pending->selected_queue.Get(), SwapchainSource::XeFGInternal, pending->observe_only);
+}
+
+bool D3D12Hook::external_binding_matches(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source, bool xefg_observe_only) const {
+    const auto normalized_observe_only = source == SwapchainSource::XeFGInternal && xefg_observe_only;
+
+    if (!m_hooked
+        || m_swapchain_hook == nullptr
+        || m_swapchain_source != source
+        || m_swap_chain != swapchain
+        || m_command_queue != command_queue) {
+        return false;
+    }
+
+    return source != SwapchainSource::XeFGInternal || m_xefg_p21_observe_only == normalized_observe_only;
 }
 
 bool D3D12Hook::bind_external_swapchain(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source, bool xefg_p21_observe_only) {
@@ -606,7 +661,7 @@ bool D3D12Hook::bind_external_swapchain(IDXGISwapChain3* swapchain, ID3D12Comman
         return false;
     }
 
-    if (m_swapchain_source == source && m_swap_chain == swapchain && m_command_queue == command_queue && m_swapchain_hook != nullptr && m_hooked) {
+    if (external_binding_matches(swapchain, command_queue, source, xefg_p21_observe_only)) {
         return true;
     }
 
@@ -615,11 +670,34 @@ bool D3D12Hook::bind_external_swapchain(IDXGISwapChain3* swapchain, ID3D12Comman
         return false;
     }
 
+    Microsoft::WRL::ComPtr<IDXGISwapChain3> next_xefg_swapchain;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> next_xefg_queue;
+    Microsoft::WRL::ComPtr<ID3D12Device4> next_xefg_device;
+    if (source == SwapchainSource::XeFGInternal) {
+        next_xefg_swapchain = swapchain;
+        next_xefg_queue = command_queue;
+        next_xefg_device = device;
+    }
+
+    // Existing XeFG ownership keeps the old instance alive through hook removal.
     m_present_hook.reset();
     m_swapchain_hook.reset();
-    m_swap_chain = swapchain;
-    m_command_queue = command_queue;
-    m_device = device.Get();
+    m_xefg_bound_swapchain.Reset();
+    m_xefg_bound_queue.Reset();
+    m_xefg_bound_device.Reset();
+
+    if (source == SwapchainSource::XeFGInternal) {
+        m_xefg_bound_swapchain = std::move(next_xefg_swapchain);
+        m_xefg_bound_queue = std::move(next_xefg_queue);
+        m_xefg_bound_device = std::move(next_xefg_device);
+        m_swap_chain = m_xefg_bound_swapchain.Get();
+        m_command_queue = m_xefg_bound_queue.Get();
+        m_device = m_xefg_bound_device.Get();
+    } else {
+        m_swap_chain = swapchain;
+        m_command_queue = command_queue;
+        m_device = device.Get();
+    }
     m_swapchain_source = source;
     m_xefg_p21_observe_only = source == SwapchainSource::XeFGInternal && xefg_p21_observe_only;
     m_xefg_p21_render_boundary_logged = false;
@@ -1313,14 +1391,34 @@ bool D3D12Hook::unhook() {
         g_d3d12_hook = nullptr;
     }
 
-    if (!m_hooked) {
+    if (!m_hooked && m_xefg_bound_swapchain == nullptr) {
         return true;
     }
 
-    spdlog::info("Unhooking D3D12");
+    if (m_hooked) {
+        spdlog::info("Unhooking D3D12");
+    }
+
+    const auto* owned_swapchain = m_xefg_bound_swapchain.Get();
+    const auto* owned_queue = m_xefg_bound_queue.Get();
+    const auto* owned_device = m_xefg_bound_device.Get();
 
     m_present_hook.reset();
     m_swapchain_hook.reset();
+
+    if (m_swap_chain == owned_swapchain) {
+        m_swap_chain = nullptr;
+    }
+    if (m_command_queue == owned_queue) {
+        m_command_queue = nullptr;
+    }
+    if (m_device == owned_device) {
+        m_device = nullptr;
+    }
+
+    m_xefg_bound_swapchain.Reset();
+    m_xefg_bound_queue.Reset();
+    m_xefg_bound_device.Reset();
 
     m_hooked = false;
     m_is_phase_1 = true;
