@@ -51,6 +51,22 @@ public:
         return m_hooked;
     }
 
+    // Caller must hold the D3D hook lifecycle mutex when a stable binding
+    // snapshot is required.
+    bool has_active_xefg_instance_binding() const noexcept {
+        return m_hooked
+            && !m_is_phase_1
+            && m_swapchain_source == SwapchainSource::XeFGInternal
+            && m_xefg_binding_generation != 0
+            && m_swapchain_hook != nullptr
+            && m_xefg_bound_swapchain != nullptr
+            && m_xefg_bound_queue != nullptr
+            && m_xefg_bound_device != nullptr
+            && m_swap_chain == m_xefg_bound_swapchain.Get()
+            && m_command_queue == m_xefg_bound_queue.Get()
+            && m_device == m_xefg_bound_device.Get();
+    }
+
     void on_present(OnPresentFn fn) {
         m_on_present = fn;
     }
