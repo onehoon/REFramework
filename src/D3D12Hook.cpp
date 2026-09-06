@@ -25,6 +25,7 @@
 #include "compatibility/xefg/XeFGCompatibility.hpp"
 #include "compatibility/xefg/XeFGRuntimeRegistry.hpp"
 #include "compatibility/xefg/XeFGDiscovery.hpp"
+#include "compatibility/xefg/XeFGCandidateHandoff.hpp"
 #include <sdk/GameIdentity.hpp>
 
 static D3D12Hook* g_d3d12_hook = nullptr;
@@ -33,37 +34,6 @@ thread_local bool g_inside_d3d12_hook = false;
 namespace {
 
 constexpr int32_t kXefgSuccess = 0;
-
-struct PendingXefgBinding {
-    Microsoft::WRL::ComPtr<IDXGISwapChain3> swapchain{};
-    Microsoft::WRL::ComPtr<ID3D12CommandQueue> selected_queue{};
-    HWND hwnd{};
-    XeFGQueueRelation relation{ XeFGQueueRelation::InitQueueUnavailable };
-    bool observe_only{ true };
-    bool valid() const {
-        return swapchain != nullptr && selected_queue != nullptr;
-    }
-};
-
-const char* binding_change_reason(bool swapchain_changed, bool queue_changed, bool mode_changed) {
-    const auto change_count = static_cast<int>(swapchain_changed)
-        + static_cast<int>(queue_changed)
-        + static_cast<int>(mode_changed);
-
-    if (change_count > 1) {
-        return "multiple_fields_changed";
-    }
-    if (swapchain_changed) {
-        return "swapchain_changed";
-    }
-    if (queue_changed) {
-        return "queue_changed";
-    }
-    if (mode_changed) {
-        return "mode_changed";
-    }
-    return "identical";
-}
 
 void log_xefg_rebind(std::string_view stage, const char* reason, uint64_t generation, IDXGISwapChain3* old_swapchain, IDXGISwapChain3* new_swapchain, ID3D12CommandQueue* old_queue, ID3D12CommandQueue* new_queue, bool old_observe_only, bool new_observe_only) {
     spdlog::info("[XeFG][Rebind] stage = {}, reason = {}, generation = {}, old_swapchain = 0x{:x}, new_swapchain = 0x{:x}, old_queue = 0x{:x}, new_queue = 0x{:x}, old_observe_only = {}, new_observe_only = {}",
@@ -79,7 +49,6 @@ void log_xefg_rebind(std::string_view stage, const char* reason, uint64_t genera
 }
 
 std::mutex g_xefg_state_mutex{};
-std::optional<PendingXefgBinding> g_pending_xefg_binding{};
 
 using XefgInitFn = int32_t (WINAPI*)(void*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, ID3D12CommandQueue*, IDXGIFactory2*, const void*);
 using XefgGetSwapchainFn = int32_t (WINAPI*)(void*, REFIID, void**);
@@ -256,6 +225,10 @@ D3D12Hook::~D3D12Hook() {
     unhook();
 }
 
+D3D12Hook* D3D12Hook::current_xefg_handoff_target() noexcept {
+    return g_d3d12_hook;
+}
+
 int32_t D3D12Hook::xefg_init_desc_dispatch(size_t slot, void* context, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* swap_chain_desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc, ID3D12CommandQueue* command_queue, IDXGIFactory2* factory, const void* init_params) {
     XeFGRuntimeRegistry::InitFn original{};
     HMODULE module{};
@@ -327,7 +300,6 @@ int32_t D3D12Hook::xefg_get_swapchain_dispatch(size_t slot, void* context, REFII
 }
 
 void D3D12Hook::publish_xefg_candidate(const XeFGDiscovery::Observation& observation) {
-    PendingXefgBinding pending{};
     XeFGBindingCandidateResult decision{};
     {
         std::scoped_lock lock{g_xefg_state_mutex};
@@ -350,85 +322,7 @@ void D3D12Hook::publish_xefg_candidate(const XeFGDiscovery::Observation& observa
     if (!decision.accepted()) {
         return;
     }
-
-    const auto& candidate = *decision.candidate;
-    pending.swapchain = candidate.swapchain;
-    pending.selected_queue = candidate.selected_queue;
-    pending.hwnd = candidate.hwnd;
-    pending.relation = candidate.relation;
-    pending.observe_only = candidate.observe_only;
-
-    if (g_framework != nullptr) {
-        std::unique_lock<std::recursive_mutex> framework_lock{g_framework->get_hook_monitor_mutex()};
-
-        // Hook-monitor recovery destroys and replaces D3D12Hook under this same
-        // mutex. Read the current object only after acquiring it so a XeFG init
-        // cannot bind through a pointer retained from before that replacement.
-        if (auto* hook = g_d3d12_hook; hook != nullptr) {
-            const auto has_active_xefg = hook->is_hooked()
-                && hook->get_swap_chain() != nullptr
-                && hook->get_swapchain_source() == SwapchainSource::XeFGInternal;
-            if (has_active_xefg) {
-                const auto swapchain_changed = hook->get_swap_chain() != pending.swapchain.Get();
-                const auto queue_changed = hook->get_command_queue() != pending.selected_queue.Get();
-                const auto mode_changed = hook->is_xefg_observe_only() != pending.observe_only;
-                const auto changed = swapchain_changed || queue_changed || mode_changed;
-                const auto reason = binding_change_reason(swapchain_changed, queue_changed, mode_changed);
-
-                spdlog::info("[XeFG][BindingGate] action = {}, reason = {}, old_swapchain = 0x{:x}, new_swapchain = 0x{:x}, old_queue = 0x{:x}, new_queue = 0x{:x}, old_observe_only = {}, new_observe_only = {}",
-                    changed ? "rebind" : "unchanged",
-                    reason,
-                    reinterpret_cast<uintptr_t>(hook->get_swap_chain()),
-                    reinterpret_cast<uintptr_t>(pending.swapchain.Get()),
-                    reinterpret_cast<uintptr_t>(hook->get_command_queue()),
-                    reinterpret_cast<uintptr_t>(pending.selected_queue.Get()),
-                    hook->is_xefg_observe_only(),
-                    pending.observe_only);
-
-                if (changed && !hook->replace_xefg_binding(pending.swapchain.Get(), pending.selected_queue.Get(), pending.observe_only, reason)) {
-                    spdlog::warn("[XeFG][Bind] candidate = 0x{:x}, accepted = false, reason = rebind_failed",
-                        reinterpret_cast<uintptr_t>(pending.swapchain.Get()));
-                }
-                return;
-            }
-
-            const auto replacing_active_non_xefg = hook->is_hooked()
-                && hook->get_swap_chain() != nullptr
-                && hook->get_swapchain_source() != SwapchainSource::XeFGInternal;
-            if (replacing_active_non_xefg) {
-                spdlog::info("[XeFG][Bind] resetting active D3D12 renderer before XeFG bind");
-                g_framework->on_reset();
-            }
-
-            if (!hook->bind_external_swapchain(pending.swapchain.Get(), pending.selected_queue.Get(), SwapchainSource::XeFGInternal, pending.observe_only)) {
-                spdlog::warn("[XeFG][Bind] candidate = 0x{:x}, accepted = false, reason = external_bind_failed",
-                    reinterpret_cast<uintptr_t>(pending.swapchain.Get()));
-            }
-            return;
-        }
-
-        // Publish before releasing the lifecycle mutex. D3D12Hook::hook() runs
-        // under the same mutex, so a newly created hook cannot consume an empty
-        // slot and then miss this capture-before-hook XeFG binding.
-        std::scoped_lock state_lock{g_xefg_state_mutex};
-        g_pending_xefg_binding = pending;
-        return;
-    }
-
-    // Constructor-time fallback before REFramework publishes its lifecycle mutex.
-    std::scoped_lock lock{g_xefg_state_mutex};
-    g_pending_xefg_binding = pending;
-}
-
-bool D3D12Hook::consume_pending_xefg_binding(D3D12Hook& hook) {
-    std::optional<PendingXefgBinding> pending{};
-    {
-        std::scoped_lock lock{g_xefg_state_mutex};
-        pending = g_pending_xefg_binding;
-        g_pending_xefg_binding.reset();
-    }
-
-    return pending.has_value() && hook.bind_external_swapchain(pending->swapchain.Get(), pending->selected_queue.Get(), SwapchainSource::XeFGInternal, pending->observe_only);
+    XeFGCandidateHandoff::publish(std::move(*decision.candidate));
 }
 
 bool D3D12Hook::external_binding_matches(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source, bool xefg_observe_only) const {
@@ -814,7 +708,7 @@ bool D3D12Hook::hook() {
         g_inside_d3d12_hook = false;
     }};
 
-    if (consume_pending_xefg_binding(*this)) {
+    if (XeFGCandidateHandoff::consume_pending(*this)) {
         spdlog::info("Hooked DirectX 12 through pending XeFG binding");
         return true;
     }
