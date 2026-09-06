@@ -75,6 +75,10 @@ jobs:
           name: dinput8.dll
           path: ${{github.workspace}}/artifact
 
+      - name: Create REFramework.zip
+        shell: pwsh
+        run: Compress-Archive -Path "${{github.workspace}}/artifact/dinput8.dll" -DestinationPath "${{github.workspace}}/artifact/REFramework.zip" -Force
+
       - name: Create fork release
         uses: ncipollo/release-action@6c75be85e571768fa31b40abf38de58ba0397db5
         with:
@@ -82,6 +86,6 @@ jobs:
           commit: ${{ github.sha }}
           name: ${{format('REFramework Fork Release {0} ({1})', github.run_number, github.sha)}}
           tag: ${{format('fork-release-{0}-{1}', github.run_number, github.sha)}}
-          artifacts: ${{github.workspace}}/artifact/dinput8.dll
+          artifacts: ${{github.workspace}}/artifact/REFramework.zip
           makeLatest: false
           allowUpdates: false
