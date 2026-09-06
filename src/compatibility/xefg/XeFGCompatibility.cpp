@@ -118,6 +118,9 @@ int32_t XeFGCompatibility::dispatch_init_desc(size_t slot, void* context, HWND h
         module = target->module;
     }
 
+    spdlog::info("[XeFG][RuntimeDispatch] api = InitFromSwapChainDesc, slot = {}, module = 0x{:x}, context = 0x{:x}",
+        slot, reinterpret_cast<uintptr_t>(module), reinterpret_cast<uintptr_t>(context));
+
     auto observation_scope = XeFGDiscovery::observe_init(
         original, context, hwnd, swap_chain_desc, fullscreen_desc, command_queue, factory, init_params);
     const auto& observation = observation_scope.observation;
