@@ -153,6 +153,16 @@ public:
         return m_xefg_binding.observe_only();
     }
 
+    bool is_xefg_source() const noexcept { return m_swapchain_source == SwapchainSource::XeFGInternal; }
+    bool is_tracked_xefg_instance(IDXGISwapChain3* swapchain) const noexcept;
+    bool is_xefg_render_capable() const noexcept { return is_xefg_source() && !m_xefg_binding.observe_only(); }
+    bool is_xefg_resize_hold_active() const noexcept { return is_xefg_source() && m_xefg_resize_lifecycle.suppress_renderer(); }
+    bool should_suppress_xefg_render_callbacks() const noexcept {
+        return is_xefg_source() && (m_xefg_binding.observe_only() || m_xefg_resize_lifecycle.suppress_renderer());
+    }
+    uint32_t note_xefg_suppressed_present() noexcept { return m_xefg_resize_lifecycle.note_suppressed_present(); }
+    uint64_t begin_tracked_xefg_resize_event(IDXGISwapChain3* swapchain, XeFGResizeLifecycle::EventKind kind, bool top_level);
+
     void ignore_next_present() {
         m_ignore_next_present = true;
     }

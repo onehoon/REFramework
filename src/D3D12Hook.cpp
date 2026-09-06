@@ -1469,11 +1469,9 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
         return result;
     }
 
-    const auto xefg_resize_transition_hold = d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
-        && d3d12->m_xefg_resize_lifecycle.suppress_renderer();
-    const auto suppress_render_callbacks = d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
-        && (d3d12->m_xefg_binding.observe_only() || xefg_resize_transition_hold);
-    const auto post_resize_ordinal = d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
+    const auto xefg_resize_transition_hold = d3d12->is_xefg_resize_hold_active();
+    const auto suppress_render_callbacks = d3d12->should_suppress_xefg_render_callbacks();
+    const auto post_resize_ordinal = d3d12->is_xefg_source()
         ? d3d12->log_xefg_post_resize_present(swap_chain, kind, original_present)
         : 0;
     const auto log_render_boundary = d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
@@ -1486,7 +1484,7 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
     }
 
     if (xefg_resize_transition_hold) {
-        const auto suppressed_present = d3d12->m_xefg_resize_lifecycle.note_suppressed_present();
+        const auto suppressed_present = d3d12->note_xefg_suppressed_present();
         if (suppressed_present <= 3) {
             spdlog::info(
                 "[XeFG][ResizeHold] action = suppress_present, trigger_event_id = {}, "
@@ -1546,6 +1544,20 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
 
 uint64_t D3D12Hook::begin_xefg_resize_event(XefgResizeEventKind kind) {
     return m_xefg_resize_lifecycle.begin(kind);
+}
+
+bool D3D12Hook::is_tracked_xefg_instance(IDXGISwapChain3* swapchain) const noexcept {
+    return swapchain != nullptr
+        && is_xefg_source()
+        && m_swapchain_hook != nullptr
+        && swapchain == m_swapchain_hook->get_instance();
+}
+
+uint64_t D3D12Hook::begin_tracked_xefg_resize_event(IDXGISwapChain3* swapchain, XefgResizeEventKind kind, bool top_level) {
+    if (!top_level || !is_tracked_xefg_instance(swapchain)) {
+        return 0;
+    }
+    return begin_xefg_resize_event(kind);
 }
 
 void D3D12Hook::arm_xefg_resize_transition_hold(uint64_t event_id) {
@@ -1734,12 +1746,9 @@ HRESULT WINAPI D3D12Hook::resize_buffers(IDXGISwapChain3* swap_chain, UINT buffe
     auto resize_buffers_fn = d3d12->m_swapchain_hook->get_method<decltype(D3D12Hook::resize_buffers)*>(13);
     const auto resize_buffers_original = reinterpret_cast<void*>(resize_buffers_fn);
 
-    const auto is_xefg_internal = d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
-        && swap_chain == d3d12->m_swapchain_hook->get_instance();
     const auto is_top_level = g_resize_buffers_depth == 0;
-    const auto event_id = is_xefg_internal && is_top_level
-        ? d3d12->begin_xefg_resize_event(D3D12Hook::XefgResizeEventKind::ResizeBuffers)
-        : 0;
+    const auto event_id = d3d12->begin_tracked_xefg_resize_event(
+        swap_chain, D3D12Hook::XefgResizeEventKind::ResizeBuffers, is_top_level);
     if (event_id != 0) {
         d3d12->log_xefg_resize_event(event_id, D3D12Hook::XefgResizeEventKind::ResizeBuffers, "enter",
             swap_chain, resize_buffers_original);
@@ -1829,10 +1838,7 @@ HRESULT WINAPI D3D12Hook::resize_buffers1(IDXGISwapChain3* swap_chain, UINT buff
     using ResizeBuffers1Fn = decltype(D3D12Hook::resize_buffers1)*;
     const auto original = d3d12->m_swapchain_hook->get_method<ResizeBuffers1Fn>(39);
     const auto resize_buffers1_original = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(original));
-    const auto is_tracked_instance = swap_chain == d3d12->m_swapchain_hook->get_instance();
-    const auto is_xefg_internal = d3d12->m_swapchain_source == SwapchainSource::XeFGInternal;
-
-    if (!is_tracked_instance || !is_xefg_internal) {
+    if (!d3d12->is_tracked_xefg_instance(swap_chain)) {
         return original(swap_chain, buffer_count, width, height, new_format, swap_chain_flags, creation_node_mask, present_queues);
     }
 
@@ -1929,12 +1935,9 @@ HRESULT WINAPI D3D12Hook::resize_target(IDXGISwapChain3* swap_chain, const DXGI_
     auto resize_target_fn = d3d12->m_swapchain_hook->get_method<decltype(D3D12Hook::resize_target)*>(14);
     const auto resize_target_original = reinterpret_cast<void*>(resize_target_fn);
 
-    const auto is_xefg_internal = d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
-        && swap_chain == d3d12->m_swapchain_hook->get_instance();
     const auto is_top_level = g_resize_target_depth == 0;
-    const auto event_id = is_xefg_internal && is_top_level
-        ? d3d12->begin_xefg_resize_event(D3D12Hook::XefgResizeEventKind::ResizeTarget)
-        : 0;
+    const auto event_id = d3d12->begin_tracked_xefg_resize_event(
+        swap_chain, D3D12Hook::XefgResizeEventKind::ResizeTarget, is_top_level);
 
     if (new_target_parameters != nullptr) {
         d3d12->m_render_width = new_target_parameters->Width;
@@ -2004,7 +2007,7 @@ HRESULT WINAPI D3D12Hook::resize_target(IDXGISwapChain3* swap_chain, const DXGI_
 
     if (event_id != 0
         && renderer_reset_performed
-        && !d3d12->m_xefg_binding.observe_only()
+        && d3d12->is_xefg_render_capable()
         && sdk::GameIdentity::get().is_mhwilds()) {
         d3d12->arm_xefg_resize_transition_hold(event_id);
     }
