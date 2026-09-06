@@ -23,17 +23,14 @@
 
 #include "D3D12Hook.hpp"
 #include "compatibility/xefg/XeFGCompatibility.hpp"
-#include "compatibility/xefg/XeFGRuntimeRegistry.hpp"
-#include "compatibility/xefg/XeFGDiscovery.hpp"
 #include "compatibility/xefg/XeFGCandidateHandoff.hpp"
+#include "compatibility/xefg/XeFGDiscovery.hpp"
 #include <sdk/GameIdentity.hpp>
 
 static D3D12Hook* g_d3d12_hook = nullptr;
 thread_local bool g_inside_d3d12_hook = false;
 
 namespace {
-
-constexpr int32_t kXefgSuccess = 0;
 
 void log_xefg_rebind(std::string_view stage, const char* reason, uint64_t generation, IDXGISwapChain3* old_swapchain, IDXGISwapChain3* new_swapchain, ID3D12CommandQueue* old_queue, ID3D12CommandQueue* new_queue, bool old_observe_only, bool new_observe_only) {
     spdlog::info("[XeFG][Rebind] stage = {}, reason = {}, generation = {}, old_swapchain = 0x{:x}, new_swapchain = 0x{:x}, old_queue = 0x{:x}, new_queue = 0x{:x}, old_observe_only = {}, new_observe_only = {}",
@@ -47,11 +44,6 @@ void log_xefg_rebind(std::string_view stage, const char* reason, uint64_t genera
         old_observe_only,
         new_observe_only);
 }
-
-std::mutex g_xefg_state_mutex{};
-
-using XefgInitFn = int32_t (WINAPI*)(void*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, ID3D12CommandQueue*, IDXGIFactory2*, const void*);
-using XefgGetSwapchainFn = int32_t (WINAPI*)(void*, REFIID, void**);
 
 struct SwapchainVtableSnapshot {
     void* object{};
@@ -229,100 +221,13 @@ D3D12Hook* D3D12Hook::current_xefg_handoff_target() noexcept {
     return g_d3d12_hook;
 }
 
-int32_t D3D12Hook::xefg_init_desc_dispatch(size_t slot, void* context, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* swap_chain_desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc, ID3D12CommandQueue* command_queue, IDXGIFactory2* factory, const void* init_params) {
-    XeFGRuntimeRegistry::InitFn original{};
-    HMODULE module{};
-    {
-        const auto target = XeFGRuntimeRegistry::instance().resolve_init(slot);
-        if (!target) {
-            spdlog::error("[XeFG][RuntimeDispatch] api = InitFromSwapChainDesc, slot = {}, action = fail, reason = runtime_not_active", slot);
-            return -1;
-        }
-        original = target->original;
-        module = target->module;
-    }
-
-    spdlog::info("[XeFG][RuntimeDispatch] api = InitFromSwapChainDesc, slot = {}, module = 0x{:x}, context = 0x{:x}",
-        slot, reinterpret_cast<uintptr_t>(module), reinterpret_cast<uintptr_t>(context));
-    return xefg_init_desc_common(slot, module, original, context, hwnd, swap_chain_desc, fullscreen_desc, command_queue, factory, init_params);
-}
-
-int32_t D3D12Hook::xefg_init_desc_common(size_t slot, HMODULE module, XefgInitFn original, void* context, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* swap_chain_desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc, ID3D12CommandQueue* command_queue, IDXGIFactory2* factory, const void* init_params) {
-    auto observation_scope = XeFGDiscovery::observe_init(
-        original, context, hwnd, swap_chain_desc, fullscreen_desc, command_queue, factory, init_params);
-    const auto& observation = observation_scope.observation;
-
-    spdlog::info("[XeFG][InitDesc] context = 0x{:x}, hwnd = 0x{:x}, queue = 0x{:x}, factory = 0x{:x}, width = {}, height = {}, format = {}, buffer_count = {}, flags = 0x{:x}, result = {}",
-        reinterpret_cast<uintptr_t>(context),
-        reinterpret_cast<uintptr_t>(hwnd),
-        reinterpret_cast<uintptr_t>(command_queue),
-        reinterpret_cast<uintptr_t>(factory),
-        swap_chain_desc != nullptr ? swap_chain_desc->Width : 0,
-        swap_chain_desc != nullptr ? swap_chain_desc->Height : 0,
-        swap_chain_desc != nullptr ? swap_chain_desc->Format : DXGI_FORMAT_UNKNOWN,
-        swap_chain_desc != nullptr ? swap_chain_desc->BufferCount : 0,
-        swap_chain_desc != nullptr ? swap_chain_desc->Flags : 0,
-        observation.init_result);
-
-    spdlog::info("[XeFG][InitDesc] slot = {}, module = 0x{:x}, context = 0x{:x}, result = {}",
-        slot, reinterpret_cast<uintptr_t>(module), reinterpret_cast<uintptr_t>(context), observation.init_result);
-    publish_xefg_candidate(observation);
-    return observation.init_result;
-}
-
-int32_t D3D12Hook::xefg_get_swapchain_dispatch(size_t slot, void* context, REFIID riid, void** swap_chain) {
-    XeFGRuntimeRegistry::GetSwapchainFn original{};
-    HMODULE module{};
-    {
-        const auto target = XeFGRuntimeRegistry::instance().resolve_get_swapchain(slot);
-        if (!target) {
-            spdlog::error("[XeFG][RuntimeDispatch] api = GetSwapChainPtr, slot = {}, action = fail, reason = runtime_not_active", slot);
-            return -1;
-        }
-        original = target->original;
-        module = target->module;
-    }
-    const auto result = original(context, riid, swap_chain);
-
-    spdlog::info("[XeFG][RuntimeDispatch] api = GetSwapChainPtr, slot = {}, module = 0x{:x}, context = 0x{:x}, result = {}",
-        slot, reinterpret_cast<uintptr_t>(module), reinterpret_cast<uintptr_t>(context), result);
-
-    if (result == kXefgSuccess && swap_chain != nullptr && *swap_chain != nullptr) {
-        std::scoped_lock lock{g_xefg_state_mutex};
-        const auto internal_candidate = XeFGDiscovery::current_internal_swapchain_for_diagnostics();
-        spdlog::info("[XeFG][PublicProxy] context = 0x{:x}, swapchain = 0x{:x}, internal_same = {}",
-            reinterpret_cast<uintptr_t>(context),
-            reinterpret_cast<uintptr_t>(*swap_chain),
-            *swap_chain == internal_candidate);
-    }
-
-    return result;
-}
-
-void D3D12Hook::publish_xefg_candidate(const XeFGDiscovery::Observation& observation) {
-    XeFGBindingCandidateResult decision{};
-    {
-        std::scoped_lock lock{g_xefg_state_mutex};
-        decision = XeFGDiscovery::build_binding_candidate(observation);
-        if (!decision.accepted()) {
-            spdlog::warn("[XeFG][Bind] candidate = 0x{:x}, accepted = false, reason = {}",
-                reinterpret_cast<uintptr_t>(observation.internal_swapchain), decision.reject_reason);
-        } else {
-            const auto& candidate = *decision.candidate;
-            spdlog::info("[XeFG][Bind] candidate = 0x{:x}, accepted = true, reason = {}",
-                reinterpret_cast<uintptr_t>(candidate.swapchain.Get()), decision.bind_reason);
-            spdlog::info("[XeFG][P2.1Probe] mode = {}, selected_queue = 0x{:x}, render_callbacks = {}, reason = {}",
-                candidate.observe_only ? (candidate.relation == XeFGQueueRelation::SameComIdentity ? "observe_only_same_queue" : "observe_only_invalid_presentation_queue") : "presentation_queue_render",
-                reinterpret_cast<uintptr_t>(candidate.selected_queue.Get()),
-                !candidate.observe_only,
-                decision.probe_reason);
-        }
-    }
-
-    if (!decision.accepted()) {
-        return;
-    }
-    XeFGCandidateHandoff::publish(std::move(*decision.candidate));
+bool D3D12Hook::has_active_xefg_instance_binding() const noexcept {
+    return m_hooked
+        && !m_is_phase_1
+        && m_swapchain_source == SwapchainSource::XeFGInternal
+        && m_xefg_binding.active()
+        && m_swapchain_hook != nullptr
+        && m_xefg_binding.aliases_match(m_swap_chain, m_command_queue, m_device);
 }
 
 bool D3D12Hook::external_binding_matches(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source, bool xefg_observe_only) const {

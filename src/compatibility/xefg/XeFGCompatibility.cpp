@@ -1,15 +1,21 @@
 #include "XeFGCompatibility.hpp"
 
 #include <chrono>
+#include <mutex>
 #include <tlhelp32.h>
 
 #include <spdlog/spdlog.h>
 
 #include "XeFGRuntimeRegistry.hpp"
+#include "XeFGCandidateHandoff.hpp"
+#include "XeFGDiscovery.hpp"
+#include "D3D12Hook.hpp"
 #include "utility/String.hpp"
 
 namespace {
 const auto g_diagnostic_start_time = std::chrono::steady_clock::now();
+constexpr int32_t kXefgSuccess = 0;
+std::mutex g_xefg_state_mutex{};
 }
 
 std::atomic<bool> XeFGCompatibility::s_module_loaded{false};
@@ -79,4 +85,92 @@ void XeFGCompatibility::process_pending_work() {
 
 bool XeFGCompatibility::is_module_loaded() noexcept {
     return s_module_loaded.load(std::memory_order_relaxed);
+}
+
+bool XeFGCompatibility::should_preserve_active_binding_on_monitor_timeout(D3D12Hook& hook) noexcept {
+    if (!hook.has_active_xefg_instance_binding()) {
+        return false;
+    }
+
+    spdlog::info(
+        "[XeFG][HookMonitor] action = preserve_binding, "
+        "reason = present_timeout, generation = {}, "
+        "swapchain = 0x{:x}, queue = 0x{:x}",
+        hook.get_xefg_binding_generation(),
+        reinterpret_cast<uintptr_t>(hook.get_swap_chain()),
+        reinterpret_cast<uintptr_t>(hook.get_command_queue()));
+    hook.log_hook_monitor_snapshot("xefg_rehook_suppressed");
+    return true;
+}
+
+int32_t XeFGCompatibility::dispatch_init_desc(size_t slot, void* context, HWND hwnd,
+    const DXGI_SWAP_CHAIN_DESC1* swap_chain_desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc,
+    ID3D12CommandQueue* command_queue, IDXGIFactory2* factory, const void* init_params) {
+    XeFGRuntimeRegistry::InitFn original{};
+    HMODULE module{};
+    {
+        const auto target = XeFGRuntimeRegistry::instance().resolve_init(slot);
+        if (!target) {
+            spdlog::error("[XeFG][RuntimeDispatch] api = InitFromSwapChainDesc, slot = {}, action = fail, reason = runtime_not_active", slot);
+            return -1;
+        }
+        original = target->original;
+        module = target->module;
+    }
+
+    auto observation_scope = XeFGDiscovery::observe_init(
+        original, context, hwnd, swap_chain_desc, fullscreen_desc, command_queue, factory, init_params);
+    const auto& observation = observation_scope.observation;
+    spdlog::info("[XeFG][InitDesc] context = 0x{:x}, hwnd = 0x{:x}, queue = 0x{:x}, factory = 0x{:x}, width = {}, height = {}, format = {}, buffer_count = {}, flags = 0x{:x}, result = {}",
+        reinterpret_cast<uintptr_t>(context), reinterpret_cast<uintptr_t>(hwnd), reinterpret_cast<uintptr_t>(command_queue), reinterpret_cast<uintptr_t>(factory),
+        swap_chain_desc != nullptr ? swap_chain_desc->Width : 0, swap_chain_desc != nullptr ? swap_chain_desc->Height : 0,
+        swap_chain_desc != nullptr ? swap_chain_desc->Format : DXGI_FORMAT_UNKNOWN, swap_chain_desc != nullptr ? swap_chain_desc->BufferCount : 0,
+        swap_chain_desc != nullptr ? swap_chain_desc->Flags : 0, observation.init_result);
+    spdlog::info("[XeFG][InitDesc] slot = {}, module = 0x{:x}, context = 0x{:x}, result = {}",
+        slot, reinterpret_cast<uintptr_t>(module), reinterpret_cast<uintptr_t>(context), observation.init_result);
+
+    XeFGBindingCandidateResult decision{};
+    {
+        std::scoped_lock lock{g_xefg_state_mutex};
+        decision = XeFGDiscovery::build_binding_candidate(observation);
+        if (!decision.accepted()) {
+            spdlog::warn("[XeFG][Bind] candidate = 0x{:x}, accepted = false, reason = {}",
+                reinterpret_cast<uintptr_t>(observation.internal_swapchain), decision.reject_reason);
+        } else {
+            const auto& candidate = *decision.candidate;
+            spdlog::info("[XeFG][Bind] candidate = 0x{:x}, accepted = true, reason = {}",
+                reinterpret_cast<uintptr_t>(candidate.swapchain.Get()), decision.bind_reason);
+            spdlog::info("[XeFG][P2.1Probe] mode = {}, selected_queue = 0x{:x}, render_callbacks = {}, reason = {}",
+                candidate.observe_only ? (candidate.relation == XeFGQueueRelation::SameComIdentity ? "observe_only_same_queue" : "observe_only_invalid_presentation_queue") : "presentation_queue_render",
+                reinterpret_cast<uintptr_t>(candidate.selected_queue.Get()), !candidate.observe_only, decision.probe_reason);
+        }
+    }
+    if (decision.accepted()) {
+        XeFGCandidateHandoff::publish(std::move(*decision.candidate));
+    }
+    return observation.init_result;
+}
+
+int32_t XeFGCompatibility::dispatch_get_swapchain(size_t slot, void* context, REFIID riid, void** swap_chain) {
+    XeFGRuntimeRegistry::GetSwapchainFn original{};
+    HMODULE module{};
+    {
+        const auto target = XeFGRuntimeRegistry::instance().resolve_get_swapchain(slot);
+        if (!target) {
+            spdlog::error("[XeFG][RuntimeDispatch] api = GetSwapChainPtr, slot = {}, action = fail, reason = runtime_not_active", slot);
+            return -1;
+        }
+        original = target->original;
+        module = target->module;
+    }
+    const auto result = original(context, riid, swap_chain);
+    spdlog::info("[XeFG][RuntimeDispatch] api = GetSwapChainPtr, slot = {}, module = 0x{:x}, context = 0x{:x}, result = {}",
+        slot, reinterpret_cast<uintptr_t>(module), reinterpret_cast<uintptr_t>(context), result);
+    if (result == kXefgSuccess && swap_chain != nullptr && *swap_chain != nullptr) {
+        std::scoped_lock lock{g_xefg_state_mutex};
+        const auto internal_candidate = XeFGDiscovery::current_internal_swapchain_for_diagnostics();
+        spdlog::info("[XeFG][PublicProxy] context = 0x{:x}, swapchain = 0x{:x}, internal_same = {}",
+            reinterpret_cast<uintptr_t>(context), reinterpret_cast<uintptr_t>(*swap_chain), *swap_chain == internal_candidate);
+    }
+    return result;
 }

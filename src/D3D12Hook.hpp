@@ -19,16 +19,18 @@
 #include "utility/PointerHook.hpp"
 #include "utility/FunctionHook.hpp"
 #include "utility/VtableHook.hpp"
-#include "compatibility/xefg/XeFGDiscovery.hpp"
 #include "compatibility/xefg/XeFGBinding.hpp"
 #include "compatibility/xefg/XeFGResizeLifecycle.hpp"
 
 class XeFGCandidateHandoff;
+class XeFGCompatibility;
+struct XeFGBindingCandidate;
 
 class D3D12Hook
 {
 public:
 	friend class XeFGCandidateHandoff;
+	friend class XeFGCompatibility;
 	enum class SwapchainSource : uint8_t {
 		Native,
 		XeFGInternal,
@@ -45,25 +47,10 @@ public:
 	bool hook();
 	bool unhook();
 
-	using XefgInitFn = int32_t (WINAPI*)(void*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, ID3D12CommandQueue*, IDXGIFactory2*, const void*);
-	using XefgGetSwapchainFn = int32_t (WINAPI*)(void*, REFIID, void**);
-	static int32_t xefg_init_desc_dispatch(size_t slot, void* context, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* swap_chain_desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc, ID3D12CommandQueue* command_queue, IDXGIFactory2* factory, const void* init_params);
-	static int32_t xefg_get_swapchain_dispatch(size_t slot, void* context, REFIID riid, void** swap_chain);
 	bool bind_external_swapchain(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source, bool xefg_p21_observe_only = false);
 
     bool is_hooked() {
         return m_hooked;
-    }
-
-    // Caller must hold the D3D hook lifecycle mutex when a stable binding
-    // snapshot is required.
-    bool has_active_xefg_instance_binding() const noexcept {
-        return m_hooked
-            && !m_is_phase_1
-            && m_swapchain_source == SwapchainSource::XeFGInternal
-            && m_xefg_binding.active()
-            && m_swapchain_hook != nullptr
-            && m_xefg_binding.aliases_match(m_swap_chain, m_command_queue, m_device);
     }
 
     void on_present(OnPresentFn fn) {
@@ -153,16 +140,6 @@ public:
         return m_xefg_binding.observe_only();
     }
 
-    bool is_xefg_source() const noexcept { return m_swapchain_source == SwapchainSource::XeFGInternal; }
-    bool is_tracked_xefg_instance(IDXGISwapChain3* swapchain) const noexcept;
-    bool is_xefg_render_capable() const noexcept { return is_xefg_source() && !m_xefg_binding.observe_only(); }
-    bool is_xefg_resize_hold_active() const noexcept { return is_xefg_source() && m_xefg_resize_lifecycle.suppress_renderer(); }
-    bool should_suppress_xefg_render_callbacks() const noexcept {
-        return is_xefg_source() && (m_xefg_binding.observe_only() || m_xefg_resize_lifecycle.suppress_renderer());
-    }
-    uint32_t note_xefg_suppressed_present() noexcept { return m_xefg_resize_lifecycle.note_suppressed_present(); }
-    uint64_t begin_tracked_xefg_resize_event(IDXGISwapChain3* swapchain, XeFGResizeLifecycle::EventKind kind, bool top_level);
-
     void ignore_next_present() {
         m_ignore_next_present = true;
     }
@@ -172,11 +149,19 @@ public:
     using XefgResizeEventKind = XeFGResizeLifecycle::EventKind;
 
 protected:
+    bool has_active_xefg_instance_binding() const noexcept;
+    bool is_xefg_source() const noexcept { return m_swapchain_source == SwapchainSource::XeFGInternal; }
+    bool is_tracked_xefg_instance(IDXGISwapChain3* swapchain) const noexcept;
+    bool is_xefg_render_capable() const noexcept { return is_xefg_source() && !m_xefg_binding.observe_only(); }
+    bool is_xefg_resize_hold_active() const noexcept { return is_xefg_source() && m_xefg_resize_lifecycle.suppress_renderer(); }
+    bool should_suppress_xefg_render_callbacks() const noexcept {
+        return is_xefg_source() && (m_xefg_binding.observe_only() || m_xefg_resize_lifecycle.suppress_renderer());
+    }
+    uint32_t note_xefg_suppressed_present() noexcept { return m_xefg_resize_lifecycle.note_suppressed_present(); }
+    uint64_t begin_tracked_xefg_resize_event(IDXGISwapChain3* swapchain, XeFGResizeLifecycle::EventKind kind, bool top_level);
     void hook_impl();
-	static int32_t xefg_init_desc_common(size_t slot, HMODULE module, XefgInitFn original, void* context, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* swap_chain_desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc, ID3D12CommandQueue* command_queue, IDXGIFactory2* factory, const void* init_params);
 	static HRESULT WINAPI present1(IDXGISwapChain1* swap_chain, UINT sync_interval, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters);
     static HRESULT present_common(IDXGISwapChain3* swap_chain, const char* kind, void* original_present, std::function<HRESULT()> original_call, bool allow_phase_transition);
-    static void publish_xefg_candidate(const XeFGDiscovery::Observation& observation);
     bool apply_xefg_candidate(const XeFGBindingCandidate& candidate);
     static D3D12Hook* current_xefg_handoff_target() noexcept;
     uint64_t begin_xefg_resize_event(XefgResizeEventKind kind);
