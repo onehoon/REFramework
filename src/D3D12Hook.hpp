@@ -155,6 +155,7 @@ protected:
     static HRESULT present_common(IDXGISwapChain3* swap_chain, const char* kind, void* original_present, std::function<HRESULT()> original_call, bool allow_phase_transition);
 	static void publish_xefg_candidate();
     bool external_binding_matches(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source, bool xefg_observe_only) const;
+    bool replace_xefg_binding(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, bool observe_only, const char* reason);
     
     ID3D12Device4* m_device{ nullptr };
     IDXGISwapChain3* m_swap_chain{ nullptr };
@@ -164,6 +165,7 @@ protected:
     Microsoft::WRL::ComPtr<IDXGISwapChain3> m_xefg_bound_swapchain{};
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_xefg_bound_queue{};
     Microsoft::WRL::ComPtr<ID3D12Device4> m_xefg_bound_device{};
+    uint64_t m_xefg_binding_generation{ 0 };
     UINT m_display_width{ NULL };
     UINT m_display_height{ NULL };
     UINT m_render_width{ NULL };
