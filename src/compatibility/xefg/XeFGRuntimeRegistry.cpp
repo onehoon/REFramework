@@ -124,10 +124,13 @@ bool XeFGRuntimeRegistry::install_for_module(HMODULE module, std::wstring_view f
     }
 
     runtime.state = InstallState::Active;
-    spdlog::info("[XeFG][RuntimeRegistry] action = installed, slot = {}, module = 0x{:x}, path = {}, init_desc = 0x{:x}, get_swapchain = 0x{:x}",
-        *slot, reinterpret_cast<uintptr_t>(module), utility::narrow(runtime.path),
-        reinterpret_cast<uintptr_t>(runtime.init_desc_export),
-        reinterpret_cast<uintptr_t>(runtime.get_swapchain_export));
+    spdlog::info("[XeFG][RuntimeRegistry] action = installed, slot = {}, module = 0x{:x}, get_swapchain = {}",
+        *slot, reinterpret_cast<uintptr_t>(module), runtime.get_swapchain_export != nullptr ? "present" : "missing");
+    if (XeFGCompatibility::is_debug_log_enabled()) {
+        spdlog::info("[XeFG][RuntimeRegistry] slot = {}, path = {}, init_desc = 0x{:x}, get_swapchain = 0x{:x}",
+            *slot, utility::narrow(runtime.path), reinterpret_cast<uintptr_t>(runtime.init_desc_export),
+            reinterpret_cast<uintptr_t>(runtime.get_swapchain_export));
+    }
     return true;
 }
 
