@@ -1451,6 +1451,8 @@ if(REF_BUILD_FRAMEWORK AND CMAKE_SIZEOF_VOID_P EQUAL 8) # build-framework
 		"src/cimgui/cimgui_ref.cpp"
 		"src/compatibility/xefg/XeFGCompatibility.cpp"
 		"src/compatibility/xefg/XeFGCompatibility.hpp"
+		"src/compatibility/xefg/XeFGDiscovery.cpp"
+		"src/compatibility/xefg/XeFGDiscovery.hpp"
 		"src/compatibility/xefg/XeFGRuntimeRegistry.cpp"
 		"src/compatibility/xefg/XeFGRuntimeRegistry.hpp"
 		"src/mods/APIProxy.cpp"
