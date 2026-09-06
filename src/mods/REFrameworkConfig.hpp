@@ -1,5 +1,7 @@
 #pragma once
 
+#include <chrono>
+
 #include "Mod.hpp"
 
 class REFrameworkConfig : public Mod {
@@ -58,6 +60,8 @@ private:
     ModInt32::Ptr m_ui_monitor_width{ModInt32::create(UI_MONITOR_WIDTH_CONFIG_NAME, 0)};
     ModInt32::Ptr m_ui_monitor_height{ModInt32::create(UI_MONITOR_HEIGHT_CONFIG_NAME, 0)};
     ModFloat::Ptr m_ui_font_size{ModFloat::create(UI_FONT_SIZE_CONFIG_NAME, 0.0f)};
+    bool m_startup_menu_auto_hide_done{false};
+    std::chrono::steady_clock::time_point m_startup_menu_open_time{};
     std::vector<std::string> fonts{};
     ModComboString::Ptr m_font_file{};
 
