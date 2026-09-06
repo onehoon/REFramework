@@ -8,15 +8,15 @@ Current reference master at time of writing: `cfb6efe5102f330c9ddf6fdadb7e9af984
 
 ## 1. Purpose
 
-Record the currently observed input conflict between OptiScaler and REFramework when both overlays use `VK_INSERT` as their menu hotkey.
+Record the currently observed input coexistence behavior between OptiScaler and REFramework when both overlays use `VK_INSERT` as their menu hotkey.
 
 This document is intentionally analysis-only. It does not prescribe an immediate code change and should not block the ongoing XeFG compatibility refactor.
 
-The issue is separate from the XeFG presentation/rendering failures that were handled by the P3.x work. The REFramework overlay is now renderable in the affected PRAGMATA test path; the remaining problem is intermittent menu-toggle input behavior when OptiScaler and REFramework share the same key.
+The issue is separate from the XeFG presentation/rendering failures that were handled by the P3.x work. The REFramework overlay is now renderable in the affected PRAGMATA test path; the remaining observation is game-dependent menu-toggle behavior when OptiScaler and REFramework share the same key.
 
 ## 2. Observed behavior
 
-### Shared-key configuration
+### Shared-key configuration in the problematic game
 
 When both components use Insert:
 
@@ -36,7 +36,7 @@ Observed behavior:
 
 ### Control test with separate hotkeys
 
-A direct control test was performed:
+A direct control test was performed in the problematic game:
 
 - OptiScaler hotkey changed away from Insert.
 - REFramework kept Insert as its only Insert consumer.
@@ -45,17 +45,39 @@ Result:
 
 - REFramework Insert no longer exhibited the intermittent missed-toggle behavior.
 
-This is the strongest current evidence.
+This remains strong evidence that shared-key coexistence is involved in that game's failure mode.
+
+### Control game with the same shared Insert hotkey
+
+A different tested game used the same `VK_INSERT` hotkey for both overlays and did **not** reproduce the missed REFramework toggle.
+
+Observed behavior:
+
+- REFramework overlay responds first.
+- OptiScaler overlay follows slightly later, approximately one update/frame behind.
+- The same ordering is visible when opening the overlays and when closing them.
+- Both overlays remain usable.
+
+This control result is important because it proves that sharing Insert is **not inherently broken** and is **not sufficient by itself** to reproduce the problem.
+
+The more accurate current interpretation is:
+
+> Shared `VK_INSERT` is a triggering condition in at least one game, but the actual failure depends on game/context-specific input/WndProc behavior and/or OptiScaler input-blocking state.
+
+The visible REFramework-first / OptiScaler-later ordering in the healthy control game is not considered a bug by itself because both overlays still toggle correctly.
 
 ## 3. What is confirmed
 
 The following is considered confirmed by runtime testing:
 
-1. The failure requires, or is at least strongly triggered by, OptiScaler and REFramework sharing `VK_INSERT`.
-2. Separating the hotkeys removes the reproduced REFramework Insert miss.
-3. OptiScaler remains responsive while REFramework misses some Insert toggles.
-4. The issue is not equivalent to the earlier "REFramework overlay cannot render under XeFG" failure.
-5. The issue should be treated as an input/WndProc coexistence problem unless later evidence disproves that classification.
+1. At least one game shows intermittent REFramework Insert misses when OptiScaler and REFramework share `VK_INSERT`.
+2. Separating the hotkeys removes the reproduced REFramework Insert miss in that game.
+3. OptiScaler remains responsive while REFramework misses some Insert toggles in the problematic case.
+4. At least one other game works normally with both overlays sharing `VK_INSERT`.
+5. In that healthy control game, REFramework visibly toggles first and OptiScaler follows slightly later for both open and close.
+6. Therefore, same-key sharing is **not a universal conflict** and is not sufficient by itself to reproduce the failure.
+7. The issue is not equivalent to the earlier "REFramework overlay cannot render under XeFG" failure.
+8. The remaining problem should be treated as a game-dependent input/WndProc coexistence issue unless later evidence disproves that classification.
 
 ## 4. Relevant REFramework input behavior
 
@@ -124,6 +146,8 @@ OptiScaler also has its own input/window-message handling and installs its own w
 
 Its input layer tracks keyboard state independently and can block keyboard messages depending on menu/input-capture state.
 
+OptiScaler's menu shortcut processing occurs through its own input/update path rather than REFramework's immediate `set_draw_ui()` call from the window-message handler. This is consistent with the healthy control game where REFramework visibly reacts first and OptiScaler follows slightly later.
+
 OptiScaler's WndProc implementation also explicitly accounts for another component installing a WndProc above it and for preserving a previously captured WndProc chain.
 
 Relevant upstream OptiScaler source areas at the time of analysis:
@@ -136,7 +160,7 @@ Relevant upstream OptiScaler source areas at the time of analysis:
 
 ## 7. Leading hypothesis: asymmetric key-down/key-up delivery
 
-The strongest current hypothesis is that the shared-key interaction can cause REFramework to observe a key-down without observing the matching key-up in some menu-state/order combinations.
+The strongest current hypothesis for the problematic game is that the shared-key interaction can cause REFramework to observe a key-down without observing the matching key-up in some menu-state/order combinations.
 
 Possible sequence:
 
@@ -173,6 +197,8 @@ This sequence explains the observed near-alternating pattern particularly well.
 
 However, this exact key-up-loss sequence is **not yet proven by message-level logging** and must remain a hypothesis until instrumented.
 
+The healthy shared-key control game makes it especially important not to generalize this hypothesis as a universal OptiScaler/REFramework Insert conflict.
+
 ## 8. Secondary hypothesis: WndProc chain ordering / refresh interaction
 
 A second plausible contributor is WndProc ordering.
@@ -186,10 +212,13 @@ Potential effects include:
 - chain order changes during runtime
 - forwarding behavior depends on which component currently sits above the other
 - input blocking in the upper component may prevent the lower component from seeing selected messages
+- different games may produce different window/input lifecycles even with the same two injected components
 
-This hypothesis is compatible with the shared-key test but is not independently proven yet.
+This hypothesis is compatible with the problematic shared-key test but is not independently proven yet.
 
-Do not assume that the issue is simply "OptiScaler always consumes Insert." That is contradicted by the runtime pattern because REFramework does receive enough Insert events to toggle successfully on some presses.
+The healthy control game's REFramework-first / OptiScaler-later visible toggle order does not, by itself, prove which component is physically top-most in the WndProc chain. The two overlays process their shortcut state at different points.
+
+Do not assume that the issue is simply "OptiScaler always consumes Insert." That is contradicted by both the intermittent pattern in the problematic game and the fully working shared-key control game.
 
 ## 9. What is not yet proven
 
@@ -200,7 +229,8 @@ The following points must not be treated as established facts yet:
 - that the issue is caused by XeFG specifically
 - that the issue is caused by the P3.3B/P3.3B.1 resize-hold code
 - that REFramework's ImGui backend is failing
-- that a generic hotkey implementation change is safe for all REFramework games
+- that a generic hotkey implementation change is safe or necessary for all REFramework games
+- that all games sharing Insert will reproduce the issue
 
 ## 10. Relationship to the XeFG compatibility work
 
@@ -213,14 +243,24 @@ XeFG presentation path             PASS in this test context
 REFramework D3D12 render path       PASS
 REFramework overlay can render      PASS
 P3.3B generic ResizeHold regression addressed separately
-Shared Insert input coexistence     OPEN / DEFERRED
+Shared Insert input coexistence     GAME-DEPENDENT / DEFERRED
 ```
 
 Do not mix this investigation into unrelated XeFG lifecycle refactor PRs unless direct evidence later shows a coupling.
 
-## 11. Current workaround
+## 11. Current workaround and product decision
 
-Use different menu hotkeys for the two overlays.
+No general code change is currently required.
+
+Reasoning:
+
+- The REFramework overlay is not generally missing.
+- Shared Insert works normally in other tested games.
+- The remaining problem is game/context dependent.
+- A global input semantic change could regress games where current behavior already works.
+- The current project priority remains OptiScaler + XeFG + REFramework rendering/presentation compatibility.
+
+For a game that does reproduce the shared-key issue, use different menu hotkeys for the two overlays.
 
 Example:
 
@@ -229,13 +269,15 @@ REFramework = Insert
 OptiScaler   = Home (or another unused key)
 ```
 
-The control test with separated hotkeys removed the reproduced REFramework Insert miss.
+The control test with separated hotkeys removed the reproduced REFramework Insert miss in the problematic game.
 
-This workaround is acceptable while the root cause remains deferred.
+For normal games where both overlays appear and operate correctly, leave the current behavior unchanged.
 
 ## 12. Recommended future investigation
 
-When this is resumed, start with diagnostics rather than an immediate behavioral fix.
+Only resume this work if the game-dependent shared-key behavior becomes important enough to justify a separate input-coexistence PR.
+
+Start with diagnostics rather than an immediate behavioral fix.
 
 ### A. Add bounded REFramework menu-key diagnostics
 
@@ -286,11 +328,12 @@ hook intact yes/no
 
 Compare those timestamps with OptiScaler's subclass install/validation logs.
 
-### D. Re-run the exact A/B matrix
+### D. Re-run a three-way validation matrix
 
 ```text
-A: OptiScaler Insert + REFramework Insert
-B: OptiScaler other key + REFramework Insert
+A: Problem game, OptiScaler Insert + REFramework Insert
+B: Problem game, OptiScaler other key + REFramework Insert
+C: Healthy control game, OptiScaler Insert + REFramework Insert
 ```
 
 Expected current behavior:
@@ -298,6 +341,7 @@ Expected current behavior:
 ```text
 A -> intermittent REFramework misses
 B -> no reproduced REFramework misses
+C -> both overlays work; REFramework visibly reacts first, OptiScaler follows slightly later
 ```
 
 The diagnostic patch should preserve this behavior and only explain it.
@@ -332,6 +376,7 @@ Risks to validate before adoption:
 - repeat semantics
 - interaction with REFramework's broader `m_last_keys` use
 - native non-OptiScaler behavior
+- games where shared Insert already works correctly
 
 ### Option 2: improve WndProc coexistence semantics
 
@@ -352,6 +397,7 @@ Do not use the eventual Insert fix as a reason to:
 - change the P3.3R hook-monitor policy
 - change P3.3B MHW resize-hold policy
 - change default user hotkeys solely to hide the bug
+- modify working shared-Insert games without evidence
 
 The future fix should be the smallest evidence-based coexistence correction.
 
@@ -366,7 +412,7 @@ Both overlays functional/renderable
 Game window focused
 ```
 
-Test 1 - shared hotkey:
+Test 1 - problematic game, shared hotkey:
 
 ```text
 OptiScaler ShortcutKey = Insert
@@ -383,7 +429,7 @@ OptiScaler: reliable
 REFramework: intermittent, approximately alternating in the observed session
 ```
 
-Test 2 - separated hotkeys:
+Test 2 - problematic game, separated hotkeys:
 
 ```text
 OptiScaler ShortcutKey = another key
@@ -398,10 +444,27 @@ Current observed result:
 REFramework: no reproduced misses
 ```
 
+Test 3 - healthy control game, shared hotkey:
+
+```text
+OptiScaler ShortcutKey = Insert
+REFramework menu key   = Insert
+```
+
+Current observed result:
+
+```text
+REFramework: reliable and visibly reacts first
+OptiScaler: reliable and follows slightly later
+Open and close show the same ordering
+```
+
 ## 16. Current conclusion
 
 The current evidence supports the following conclusion:
 
-> REFramework's intermittent Insert failure is triggered by sharing the same `VK_INSERT` overlay shortcut with OptiScaler. Separating the hotkeys removes the reproduced failure. REFramework's current menu edge detection depends on its own tracked key-up state, while both components participate in the same window-message/WndProc environment. A lost or blocked matching key-up is the leading explanation for the observed near-alternating REFramework toggle pattern, but this exact message-loss mechanism still requires bounded message-level logging before a code fix is selected.
+> Shared `VK_INSERT` use by OptiScaler and REFramework is not inherently broken. One tested game shows intermittent REFramework menu-toggle misses when both overlays share Insert, and separating the hotkeys removes that reproduced failure. Another tested game works normally with the same shared Insert key, with REFramework visibly toggling first and OptiScaler following slightly later. The remaining issue is therefore game/context dependent. A lost or blocked matching key-up remains the leading explanation for the problematic game's near-alternating pattern, but this exact message-loss mechanism still requires bounded message-level logging before any code fix is selected.
 
-Keep this issue deferred until the current XeFG refactor reaches an appropriate point for a small, isolated input-coexistence diagnostic/fix PR.
+Current project decision:
+
+> Leave general behavior unchanged. Do not prioritize an input fix while overlays are otherwise functional. Revisit only if the game-dependent shared-hotkey coexistence issue becomes important enough for a separate diagnostic/fix PR.
