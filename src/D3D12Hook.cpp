@@ -1587,11 +1587,8 @@ void D3D12Hook::log_xefg_resize_event(uint64_t event_id, XefgResizeEventKind kin
 }
 
 uint32_t D3D12Hook::log_xefg_post_resize_present(IDXGISwapChain3* swap_chain, const char* kind, void* original_fn) {
-    if (!XeFGCompatibility::is_debug_log_enabled()) {
-        return 0;
-    }
     const auto sample = m_xefg_resize_lifecycle.consume_post_resize_present_sample();
-    if (!sample.has_value()) return 0;
+    if (!sample.has_value() || !XeFGCompatibility::is_debug_log_enabled()) return 0;
     spdlog::info("[XeFG][ResizeLifecycle] event_id = {}, kind = {}, stage = present_after_resize, present_ordinal = {}, elapsed_ms_since_resize = {}, thread_id = {}, swapchain = 0x{:x}, tracked_swapchain = 0x{:x}, hook_instance = 0x{:x}, owned_swapchain = 0x{:x}, binding_generation = {}, command_queue = 0x{:x}, device = 0x{:x}, original_fn = 0x{:x}, original_owner = {}",
         sample->event_id,
         kind,
