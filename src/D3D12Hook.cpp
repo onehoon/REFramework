@@ -1470,15 +1470,12 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
     }
 
     const auto xefg_resize_transition_hold = d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
-        && d3d12->m_xefg_resize_transition_hold;
+        && d3d12->m_xefg_resize_lifecycle.suppress_renderer();
     const auto suppress_render_callbacks = d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
         && (d3d12->m_xefg_binding.observe_only() || xefg_resize_transition_hold);
-    const auto post_resize_ordinal = d3d12->m_xefg_post_resize_present_budget > 0
-        ? d3d12->m_xefg_post_resize_present_ordinal + 1
+    const auto post_resize_ordinal = d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
+        ? d3d12->log_xefg_post_resize_present(swap_chain, kind, original_present)
         : 0;
-    if (d3d12->m_swapchain_source == SwapchainSource::XeFGInternal && post_resize_ordinal > 0) {
-        d3d12->log_xefg_post_resize_present(swap_chain, kind, original_present);
-    }
     const auto log_render_boundary = d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
         && !suppress_render_callbacks
         && d3d12->m_on_present
@@ -1489,12 +1486,12 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
     }
 
     if (xefg_resize_transition_hold) {
-        const auto suppressed_present = ++d3d12->m_xefg_resize_transition_suppressed_present_count;
+        const auto suppressed_present = d3d12->m_xefg_resize_lifecycle.note_suppressed_present();
         if (suppressed_present <= 3) {
             spdlog::info(
                 "[XeFG][ResizeHold] action = suppress_present, trigger_event_id = {}, "
                 "suppressed_present = {}, kind = {}, present_call = {}",
-                d3d12->m_xefg_resize_transition_hold_event_id,
+                d3d12->m_xefg_resize_lifecycle.hold_trigger_event_id(),
                 suppressed_present,
                 kind,
                 present_call);
@@ -1503,12 +1500,12 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
 
     if (!suppress_render_callbacks && d3d12->m_on_present) {
         if (post_resize_ordinal == 1 && g_framework != nullptr) {
-            g_framework->log_d3d12_resize_snapshot("present_pre_render_callback", d3d12->m_xefg_resize_event_id);
+            g_framework->log_d3d12_resize_snapshot("present_pre_render_callback", d3d12->m_xefg_resize_lifecycle.event_id());
         }
         d3d12->m_on_present(*d3d12);
 
         if (post_resize_ordinal == 1 && g_framework != nullptr) {
-            g_framework->log_d3d12_resize_snapshot("present_post_render_callback", d3d12->m_xefg_resize_event_id);
+            g_framework->log_d3d12_resize_snapshot("present_post_render_callback", d3d12->m_xefg_resize_lifecycle.event_id());
         }
 
         if (log_render_boundary) {
@@ -1548,12 +1545,7 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
 }
 
 uint64_t D3D12Hook::begin_xefg_resize_event(XefgResizeEventKind kind) {
-    m_xefg_resize_event_id++;
-    m_xefg_last_resize_kind = kind;
-    m_xefg_last_resize_event_time = std::chrono::steady_clock::now();
-    m_xefg_post_resize_present_budget = 3;
-    m_xefg_post_resize_present_ordinal = 0;
-    return m_xefg_resize_event_id;
+    return m_xefg_resize_lifecycle.begin(kind);
 }
 
 void D3D12Hook::arm_xefg_resize_transition_hold(uint64_t event_id) {
@@ -1563,9 +1555,7 @@ void D3D12Hook::arm_xefg_resize_transition_hold(uint64_t event_id) {
         return;
     }
 
-    m_xefg_resize_transition_hold = true;
-    m_xefg_resize_transition_hold_event_id = event_id;
-    m_xefg_resize_transition_suppressed_present_count = 0;
+    m_xefg_resize_lifecycle.arm(event_id);
 
     spdlog::info(
         "[XeFG][ResizeHold] action = arm, trigger_event_id = {}, "
@@ -1576,7 +1566,7 @@ void D3D12Hook::arm_xefg_resize_transition_hold(uint64_t event_id) {
 }
 
 void D3D12Hook::complete_xefg_resize_transition_hold(uint64_t completion_event_id, XefgResizeEventKind completion_kind, HRESULT result) {
-    if (!m_xefg_resize_transition_hold) {
+    if (!m_xefg_resize_lifecycle.suppress_renderer()) {
         return;
     }
 
@@ -1585,7 +1575,7 @@ void D3D12Hook::complete_xefg_resize_transition_hold(uint64_t completion_event_i
             "[XeFG][ResizeHold] action = keep, reason = completion_failed, "
             "trigger_event_id = {}, completion_event_id = {}, completion_kind = {}, "
             "result = 0x{:08x}",
-            m_xefg_resize_transition_hold_event_id,
+            m_xefg_resize_lifecycle.hold_trigger_event_id(),
             completion_event_id,
             resize_kind_name(completion_kind),
             static_cast<uint32_t>(result));
@@ -1596,20 +1586,18 @@ void D3D12Hook::complete_xefg_resize_transition_hold(uint64_t completion_event_i
         "[XeFG][ResizeHold] action = complete, trigger_event_id = {}, "
         "completion_event_id = {}, completion_kind = {}, result = 0x{:08x}, "
         "suppressed_presents = {}, generation = {}",
-        m_xefg_resize_transition_hold_event_id,
+        m_xefg_resize_lifecycle.hold_trigger_event_id(),
         completion_event_id,
         resize_kind_name(completion_kind),
         static_cast<uint32_t>(result),
-        m_xefg_resize_transition_suppressed_present_count,
+        m_xefg_resize_lifecycle.suppressed_present_count(),
         m_xefg_binding.generation());
 
-    m_xefg_resize_transition_hold = false;
-    m_xefg_resize_transition_hold_event_id = 0;
-    m_xefg_resize_transition_suppressed_present_count = 0;
+    m_xefg_resize_lifecycle.complete(completion_event_id, completion_kind, result);
 }
 
 void D3D12Hook::clear_xefg_resize_transition_hold(const char* reason) {
-    if (!m_xefg_resize_transition_hold) {
+    if (!m_xefg_resize_lifecycle.suppress_renderer()) {
         return;
     }
 
@@ -1617,17 +1605,15 @@ void D3D12Hook::clear_xefg_resize_transition_hold(const char* reason) {
         "[XeFG][ResizeHold] action = clear, reason = {}, trigger_event_id = {}, "
         "suppressed_presents = {}, generation = {}",
         reason != nullptr ? reason : "unknown",
-        m_xefg_resize_transition_hold_event_id,
-        m_xefg_resize_transition_suppressed_present_count,
+        m_xefg_resize_lifecycle.hold_trigger_event_id(),
+        m_xefg_resize_lifecycle.suppressed_present_count(),
         m_xefg_binding.generation());
 
-    m_xefg_resize_transition_hold = false;
-    m_xefg_resize_transition_hold_event_id = 0;
-    m_xefg_resize_transition_suppressed_present_count = 0;
+    m_xefg_resize_lifecycle.clear();
 }
 
 const char* D3D12Hook::get_xefg_last_resize_kind() const {
-    return resize_kind_name(m_xefg_last_resize_kind);
+    return resize_kind_name(m_xefg_resize_lifecycle.last_kind());
 }
 
 void D3D12Hook::log_xefg_resize_event(uint64_t event_id, XefgResizeEventKind kind, const char* stage,
@@ -1659,20 +1645,14 @@ void D3D12Hook::log_xefg_resize_event(uint64_t event_id, XefgResizeEventKind kin
     }
 }
 
-void D3D12Hook::log_xefg_post_resize_present(IDXGISwapChain3* swap_chain, const char* kind, void* original_fn) {
-    if (m_xefg_post_resize_present_budget == 0) {
-        return;
-    }
-
-    --m_xefg_post_resize_present_budget;
-    const auto ordinal = ++m_xefg_post_resize_present_ordinal;
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - m_xefg_last_resize_event_time).count();
+uint32_t D3D12Hook::log_xefg_post_resize_present(IDXGISwapChain3* swap_chain, const char* kind, void* original_fn) {
+    const auto sample = m_xefg_resize_lifecycle.consume_post_resize_present_sample();
+    if (!sample.has_value()) return 0;
     spdlog::info("[XeFG][ResizeLifecycle] event_id = {}, kind = {}, stage = present_after_resize, present_ordinal = {}, elapsed_ms_since_resize = {}, thread_id = {}, swapchain = 0x{:x}, tracked_swapchain = 0x{:x}, hook_instance = 0x{:x}, owned_swapchain = 0x{:x}, binding_generation = {}, command_queue = 0x{:x}, device = 0x{:x}, original_fn = 0x{:x}, original_owner = {}",
-        m_xefg_resize_event_id,
+        sample->event_id,
         kind,
-        ordinal,
-        elapsed,
+        sample->ordinal,
+        sample->elapsed.count(),
         GetCurrentThreadId(),
         reinterpret_cast<uintptr_t>(swap_chain),
         reinterpret_cast<uintptr_t>(m_swap_chain),
@@ -1683,6 +1663,7 @@ void D3D12Hook::log_xefg_post_resize_present(IDXGISwapChain3* swap_chain, const 
         reinterpret_cast<uintptr_t>(m_device),
         reinterpret_cast<uintptr_t>(original_fn),
         describe_address(original_fn));
+    return sample->ordinal;
 }
 
 HRESULT WINAPI D3D12Hook::present1(IDXGISwapChain1* swap_chain, UINT sync_interval, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters) {

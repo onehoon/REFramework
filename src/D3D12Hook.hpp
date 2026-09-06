@@ -21,6 +21,7 @@
 #include "utility/VtableHook.hpp"
 #include "compatibility/xefg/XeFGDiscovery.hpp"
 #include "compatibility/xefg/XeFGBinding.hpp"
+#include "compatibility/xefg/XeFGResizeLifecycle.hpp"
 
 class XeFGCandidateHandoff;
 
@@ -126,7 +127,7 @@ public:
 
     int64_t get_last_present_age_ms() const;
 
-    uint64_t get_xefg_last_resize_event_id() const { return m_xefg_resize_event_id; }
+    uint64_t get_xefg_last_resize_event_id() const { return m_xefg_resize_lifecycle.event_id(); }
     uint64_t get_xefg_binding_generation() const { return m_xefg_binding.generation(); }
     const char* get_xefg_last_resize_kind() const;
 
@@ -158,12 +159,7 @@ public:
 
     static void hook_streamline(HMODULE dlssg_module = nullptr);
 
-    enum class XefgResizeEventKind : uint8_t {
-        None,
-        ResizeTarget,
-        ResizeBuffers,
-        ResizeBuffers1,
-    };
+    using XefgResizeEventKind = XeFGResizeLifecycle::EventKind;
 
 protected:
     void hook_impl();
@@ -178,7 +174,7 @@ protected:
     void complete_xefg_resize_transition_hold(uint64_t completion_event_id, XefgResizeEventKind completion_kind, HRESULT result);
     void clear_xefg_resize_transition_hold(const char* reason);
     void log_xefg_resize_event(uint64_t event_id, XefgResizeEventKind kind, const char* stage, IDXGISwapChain3* swap_chain, void* original_fn, HRESULT result = S_OK, bool has_result = false) const;
-    void log_xefg_post_resize_present(IDXGISwapChain3* swap_chain, const char* kind, void* original_fn);
+    uint32_t log_xefg_post_resize_present(IDXGISwapChain3* swap_chain, const char* kind, void* original_fn);
     bool external_binding_matches(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source, bool xefg_observe_only) const;
     bool replace_xefg_binding(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, bool observe_only, const char* reason);
     void sync_xefg_binding_aliases() noexcept;
@@ -189,14 +185,7 @@ protected:
     IDXGISwapChain3* m_swapchain_1{};
     ID3D12CommandQueue* m_command_queue{ nullptr };
     XeFGBinding m_xefg_binding{};
-    uint64_t m_xefg_resize_event_id{ 0 };
-    bool m_xefg_resize_transition_hold{ false };
-    uint64_t m_xefg_resize_transition_hold_event_id{ 0 };
-    uint32_t m_xefg_resize_transition_suppressed_present_count{ 0 };
-    XefgResizeEventKind m_xefg_last_resize_kind{ XefgResizeEventKind::None };
-    std::chrono::steady_clock::time_point m_xefg_last_resize_event_time{};
-    uint32_t m_xefg_post_resize_present_budget{ 0 };
-    uint32_t m_xefg_post_resize_present_ordinal{ 0 };
+    XeFGResizeLifecycle m_xefg_resize_lifecycle{};
     UINT m_display_width{ NULL };
     UINT m_display_height{ NULL };
     UINT m_render_width{ NULL };
