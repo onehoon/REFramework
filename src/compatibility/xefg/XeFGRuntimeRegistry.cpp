@@ -2,7 +2,7 @@
 
 #include <spdlog/spdlog.h>
 
-#include "D3D12Hook.hpp"
+#include "XeFGCompatibility.hpp"
 #include "utility/String.hpp"
 
 namespace {
@@ -13,14 +13,14 @@ int32_t WINAPI xefg_init_desc_thunk(
     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc,
     ID3D12CommandQueue* command_queue, IDXGIFactory2* factory,
     const void* init_params) {
-    return D3D12Hook::xefg_init_desc_dispatch(
+    return XeFGCompatibility::dispatch_init_desc(
         Slot, context, hwnd, swap_chain_desc, fullscreen_desc, command_queue,
         factory, init_params);
 }
 
 template <size_t Slot>
 int32_t WINAPI xefg_get_swapchain_thunk(void* context, REFIID riid, void** swap_chain) {
-    return D3D12Hook::xefg_get_swapchain_dispatch(Slot, context, riid, swap_chain);
+    return XeFGCompatibility::dispatch_get_swapchain(Slot, context, riid, swap_chain);
 }
 
 constexpr std::array<XeFGRuntimeRegistry::InitFn, 8> kInitThunks{
