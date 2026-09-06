@@ -50,6 +50,7 @@ private:
     ModKey::Ptr m_menu_key{ ModKey::create(generate_name("MenuKey_V2"), VK_INSERT) };
     ModToggle::Ptr m_menu_open{ ModToggle::create(generate_name("MenuOpen"), true) };
     ModToggle::Ptr m_remember_menu_state{ ModToggle::create(generate_name("RememberMenuState"), false) };
+    ModToggle::Ptr m_debug_log{ ModToggle::create(generate_name("DebugLog"), false) };
 #if defined(RE8) && !defined(REFRAMEWORK_UNIVERSAL)
     ModToggle::Ptr m_always_show_cursor{ ModToggle::create(generate_name("DrawCursorWithMenuOpen"), true) };
 #else
@@ -69,6 +70,7 @@ private:
         *m_menu_key,
         *m_menu_open,
         *m_remember_menu_state,
+        *m_debug_log,
         *m_always_show_cursor,
         *m_show_cursor_key,
         *m_font_size,

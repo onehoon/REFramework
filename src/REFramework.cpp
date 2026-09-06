@@ -265,8 +265,10 @@ NTSTATUS NTAPI ldr_load_dll_hook(PWSTR search_path, PULONG load_flags, PUNICODE_
         wchar_t path[MAX_PATH]{};
         const auto path_length = GetModuleFileNameW(xefg_module, path, ARRAYSIZE(path));
 
-        spdlog::info("[XeFG][LoaderHandoff] module = 0x{:x}, action = install_api_hooks_before_load_return",
-            reinterpret_cast<uintptr_t>(xefg_module));
+        if (XeFGCompatibility::is_debug_log_enabled()) {
+            spdlog::info("[XeFG][LoaderHandoff] module = 0x{:x}, action = install_api_hooks_before_load_return",
+                reinterpret_cast<uintptr_t>(xefg_module));
+        }
         XeFGCompatibility::on_module_loaded(xefg_module, L"libxess_fg.dll", std::wstring_view{path, path_length});
     } catch (const std::exception& e) {
         spdlog::error("[XeFG][LoaderHandoff] Failed to install API hooks: {}", e.what());
@@ -1329,7 +1331,7 @@ void REFramework::on_reset() {
 }
 
 void REFramework::log_d3d12_resize_snapshot(std::string_view stage, uint64_t event_id) const {
-    if (!m_is_d3d12) {
+    if (!m_is_d3d12 || !XeFGCompatibility::is_debug_log_enabled()) {
         return;
     }
 
@@ -2824,7 +2826,7 @@ bool REFramework::init_d3d12() {
 
     const auto resize_event_id = m_d3d12_hook->get_xefg_last_resize_event_id();
     const auto xefg_resize_diagnostic = m_d3d12_hook->get_swapchain_source() == D3D12Hook::SwapchainSource::XeFGInternal;
-    if (xefg_resize_diagnostic) {
+    if (xefg_resize_diagnostic && XeFGCompatibility::is_debug_log_enabled()) {
         UINT current_backbuffer_index = 0;
         current_backbuffer_index = swapchain->GetCurrentBackBufferIndex();
         spdlog::info("[XeFG][RendererAcquire] stage = begin, event_id = {}, last_resize_kind = {}, swapchain = 0x{:x}, binding_generation = {}, buffer_count = {}, current_backbuffer_index = {}",
@@ -2846,13 +2848,13 @@ bool REFramework::init_d3d12() {
             const auto get_buffer_result = swapchain->GetBuffer(i, IID_PPV_ARGS(&m_d3d12.rts[i]));
             if (SUCCEEDED(get_buffer_result)) {
                 device->CreateRenderTargetView(m_d3d12.rts[i].Get(), nullptr, m_d3d12.get_cpu_rtv(device, (D3D12::RTV)i));
-                if (xefg_resize_diagnostic) {
+                if (xefg_resize_diagnostic && XeFGCompatibility::is_debug_log_enabled()) {
                     spdlog::info("[XeFG][RendererAcquire] stage = get_buffer_success, event_id = {}, buffer_index = {}, resource = 0x{:x}",
                         resize_event_id, i, reinterpret_cast<uintptr_t>(m_d3d12.rts[i].Get()));
                 }
             } else {
                 spdlog::error("[D3D12] Failed to get back buffer for rtv {}", i);
-                if (xefg_resize_diagnostic) {
+                if (xefg_resize_diagnostic && XeFGCompatibility::is_debug_log_enabled()) {
                     spdlog::info("[XeFG][RendererAcquire] stage = get_buffer_failed, event_id = {}, buffer_index = {}, result = 0x{:08x}",
                         resize_event_id, i, static_cast<uint32_t>(get_buffer_result));
                 }

@@ -1,6 +1,7 @@
 #include "../REFramework.hpp"
 
 #include "REFrameworkConfig.hpp"
+#include "../compatibility/xefg/XeFGCompatibility.hpp"
 
 namespace {
 constexpr auto STARTUP_MENU_AUTO_HIDE_DELAY = std::chrono::seconds{3};
@@ -49,6 +50,10 @@ void REFrameworkConfig::on_draw_ui() {
     changed |= m_menu_key->draw("Menu Key");
     changed |= m_show_cursor_key->draw("Show Cursor Key");
     changed |= m_remember_menu_state->draw("Remember Menu Open/Closed State");
+    if (m_debug_log->draw("Debug Log")) {
+        XeFGCompatibility::set_debug_log_enabled(m_debug_log->value());
+        changed = true;
+    }
     changed |= m_always_show_cursor->draw("Draw Cursor With Menu Open");
 
     if (m_font_file->draw("Font")) {
@@ -107,6 +112,8 @@ void REFrameworkConfig::on_config_load(const utility::Config& cfg) {
     for (IModValue& option : m_options) {
         option.config_load(cfg);
     }
+
+    XeFGCompatibility::set_debug_log_enabled(m_debug_log->value());
 
     if (m_remember_menu_state->value()) {
         g_framework->set_draw_ui(m_menu_open->value(), false);

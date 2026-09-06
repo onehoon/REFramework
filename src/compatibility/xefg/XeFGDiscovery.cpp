@@ -4,6 +4,8 @@
 
 #include <spdlog/spdlog.h>
 
+#include "XeFGCompatibility.hpp"
+
 namespace {
 
 constexpr int32_t kXefgSuccess = 0;
@@ -70,6 +72,9 @@ QueueIdentitySnapshot capture_queue_identity(ID3D12CommandQueue* queue) {
 }
 
 void log_queue_identity(void* context, IDXGISwapChain3* swapchain, const QueueIdentitySnapshot& init, const QueueIdentitySnapshot& presentation, XeFGQueueRelation relation) {
+    if (!XeFGCompatibility::is_debug_log_enabled()) {
+        return;
+    }
     spdlog::info("[XeFG][QueueIdentity] context = 0x{:x}, swapchain = 0x{:x}, init_queue = 0x{:x}, init_identity = 0x{:x}, init_device_identity = 0x{:x}, init_type = {}, init_priority = {}, init_flags = 0x{:x}, init_node_mask = {}, presentation_queue = 0x{:x}, presentation_identity = 0x{:x}, presentation_device_identity = 0x{:x}, presentation_type = {}, presentation_priority = {}, presentation_flags = 0x{:x}, presentation_node_mask = {}, relation = {}",
         reinterpret_cast<uintptr_t>(context),
         reinterpret_cast<uintptr_t>(swapchain),
@@ -282,7 +287,7 @@ HRESULT WINAPI XeFGDiscovery::create_swapchain_for_hwnd(
         s_active.observation.internal_swapchain = *swap_chain;
         s_active.observation.factory_create_succeeded = true;
         s_diagnostic_candidate.store(*swap_chain, std::memory_order_release);
-        spdlog::info(
+        if (XeFGCompatibility::is_debug_log_enabled()) spdlog::info(
             "[XeFG][InternalSwapchain] context = 0x{:x}, candidate = 0x{:x}, presentation_queue = 0x{:x}, provisional = true",
             reinterpret_cast<uintptr_t>(s_active.observation.context),
             reinterpret_cast<uintptr_t>(*swap_chain),
