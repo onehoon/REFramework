@@ -1449,6 +1449,8 @@ if(REF_BUILD_FRAMEWORK AND CMAKE_SIZEOF_VOID_P EQUAL 8) # build-framework
 		"src/cimgui/cimgui.cpp"
 		"src/cimgui/cimgui.h"
 		"src/cimgui/cimgui_ref.cpp"
+		"src/compatibility/xefg/XeFGBinding.cpp"
+		"src/compatibility/xefg/XeFGBinding.hpp"
 		"src/compatibility/xefg/XeFGCandidateHandoff.cpp"
 		"src/compatibility/xefg/XeFGCandidateHandoff.hpp"
 		"src/compatibility/xefg/XeFGCompatibility.cpp"

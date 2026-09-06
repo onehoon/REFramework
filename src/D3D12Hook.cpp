@@ -336,7 +336,13 @@ bool D3D12Hook::external_binding_matches(IDXGISwapChain3* swapchain, ID3D12Comma
         return false;
     }
 
-    return source != SwapchainSource::XeFGInternal || m_xefg_p21_observe_only == normalized_observe_only;
+    return source != SwapchainSource::XeFGInternal || m_xefg_binding.observe_only() == normalized_observe_only;
+}
+
+void D3D12Hook::sync_xefg_binding_aliases() noexcept {
+    m_swap_chain = m_xefg_binding.swapchain();
+    m_command_queue = m_xefg_binding.queue();
+    m_device = m_xefg_binding.device();
 }
 
 bool D3D12Hook::replace_xefg_binding(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, bool observe_only, const char* reason) {
@@ -353,32 +359,27 @@ bool D3D12Hook::replace_xefg_binding(IDXGISwapChain3* swapchain, ID3D12CommandQu
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> next_queue = command_queue;
     Microsoft::WRL::ComPtr<ID3D12Device4> next_device;
     if (FAILED(next_swapchain->GetDevice(IID_PPV_ARGS(&next_device)))) {
-        log_xefg_rebind("failed", "new_device_unavailable", m_xefg_binding_generation, m_swap_chain, swapchain, m_command_queue, command_queue, m_xefg_p21_observe_only, observe_only);
+        log_xefg_rebind("failed", "new_device_unavailable", m_xefg_binding.generation(), m_swap_chain, swapchain, m_command_queue, command_queue, m_xefg_binding.observe_only(), observe_only);
         return false;
     }
 
     auto* const old_swapchain = m_swap_chain;
     auto* const old_queue = m_command_queue;
-    const auto old_observe_only = m_xefg_p21_observe_only;
+    const auto old_observe_only = m_xefg_binding.observe_only();
     const auto same_swapchain = old_swapchain == swapchain;
 
-    log_xefg_rebind("begin", reason, m_xefg_binding_generation, old_swapchain, swapchain, old_queue, command_queue, old_observe_only, observe_only);
+    log_xefg_rebind("begin", reason, m_xefg_binding.generation(), old_swapchain, swapchain, old_queue, command_queue, old_observe_only, observe_only);
 
     if (same_swapchain) {
-        spdlog::info("[XeFG][Rebind] stage = old_renderer_reset, reason = {}, generation = {}", reason, m_xefg_binding_generation);
+        spdlog::info("[XeFG][Rebind] stage = old_renderer_reset, reason = {}, generation = {}", reason, m_xefg_binding.generation());
         g_framework->on_reset();
 
-        m_xefg_bound_queue = std::move(next_queue);
-        m_xefg_bound_device = std::move(next_device);
-        m_swap_chain = m_xefg_bound_swapchain.Get();
-        m_command_queue = m_xefg_bound_queue.Get();
-        m_device = m_xefg_bound_device.Get();
-        m_xefg_p21_observe_only = observe_only;
+        m_xefg_binding.commit_same_swapchain_update(std::move(next_queue), std::move(next_device), observe_only);
+        sync_xefg_binding_aliases();
         m_xefg_p21_render_boundary_logged = false;
-        ++m_xefg_binding_generation;
 
         clear_xefg_resize_transition_hold("binding_replaced");
-        log_xefg_rebind("same_object_updated", reason, m_xefg_binding_generation, old_swapchain, m_swap_chain, old_queue, m_command_queue, old_observe_only, m_xefg_p21_observe_only);
+        log_xefg_rebind("same_object_updated", reason, m_xefg_binding.generation(), old_swapchain, m_swap_chain, old_queue, m_command_queue, old_observe_only, m_xefg_binding.observe_only());
         return true;
     }
 
@@ -391,38 +392,32 @@ bool D3D12Hook::replace_xefg_binding(IDXGISwapChain3* swapchain, ID3D12CommandQu
         const auto resize_target_ok = next_hook->hook_method(14, Address{reinterpret_cast<void*>(&D3D12Hook::resize_target)});
         const auto resize_buffers1_ok = next_hook->hook_method(39, Address{reinterpret_cast<void*>(&D3D12Hook::resize_buffers1)});
         if (!(present_ok && present1_ok && resize_buffers_ok && resize_target_ok && resize_buffers1_ok)) {
-            log_xefg_rebind("failed", "new_hook_method_failed", m_xefg_binding_generation, old_swapchain, swapchain, old_queue, command_queue, old_observe_only, observe_only);
+            log_xefg_rebind("failed", "new_hook_method_failed", m_xefg_binding.generation(), old_swapchain, swapchain, old_queue, command_queue, old_observe_only, observe_only);
             return false;
         }
     } catch (...) {
-        log_xefg_rebind("failed", "new_hook_create_failed", m_xefg_binding_generation, old_swapchain, swapchain, old_queue, command_queue, old_observe_only, observe_only);
+        log_xefg_rebind("failed", "new_hook_create_failed", m_xefg_binding.generation(), old_swapchain, swapchain, old_queue, command_queue, old_observe_only, observe_only);
         return false;
     }
 
-    log_xefg_rebind("new_hook_prepared", reason, m_xefg_binding_generation, old_swapchain, swapchain, old_queue, command_queue, old_observe_only, observe_only);
-    spdlog::info("[XeFG][Rebind] stage = old_renderer_reset, reason = {}, generation = {}", reason, m_xefg_binding_generation);
+    log_xefg_rebind("new_hook_prepared", reason, m_xefg_binding.generation(), old_swapchain, swapchain, old_queue, command_queue, old_observe_only, observe_only);
+    spdlog::info("[XeFG][Rebind] stage = old_renderer_reset, reason = {}, generation = {}", reason, m_xefg_binding.generation());
     g_framework->on_reset();
 
     m_present_hook.reset();
     m_swapchain_hook.reset();
-    log_xefg_rebind("old_hook_removed", reason, m_xefg_binding_generation, old_swapchain, swapchain, old_queue, command_queue, old_observe_only, observe_only);
+    log_xefg_rebind("old_hook_removed", reason, m_xefg_binding.generation(), old_swapchain, swapchain, old_queue, command_queue, old_observe_only, observe_only);
 
-    m_xefg_bound_swapchain = std::move(next_swapchain);
-    m_xefg_bound_queue = std::move(next_queue);
-    m_xefg_bound_device = std::move(next_device);
-    m_swap_chain = m_xefg_bound_swapchain.Get();
-    m_command_queue = m_xefg_bound_queue.Get();
-    m_device = m_xefg_bound_device.Get();
+    m_xefg_binding.commit_replacement(std::move(next_swapchain), std::move(next_queue), std::move(next_device), observe_only);
+    sync_xefg_binding_aliases();
     m_swapchain_hook = std::move(next_hook);
     m_swapchain_source = SwapchainSource::XeFGInternal;
-    m_xefg_p21_observe_only = observe_only;
     m_xefg_p21_render_boundary_logged = false;
     m_is_phase_1 = false;
     m_hooked = true;
-    ++m_xefg_binding_generation;
 
     clear_xefg_resize_transition_hold("binding_replaced");
-    log_xefg_rebind("new_binding_committed", reason, m_xefg_binding_generation, old_swapchain, m_swap_chain, old_queue, m_command_queue, old_observe_only, m_xefg_p21_observe_only);
+    log_xefg_rebind("new_binding_committed", reason, m_xefg_binding.generation(), old_swapchain, m_swap_chain, old_queue, m_command_queue, old_observe_only, m_xefg_binding.observe_only());
     return true;
 }
 
@@ -452,24 +447,17 @@ bool D3D12Hook::bind_external_swapchain(IDXGISwapChain3* swapchain, ID3D12Comman
     // Existing XeFG ownership keeps the old instance alive through hook removal.
     m_present_hook.reset();
     m_swapchain_hook.reset();
-    m_xefg_bound_swapchain.Reset();
-    m_xefg_bound_queue.Reset();
-    m_xefg_bound_device.Reset();
+    m_xefg_binding.clear();
 
     if (source == SwapchainSource::XeFGInternal) {
-        m_xefg_bound_swapchain = std::move(next_xefg_swapchain);
-        m_xefg_bound_queue = std::move(next_xefg_queue);
-        m_xefg_bound_device = std::move(next_xefg_device);
-        m_swap_chain = m_xefg_bound_swapchain.Get();
-        m_command_queue = m_xefg_bound_queue.Get();
-        m_device = m_xefg_bound_device.Get();
+        m_xefg_binding.commit_initial(std::move(next_xefg_swapchain), std::move(next_xefg_queue), std::move(next_xefg_device), xefg_p21_observe_only);
+        sync_xefg_binding_aliases();
     } else {
         m_swap_chain = swapchain;
         m_command_queue = command_queue;
         m_device = device.Get();
     }
     m_swapchain_source = source;
-    m_xefg_p21_observe_only = source == SwapchainSource::XeFGInternal && xefg_p21_observe_only;
     m_xefg_p21_render_boundary_logged = false;
     m_is_phase_1 = false;
 
@@ -486,7 +474,6 @@ bool D3D12Hook::bind_external_swapchain(IDXGISwapChain3* swapchain, ID3D12Comman
     }
 
     m_hooked = true;
-    m_xefg_binding_generation = source == SwapchainSource::XeFGInternal ? 1 : 0;
     clear_xefg_resize_transition_hold("external_bind");
 
     spdlog::info("[D3D12][ExternalBind] source = {}, swapchain = 0x{:x}, queue = 0x{:x}, device = 0x{:x}, Present[8].original = 0x{:x}, Present1[22].original = 0x{:x}, ResizeBuffers1[39].original = 0x{:x}",
@@ -1109,7 +1096,7 @@ bool D3D12Hook::unhook() {
 
     clear_xefg_resize_transition_hold("unhook");
 
-    if (!m_hooked && m_xefg_bound_swapchain == nullptr) {
+    if (!m_hooked && !m_xefg_binding.complete()) {
         return true;
     }
 
@@ -1117,9 +1104,9 @@ bool D3D12Hook::unhook() {
         spdlog::info("Unhooking D3D12");
     }
 
-    const auto* owned_swapchain = m_xefg_bound_swapchain.Get();
-    const auto* owned_queue = m_xefg_bound_queue.Get();
-    const auto* owned_device = m_xefg_bound_device.Get();
+    const auto* owned_swapchain = m_xefg_binding.swapchain();
+    const auto* owned_queue = m_xefg_binding.queue();
+    const auto* owned_device = m_xefg_binding.device();
 
     m_present_hook.reset();
     m_swapchain_hook.reset();
@@ -1134,10 +1121,7 @@ bool D3D12Hook::unhook() {
         m_device = nullptr;
     }
 
-    m_xefg_bound_swapchain.Reset();
-    m_xefg_bound_queue.Reset();
-    m_xefg_bound_device.Reset();
-    m_xefg_binding_generation = 0;
+    m_xefg_binding.clear();
 
     m_hooked = false;
     m_is_phase_1 = true;
@@ -1426,7 +1410,7 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
     const auto xefg_resize_transition_hold = d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
         && d3d12->m_xefg_resize_transition_hold;
     const auto suppress_render_callbacks = d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
-        && (d3d12->m_xefg_p21_observe_only || xefg_resize_transition_hold);
+        && (d3d12->m_xefg_binding.observe_only() || xefg_resize_transition_hold);
     const auto post_resize_ordinal = d3d12->m_xefg_post_resize_present_budget > 0
         ? d3d12->m_xefg_post_resize_present_ordinal + 1
         : 0;
@@ -1512,7 +1496,7 @@ uint64_t D3D12Hook::begin_xefg_resize_event(XefgResizeEventKind kind) {
 
 void D3D12Hook::arm_xefg_resize_transition_hold(uint64_t event_id) {
     if (m_swapchain_source != SwapchainSource::XeFGInternal
-        || m_xefg_p21_observe_only
+        || m_xefg_binding.observe_only()
         || event_id == 0) {
         return;
     }
@@ -1525,7 +1509,7 @@ void D3D12Hook::arm_xefg_resize_transition_hold(uint64_t event_id) {
         "[XeFG][ResizeHold] action = arm, trigger_event_id = {}, "
         "binding_generation = {}, swapchain = 0x{:x}",
         event_id,
-        m_xefg_binding_generation,
+        m_xefg_binding.generation(),
         reinterpret_cast<uintptr_t>(m_swap_chain));
 }
 
@@ -1555,7 +1539,7 @@ void D3D12Hook::complete_xefg_resize_transition_hold(uint64_t completion_event_i
         resize_kind_name(completion_kind),
         static_cast<uint32_t>(result),
         m_xefg_resize_transition_suppressed_present_count,
-        m_xefg_binding_generation);
+        m_xefg_binding.generation());
 
     m_xefg_resize_transition_hold = false;
     m_xefg_resize_transition_hold_event_id = 0;
@@ -1573,7 +1557,7 @@ void D3D12Hook::clear_xefg_resize_transition_hold(const char* reason) {
         reason != nullptr ? reason : "unknown",
         m_xefg_resize_transition_hold_event_id,
         m_xefg_resize_transition_suppressed_present_count,
-        m_xefg_binding_generation);
+        m_xefg_binding.generation());
 
     m_xefg_resize_transition_hold = false;
     m_xefg_resize_transition_hold_event_id = 0;
@@ -1598,18 +1582,18 @@ void D3D12Hook::log_xefg_resize_event(uint64_t event_id, XefgResizeEventKind kin
             event_id, resize_kind_name(kind), stage, GetCurrentThreadId(),
             reinterpret_cast<uintptr_t>(swap_chain), reinterpret_cast<uintptr_t>(identity.Get()),
         reinterpret_cast<uintptr_t>(m_swap_chain), reinterpret_cast<uintptr_t>(hook_instance),
-            reinterpret_cast<uintptr_t>(m_xefg_bound_swapchain.Get()), m_xefg_binding_generation,
+            reinterpret_cast<uintptr_t>(m_xefg_binding.swapchain()), m_xefg_binding.generation(),
             reinterpret_cast<uintptr_t>(m_command_queue), reinterpret_cast<uintptr_t>(m_device),
-            m_xefg_p21_observe_only, reinterpret_cast<uintptr_t>(original_fn), owner,
+            m_xefg_binding.observe_only(), reinterpret_cast<uintptr_t>(original_fn), owner,
             static_cast<uint32_t>(result));
     } else {
         spdlog::info("[XeFG][ResizeLifecycle] event_id = {}, kind = {}, stage = {}, thread_id = {}, swapchain = 0x{:x}, swapchain_identity = 0x{:x}, tracked_swapchain = 0x{:x}, hook_instance = 0x{:x}, owned_swapchain = 0x{:x}, binding_generation = {}, command_queue = 0x{:x}, device = 0x{:x}, observe_only = {}, original_fn = 0x{:x}, original_owner = {}",
             event_id, resize_kind_name(kind), stage, GetCurrentThreadId(),
             reinterpret_cast<uintptr_t>(swap_chain), reinterpret_cast<uintptr_t>(identity.Get()),
         reinterpret_cast<uintptr_t>(m_swap_chain), reinterpret_cast<uintptr_t>(hook_instance),
-            reinterpret_cast<uintptr_t>(m_xefg_bound_swapchain.Get()), m_xefg_binding_generation,
+            reinterpret_cast<uintptr_t>(m_xefg_binding.swapchain()), m_xefg_binding.generation(),
             reinterpret_cast<uintptr_t>(m_command_queue), reinterpret_cast<uintptr_t>(m_device),
-            m_xefg_p21_observe_only, reinterpret_cast<uintptr_t>(original_fn), owner);
+            m_xefg_binding.observe_only(), reinterpret_cast<uintptr_t>(original_fn), owner);
     }
 }
 
@@ -1631,8 +1615,8 @@ void D3D12Hook::log_xefg_post_resize_present(IDXGISwapChain3* swap_chain, const 
         reinterpret_cast<uintptr_t>(swap_chain),
         reinterpret_cast<uintptr_t>(m_swap_chain),
         reinterpret_cast<uintptr_t>(m_swapchain_hook != nullptr ? m_swapchain_hook->get_instance().ptr() : nullptr),
-        reinterpret_cast<uintptr_t>(m_xefg_bound_swapchain.Get()),
-        m_xefg_binding_generation,
+        reinterpret_cast<uintptr_t>(m_xefg_binding.swapchain()),
+        m_xefg_binding.generation(),
         reinterpret_cast<uintptr_t>(m_command_queue),
         reinterpret_cast<uintptr_t>(m_device),
         reinterpret_cast<uintptr_t>(original_fn),
@@ -1827,7 +1811,7 @@ HRESULT WINAPI D3D12Hook::resize_buffers1(IDXGISwapChain3* swap_chain, UINT buff
     d3d12->m_display_width = width;
     d3d12->m_display_height = height;
 
-    const auto should_reset_renderer = !d3d12->m_xefg_p21_observe_only && static_cast<bool>(d3d12->m_on_resize_buffers);
+    const auto should_reset_renderer = !d3d12->m_xefg_binding.observe_only() && static_cast<bool>(d3d12->m_on_resize_buffers);
     spdlog::info("[XeFG][ResizeBuffers1] stage = enter, swapchain = 0x{:x}, buffer_count = {}, width = {}, height = {}, format = {}, flags = 0x{:x}, creation_node_mask = 0x{:x}, present_queues = 0x{:x}, pre_reset = {}",
         reinterpret_cast<uintptr_t>(swap_chain),
         buffer_count,
@@ -1977,7 +1961,7 @@ HRESULT WINAPI D3D12Hook::resize_target(IDXGISwapChain3* swap_chain, const DXGI_
 
     if (event_id != 0
         && renderer_reset_performed
-        && !d3d12->m_xefg_p21_observe_only
+        && !d3d12->m_xefg_binding.observe_only()
         && sdk::GameIdentity::get().is_mhwilds()) {
         d3d12->arm_xefg_resize_transition_hold(event_id);
     }
