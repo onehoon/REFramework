@@ -10,6 +10,7 @@
 #include "XeFGCandidateHandoff.hpp"
 #include "XeFGDiscovery.hpp"
 #include "D3D12Hook.hpp"
+#include "REFramework.hpp"
 #include "utility/String.hpp"
 
 namespace {
@@ -33,18 +34,39 @@ int64_t runtime_slot_for_log(size_t slot) noexcept {
     return slot == XeFGBinding::kInvalidRuntimeSlot ? -1 : static_cast<int64_t>(slot);
 }
 
-XeFGBinding::RuntimeLifecycleSnapshot active_binding_snapshot() noexcept {
+struct ActiveBindingSnapshot {
+    XeFGBinding::RuntimeLifecycleSnapshot binding{};
+    uint64_t last_resize_event_id{};
+    const char* last_resize_kind{"none"};
+    int64_t last_present_age_ms{-1};
+};
+
+ActiveBindingSnapshot active_binding_snapshot() noexcept {
+    if (g_framework == nullptr) {
+        return {};
+    }
+
+    std::scoped_lock lifecycle_lock{g_framework->get_hook_monitor_mutex()};
     const auto* hook = D3D12Hook::current_xefg_handoff_target();
-    return hook != nullptr ? hook->get_xefg_lifecycle_snapshot() : XeFGBinding::RuntimeLifecycleSnapshot{};
+    if (hook == nullptr) {
+        return {};
+    }
+
+    return {
+        hook->get_xefg_lifecycle_snapshot(),
+        hook->get_xefg_last_resize_event_id(),
+        hook->get_xefg_last_resize_kind(),
+        hook->get_last_present_age_ms(),
+    };
 }
 
-void log_runtime_lifecycle(const char* stage, size_t slot, HMODULE module, void* context, HWND hwnd, int32_t result = 0, bool has_result = false, const XeFGBinding::RuntimeLifecycleSnapshot* cached_binding = nullptr) {
+void log_runtime_lifecycle(const char* stage, size_t slot, HMODULE module, void* context, HWND hwnd, int32_t result = 0, bool has_result = false, const ActiveBindingSnapshot* cached_snapshot = nullptr) {
     if (!XeFGCompatibility::is_debug_log_enabled()) {
         return;
     }
 
-    const auto binding = cached_binding != nullptr ? *cached_binding : active_binding_snapshot();
-    const auto* hook = cached_binding == nullptr ? D3D12Hook::current_xefg_handoff_target() : nullptr;
+    const auto snapshot = cached_snapshot != nullptr ? *cached_snapshot : active_binding_snapshot();
+    const auto& binding = snapshot.binding;
     const auto context_match = binding.active && context != nullptr && binding.runtime.context == context;
     const auto hwnd_match = hwnd != nullptr && binding.runtime.hwnd == hwnd;
     const auto slot_match = binding.active && binding.runtime.slot == slot;
@@ -67,9 +89,9 @@ void log_runtime_lifecycle(const char* stage, size_t slot, HMODULE module, void*
         context_match,
         hwnd_match,
         slot_match,
-        hook != nullptr ? hook->get_xefg_last_resize_event_id() : 0,
-        hook != nullptr ? hook->get_xefg_last_resize_kind() : "none",
-        hook != nullptr ? hook->get_last_present_age_ms() : -1);
+        snapshot.last_resize_event_id,
+        snapshot.last_resize_kind,
+        snapshot.last_present_age_ms);
 }
 }
 
@@ -267,7 +289,7 @@ int32_t XeFGCompatibility::dispatch_destroy(size_t slot, void* context) {
     }
 
     const auto binding_before_destroy = active_binding_snapshot();
-    log_runtime_lifecycle("destroy_enter", slot, module, context, nullptr);
+    log_runtime_lifecycle("destroy_enter", slot, module, context, nullptr, 0, false, &binding_before_destroy);
     const auto result = original(context);
     log_runtime_lifecycle("destroy_return", slot, module, context, nullptr, result, true, &binding_before_destroy);
     return result;
