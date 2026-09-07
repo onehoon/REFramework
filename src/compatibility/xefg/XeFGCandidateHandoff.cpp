@@ -1,6 +1,7 @@
 #include "XeFGCandidateHandoff.hpp"
 
 #include "../../D3D12Hook.hpp"
+#include "XeFGCompatibility.hpp"
 #include "REFramework.hpp"
 
 #include <spdlog/spdlog.h>
@@ -55,6 +56,55 @@ bool XeFGCandidateHandoff::consume_pending(D3D12Hook& hook) {
         D3D12Hook::SwapchainSource::XeFGInternal,
         pending->observe_only,
         pending->runtime);
+}
+
+bool XeFGCandidateHandoff::discard_pending_for_runtime_transition(
+    size_t runtime_slot,
+    void* context,
+    HWND hwnd,
+    bool allow_same_hwnd_match,
+    const char* reason) {
+    std::optional<XeFGBindingCandidate> dropped;
+    {
+        std::scoped_lock lock{s_pending_mutex};
+        if (!s_pending_candidate.has_value()) {
+            return false;
+        }
+
+        const auto& pending = *s_pending_candidate;
+        const bool exact_runtime_match = context != nullptr
+            && pending.runtime.slot == runtime_slot
+            && pending.runtime.context == context;
+        const bool same_hwnd_match = allow_same_hwnd_match
+            && hwnd != nullptr
+            && pending.runtime.hwnd == hwnd;
+        const char* match = exact_runtime_match ? "exact_runtime" : (same_hwnd_match ? "same_hwnd" : "none");
+        if (!exact_runtime_match && !same_hwnd_match) {
+            return false;
+        }
+
+        if (XeFGCompatibility::is_debug_log_enabled()) {
+            spdlog::info("[XeFG][LifecycleDetach] stage = pending_candidate_dropped, reason = {}, match = {}, runtime_slot = {}, context = 0x{:x}, hwnd = 0x{:x}, candidate_context = 0x{:x}, candidate_hwnd = 0x{:x}, swapchain = 0x{:x}",
+                reason != nullptr ? reason : "unknown",
+                match,
+                runtime_slot == XeFGBinding::kInvalidRuntimeSlot ? -1 : static_cast<int64_t>(runtime_slot),
+                reinterpret_cast<uintptr_t>(context),
+                reinterpret_cast<uintptr_t>(hwnd),
+                reinterpret_cast<uintptr_t>(pending.runtime.context),
+                reinterpret_cast<uintptr_t>(pending.runtime.hwnd),
+                reinterpret_cast<uintptr_t>(pending.swapchain.Get()));
+        }
+
+        // Move ownership out while protected by the mutex; the moved-from
+        // optional no longer owns any COM references.
+        dropped = std::move(s_pending_candidate);
+        s_pending_candidate.reset();
+    }
+
+    // Release candidate COM references only after s_pending_mutex is free so
+    // a Release-triggered XeFG callback can safely re-enter this path.
+    dropped.reset();
+    return true;
 }
 
 void XeFGCandidateHandoff::apply_to_live_hook(

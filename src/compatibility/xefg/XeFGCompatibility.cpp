@@ -60,6 +60,29 @@ ActiveBindingSnapshot active_binding_snapshot() noexcept {
     };
 }
 
+void prepare_for_xefg_runtime_transition(
+    size_t runtime_slot,
+    void* context,
+    HWND hwnd,
+    bool allow_same_hwnd_match,
+    const char* reason) {
+    if (g_framework == nullptr) {
+        XeFGCandidateHandoff::discard_pending_for_runtime_transition(
+            runtime_slot, context, hwnd, allow_same_hwnd_match, reason);
+        return;
+    }
+
+    // Lock order is lifecycle mutex -> pending-candidate mutex. The lock is
+    // released when this helper returns, before Intel Init/Destroy executes.
+    std::scoped_lock lifecycle_lock{g_framework->get_hook_monitor_mutex()};
+    XeFGCandidateHandoff::discard_pending_for_runtime_transition(
+        runtime_slot, context, hwnd, allow_same_hwnd_match, reason);
+    if (auto* hook = D3D12Hook::current_xefg_handoff_target(); hook != nullptr) {
+        hook->detach_xefg_binding_for_runtime_transition(
+            runtime_slot, context, hwnd, allow_same_hwnd_match, reason);
+    }
+}
+
 void log_runtime_lifecycle(const char* stage, size_t slot, HMODULE module, void* context, HWND hwnd, int32_t result = 0, bool has_result = false, const ActiveBindingSnapshot* cached_snapshot = nullptr) {
     if (!XeFGCompatibility::is_debug_log_enabled()) {
         return;
@@ -211,6 +234,7 @@ int32_t XeFGCompatibility::dispatch_init_desc(size_t slot, void* context, HWND h
     }
 
     log_runtime_lifecycle("pre_init", slot, module, context, hwnd);
+    prepare_for_xefg_runtime_transition(slot, context, hwnd, true, "reinit");
 
     auto observation_scope = XeFGDiscovery::observe_init(
         original, slot, context, hwnd, swap_chain_desc, fullscreen_desc, command_queue, factory, init_params);
@@ -290,6 +314,7 @@ int32_t XeFGCompatibility::dispatch_destroy(size_t slot, void* context) {
 
     const auto binding_before_destroy = active_binding_snapshot();
     log_runtime_lifecycle("destroy_enter", slot, module, context, nullptr, 0, false, &binding_before_destroy);
+    prepare_for_xefg_runtime_transition(slot, context, nullptr, false, "destroy");
     const auto result = original(context);
     log_runtime_lifecycle("destroy_return", slot, module, context, nullptr, result, true, &binding_before_destroy);
     return result;
