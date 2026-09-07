@@ -146,6 +146,15 @@ public:
 
     static D3D12Hook* current_xefg_handoff_target() noexcept;
 
+    // Detach only the active XeFG instance relationship before its runtime
+    // destroys or reinitializes the borrowed proxy.
+    bool detach_xefg_binding_for_runtime_transition(
+        size_t runtime_slot,
+        void* context,
+        HWND hwnd,
+        bool allow_same_hwnd_match,
+        const char* reason);
+
     void ignore_next_present() {
         m_ignore_next_present = true;
     }

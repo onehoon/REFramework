@@ -242,6 +242,79 @@ bool D3D12Hook::has_active_xefg_instance_binding() const noexcept {
         && m_xefg_binding.aliases_match(m_swap_chain, m_command_queue, m_device);
 }
 
+bool D3D12Hook::detach_xefg_binding_for_runtime_transition(
+    size_t runtime_slot,
+    void* context,
+    HWND hwnd,
+    bool allow_same_hwnd_match,
+    const char* reason) {
+    const auto snapshot = m_xefg_binding.lifecycle_snapshot();
+    const bool exact_runtime_match = snapshot.active
+        && context != nullptr
+        && snapshot.runtime.slot == runtime_slot
+        && snapshot.runtime.context == context;
+    const bool same_hwnd_match = allow_same_hwnd_match
+        && hwnd != nullptr
+        && snapshot.active
+        && snapshot.runtime.hwnd == hwnd;
+    const char* match = exact_runtime_match ? "exact_runtime" : (same_hwnd_match ? "same_hwnd" : "none");
+
+    if (XeFGCompatibility::is_debug_log_enabled()) {
+        spdlog::info("[XeFG][LifecycleDetach] stage = evaluate, reason = {}, match = {}, runtime_slot = {}, context = 0x{:x}, hwnd = 0x{:x}, binding_generation = {}, binding_context = 0x{:x}, binding_hwnd = 0x{:x}, swapchain = 0x{:x}",
+            reason != nullptr ? reason : "unknown",
+            match,
+            runtime_slot == XeFGBinding::kInvalidRuntimeSlot ? -1 : static_cast<int64_t>(runtime_slot),
+            reinterpret_cast<uintptr_t>(context),
+            reinterpret_cast<uintptr_t>(hwnd),
+            snapshot.generation,
+            reinterpret_cast<uintptr_t>(snapshot.runtime.context),
+            reinterpret_cast<uintptr_t>(snapshot.runtime.hwnd),
+            reinterpret_cast<uintptr_t>(snapshot.swapchain));
+    }
+
+    if (!exact_runtime_match && !same_hwnd_match
+        || m_swapchain_source != SwapchainSource::XeFGInternal
+        || !m_xefg_binding.active()) {
+        return false;
+    }
+
+    // The active binding is borrowed. Keep the proxy alive only through the
+    // renderer reset and instance-hook removal below.
+    Microsoft::WRL::ComPtr<IDXGISwapChain3> old_keepalive = snapshot.swapchain;
+    if (XeFGCompatibility::is_debug_log_enabled()) {
+        spdlog::info("[XeFG][LifecycleDetach] stage = begin, reason = {}, match = {}, generation = {}, swapchain = 0x{:x}",
+            reason != nullptr ? reason : "unknown", match, snapshot.generation,
+            reinterpret_cast<uintptr_t>(snapshot.swapchain));
+    }
+
+    if (g_framework != nullptr) {
+        g_framework->on_reset();
+    }
+    clear_xefg_resize_transition_hold("runtime_transition");
+    m_present_hook.reset();
+    m_swapchain_hook.reset();
+    if (XeFGCompatibility::is_debug_log_enabled()) {
+        spdlog::info("[XeFG][LifecycleDetach] stage = hook_removed, reason = {}, match = {}, generation = {}",
+            reason != nullptr ? reason : "unknown", match, snapshot.generation);
+    }
+
+    if (m_swap_chain == snapshot.swapchain) {
+        m_swap_chain = nullptr;
+    }
+    if (m_command_queue == snapshot.queue) {
+        m_command_queue = nullptr;
+    }
+    if (m_device == snapshot.device) {
+        m_device = nullptr;
+    }
+    m_xefg_binding.clear();
+    if (XeFGCompatibility::is_debug_log_enabled()) {
+        spdlog::info("[XeFG][LifecycleDetach] stage = complete, reason = {}, match = {}, generation = {}",
+            reason != nullptr ? reason : "unknown", match, snapshot.generation);
+    }
+    return true;
+}
+
 bool D3D12Hook::external_binding_matches(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source, bool xefg_observe_only) const {
     const auto normalized_observe_only = source == SwapchainSource::XeFGInternal && xefg_observe_only;
 
@@ -281,6 +354,10 @@ bool D3D12Hook::replace_xefg_binding(IDXGISwapChain3* swapchain, ID3D12CommandQu
     }
 
     auto* const old_swapchain = m_swap_chain;
+    Microsoft::WRL::ComPtr<IDXGISwapChain3> old_keepalive;
+    if (m_xefg_binding.active()) {
+        old_keepalive = old_swapchain;
+    }
     auto* const old_queue = m_command_queue;
     const auto old_observe_only = m_xefg_binding.observe_only();
     const auto same_swapchain = old_swapchain == swapchain;
@@ -325,7 +402,7 @@ bool D3D12Hook::replace_xefg_binding(IDXGISwapChain3* swapchain, ID3D12CommandQu
     m_swapchain_hook.reset();
     log_xefg_rebind("old_hook_removed", reason, m_xefg_binding.generation(), old_swapchain, swapchain, old_queue, command_queue, old_observe_only, observe_only);
 
-    m_xefg_binding.commit_replacement(std::move(next_swapchain), std::move(next_queue), std::move(next_device), observe_only, runtime);
+    m_xefg_binding.commit_replacement(swapchain, std::move(next_queue), std::move(next_device), observe_only, runtime);
     sync_xefg_binding_aliases();
     m_swapchain_hook = std::move(next_hook);
     m_swapchain_source = SwapchainSource::XeFGInternal;
@@ -378,6 +455,14 @@ bool D3D12Hook::bind_external_swapchain(IDXGISwapChain3* swapchain, ID3D12Comman
             m_hooked
             && m_swap_chain != nullptr
             && m_swapchain_source != SwapchainSource::XeFGInternal;
+        Microsoft::WRL::ComPtr<IDXGISwapChain3> old_keepalive;
+        if (m_xefg_binding.active()) {
+            old_keepalive = m_xefg_binding.swapchain();
+        }
+        if (m_xefg_binding.active() && g_framework != nullptr) {
+            spdlog::info("[XeFG][Bind] stage = old_renderer_reset, reason = xefg_replacement");
+            g_framework->on_reset();
+        }
         if (replacing_active_non_xefg && g_framework != nullptr) {
             spdlog::info("[XeFG][Bind] stage = old_renderer_reset, reason = non_xefg_to_xefg");
             g_framework->on_reset();
@@ -385,7 +470,7 @@ bool D3D12Hook::bind_external_swapchain(IDXGISwapChain3* swapchain, ID3D12Comman
         m_present_hook.reset();
         m_swapchain_hook.reset();
         m_xefg_binding.clear();
-        m_xefg_binding.commit_initial(std::move(next_swapchain), std::move(next_queue), std::move(next_device), xefg_p21_observe_only, runtime);
+        m_xefg_binding.commit_initial(swapchain, std::move(next_queue), std::move(next_device), xefg_p21_observe_only, runtime);
         sync_xefg_binding_aliases();
         m_swapchain_hook = std::move(next_hook);
         m_swapchain_source = SwapchainSource::XeFGInternal;
@@ -402,22 +487,26 @@ bool D3D12Hook::bind_external_swapchain(IDXGISwapChain3* swapchain, ID3D12Comman
         return true;
     }
 
-    Microsoft::WRL::ComPtr<IDXGISwapChain3> next_xefg_swapchain;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> next_xefg_queue;
     Microsoft::WRL::ComPtr<ID3D12Device4> next_xefg_device;
     if (source == SwapchainSource::XeFGInternal) {
-        next_xefg_swapchain = swapchain;
         next_xefg_queue = command_queue;
         next_xefg_device = device;
     }
 
-    // Existing XeFG ownership keeps the old instance alive through hook removal.
+    Microsoft::WRL::ComPtr<IDXGISwapChain3> old_keepalive;
+    if (m_xefg_binding.active()) {
+        old_keepalive = m_xefg_binding.swapchain();
+    }
+    if (m_xefg_binding.active() && g_framework != nullptr) {
+        g_framework->on_reset();
+    }
     m_present_hook.reset();
     m_swapchain_hook.reset();
     m_xefg_binding.clear();
 
     if (source == SwapchainSource::XeFGInternal) {
-        m_xefg_binding.commit_initial(std::move(next_xefg_swapchain), std::move(next_xefg_queue), std::move(next_xefg_device), xefg_p21_observe_only, runtime);
+        m_xefg_binding.commit_initial(swapchain, std::move(next_xefg_queue), std::move(next_xefg_device), xefg_p21_observe_only, runtime);
         sync_xefg_binding_aliases();
     } else {
         m_swap_chain = swapchain;
@@ -1093,7 +1182,11 @@ bool D3D12Hook::unhook() {
         spdlog::info("Unhooking D3D12");
     }
 
-    const auto* owned_swapchain = m_xefg_binding.swapchain();
+    auto* owned_swapchain = m_xefg_binding.swapchain();
+    Microsoft::WRL::ComPtr<IDXGISwapChain3> old_keepalive;
+    if (m_xefg_binding.active()) {
+        old_keepalive = owned_swapchain;
+    }
     const auto* owned_queue = m_xefg_binding.queue();
     const auto* owned_device = m_xefg_binding.device();
 

@@ -52,14 +52,14 @@ public:
     RuntimeLifecycleSnapshot lifecycle_snapshot() const noexcept;
     bool runtime_identity_matches(size_t slot, void* context) const noexcept;
 
-    void commit_initial(Microsoft::WRL::ComPtr<IDXGISwapChain3> swapchain, Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue, Microsoft::WRL::ComPtr<ID3D12Device4> device, bool observe_only, RuntimeIdentity runtime = {});
+    void commit_initial(IDXGISwapChain3* swapchain, Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue, Microsoft::WRL::ComPtr<ID3D12Device4> device, bool observe_only, RuntimeIdentity runtime = {});
     void commit_same_swapchain_update(Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue, Microsoft::WRL::ComPtr<ID3D12Device4> device, bool observe_only, RuntimeIdentity runtime = {});
-    void commit_replacement(Microsoft::WRL::ComPtr<IDXGISwapChain3> swapchain, Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue, Microsoft::WRL::ComPtr<ID3D12Device4> device, bool observe_only, RuntimeIdentity runtime = {});
+    void commit_replacement(IDXGISwapChain3* swapchain, Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue, Microsoft::WRL::ComPtr<ID3D12Device4> device, bool observe_only, RuntimeIdentity runtime = {});
     void refresh_runtime_identity(RuntimeIdentity runtime) noexcept;
     void clear() noexcept;
 
 private:
-    Microsoft::WRL::ComPtr<IDXGISwapChain3> m_swapchain{};
+    IDXGISwapChain3* m_swapchain{}; // borrowed; hook lifetime is bounded by the caller
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_queue{};
     Microsoft::WRL::ComPtr<ID3D12Device4> m_device{};
     uint64_t m_generation{};

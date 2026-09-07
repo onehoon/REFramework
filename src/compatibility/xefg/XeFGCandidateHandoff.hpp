@@ -11,6 +11,12 @@ class XeFGCandidateHandoff {
 public:
     static void publish(XeFGBindingCandidate candidate);
     static bool consume_pending(D3D12Hook& hook);
+    static bool discard_pending_for_runtime_transition(
+        size_t runtime_slot,
+        void* context,
+        HWND hwnd,
+        bool allow_same_hwnd_match,
+        const char* reason);
 
 private:
     static void store_pending(XeFGBindingCandidate candidate);
