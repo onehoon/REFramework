@@ -23,6 +23,7 @@ public:
     static int32_t dispatch_init_desc(size_t slot, void* context, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* swap_chain_desc,
         const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc, ID3D12CommandQueue* command_queue, IDXGIFactory2* factory, const void* init_params);
     static int32_t dispatch_get_swapchain(size_t slot, void* context, REFIID riid, void** swap_chain);
+    static int32_t dispatch_destroy(size_t slot, void* context);
 
 private:
     static std::atomic<bool> s_module_loaded;

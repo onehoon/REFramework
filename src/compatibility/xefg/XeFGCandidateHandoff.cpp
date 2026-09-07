@@ -53,7 +53,8 @@ bool XeFGCandidateHandoff::consume_pending(D3D12Hook& hook) {
         pending->swapchain.Get(),
         pending->selected_queue.Get(),
         D3D12Hook::SwapchainSource::XeFGInternal,
-        pending->observe_only);
+        pending->observe_only,
+        pending->runtime);
 }
 
 void XeFGCandidateHandoff::apply_to_live_hook(

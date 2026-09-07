@@ -21,6 +21,7 @@ public:
         const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, ID3D12CommandQueue*,
         IDXGIFactory2*, const void*);
     using GetSwapchainFn = int32_t (WINAPI*)(void*, REFIID, void**);
+    using DestroyFn = int32_t (WINAPI*)(void*);
 
     struct InitDispatchTarget {
         HMODULE module{};
@@ -31,12 +32,17 @@ public:
         HMODULE module{};
         GetSwapchainFn original{};
     };
+    struct DestroyDispatchTarget {
+        HMODULE module{};
+        DestroyFn original{};
+    };
 
     static XeFGRuntimeRegistry& instance();
 
     bool install_for_module(HMODULE module, std::wstring_view full_path);
     std::optional<InitDispatchTarget> resolve_init(size_t slot);
     std::optional<GetSwapchainDispatchTarget> resolve_get_swapchain(size_t slot);
+    std::optional<DestroyDispatchTarget> resolve_destroy(size_t slot);
 
 private:
     static constexpr size_t kMaxRuntimes = 8;
@@ -53,8 +59,10 @@ private:
         size_t slot{};
         FARPROC init_desc_export{};
         FARPROC get_swapchain_export{};
+        FARPROC destroy_export{};
         std::unique_ptr<FunctionHook> init_desc_hook{};
         std::unique_ptr<FunctionHook> get_swapchain_hook{};
+        std::unique_ptr<FunctionHook> destroy_hook{};
         InstallState state{InstallState::Empty};
     };
 

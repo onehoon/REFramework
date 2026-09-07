@@ -12,6 +12,7 @@
 #include <dxgi1_4.h>
 
 #include "utility/VtableHook.hpp"
+#include "XeFGBinding.hpp"
 
 enum class XeFGQueueRelation : uint8_t {
     SameComIdentity,
@@ -26,6 +27,7 @@ struct XeFGBindingCandidate {
     Microsoft::WRL::ComPtr<IDXGISwapChain3> swapchain{};
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> selected_queue{};
     Microsoft::WRL::ComPtr<ID3D12Device4> device{};
+    XeFGBinding::RuntimeIdentity runtime{};
     HWND hwnd{};
     XeFGQueueRelation relation{XeFGQueueRelation::InitQueueUnavailable};
     bool observe_only{true};
@@ -53,6 +55,7 @@ public:
         ID3D12CommandQueue*, IDXGIFactory2*, const void*);
 
     struct Observation {
+        size_t runtime_slot{XeFGBinding::kInvalidRuntimeSlot};
         void* context{};
         HWND hwnd{};
         ID3D12CommandQueue* init_queue{};
@@ -80,6 +83,7 @@ public:
 
     static ObservationScope observe_init(
         InitFn original,
+        size_t runtime_slot,
         void* context,
         HWND hwnd,
         const DXGI_SWAP_CHAIN_DESC1* swap_chain_desc,

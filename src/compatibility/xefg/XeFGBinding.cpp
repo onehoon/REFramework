@@ -37,28 +37,43 @@ bool XeFGBinding::aliases_match(IDXGISwapChain3* swapchain, ID3D12CommandQueue* 
     return complete() && m_swapchain.Get() == swapchain && m_queue.Get() == queue && m_device.Get() == device;
 }
 
-void XeFGBinding::commit_initial(Microsoft::WRL::ComPtr<IDXGISwapChain3> swapchain, Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue, Microsoft::WRL::ComPtr<ID3D12Device4> device, bool observe_only) {
+XeFGBinding::RuntimeLifecycleSnapshot XeFGBinding::lifecycle_snapshot() const noexcept {
+    return {active(), m_generation, m_runtime, m_swapchain.Get(), m_queue.Get(), m_device.Get(), m_observe_only};
+}
+
+bool XeFGBinding::runtime_identity_matches(size_t slot, void* context) const noexcept {
+    return active() && context != nullptr && m_runtime.slot == slot && m_runtime.context == context;
+}
+
+void XeFGBinding::commit_initial(Microsoft::WRL::ComPtr<IDXGISwapChain3> swapchain, Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue, Microsoft::WRL::ComPtr<ID3D12Device4> device, bool observe_only, RuntimeIdentity runtime) {
     m_swapchain = std::move(swapchain);
     m_queue = std::move(queue);
     m_device = std::move(device);
     m_observe_only = observe_only;
+    m_runtime = runtime;
     m_generation = 1;
 }
 
-void XeFGBinding::commit_same_swapchain_update(Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue, Microsoft::WRL::ComPtr<ID3D12Device4> device, bool observe_only) {
+void XeFGBinding::commit_same_swapchain_update(Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue, Microsoft::WRL::ComPtr<ID3D12Device4> device, bool observe_only, RuntimeIdentity runtime) {
     m_queue = std::move(queue);
     m_device = std::move(device);
     m_observe_only = observe_only;
+    m_runtime = runtime;
     ++m_generation;
 }
 
-void XeFGBinding::commit_replacement(Microsoft::WRL::ComPtr<IDXGISwapChain3> swapchain, Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue, Microsoft::WRL::ComPtr<ID3D12Device4> device, bool observe_only) {
+void XeFGBinding::commit_replacement(Microsoft::WRL::ComPtr<IDXGISwapChain3> swapchain, Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue, Microsoft::WRL::ComPtr<ID3D12Device4> device, bool observe_only, RuntimeIdentity runtime) {
     const auto next_generation = m_generation + 1;
     m_swapchain = std::move(swapchain);
     m_queue = std::move(queue);
     m_device = std::move(device);
     m_observe_only = observe_only;
+    m_runtime = runtime;
     m_generation = next_generation;
+}
+
+void XeFGBinding::refresh_runtime_identity(RuntimeIdentity runtime) noexcept {
+    m_runtime = runtime;
 }
 
 void XeFGBinding::clear() noexcept {
@@ -67,4 +82,5 @@ void XeFGBinding::clear() noexcept {
     m_device.Reset();
     m_generation = 0;
     m_observe_only = false;
+    m_runtime = {};
 }
