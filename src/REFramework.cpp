@@ -413,6 +413,10 @@ REFramework::REFramework(HMODULE reframework_module)
 
     const auto ntdll = GetModuleHandle("ntdll.dll");
 
+    // The normal mod config load happens after XeFG can be loaded and initialized.
+    // Seed only this diagnostic flag before installing any XeFG loader/runtime hooks.
+    REFrameworkConfig::bootstrap_xefg_debug_log();
+
     if (ntdll != nullptr) {
         // Manually get RtlGetVersion
         auto rtl_get_version = (RtlGetVersionFunc)GetProcAddress(ntdll, "RtlGetVersion");

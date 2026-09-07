@@ -12,6 +12,21 @@ std::shared_ptr<REFrameworkConfig>& REFrameworkConfig::get() {
      return instance;
 }
 
+void REFrameworkConfig::bootstrap_xefg_debug_log() noexcept {
+    bool enabled = false;
+
+    try {
+        const utility::Config config{
+            (REFramework::get_persistent_dir() / REFRAMEWORK_CONFIG_NAME).string()
+        };
+        enabled = config.get<bool>(std::string{DEBUG_LOG_CONFIG_NAME}).value_or(false);
+    } catch (...) {
+        // Diagnostic configuration must never prevent REFramework startup.
+    }
+
+    XeFGCompatibility::set_debug_log_enabled(enabled);
+}
+
 std::optional<std::string> REFrameworkConfig::on_initialize() {
     namespace fs = std::filesystem;
     fonts.clear();
