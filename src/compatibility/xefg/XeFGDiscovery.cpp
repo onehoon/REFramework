@@ -138,6 +138,7 @@ std::atomic<IDXGISwapChain1*> XeFGDiscovery::s_diagnostic_candidate{nullptr};
 
 XeFGDiscovery::ObservationScope XeFGDiscovery::observe_init(
     InitFn original,
+    size_t runtime_slot,
     void* context,
     HWND hwnd,
     const DXGI_SWAP_CHAIN_DESC1* swap_chain_desc,
@@ -148,6 +149,7 @@ XeFGDiscovery::ObservationScope XeFGDiscovery::observe_init(
     std::unique_lock transaction_lock{s_transaction_mutex};
 
     s_active.observation = {};
+    s_active.observation.runtime_slot = runtime_slot;
     s_active.observation.context = context;
     s_active.observation.hwnd = hwnd;
     s_active.observation.init_queue = command_queue;
@@ -235,6 +237,7 @@ XeFGBindingCandidateResult XeFGDiscovery::build_binding_candidate(const Observat
     XeFGBindingCandidate candidate{};
     candidate.swapchain = swapchain;
     candidate.device = device;
+    candidate.runtime = {observation.runtime_slot, observation.context, observation.hwnd};
     candidate.hwnd = observation.hwnd;
     candidate.relation = relation;
 

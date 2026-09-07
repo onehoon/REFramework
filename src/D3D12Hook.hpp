@@ -47,7 +47,7 @@ public:
 	bool hook();
 	bool unhook();
 
-	bool bind_external_swapchain(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source, bool xefg_p21_observe_only = false);
+	bool bind_external_swapchain(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source, bool xefg_p21_observe_only = false, XeFGBinding::RuntimeIdentity runtime = {});
 
     bool is_hooked() {
         return m_hooked;
@@ -140,6 +140,12 @@ public:
         return m_xefg_binding.observe_only();
     }
 
+    XeFGBinding::RuntimeLifecycleSnapshot get_xefg_lifecycle_snapshot() const noexcept {
+        return m_xefg_binding.lifecycle_snapshot();
+    }
+
+    static D3D12Hook* current_xefg_handoff_target() noexcept;
+
     void ignore_next_present() {
         m_ignore_next_present = true;
     }
@@ -163,7 +169,6 @@ protected:
 	static HRESULT WINAPI present1(IDXGISwapChain1* swap_chain, UINT sync_interval, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters);
     static HRESULT present_common(IDXGISwapChain3* swap_chain, const char* kind, void* original_present, std::function<HRESULT()> original_call, bool allow_phase_transition);
     bool apply_xefg_candidate(const XeFGBindingCandidate& candidate);
-    static D3D12Hook* current_xefg_handoff_target() noexcept;
     uint64_t begin_xefg_resize_event(XefgResizeEventKind kind);
     void arm_xefg_resize_transition_hold(uint64_t event_id);
     void complete_xefg_resize_transition_hold(uint64_t completion_event_id, XefgResizeEventKind completion_kind, HRESULT result);
@@ -171,7 +176,7 @@ protected:
     void log_xefg_resize_event(uint64_t event_id, XefgResizeEventKind kind, const char* stage, IDXGISwapChain3* swap_chain, void* original_fn, HRESULT result = S_OK, bool has_result = false) const;
     uint32_t log_xefg_post_resize_present(IDXGISwapChain3* swap_chain, const char* kind, void* original_fn);
     bool external_binding_matches(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source, bool xefg_observe_only) const;
-    bool replace_xefg_binding(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, bool observe_only, const char* reason);
+    bool replace_xefg_binding(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, bool observe_only, const char* reason, XeFGBinding::RuntimeIdentity runtime);
     void sync_xefg_binding_aliases() noexcept;
     
     ID3D12Device4* m_device{ nullptr };

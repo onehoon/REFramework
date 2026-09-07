@@ -23,6 +23,11 @@ int32_t WINAPI xefg_get_swapchain_thunk(void* context, REFIID riid, void** swap_
     return XeFGCompatibility::dispatch_get_swapchain(Slot, context, riid, swap_chain);
 }
 
+template <size_t Slot>
+int32_t WINAPI xefg_destroy_thunk(void* context) {
+    return XeFGCompatibility::dispatch_destroy(Slot, context);
+}
+
 constexpr std::array<XeFGRuntimeRegistry::InitFn, 8> kInitThunks{
     &xefg_init_desc_thunk<0>, &xefg_init_desc_thunk<1>,
     &xefg_init_desc_thunk<2>, &xefg_init_desc_thunk<3>,
@@ -35,6 +40,13 @@ constexpr std::array<XeFGRuntimeRegistry::GetSwapchainFn, 8> kGetSwapchainThunks
     &xefg_get_swapchain_thunk<2>, &xefg_get_swapchain_thunk<3>,
     &xefg_get_swapchain_thunk<4>, &xefg_get_swapchain_thunk<5>,
     &xefg_get_swapchain_thunk<6>, &xefg_get_swapchain_thunk<7>,
+};
+
+constexpr std::array<XeFGRuntimeRegistry::DestroyFn, 8> kDestroyThunks{
+    &xefg_destroy_thunk<0>, &xefg_destroy_thunk<1>,
+    &xefg_destroy_thunk<2>, &xefg_destroy_thunk<3>,
+    &xefg_destroy_thunk<4>, &xefg_destroy_thunk<5>,
+    &xefg_destroy_thunk<6>, &xefg_destroy_thunk<7>,
 };
 
 } // namespace
@@ -103,6 +115,7 @@ bool XeFGRuntimeRegistry::install_for_module(HMODULE module, std::wstring_view f
     runtime.slot = *slot;
     runtime.init_desc_export = init_export;
     runtime.get_swapchain_export = GetProcAddress(module, "xefgSwapChainD3D12GetSwapChainPtr");
+    runtime.destroy_export = GetProcAddress(module, "xefgSwapChainDestroy");
     runtime.state = InstallState::Installing;
     runtime.init_desc_hook = std::make_unique<FunctionHook>(
         Address{reinterpret_cast<void*>(init_export)},
@@ -125,13 +138,25 @@ bool XeFGRuntimeRegistry::install_for_module(HMODULE module, std::wstring_view f
         }
     }
 
+    if (runtime.destroy_export != nullptr) {
+        runtime.destroy_hook = std::make_unique<FunctionHook>(
+            Address{reinterpret_cast<void*>(runtime.destroy_export)},
+            Address{reinterpret_cast<void*>(kDestroyThunks[*slot])});
+        if (!runtime.destroy_hook->create()) {
+            spdlog::warn("[XeFG][RuntimeRegistry] api = Destroy, action = optional_hook_failed, slot = {}, module = 0x{:x}",
+                *slot, reinterpret_cast<uintptr_t>(module));
+            runtime.destroy_hook.reset();
+        }
+    }
+
     runtime.state = InstallState::Active;
-    spdlog::info("[XeFG][RuntimeRegistry] action = installed, slot = {}, path = {}, get_swapchain = {}",
-        *slot, utility::narrow(runtime.path), runtime.get_swapchain_export != nullptr ? "present" : "missing");
+    spdlog::info("[XeFG][RuntimeRegistry] action = installed, slot = {}, path = {}, init_desc = {}, get_swapchain = {}, destroy = {}",
+        *slot, utility::narrow(runtime.path), runtime.init_desc_export != nullptr ? "present" : "missing",
+        runtime.get_swapchain_export != nullptr ? "present" : "missing", runtime.destroy_export != nullptr ? "present" : "missing");
     if (XeFGCompatibility::is_debug_log_enabled()) {
-        spdlog::info("[XeFG][RuntimeRegistry] slot = {}, path = {}, init_desc = 0x{:x}, get_swapchain = 0x{:x}",
+        spdlog::info("[XeFG][RuntimeRegistry] slot = {}, path = {}, init_desc = 0x{:x}, get_swapchain = 0x{:x}, destroy = 0x{:x}",
             *slot, utility::narrow(runtime.path), reinterpret_cast<uintptr_t>(runtime.init_desc_export),
-            reinterpret_cast<uintptr_t>(runtime.get_swapchain_export));
+            reinterpret_cast<uintptr_t>(runtime.get_swapchain_export), reinterpret_cast<uintptr_t>(runtime.destroy_export));
     }
     return true;
 }
@@ -160,4 +185,14 @@ XeFGRuntimeRegistry::resolve_get_swapchain(size_t slot) {
         runtime->module,
         reinterpret_cast<GetSwapchainFn>(runtime->get_swapchain_hook->get_original()),
     };
+}
+
+std::optional<XeFGRuntimeRegistry::DestroyDispatchTarget>
+XeFGRuntimeRegistry::resolve_destroy(size_t slot) {
+    std::scoped_lock lock{m_mutex};
+    auto* runtime = find_by_slot_locked(slot);
+    if (runtime == nullptr || runtime->state != InstallState::Active || runtime->destroy_hook == nullptr) {
+        return std::nullopt;
+    }
+    return DestroyDispatchTarget{runtime->module, reinterpret_cast<DestroyFn>(runtime->destroy_hook->get_original())};
 }

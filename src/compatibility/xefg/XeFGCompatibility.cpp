@@ -28,6 +28,49 @@ const char* queue_relation_name(XeFGQueueRelation relation) noexcept {
     default: return "unknown";
     }
 }
+
+int64_t runtime_slot_for_log(size_t slot) noexcept {
+    return slot == XeFGBinding::kInvalidRuntimeSlot ? -1 : static_cast<int64_t>(slot);
+}
+
+XeFGBinding::RuntimeLifecycleSnapshot active_binding_snapshot() noexcept {
+    const auto* hook = D3D12Hook::current_xefg_handoff_target();
+    return hook != nullptr ? hook->get_xefg_lifecycle_snapshot() : XeFGBinding::RuntimeLifecycleSnapshot{};
+}
+
+void log_runtime_lifecycle(const char* stage, size_t slot, HMODULE module, void* context, HWND hwnd, int32_t result = 0, bool has_result = false, const XeFGBinding::RuntimeLifecycleSnapshot* cached_binding = nullptr) {
+    if (!XeFGCompatibility::is_debug_log_enabled()) {
+        return;
+    }
+
+    const auto binding = cached_binding != nullptr ? *cached_binding : active_binding_snapshot();
+    const auto* hook = cached_binding == nullptr ? D3D12Hook::current_xefg_handoff_target() : nullptr;
+    const auto context_match = binding.active && context != nullptr && binding.runtime.context == context;
+    const auto hwnd_match = hwnd != nullptr && binding.runtime.hwnd == hwnd;
+    const auto slot_match = binding.active && binding.runtime.slot == slot;
+    spdlog::info("[XeFG][RuntimeLifecycle] stage = {}, slot = {}, module = 0x{:x}, context = 0x{:x}, hwnd = 0x{:x}, result = {}, active_binding_present = {}, active_generation = {}, active_context = 0x{:x}, active_hwnd = 0x{:x}, active_runtime_slot = {}, active_swapchain = 0x{:x}, active_queue = 0x{:x}, active_device = 0x{:x}, active_observe_only = {}, context_match = {}, hwnd_match = {}, runtime_slot_match = {}, last_resize_event_id = {}, last_resize_kind = {}, last_present_age_ms = {}",
+        stage,
+        slot,
+        reinterpret_cast<uintptr_t>(module),
+        reinterpret_cast<uintptr_t>(context),
+        reinterpret_cast<uintptr_t>(hwnd),
+        has_result ? result : 0,
+        binding.active,
+        binding.generation,
+        reinterpret_cast<uintptr_t>(binding.runtime.context),
+        reinterpret_cast<uintptr_t>(binding.runtime.hwnd),
+        runtime_slot_for_log(binding.runtime.slot),
+        reinterpret_cast<uintptr_t>(binding.swapchain),
+        reinterpret_cast<uintptr_t>(binding.queue),
+        reinterpret_cast<uintptr_t>(binding.device),
+        binding.observe_only,
+        context_match,
+        hwnd_match,
+        slot_match,
+        hook != nullptr ? hook->get_xefg_last_resize_event_id() : 0,
+        hook != nullptr ? hook->get_xefg_last_resize_kind() : "none",
+        hook != nullptr ? hook->get_last_present_age_ms() : -1);
+}
 }
 
 std::atomic<bool> XeFGCompatibility::s_module_loaded{false};
@@ -72,11 +115,13 @@ void XeFGCompatibility::on_module_loaded(HMODULE module, std::wstring_view base_
     const auto init_from_swap_chain = GetProcAddress(module, "xefgSwapChainD3D12InitFromSwapChain");
     const auto init_from_swap_chain_desc = GetProcAddress(module, "xefgSwapChainD3D12InitFromSwapChainDesc");
     const auto get_swap_chain_ptr = GetProcAddress(module, "xefgSwapChainD3D12GetSwapChainPtr");
+    const auto destroy = GetProcAddress(module, "xefgSwapChainDestroy");
     if (is_debug_log_enabled()) {
-        spdlog::info("[XeFG][Exports] InitFromSwapChain = 0x{:x} / {}, InitFromSwapChainDesc = 0x{:x} / {}, GetSwapChainPtr = 0x{:x} / {}",
+        spdlog::info("[XeFG][Exports] InitFromSwapChain = 0x{:x} / {}, InitFromSwapChainDesc = 0x{:x} / {}, GetSwapChainPtr = 0x{:x} / {}, Destroy = 0x{:x} / {}",
             reinterpret_cast<uintptr_t>(init_from_swap_chain), init_from_swap_chain != nullptr ? "present" : "missing",
             reinterpret_cast<uintptr_t>(init_from_swap_chain_desc), init_from_swap_chain_desc != nullptr ? "present" : "missing",
-            reinterpret_cast<uintptr_t>(get_swap_chain_ptr), get_swap_chain_ptr != nullptr ? "present" : "missing");
+            reinterpret_cast<uintptr_t>(get_swap_chain_ptr), get_swap_chain_ptr != nullptr ? "present" : "missing",
+            reinterpret_cast<uintptr_t>(destroy), destroy != nullptr ? "present" : "missing");
     }
 
     XeFGRuntimeRegistry::instance().install_for_module(module, full_path);
@@ -143,8 +188,10 @@ int32_t XeFGCompatibility::dispatch_init_desc(size_t slot, void* context, HWND h
             slot, reinterpret_cast<uintptr_t>(module), reinterpret_cast<uintptr_t>(context));
     }
 
+    log_runtime_lifecycle("pre_init", slot, module, context, hwnd);
+
     auto observation_scope = XeFGDiscovery::observe_init(
-        original, context, hwnd, swap_chain_desc, fullscreen_desc, command_queue, factory, init_params);
+        original, slot, context, hwnd, swap_chain_desc, fullscreen_desc, command_queue, factory, init_params);
     const auto& observation = observation_scope.observation;
     if (is_debug_log_enabled()) {
     spdlog::info("[XeFG][InitDesc] context = 0x{:x}, hwnd = 0x{:x}, queue = 0x{:x}, factory = 0x{:x}, width = {}, height = {}, format = {}, buffer_count = {}, flags = 0x{:x}, result = {}",
@@ -176,6 +223,7 @@ int32_t XeFGCompatibility::dispatch_init_desc(size_t slot, void* context, HWND h
     if (decision.accepted()) {
         XeFGCandidateHandoff::publish(std::move(*decision.candidate));
     }
+    log_runtime_lifecycle("init_return", slot, module, context, hwnd, observation.init_result, true);
     return observation.init_result;
 }
 
@@ -202,5 +250,25 @@ int32_t XeFGCompatibility::dispatch_get_swapchain(size_t slot, void* context, RE
         if (is_debug_log_enabled()) spdlog::info("[XeFG][PublicProxy] context = 0x{:x}, swapchain = 0x{:x}, internal_same = {}",
             reinterpret_cast<uintptr_t>(context), reinterpret_cast<uintptr_t>(*swap_chain), *swap_chain == internal_candidate);
     }
+    return result;
+}
+
+int32_t XeFGCompatibility::dispatch_destroy(size_t slot, void* context) {
+    XeFGRuntimeRegistry::DestroyFn original{};
+    HMODULE module{};
+    {
+        const auto target = XeFGRuntimeRegistry::instance().resolve_destroy(slot);
+        if (!target) {
+            spdlog::error("[XeFG][RuntimeDispatch] api = Destroy, slot = {}, action = fail, reason = runtime_not_active", slot);
+            return -1;
+        }
+        original = target->original;
+        module = target->module;
+    }
+
+    const auto binding_before_destroy = active_binding_snapshot();
+    log_runtime_lifecycle("destroy_enter", slot, module, context, nullptr);
+    const auto result = original(context);
+    log_runtime_lifecycle("destroy_return", slot, module, context, nullptr, result, true, &binding_before_destroy);
     return result;
 }
