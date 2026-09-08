@@ -383,7 +383,15 @@ int32_t XeFGCompatibility::dispatch_destroy(size_t slot, void* context) {
     log_runtime_lifecycle("destroy_enter", slot, module, context, nullptr, 0, false, &binding_before_destroy);
     prepare_for_xefg_runtime_transition(slot, context, nullptr, false, "destroy");
     const auto result = original(context);
-    if (auto* hook = D3D12Hook::current_xefg_handoff_target(); hook != nullptr) {
+    if (g_framework != nullptr) {
+        // The vendor call has returned, so reacquire the lifecycle mutex before
+        // mutating hook-monitor state. RuntimeTransitionScope remains active
+        // until this function returns, so monitor recovery stays suppressed.
+        std::scoped_lock lifecycle_lock{g_framework->get_hook_monitor_mutex()};
+        if (auto* hook = D3D12Hook::current_xefg_handoff_target(); hook != nullptr) {
+            hook->note_xefg_destroy_result(slot, context, result);
+        }
+    } else if (auto* hook = D3D12Hook::current_xefg_handoff_target(); hook != nullptr) {
         hook->note_xefg_destroy_result(slot, context, result);
     }
     log_runtime_lifecycle("destroy_return", slot, module, context, nullptr, result, true, &binding_before_destroy);
