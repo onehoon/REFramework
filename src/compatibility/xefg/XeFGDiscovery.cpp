@@ -5,10 +5,9 @@
 #include <spdlog/spdlog.h>
 
 #include "XeFGCompatibility.hpp"
+#include "XeFGResult.hpp"
 
 namespace {
-
-constexpr int32_t kXefgSuccess = 0;
 
 struct QueueIdentitySnapshot {
     ID3D12CommandQueue* queue{};
@@ -183,7 +182,7 @@ IDXGISwapChain1* XeFGDiscovery::current_internal_swapchain_for_diagnostics() noe
 XeFGBindingCandidateResult XeFGDiscovery::build_binding_candidate(const Observation& observation) {
     XeFGBindingCandidateResult result{};
 
-    if (observation.init_result != kXefgSuccess) {
+    if (xefg_result::failed(observation.init_result)) {
         result.reject_reason = "init_failed";
         return result;
     }

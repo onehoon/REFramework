@@ -1459,6 +1459,7 @@ if(REF_BUILD_FRAMEWORK AND CMAKE_SIZEOF_VOID_P EQUAL 8) # build-framework
 		"src/compatibility/xefg/XeFGDiscovery.hpp"
 		"src/compatibility/xefg/XeFGResizeLifecycle.cpp"
 		"src/compatibility/xefg/XeFGResizeLifecycle.hpp"
+		"src/compatibility/xefg/XeFGResult.hpp"
 		"src/compatibility/xefg/XeFGRuntimeRegistry.cpp"
 		"src/compatibility/xefg/XeFGRuntimeRegistry.hpp"
 		"src/mods/APIProxy.cpp"

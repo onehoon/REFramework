@@ -25,6 +25,7 @@
 #include "compatibility/xefg/XeFGCompatibility.hpp"
 #include "compatibility/xefg/XeFGCandidateHandoff.hpp"
 #include "compatibility/xefg/XeFGDiscovery.hpp"
+#include "compatibility/xefg/XeFGResult.hpp"
 #include <sdk/GameIdentity.hpp>
 
 static D3D12Hook* g_d3d12_hook = nullptr;
@@ -393,7 +394,7 @@ bool D3D12Hook::detach_xefg_binding_for_runtime_transition(
 
 void D3D12Hook::note_xefg_destroy_result(size_t runtime_slot, void* context, int32_t result) noexcept {
     if (!m_xefg_detached_state.active
-        || result != 0
+        || xefg_result::failed(result)
         || m_xefg_detached_state.previous_runtime.slot != runtime_slot
         || m_xefg_detached_state.previous_runtime.context != context) {
         return;
