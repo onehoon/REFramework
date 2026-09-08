@@ -9,13 +9,13 @@
 #include "XeFGRuntimeRegistry.hpp"
 #include "XeFGCandidateHandoff.hpp"
 #include "XeFGDiscovery.hpp"
+#include "XeFGResult.hpp"
 #include "D3D12Hook.hpp"
 #include "REFramework.hpp"
 #include "utility/String.hpp"
 
 namespace {
 const auto g_diagnostic_start_time = std::chrono::steady_clock::now();
-constexpr int32_t kXefgSuccess = 0;
 std::mutex g_xefg_state_mutex{};
 
 const char* queue_relation_name(XeFGQueueRelation relation) noexcept {
@@ -355,7 +355,7 @@ int32_t XeFGCompatibility::dispatch_get_swapchain(size_t slot, void* context, RE
         spdlog::info("[XeFG][RuntimeDispatch] api = GetSwapChainPtr, slot = {}, module = 0x{:x}, context = 0x{:x}, result = {}",
             slot, reinterpret_cast<uintptr_t>(module), reinterpret_cast<uintptr_t>(context), result);
     }
-    if (result == kXefgSuccess && swap_chain != nullptr && *swap_chain != nullptr) {
+    if (xefg_result::succeeded(result) && swap_chain != nullptr && *swap_chain != nullptr) {
         std::scoped_lock lock{g_xefg_state_mutex};
         const auto internal_candidate = XeFGDiscovery::current_internal_swapchain_for_diagnostics();
         if (is_debug_log_enabled()) spdlog::info("[XeFG][PublicProxy] context = 0x{:x}, swapchain = 0x{:x}, internal_same = {}",
