@@ -118,11 +118,15 @@ void REFramework::hook_monitor() {
             }
 
             if (!m_has_last_chance && now - m_last_chance_time > std::chrono::seconds(1)) {
-                const bool preserve_xefg_binding = !m_is_d3d11
-                    && d3d12 != nullptr
-                    && XeFGCompatibility::should_preserve_active_binding_on_monitor_timeout(*d3d12);
+                const auto xefg_action = !m_is_d3d11
+                    ? (d3d12 != nullptr
+                        ? XeFGCompatibility::evaluate_hook_monitor_timeout(*d3d12)
+                        : (XeFGCompatibility::is_runtime_transition_active()
+                            ? XeFGMonitorAction::SuppressRuntimeTransition
+                            : XeFGMonitorAction::AllowGenericRecovery))
+                    : XeFGMonitorAction::AllowGenericRecovery;
 
-                if (!preserve_xefg_binding) {
+                if (xefg_action == XeFGMonitorAction::AllowGenericRecovery) {
                     spdlog::info("Sending rehook request for D3D");
                     if (d3d12 != nullptr) {
                         d3d12->log_hook_monitor_snapshot("rehook_request");
