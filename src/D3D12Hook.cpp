@@ -671,12 +671,16 @@ bool D3D12Hook::apply_xefg_candidate(const XeFGBindingCandidate& candidate) {
     return replace_xefg_binding(candidate.swapchain.Get(), candidate.selected_queue.Get(), candidate.observe_only, change.reason(), candidate.runtime);
 }
 
-int64_t D3D12Hook::get_last_present_age_ms() const {
-    if (m_last_present_entry_time.time_since_epoch().count() == 0) {
+int64_t D3D12Hook::get_last_present_age_ms() const noexcept {
+    const auto ticks = m_last_present_entry_ticks.load(std::memory_order_acquire);
+    if (ticks == 0) {
         return -1;
     }
 
-    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - m_last_present_entry_time).count();
+    const auto last = std::chrono::steady_clock::time_point{
+        std::chrono::steady_clock::duration{ticks}};
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - last).count();
 }
 
 void D3D12Hook::log_hook_monitor_snapshot(std::string_view event) const {
@@ -1366,8 +1370,10 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
     HWND swapchain_wnd{nullptr};
     swap_chain->GetHwnd(&swapchain_wnd);
 
+    const auto present_entry_time = std::chrono::steady_clock::now();
     const auto present_call = d3d12->m_present_entry_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    d3d12->m_last_present_entry_time = std::chrono::steady_clock::now();
+    d3d12->m_last_present_entry_ticks.store(
+        present_entry_time.time_since_epoch().count(), std::memory_order_release);
 
     const auto xefg_loaded = XeFGCompatibility::is_module_loaded();
     const auto should_log_present = present_call <= 10
@@ -1557,8 +1563,10 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
 
     HWND swapchain_wnd{nullptr};
     swap_chain->GetHwnd(&swapchain_wnd);
+    const auto present_entry_time = std::chrono::steady_clock::now();
     const auto present_call = d3d12->m_present_entry_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    d3d12->m_last_present_entry_time = std::chrono::steady_clock::now();
+    d3d12->m_last_present_entry_ticks.store(
+        present_entry_time.time_since_epoch().count(), std::memory_order_release);
 
     const auto should_log_present = present_call <= 10
         || d3d12->m_last_logged_present_swapchain != swap_chain

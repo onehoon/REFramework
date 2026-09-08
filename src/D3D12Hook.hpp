@@ -150,7 +150,7 @@ public:
         return m_present_entry_count.load(std::memory_order_relaxed);
     }
 
-    int64_t get_last_present_age_ms() const;
+    int64_t get_last_present_age_ms() const noexcept;
 
     uint64_t get_xefg_last_resize_event_id() const { return m_xefg_resize_lifecycle.event_id(); }
     uint64_t get_xefg_binding_generation() const { return m_xefg_binding.generation(); }
@@ -270,7 +270,7 @@ protected:
     bool m_inside_present{false};
     bool m_ignore_next_present{false};
     std::atomic<uint64_t> m_present_entry_count{0};
-    std::chrono::steady_clock::time_point m_last_present_entry_time{};
+    std::atomic<std::chrono::steady_clock::rep> m_last_present_entry_ticks{0};
     void* m_last_logged_present_swapchain{ nullptr };
     void* m_last_logged_present_target{ nullptr };
     bool m_last_logged_present_phase_1{ true };
