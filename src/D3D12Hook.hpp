@@ -4,6 +4,7 @@
 #include <functional>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <string_view>
@@ -25,6 +26,43 @@
 class XeFGCandidateHandoff;
 class XeFGCompatibility;
 struct XeFGBindingCandidate;
+
+struct XeFGMonitorBindingKey {
+    uint64_t generation{};
+    size_t runtime_slot{XeFGBinding::kInvalidRuntimeSlot};
+    void* runtime_context{};
+    IDXGISwapChain3* swapchain{};
+    void* hook_target{};
+
+    bool operator==(const XeFGMonitorBindingKey& other) const noexcept {
+        return generation == other.generation
+            && runtime_slot == other.runtime_slot
+            && runtime_context == other.runtime_context
+            && swapchain == other.swapchain
+            && hook_target == other.hook_target;
+    }
+};
+
+class XeFGHookMonitorState {
+public:
+    enum class TimeoutClass : uint8_t {
+        Grace,
+        Sustained,
+    };
+
+    TimeoutClass note_timeout(const XeFGMonitorBindingKey& key, uint64_t present_entry_count, int64_t present_age_ms) noexcept;
+    void clear() noexcept;
+    uint32_t consecutive_timeouts() const noexcept { return m_consecutive_timeouts; }
+
+private:
+    static constexpr uint32_t kSustainedTimeoutThreshold = 3;
+    static constexpr int64_t kMinimumSustainedPresentAgeMs = 20000;
+
+    XeFGMonitorBindingKey m_key{};
+    uint64_t m_last_present_entry_count{};
+    uint32_t m_consecutive_timeouts{};
+    bool m_initialized{};
+};
 
 class D3D12Hook
 {
@@ -155,6 +193,8 @@ public:
         bool allow_same_hwnd_match,
         const char* reason);
 
+    void note_xefg_destroy_result(size_t runtime_slot, void* context, int32_t result) noexcept;
+
     void ignore_next_present() {
         m_ignore_next_present = true;
     }
@@ -165,6 +205,14 @@ public:
 
 protected:
     bool has_active_xefg_instance_binding() const noexcept;
+    bool has_consistent_active_xefg_binding() const noexcept;
+    bool has_xefg_monitor_state() const noexcept;
+    bool has_xefg_detached_state() const noexcept { return m_xefg_detached_state.active; }
+    XeFGMonitorBindingKey get_xefg_monitor_binding_key() const noexcept;
+    XeFGHookMonitorState::TimeoutClass note_xefg_monitor_timeout() noexcept;
+    uint32_t get_xefg_timeout_count() const noexcept { return m_xefg_monitor_state.consecutive_timeouts(); }
+    bool note_xefg_monitor_action(const char* action) noexcept;
+    void clear_xefg_monitor_state() noexcept;
     bool is_xefg_source() const noexcept { return m_swapchain_source == SwapchainSource::XeFGInternal; }
     bool is_tracked_xefg_instance(IDXGISwapChain3* swapchain) const noexcept;
     bool is_xefg_render_capable() const noexcept { return is_xefg_source() && !m_xefg_binding.observe_only(); }
@@ -187,6 +235,13 @@ protected:
     bool external_binding_matches(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source, bool xefg_observe_only) const;
     bool replace_xefg_binding(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, bool observe_only, const char* reason, XeFGBinding::RuntimeIdentity runtime);
     void sync_xefg_binding_aliases() noexcept;
+
+    struct XeFGDetachedState {
+        bool active{};
+        XeFGBinding::RuntimeIdentity previous_runtime{};
+        uint64_t previous_generation{};
+        const char* reason{};
+    };
     
     ID3D12Device4* m_device{ nullptr };
     IDXGISwapChain3* m_swap_chain{ nullptr };
@@ -195,6 +250,9 @@ protected:
     ID3D12CommandQueue* m_command_queue{ nullptr };
     XeFGBinding m_xefg_binding{};
     XeFGResizeLifecycle m_xefg_resize_lifecycle{};
+    XeFGDetachedState m_xefg_detached_state{};
+    XeFGHookMonitorState m_xefg_monitor_state{};
+    const char* m_last_xefg_monitor_action{};
     UINT m_display_width{ NULL };
     UINT m_display_height{ NULL };
     UINT m_render_width{ NULL };

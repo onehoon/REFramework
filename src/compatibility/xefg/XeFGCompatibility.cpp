@@ -30,6 +30,18 @@ const char* queue_relation_name(XeFGQueueRelation relation) noexcept {
     }
 }
 
+const char* monitor_action_name(XeFGMonitorAction action) noexcept {
+    switch (action) {
+    case XeFGMonitorAction::AllowGenericRecovery: return "allow_generic_recovery";
+    case XeFGMonitorAction::PreserveGrace: return "preserve_grace";
+    case XeFGMonitorAction::SuppressRuntimeTransition: return "suppress_rehook";
+    case XeFGMonitorAction::SuppressDetachedUncertain: return "suppress_rehook";
+    case XeFGMonitorAction::QuarantineSustainedTimeout: return "quarantine";
+    case XeFGMonitorAction::QuarantineInconsistentState: return "quarantine";
+    default: return "unknown";
+    }
+}
+
 int64_t runtime_slot_for_log(size_t slot) noexcept {
     return slot == XeFGBinding::kInvalidRuntimeSlot ? -1 : static_cast<int64_t>(slot);
 }
@@ -122,6 +134,7 @@ std::atomic<bool> XeFGCompatibility::s_module_loaded{false};
 std::atomic<bool> XeFGCompatibility::s_probe_pending{false};
 std::atomic<int64_t> XeFGCompatibility::s_first_seen_ms{-1};
 std::atomic<bool> XeFGCompatibility::s_debug_log_enabled{false};
+std::atomic<uint32_t> XeFGCompatibility::s_runtime_transition_depth{0};
 
 void XeFGCompatibility::set_debug_log_enabled(bool enabled) noexcept {
     s_debug_log_enabled.store(enabled, std::memory_order_relaxed);
@@ -202,15 +215,64 @@ bool XeFGCompatibility::is_module_loaded() noexcept {
     return s_module_loaded.load(std::memory_order_relaxed);
 }
 
-bool XeFGCompatibility::should_preserve_active_binding_on_monitor_timeout(D3D12Hook& hook) noexcept {
-    if (!hook.has_active_xefg_instance_binding()) {
-        return false;
+bool XeFGCompatibility::is_runtime_transition_active() noexcept {
+    return s_runtime_transition_depth.load(std::memory_order_acquire) != 0;
+}
+
+void XeFGCompatibility::begin_runtime_transition() noexcept {
+    s_runtime_transition_depth.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void XeFGCompatibility::end_runtime_transition() noexcept {
+    auto depth = s_runtime_transition_depth.load(std::memory_order_acquire);
+    while (depth != 0
+        && !s_runtime_transition_depth.compare_exchange_weak(
+            depth, depth - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    }
+}
+
+XeFGMonitorAction XeFGCompatibility::evaluate_hook_monitor_timeout(D3D12Hook& hook) noexcept {
+    XeFGMonitorAction action = XeFGMonitorAction::AllowGenericRecovery;
+    const char* reason = "xefg_state_safe";
+
+    if (is_runtime_transition_active()) {
+        action = XeFGMonitorAction::SuppressRuntimeTransition;
+        reason = "runtime_transition";
+    } else if (!hook.has_xefg_monitor_state()) {
+        action = XeFGMonitorAction::AllowGenericRecovery;
+    } else if (hook.has_xefg_detached_state()) {
+        action = XeFGMonitorAction::SuppressDetachedUncertain;
+        reason = "detached_uncertain";
+    } else if (!hook.has_consistent_active_xefg_binding()) {
+        action = XeFGMonitorAction::QuarantineInconsistentState;
+        reason = "binding_identity_inconsistent";
+    } else if (hook.note_xefg_monitor_timeout() == XeFGHookMonitorState::TimeoutClass::Sustained) {
+        action = XeFGMonitorAction::QuarantineSustainedTimeout;
+        reason = "sustained_present_timeout";
+    } else {
+        action = XeFGMonitorAction::PreserveGrace;
+        reason = "present_timeout";
     }
 
-    spdlog::info("[XeFG][HookMonitor] action = preserve_binding, reason = present_timeout, generation = {}",
-        hook.get_xefg_binding_generation());
-    hook.log_hook_monitor_snapshot("xefg_rehook_suppressed");
-    return true;
+    if (hook.note_xefg_monitor_action(reason) && is_debug_log_enabled()) {
+        const auto binding = hook.get_xefg_lifecycle_snapshot();
+        spdlog::info("[XeFG][HookMonitor] action = {}, reason = {}, generation = {}, runtime_slot = {}, context = 0x{:x}, swapchain = 0x{:x}, hook_target = 0x{:x}, present_entry_count = {}, present_age_ms = {}, timeout_count = {}, transition_depth = {}, detached_uncertain = {}",
+            monitor_action_name(action),
+            reason,
+            binding.generation,
+            binding.runtime.slot == XeFGBinding::kInvalidRuntimeSlot ? -1 : static_cast<int64_t>(binding.runtime.slot),
+            reinterpret_cast<uintptr_t>(binding.runtime.context),
+            reinterpret_cast<uintptr_t>(binding.swapchain),
+            reinterpret_cast<uintptr_t>(hook.get_xefg_monitor_binding_key().hook_target),
+            hook.get_present_entry_count(),
+            hook.get_last_present_age_ms(),
+            hook.get_xefg_timeout_count(),
+            s_runtime_transition_depth.load(std::memory_order_acquire),
+            hook.has_xefg_detached_state());
+        hook.log_hook_monitor_snapshot("xefg_monitor_decision");
+    }
+
+    return action;
 }
 
 int32_t XeFGCompatibility::dispatch_init_desc(size_t slot, void* context, HWND hwnd,
@@ -227,6 +289,8 @@ int32_t XeFGCompatibility::dispatch_init_desc(size_t slot, void* context, HWND h
         original = target->original;
         module = target->module;
     }
+
+    RuntimeTransitionScope transition_scope;
 
     if (is_debug_log_enabled()) {
         spdlog::info("[XeFG][RuntimeDispatch] api = InitFromSwapChainDesc, slot = {}, module = 0x{:x}, context = 0x{:x}",
@@ -285,6 +349,7 @@ int32_t XeFGCompatibility::dispatch_get_swapchain(size_t slot, void* context, RE
         original = target->original;
         module = target->module;
     }
+
     const auto result = original(context, riid, swap_chain);
     if (is_debug_log_enabled()) {
         spdlog::info("[XeFG][RuntimeDispatch] api = GetSwapChainPtr, slot = {}, module = 0x{:x}, context = 0x{:x}, result = {}",
@@ -312,10 +377,15 @@ int32_t XeFGCompatibility::dispatch_destroy(size_t slot, void* context) {
         module = target->module;
     }
 
+    RuntimeTransitionScope transition_scope;
+
     const auto binding_before_destroy = active_binding_snapshot();
     log_runtime_lifecycle("destroy_enter", slot, module, context, nullptr, 0, false, &binding_before_destroy);
     prepare_for_xefg_runtime_transition(slot, context, nullptr, false, "destroy");
     const auto result = original(context);
+    if (auto* hook = D3D12Hook::current_xefg_handoff_target(); hook != nullptr) {
+        hook->note_xefg_destroy_result(slot, context, result);
+    }
     log_runtime_lifecycle("destroy_return", slot, module, context, nullptr, result, true, &binding_before_destroy);
     return result;
 }
