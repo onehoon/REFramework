@@ -150,12 +150,12 @@ bool is_readable_range(const void* address, const size_t size) {
 }
 
 bool safe_read(const void* address, void* destination, const size_t size) {
-    if (!is_readable_range(address, size)) {
+    if (address == nullptr || destination == nullptr || size == 0 || !is_readable_range(address, size)) {
         return false;
     }
 
-    std::memcpy(destination, address, size);
-    return true;
+    SIZE_T bytes_read{};
+    return ReadProcessMemory(GetCurrentProcess(), address, destination, size, &bytes_read) != FALSE && bytes_read == size;
 }
 
 std::optional<MEMORY_BASIC_INFORMATION> query_target_region(const uintptr_t target) {
@@ -181,18 +181,18 @@ std::optional<MEMORY_BASIC_INFORMATION> query_target_region(const uintptr_t targ
     return mbi;
 }
 
+bool same_region_identity(const MEMORY_BASIC_INFORMATION& expected, const MEMORY_BASIC_INFORMATION& current) {
+    return current.BaseAddress == expected.BaseAddress &&
+        current.AllocationBase == expected.AllocationBase &&
+        current.RegionSize == expected.RegionSize &&
+        current.State == expected.State &&
+        current.Type == expected.Type &&
+        current.Protect == expected.Protect;
+}
+
 bool same_target_region(const MEMORY_BASIC_INFORMATION& expected, const uintptr_t target) {
     const auto current = query_target_region(target);
-    if (!current) {
-        return false;
-    }
-
-    return current->BaseAddress == expected.BaseAddress &&
-        current->AllocationBase == expected.AllocationBase &&
-        current->RegionSize == expected.RegionSize &&
-        current->State == expected.State &&
-        current->Type == expected.Type &&
-        current->Protect == expected.Protect;
+    return current && same_region_identity(expected, *current);
 }
 
 std::optional<AntiDebugRedirectSnapshot> resolve_anti_debug_redirect(void* entry, const std::array<uint8_t, kAntiDebugEntrySize>& observed_entry) {
@@ -253,7 +253,7 @@ bool neutralize_redirect_target(void* entry, const AntiDebugRedirectSnapshot& ex
     }
 
     const auto target_region = query_target_region(current_redirect->target);
-    if (!target_region || !same_target_region(*target_region, current_redirect->target)) {
+    if (!target_region || !same_region_identity(expected.target_region, *target_region)) {
         return false;
     }
 
