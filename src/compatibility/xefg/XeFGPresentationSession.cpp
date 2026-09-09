@@ -1,5 +1,7 @@
 #include "XeFGPresentationSession.hpp"
 
+#include "XeFGResult.hpp"
+
 bool XeFGPresentationSession::has_monitor_state(bool xefg_source) const noexcept {
     return m_detached_state.active
         || m_binding.active()
@@ -49,6 +51,75 @@ bool XeFGPresentationSession::note_monitor_action(const char* action) noexcept {
 void XeFGPresentationSession::clear_monitor_state() noexcept {
     m_monitor_state.clear();
     m_last_monitor_action = nullptr;
+}
+
+XeFGPresentationSession::RuntimeDetachEvaluation XeFGPresentationSession::evaluate_runtime_detach(
+    size_t runtime_slot,
+    void* context,
+    HWND hwnd,
+    bool allow_same_hwnd_match,
+    bool xefg_source) const noexcept {
+    const auto snapshot = m_binding.lifecycle_snapshot();
+    const bool exact_runtime_match = snapshot.active
+        && context != nullptr
+        && snapshot.runtime.slot == runtime_slot
+        && snapshot.runtime.context == context;
+    const bool same_hwnd_match = allow_same_hwnd_match
+        && hwnd != nullptr
+        && snapshot.active
+        && snapshot.runtime.hwnd == hwnd;
+    const auto match = exact_runtime_match
+        ? RuntimeDetachMatch::ExactRuntime
+        : (same_hwnd_match ? RuntimeDetachMatch::SameHwnd : RuntimeDetachMatch::None);
+
+    return {
+        (exact_runtime_match || same_hwnd_match) && xefg_source && snapshot.active,
+        match,
+        snapshot,
+    };
+}
+
+void XeFGPresentationSession::begin_runtime_detach(
+    const RuntimeDetachEvaluation& evaluation,
+    const char* reason) noexcept {
+    if (!evaluation.accepted) {
+        return;
+    }
+
+    m_detached_state = {
+        true,
+        evaluation.binding.runtime,
+        evaluation.binding.generation,
+        reason != nullptr ? reason : "unknown",
+    };
+    clear_monitor_state();
+}
+
+void XeFGPresentationSession::complete_runtime_detach() noexcept {
+    m_binding.clear();
+}
+
+XeFGPresentationSession::DestroyReconciliation XeFGPresentationSession::evaluate_destroy_result(
+    size_t runtime_slot,
+    void* context,
+    int32_t result) const noexcept {
+    return {
+        m_detached_state.active
+            && xefg_result::succeeded(result)
+            && m_detached_state.previous_runtime.slot == runtime_slot
+            && m_detached_state.previous_runtime.context == context,
+        m_detached_state.previous_generation,
+    };
+}
+
+void XeFGPresentationSession::commit_destroy_reconciliation(
+    const DestroyReconciliation& reconciliation) noexcept {
+    if (!reconciliation.accepted) {
+        return;
+    }
+
+    m_detached_state = {};
+    clear_monitor_state();
 }
 
 XeFGHookMonitorState::TimeoutClass XeFGHookMonitorState::note_timeout(

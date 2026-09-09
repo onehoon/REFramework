@@ -62,6 +62,23 @@ struct XeFGDetachedState {
 
 class XeFGPresentationSession {
 public:
+    enum class RuntimeDetachMatch : uint8_t {
+        None,
+        ExactRuntime,
+        SameHwnd,
+    };
+
+    struct RuntimeDetachEvaluation {
+        bool accepted{};
+        RuntimeDetachMatch match{RuntimeDetachMatch::None};
+        XeFGBinding::RuntimeLifecycleSnapshot binding{};
+    };
+
+    struct DestroyReconciliation {
+        bool accepted{};
+        uint64_t previous_generation{};
+    };
+
     struct PhysicalBindingView {
         bool hook_active{};
         bool phase1{};
@@ -97,6 +114,17 @@ public:
     }
     bool note_monitor_action(const char* action) noexcept;
     void clear_monitor_state() noexcept;
+
+    RuntimeDetachEvaluation evaluate_runtime_detach(
+        size_t runtime_slot,
+        void* context,
+        HWND hwnd,
+        bool allow_same_hwnd_match,
+        bool xefg_source) const noexcept;
+    void begin_runtime_detach(const RuntimeDetachEvaluation& evaluation, const char* reason) noexcept;
+    void complete_runtime_detach() noexcept;
+    DestroyReconciliation evaluate_destroy_result(size_t runtime_slot, void* context, int32_t result) const noexcept;
+    void commit_destroy_reconciliation(const DestroyReconciliation& reconciliation) noexcept;
 
     bool render_boundary_logged() const noexcept { return m_render_boundary_logged; }
     void set_render_boundary_logged(bool value) noexcept { m_render_boundary_logged = value; }
