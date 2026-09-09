@@ -1,5 +1,7 @@
 #include "XeFGPresentationSession.hpp"
 
+#include <sdk/GameIdentity.hpp>
+
 #include "XeFGResult.hpp"
 
 bool XeFGPresentationSession::has_monitor_state(bool xefg_source) const noexcept {
@@ -195,6 +197,77 @@ XeFGPresentationSession::consume_post_resize_present(
 
     result.emit_present_after_resize_log = true;
     result.capture_renderer_snapshots = result.sample->ordinal == 1;
+    return result;
+}
+
+XeFGPresentationSession::ResizeHoldSnapshot
+XeFGPresentationSession::resize_hold_snapshot() const noexcept {
+    return {
+        m_resize_lifecycle.suppress_renderer(),
+        m_resize_lifecycle.hold_trigger_event_id(),
+        m_resize_lifecycle.suppressed_present_count(),
+        m_binding.generation(),
+    };
+}
+
+XeFGPresentationSession::ResizeHoldArmDecision
+XeFGPresentationSession::evaluate_and_arm_resize_target_hold(
+    bool xefg_source,
+    uint64_t event_id,
+    bool renderer_reset_performed) noexcept {
+    ResizeHoldArmDecision result{};
+    if (!xefg_source
+        || event_id == 0
+        || !renderer_reset_performed
+        || m_binding.observe_only()
+        || !sdk::GameIdentity::get().is_mhwilds()) {
+        return result;
+    }
+
+    result.armed = m_resize_lifecycle.arm(event_id);
+    result.state = resize_hold_snapshot();
+    return result;
+}
+
+XeFGPresentationSession::ResizeHoldCompletionDecision
+XeFGPresentationSession::complete_resize_hold(
+    uint64_t completion_event_id,
+    XeFGResizeLifecycle::EventKind completion_kind,
+    HRESULT result_code) noexcept {
+    ResizeHoldCompletionDecision result{
+        ResizeHoldCompletionDisposition::NoActiveHold,
+        resize_hold_snapshot(),
+        completion_event_id,
+        completion_kind,
+        result_code,
+    };
+    if (!result.previous.active) {
+        return result;
+    }
+
+    if (FAILED(result_code)) {
+        result.disposition = ResizeHoldCompletionDisposition::KeepFailedCompletion;
+        return result;
+    }
+
+    if (m_resize_lifecycle.complete(completion_event_id, completion_kind, result_code)) {
+        result.disposition = ResizeHoldCompletionDisposition::Completed;
+    }
+    return result;
+}
+
+XeFGPresentationSession::ResizeHoldClearDecision
+XeFGPresentationSession::clear_resize_hold(const char* reason) noexcept {
+    ResizeHoldClearDecision result{
+        false,
+        resize_hold_snapshot(),
+        reason != nullptr ? reason : "unknown",
+    };
+    if (!result.previous.active) {
+        return result;
+    }
+
+    result.cleared = m_resize_lifecycle.clear();
     return result;
 }
 

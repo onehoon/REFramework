@@ -98,6 +98,38 @@ public:
         bool capture_renderer_snapshots{};
     };
 
+    struct ResizeHoldSnapshot {
+        bool active{};
+        uint64_t trigger_event_id{};
+        uint32_t suppressed_present_count{};
+        uint64_t binding_generation{};
+    };
+
+    struct ResizeHoldArmDecision {
+        bool armed{};
+        ResizeHoldSnapshot state{};
+    };
+
+    enum class ResizeHoldCompletionDisposition : uint8_t {
+        NoActiveHold,
+        KeepFailedCompletion,
+        Completed,
+    };
+
+    struct ResizeHoldCompletionDecision {
+        ResizeHoldCompletionDisposition disposition{ResizeHoldCompletionDisposition::NoActiveHold};
+        ResizeHoldSnapshot previous{};
+        uint64_t completion_event_id{};
+        XeFGResizeLifecycle::EventKind completion_kind{XeFGResizeLifecycle::EventKind::None};
+        HRESULT result{S_OK};
+    };
+
+    struct ResizeHoldClearDecision {
+        bool cleared{};
+        ResizeHoldSnapshot previous{};
+        const char* reason{};
+    };
+
     enum class RuntimeDetachMatch : uint8_t {
         None,
         ExactRuntime,
@@ -173,6 +205,15 @@ public:
     PostResizePresentDecision consume_post_resize_present(
         const PresentDecision& present,
         bool diagnostics_enabled) noexcept;
+    ResizeHoldArmDecision evaluate_and_arm_resize_target_hold(
+        bool xefg_source,
+        uint64_t event_id,
+        bool renderer_reset_performed) noexcept;
+    ResizeHoldCompletionDecision complete_resize_hold(
+        uint64_t completion_event_id,
+        XeFGResizeLifecycle::EventKind completion_kind,
+        HRESULT result) noexcept;
+    ResizeHoldClearDecision clear_resize_hold(const char* reason) noexcept;
     uint32_t note_suppressed_present(const PresentDecision& decision) noexcept;
     void mark_render_boundary_logged(const PresentDecision& decision) noexcept;
 
@@ -180,6 +221,8 @@ public:
     void set_render_boundary_logged(bool value) noexcept { m_render_boundary_logged = value; }
 
 private:
+    ResizeHoldSnapshot resize_hold_snapshot() const noexcept;
+
     XeFGBinding m_binding{};
     XeFGResizeLifecycle m_resize_lifecycle{};
     XeFGDetachedState m_detached_state{};
