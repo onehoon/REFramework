@@ -25,7 +25,6 @@
 #include "compatibility/xefg/XeFGCompatibility.hpp"
 #include "compatibility/xefg/XeFGCandidateHandoff.hpp"
 #include "compatibility/xefg/XeFGDiscovery.hpp"
-#include <sdk/GameIdentity.hpp>
 
 static D3D12Hook* g_d3d12_hook = nullptr;
 thread_local bool g_inside_d3d12_hook = false;
@@ -1674,40 +1673,41 @@ uint64_t D3D12Hook::begin_tracked_xefg_resize_event(IDXGISwapChain3* swapchain, 
     return begin_xefg_resize_event(kind);
 }
 
-void D3D12Hook::arm_xefg_resize_transition_hold(uint64_t event_id) {
-    if (m_swapchain_source != SwapchainSource::XeFGInternal
-        || m_xefg_session.binding().observe_only()
-        || event_id == 0) {
+void D3D12Hook::arm_xefg_resize_transition_hold(uint64_t event_id, bool renderer_reset_performed) {
+    const auto decision = m_xefg_session.evaluate_and_arm_resize_target_hold(
+        is_xefg_source(),
+        event_id,
+        renderer_reset_performed);
+    if (!decision.armed) {
         return;
     }
-
-    m_xefg_session.resize_lifecycle().arm(event_id);
 
     spdlog::info(
         "[XeFG][ResizeHold] action = arm, trigger_event_id = {}, "
         "binding_generation = {}",
-        event_id,
-        m_xefg_session.binding().generation());
+        decision.state.trigger_event_id,
+        decision.state.binding_generation);
     if (XeFGCompatibility::is_debug_log_enabled()) {
         spdlog::info("[XeFG][ResizeHold] action = arm_debug, trigger_event_id = {}, swapchain = 0x{:x}",
-            event_id, reinterpret_cast<uintptr_t>(m_swap_chain));
+            decision.state.trigger_event_id, reinterpret_cast<uintptr_t>(m_swap_chain));
     }
 }
 
 void D3D12Hook::complete_xefg_resize_transition_hold(uint64_t completion_event_id, XefgResizeEventKind completion_kind, HRESULT result) {
-    if (!m_xefg_session.resize_lifecycle().suppress_renderer()) {
+    const auto decision = m_xefg_session.complete_resize_hold(completion_event_id, completion_kind, result);
+    if (decision.disposition == XeFGPresentationSession::ResizeHoldCompletionDisposition::NoActiveHold) {
         return;
     }
 
-    if (FAILED(result)) {
+    if (decision.disposition == XeFGPresentationSession::ResizeHoldCompletionDisposition::KeepFailedCompletion) {
         spdlog::info(
             "[XeFG][ResizeHold] action = keep, reason = completion_failed, "
             "trigger_event_id = {}, completion_event_id = {}, completion_kind = {}, "
             "result = 0x{:08x}",
-            m_xefg_session.resize_lifecycle().hold_trigger_event_id(),
-            completion_event_id,
-            resize_kind_name(completion_kind),
-            static_cast<uint32_t>(result));
+            decision.previous.trigger_event_id,
+            decision.completion_event_id,
+            resize_kind_name(decision.completion_kind),
+            static_cast<uint32_t>(decision.result));
         return;
     }
 
@@ -1715,30 +1715,27 @@ void D3D12Hook::complete_xefg_resize_transition_hold(uint64_t completion_event_i
         "[XeFG][ResizeHold] action = complete, trigger_event_id = {}, "
         "completion_event_id = {}, completion_kind = {}, result = 0x{:08x}, "
         "suppressed_presents = {}, generation = {}",
-        m_xefg_session.resize_lifecycle().hold_trigger_event_id(),
-        completion_event_id,
-        resize_kind_name(completion_kind),
-        static_cast<uint32_t>(result),
-        m_xefg_session.resize_lifecycle().suppressed_present_count(),
-        m_xefg_session.binding().generation());
-
-    m_xefg_session.resize_lifecycle().complete(completion_event_id, completion_kind, result);
+        decision.previous.trigger_event_id,
+        decision.completion_event_id,
+        resize_kind_name(decision.completion_kind),
+        static_cast<uint32_t>(decision.result),
+        decision.previous.suppressed_present_count,
+        decision.previous.binding_generation);
 }
 
 void D3D12Hook::clear_xefg_resize_transition_hold(const char* reason) {
-    if (!m_xefg_session.resize_lifecycle().suppress_renderer()) {
+    const auto decision = m_xefg_session.clear_resize_hold(reason);
+    if (!decision.cleared) {
         return;
     }
 
     spdlog::info(
         "[XeFG][ResizeHold] action = clear, reason = {}, trigger_event_id = {}, "
         "suppressed_presents = {}, generation = {}",
-        reason != nullptr ? reason : "unknown",
-        m_xefg_session.resize_lifecycle().hold_trigger_event_id(),
-        m_xefg_session.resize_lifecycle().suppressed_present_count(),
-        m_xefg_session.binding().generation());
-
-    m_xefg_session.resize_lifecycle().clear();
+        decision.reason,
+        decision.previous.trigger_event_id,
+        decision.previous.suppressed_present_count,
+        decision.previous.binding_generation);
 }
 
 const char* D3D12Hook::get_xefg_last_resize_kind() const {
@@ -2132,12 +2129,7 @@ HRESULT WINAPI D3D12Hook::resize_target(IDXGISwapChain3* swap_chain, const DXGI_
         }
     }
 
-    if (event_id != 0
-        && renderer_reset_performed
-        && d3d12->is_xefg_render_capable()
-        && sdk::GameIdentity::get().is_mhwilds()) {
-        d3d12->arm_xefg_resize_transition_hold(event_id);
-    }
+    d3d12->arm_xefg_resize_transition_hold(event_id, renderer_reset_performed);
 
     ++g_resize_target_depth;
 

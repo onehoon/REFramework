@@ -193,7 +193,7 @@ protected:
     static HRESULT present_common(IDXGISwapChain3* swap_chain, const char* kind, void* original_present, std::function<HRESULT()> original_call, bool allow_phase_transition);
     bool apply_xefg_candidate(const XeFGBindingCandidate& candidate);
     uint64_t begin_xefg_resize_event(XefgResizeEventKind kind);
-    void arm_xefg_resize_transition_hold(uint64_t event_id);
+    void arm_xefg_resize_transition_hold(uint64_t event_id, bool renderer_reset_performed);
     void complete_xefg_resize_transition_hold(uint64_t completion_event_id, XefgResizeEventKind completion_kind, HRESULT result);
     void clear_xefg_resize_transition_hold(const char* reason);
     void log_xefg_resize_event(uint64_t event_id, XefgResizeEventKind kind, const char* stage, IDXGISwapChain3* swap_chain, void* original_fn, HRESULT result = S_OK, bool has_result = false) const;
