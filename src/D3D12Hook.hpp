@@ -178,6 +178,7 @@ protected:
     bool note_xefg_monitor_action(const char* action) noexcept;
     void clear_xefg_monitor_state() noexcept;
     XeFGPresentationSession::PhysicalBindingView get_xefg_physical_binding_view() const noexcept;
+    XeFGPresentationSession::MonitorEvaluation evaluate_xefg_monitor_timeout(bool runtime_transition_active) noexcept;
     bool is_xefg_source() const noexcept { return m_swapchain_source == SwapchainSource::XeFGInternal; }
     bool is_tracked_xefg_instance(IDXGISwapChain3* swapchain) const noexcept;
     bool is_xefg_render_capable() const noexcept { return is_xefg_source() && !m_xefg_session.binding().observe_only(); }

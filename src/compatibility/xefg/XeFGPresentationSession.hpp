@@ -62,6 +62,27 @@ struct XeFGDetachedState {
 
 class XeFGPresentationSession {
 public:
+    enum class MonitorDisposition : uint8_t {
+        AllowGenericRecovery,
+        PreserveGrace,
+        SuppressRuntimeTransition,
+        SuppressDetachedUncertain,
+        QuarantineSustainedTimeout,
+        QuarantineInconsistentState,
+    };
+
+    struct MonitorEvaluation {
+        MonitorDisposition disposition{MonitorDisposition::AllowGenericRecovery};
+        const char* reason{"xefg_state_safe"};
+        XeFGBinding::RuntimeLifecycleSnapshot binding{};
+        XeFGMonitorBindingKey key{};
+        uint64_t present_entry_count{};
+        int64_t present_age_ms{-1};
+        uint32_t timeout_count{};
+        bool detached_uncertain{};
+        bool action_changed{};
+    };
+
     enum class RuntimeDetachMatch : uint8_t {
         None,
         ExactRuntime,
@@ -114,6 +135,11 @@ public:
     }
     bool note_monitor_action(const char* action) noexcept;
     void clear_monitor_state() noexcept;
+    MonitorEvaluation evaluate_monitor_timeout(
+        const PhysicalBindingView& physical,
+        bool runtime_transition_active,
+        uint64_t present_entry_count,
+        int64_t present_age_ms) noexcept;
 
     RuntimeDetachEvaluation evaluate_runtime_detach(
         size_t runtime_slot,

@@ -42,6 +42,26 @@ const char* monitor_action_name(XeFGMonitorAction action) noexcept {
     }
 }
 
+XeFGMonitorAction monitor_action_from_disposition(
+    XeFGPresentationSession::MonitorDisposition disposition) noexcept {
+    switch (disposition) {
+    case XeFGPresentationSession::MonitorDisposition::AllowGenericRecovery:
+        return XeFGMonitorAction::AllowGenericRecovery;
+    case XeFGPresentationSession::MonitorDisposition::PreserveGrace:
+        return XeFGMonitorAction::PreserveGrace;
+    case XeFGPresentationSession::MonitorDisposition::SuppressRuntimeTransition:
+        return XeFGMonitorAction::SuppressRuntimeTransition;
+    case XeFGPresentationSession::MonitorDisposition::SuppressDetachedUncertain:
+        return XeFGMonitorAction::SuppressDetachedUncertain;
+    case XeFGPresentationSession::MonitorDisposition::QuarantineSustainedTimeout:
+        return XeFGMonitorAction::QuarantineSustainedTimeout;
+    case XeFGPresentationSession::MonitorDisposition::QuarantineInconsistentState:
+        return XeFGMonitorAction::QuarantineInconsistentState;
+    }
+
+    return XeFGMonitorAction::AllowGenericRecovery;
+}
+
 int64_t runtime_slot_for_log(size_t slot) noexcept {
     return slot == XeFGBinding::kInvalidRuntimeSlot ? -1 : static_cast<int64_t>(slot);
 }
@@ -232,43 +252,24 @@ void XeFGCompatibility::end_runtime_transition() noexcept {
 }
 
 XeFGMonitorAction XeFGCompatibility::evaluate_hook_monitor_timeout(D3D12Hook& hook) noexcept {
-    XeFGMonitorAction action = XeFGMonitorAction::AllowGenericRecovery;
-    const char* reason = "xefg_state_safe";
+    const auto evaluation = hook.evaluate_xefg_monitor_timeout(is_runtime_transition_active());
+    const auto action = monitor_action_from_disposition(evaluation.disposition);
 
-    if (is_runtime_transition_active()) {
-        action = XeFGMonitorAction::SuppressRuntimeTransition;
-        reason = "runtime_transition";
-    } else if (!hook.has_xefg_monitor_state()) {
-        action = XeFGMonitorAction::AllowGenericRecovery;
-    } else if (hook.has_xefg_detached_state()) {
-        action = XeFGMonitorAction::SuppressDetachedUncertain;
-        reason = "detached_uncertain";
-    } else if (!hook.has_consistent_active_xefg_binding()) {
-        action = XeFGMonitorAction::QuarantineInconsistentState;
-        reason = "binding_identity_inconsistent";
-    } else if (hook.note_xefg_monitor_timeout() == XeFGHookMonitorState::TimeoutClass::Sustained) {
-        action = XeFGMonitorAction::QuarantineSustainedTimeout;
-        reason = "sustained_present_timeout";
-    } else {
-        action = XeFGMonitorAction::PreserveGrace;
-        reason = "present_timeout";
-    }
-
-    if (hook.note_xefg_monitor_action(reason) && is_debug_log_enabled()) {
-        const auto binding = hook.get_xefg_lifecycle_snapshot();
+    if (evaluation.action_changed && is_debug_log_enabled()) {
+        const auto& binding = evaluation.binding;
         spdlog::info("[XeFG][HookMonitor] action = {}, reason = {}, generation = {}, runtime_slot = {}, context = 0x{:x}, swapchain = 0x{:x}, hook_target = 0x{:x}, present_entry_count = {}, present_age_ms = {}, timeout_count = {}, transition_depth = {}, detached_uncertain = {}",
             monitor_action_name(action),
-            reason,
+            evaluation.reason,
             binding.generation,
             binding.runtime.slot == XeFGBinding::kInvalidRuntimeSlot ? -1 : static_cast<int64_t>(binding.runtime.slot),
             reinterpret_cast<uintptr_t>(binding.runtime.context),
             reinterpret_cast<uintptr_t>(binding.swapchain),
-            reinterpret_cast<uintptr_t>(hook.get_xefg_monitor_binding_key().hook_target),
-            hook.get_present_entry_count(),
-            hook.get_last_present_age_ms(),
-            hook.get_xefg_timeout_count(),
+            reinterpret_cast<uintptr_t>(evaluation.key.hook_target),
+            evaluation.present_entry_count,
+            evaluation.present_age_ms,
+            evaluation.timeout_count,
             s_runtime_transition_depth.load(std::memory_order_acquire),
-            hook.has_xefg_detached_state());
+            evaluation.detached_uncertain);
         hook.log_hook_monitor_snapshot("xefg_monitor_decision");
     }
 
