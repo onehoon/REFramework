@@ -21,48 +21,12 @@
 #include "utility/FunctionHook.hpp"
 #include "utility/VtableHook.hpp"
 #include "compatibility/xefg/XeFGBinding.hpp"
+#include "compatibility/xefg/XeFGPresentationSession.hpp"
 #include "compatibility/xefg/XeFGResizeLifecycle.hpp"
 
 class XeFGCandidateHandoff;
 class XeFGCompatibility;
 struct XeFGBindingCandidate;
-
-struct XeFGMonitorBindingKey {
-    uint64_t generation{};
-    size_t runtime_slot{XeFGBinding::kInvalidRuntimeSlot};
-    void* runtime_context{};
-    IDXGISwapChain3* swapchain{};
-    void* hook_target{};
-
-    bool operator==(const XeFGMonitorBindingKey& other) const noexcept {
-        return generation == other.generation
-            && runtime_slot == other.runtime_slot
-            && runtime_context == other.runtime_context
-            && swapchain == other.swapchain
-            && hook_target == other.hook_target;
-    }
-};
-
-class XeFGHookMonitorState {
-public:
-    enum class TimeoutClass : uint8_t {
-        Grace,
-        Sustained,
-    };
-
-    TimeoutClass note_timeout(const XeFGMonitorBindingKey& key, uint64_t present_entry_count, int64_t present_age_ms) noexcept;
-    void clear() noexcept;
-    uint32_t consecutive_timeouts() const noexcept { return m_consecutive_timeouts; }
-
-private:
-    static constexpr uint32_t kSustainedTimeoutThreshold = 3;
-    static constexpr int64_t kMinimumSustainedPresentAgeMs = 20000;
-
-    XeFGMonitorBindingKey m_key{};
-    uint64_t m_last_present_entry_count{};
-    uint32_t m_consecutive_timeouts{};
-    bool m_initialized{};
-};
 
 class D3D12Hook
 {
@@ -236,13 +200,6 @@ protected:
     bool replace_xefg_binding(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, bool observe_only, const char* reason, XeFGBinding::RuntimeIdentity runtime);
     void sync_xefg_binding_aliases() noexcept;
 
-    struct XeFGDetachedState {
-        bool active{};
-        XeFGBinding::RuntimeIdentity previous_runtime{};
-        uint64_t previous_generation{};
-        const char* reason{};
-    };
-    
     ID3D12Device4* m_device{ nullptr };
     IDXGISwapChain3* m_swap_chain{ nullptr };
     IDXGISwapChain3* m_swapchain_0{};
