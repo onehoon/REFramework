@@ -184,6 +184,7 @@ protected:
     };
 
     XeFGHookPreparation prepare_xefg_instance_hook(IDXGISwapChain3* swapchain);
+    bool promote_existing_native_instance_hook() noexcept;
     bool apply_xefg_binding_request(
         IDXGISwapChain3* swapchain,
         ID3D12CommandQueue* command_queue,

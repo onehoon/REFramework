@@ -393,6 +393,19 @@ D3D12Hook::XeFGHookPreparation D3D12Hook::prepare_xefg_instance_hook(IDXGISwapCh
     return result;
 }
 
+bool D3D12Hook::promote_existing_native_instance_hook() noexcept {
+    if (m_swapchain_hook == nullptr) {
+        return false;
+    }
+
+    const auto present_ok = m_swapchain_hook->hook_method(8, Address{reinterpret_cast<void*>(&D3D12Hook::present)});
+    const auto present1_ok = m_swapchain_hook->hook_method(22, Address{reinterpret_cast<void*>(&D3D12Hook::present1)});
+    const auto resize_buffers_ok = m_swapchain_hook->hook_method(13, Address{reinterpret_cast<void*>(&D3D12Hook::resize_buffers)});
+    const auto resize_target_ok = m_swapchain_hook->hook_method(14, Address{reinterpret_cast<void*>(&D3D12Hook::resize_target)});
+    const auto resize_buffers1_ok = m_swapchain_hook->hook_method(39, Address{reinterpret_cast<void*>(&D3D12Hook::resize_buffers1)});
+    return present_ok && present1_ok && resize_buffers_ok && resize_target_ok && resize_buffers1_ok;
+}
+
 bool D3D12Hook::apply_xefg_binding_request(
     IDXGISwapChain3* swapchain,
     ID3D12CommandQueue* command_queue,
@@ -412,6 +425,26 @@ bool D3D12Hook::apply_xefg_binding_request(
         return m_xefg_session.commit_identical_candidate(plan, runtime).committed;
     }
 
+    const bool candidate_matches_current_hook_target =
+        m_swapchain_hook != nullptr
+        && m_swapchain_hook->get_instance().ptr() == swapchain;
+    const bool reuse_existing_native_instance_hook =
+        plan.disposition == XeFGPresentationSession::CandidateDisposition::NoActiveBinding
+        && m_hooked
+        && !m_is_phase_1
+        && m_swapchain_source != SwapchainSource::XeFGInternal
+        && m_swap_chain == swapchain
+        && candidate_matches_current_hook_target;
+    const bool requires_new_hook =
+        plan.disposition == XeFGPresentationSession::CandidateDisposition::NoActiveBinding
+        || plan.disposition == XeFGPresentationSession::CandidateDisposition::ChangedSwapchainReplacement;
+    if (requires_new_hook && candidate_matches_current_hook_target && !reuse_existing_native_instance_hook) {
+        spdlog::warn(
+            "[XeFG][Bind] accepted = false, reason = existing_hook_target_collision, swapchain = 0x{:x}",
+            reinterpret_cast<uintptr_t>(swapchain));
+        return false;
+    }
+
     Microsoft::WRL::ComPtr<IDXGISwapChain3> next_swapchain = swapchain;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> next_queue = command_queue;
     Microsoft::WRL::ComPtr<ID3D12Device4> next_device;
@@ -424,11 +457,15 @@ bool D3D12Hook::apply_xefg_binding_request(
         return false;
     }
 
+    if (reuse_existing_native_instance_hook && !promote_existing_native_instance_hook()) {
+        spdlog::warn(
+            "[XeFG][Bind] accepted = false, reason = native_instance_hook_promotion_failed, swapchain = 0x{:x}",
+            reinterpret_cast<uintptr_t>(swapchain));
+        return false;
+    }
+
     XeFGHookPreparation prepared{};
-    const bool requires_new_hook =
-        plan.disposition == XeFGPresentationSession::CandidateDisposition::NoActiveBinding
-        || plan.disposition == XeFGPresentationSession::CandidateDisposition::ChangedSwapchainReplacement;
-    if (requires_new_hook) {
+    if (requires_new_hook && !reuse_existing_native_instance_hook) {
         prepared = prepare_xefg_instance_hook(next_swapchain.Get());
         if (!prepared.ready()) {
             if (plan.disposition == XeFGPresentationSession::CandidateDisposition::NoActiveBinding) {
@@ -462,7 +499,9 @@ bool D3D12Hook::apply_xefg_binding_request(
             g_framework->on_reset();
         }
         m_present_hook.reset();
-        m_swapchain_hook.reset();
+        if (!reuse_existing_native_instance_hook) {
+            m_swapchain_hook.reset();
+        }
 
         const auto commit = m_xefg_session.commit_prepared_candidate(
             plan, swapchain, std::move(next_queue), std::move(next_device), observe_only, runtime);
@@ -471,7 +510,13 @@ bool D3D12Hook::apply_xefg_binding_request(
         }
 
         sync_xefg_binding_aliases();
-        m_swapchain_hook = std::move(prepared.hook);
+        if (!reuse_existing_native_instance_hook) {
+            m_swapchain_hook = std::move(prepared.hook);
+        } else {
+            spdlog::info(
+                "[XeFG][Bind] physical hook decision = native_instance_hook_promoted, swapchain = 0x{:x}",
+                reinterpret_cast<uintptr_t>(swapchain));
+        }
         m_swapchain_source = SwapchainSource::XeFGInternal;
         m_is_phase_1 = false;
         m_hooked = true;
