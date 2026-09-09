@@ -53,6 +53,44 @@ void XeFGPresentationSession::clear_monitor_state() noexcept {
     m_last_monitor_action = nullptr;
 }
 
+XeFGPresentationSession::MonitorEvaluation XeFGPresentationSession::evaluate_monitor_timeout(
+    const PhysicalBindingView& physical,
+    bool runtime_transition_active,
+    uint64_t present_entry_count,
+    int64_t present_age_ms) noexcept {
+    MonitorEvaluation result{};
+    result.present_entry_count = present_entry_count;
+    result.present_age_ms = present_age_ms;
+
+    if (runtime_transition_active) {
+        result.disposition = MonitorDisposition::SuppressRuntimeTransition;
+        result.reason = "runtime_transition";
+    } else if (!has_monitor_state(physical.xefg_source)) {
+        result.disposition = MonitorDisposition::AllowGenericRecovery;
+        result.reason = "xefg_state_safe";
+    } else if (detached_uncertain()) {
+        result.disposition = MonitorDisposition::SuppressDetachedUncertain;
+        result.reason = "detached_uncertain";
+    } else if (!consistent_with(physical)) {
+        result.disposition = MonitorDisposition::QuarantineInconsistentState;
+        result.reason = "binding_identity_inconsistent";
+    } else if (note_monitor_timeout(physical.hook_target, present_entry_count, present_age_ms)
+        == XeFGHookMonitorState::TimeoutClass::Sustained) {
+        result.disposition = MonitorDisposition::QuarantineSustainedTimeout;
+        result.reason = "sustained_present_timeout";
+    } else {
+        result.disposition = MonitorDisposition::PreserveGrace;
+        result.reason = "present_timeout";
+    }
+
+    result.action_changed = note_monitor_action(result.reason);
+    result.binding = m_binding.lifecycle_snapshot();
+    result.key = monitor_binding_key(physical.hook_target);
+    result.timeout_count = monitor_timeout_count();
+    result.detached_uncertain = detached_uncertain();
+    return result;
+}
+
 XeFGPresentationSession::RuntimeDetachEvaluation XeFGPresentationSession::evaluate_runtime_detach(
     size_t runtime_slot,
     void* context,

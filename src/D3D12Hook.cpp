@@ -278,6 +278,15 @@ XeFGPresentationSession::PhysicalBindingView D3D12Hook::get_xefg_physical_bindin
     };
 }
 
+XeFGPresentationSession::MonitorEvaluation D3D12Hook::evaluate_xefg_monitor_timeout(
+    bool runtime_transition_active) noexcept {
+    return m_xefg_session.evaluate_monitor_timeout(
+        get_xefg_physical_binding_view(),
+        runtime_transition_active,
+        m_present_entry_count.load(std::memory_order_relaxed),
+        get_last_present_age_ms());
+}
+
 bool D3D12Hook::detach_xefg_binding_for_runtime_transition(
     size_t runtime_slot,
     void* context,
