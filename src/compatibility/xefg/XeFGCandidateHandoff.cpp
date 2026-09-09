@@ -50,12 +50,7 @@ bool XeFGCandidateHandoff::consume_pending(D3D12Hook& hook) {
 
     // The pending mutex is deliberately released before entering the active
     // binding implementation. A failed bind is not requeued.
-    return hook.bind_external_swapchain(
-        pending->swapchain.Get(),
-        pending->selected_queue.Get(),
-        D3D12Hook::SwapchainSource::XeFGInternal,
-        pending->observe_only,
-        pending->runtime);
+    return hook.apply_xefg_candidate(*pending);
 }
 
 bool XeFGCandidateHandoff::discard_pending_for_runtime_transition(
