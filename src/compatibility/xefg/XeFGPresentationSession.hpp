@@ -111,6 +111,27 @@ public:
         XeFGResizeLifecycle::EventKind last_kind{XeFGResizeLifecycle::EventKind::None};
     };
 
+    enum class CandidateDisposition : uint8_t {
+        Reject,
+        NoActiveBinding,
+        Identical,
+        SameSwapchainUpdate,
+        ChangedSwapchainReplacement,
+    };
+
+    struct CandidatePlan {
+        CandidateDisposition disposition{CandidateDisposition::Reject};
+        const char* reason{"candidate_invalid"};
+        XeFGBinding::RuntimeLifecycleSnapshot previous{};
+    };
+
+    struct CandidateCommitResult {
+        bool committed{};
+        uint64_t generation{};
+        bool clear_resize_hold{};
+        const char* resize_hold_reason{};
+    };
+
     struct ResizeHoldSnapshot {
         bool active{};
         uint64_t trigger_event_id{};
@@ -238,6 +259,22 @@ public:
     bool should_reset_renderer_for_resize_buffers1(bool resize_callback_available) const noexcept;
     ResizeDiagnosticSnapshot resize_diagnostic_snapshot() const noexcept;
     uint64_t last_resize_event_id() const noexcept { return m_resize_lifecycle.event_id(); }
+
+    CandidatePlan plan_candidate(
+        const PhysicalBindingView& physical,
+        IDXGISwapChain3* candidate_swapchain,
+        ID3D12CommandQueue* candidate_queue,
+        bool candidate_observe_only) const noexcept;
+    CandidateCommitResult commit_identical_candidate(
+        const CandidatePlan& plan,
+        XeFGBinding::RuntimeIdentity runtime) noexcept;
+    CandidateCommitResult commit_prepared_candidate(
+        const CandidatePlan& plan,
+        IDXGISwapChain3* candidate_swapchain,
+        Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue,
+        Microsoft::WRL::ComPtr<ID3D12Device4> device,
+        bool observe_only,
+        XeFGBinding::RuntimeIdentity runtime) noexcept;
 
     bool render_boundary_logged() const noexcept { return m_render_boundary_logged; }
     void set_render_boundary_logged(bool value) noexcept { m_render_boundary_logged = value; }

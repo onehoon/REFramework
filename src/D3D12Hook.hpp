@@ -31,7 +31,6 @@ struct XeFGBindingCandidate;
 class D3D12Hook
 {
 public:
-	friend class XeFGCandidateHandoff;
 	friend class XeFGCompatibility;
 	enum class SwapchainSource : uint8_t {
 		Native,
@@ -50,6 +49,7 @@ public:
 	bool unhook();
 
 	bool bind_external_swapchain(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source, bool xefg_p21_observe_only = false, XeFGBinding::RuntimeIdentity runtime = {});
+    bool apply_xefg_candidate(const XeFGBindingCandidate& candidate);
 
     bool is_hooked() {
         return m_hooked;
@@ -185,7 +185,21 @@ protected:
     void hook_impl();
 	static HRESULT WINAPI present1(IDXGISwapChain1* swap_chain, UINT sync_interval, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters);
     static HRESULT present_common(IDXGISwapChain3* swap_chain, const char* kind, void* original_present, std::function<HRESULT()> original_call, bool allow_phase_transition);
-    bool apply_xefg_candidate(const XeFGBindingCandidate& candidate);
+    struct XeFGHookPreparation {
+        std::unique_ptr<VtableHook> hook{};
+        const char* failure_reason{};
+
+        bool ready() const noexcept {
+            return hook != nullptr;
+        }
+    };
+
+    XeFGHookPreparation prepare_xefg_instance_hook(IDXGISwapChain3* swapchain);
+    bool apply_xefg_binding_request(
+        IDXGISwapChain3* swapchain,
+        ID3D12CommandQueue* command_queue,
+        bool observe_only,
+        XeFGBinding::RuntimeIdentity runtime);
     void arm_xefg_resize_transition_hold(uint64_t event_id, bool renderer_reset_performed);
     void complete_xefg_resize_transition_hold(uint64_t completion_event_id, XefgResizeEventKind completion_kind, HRESULT result);
     void clear_xefg_resize_transition_hold(const char* reason);
@@ -193,7 +207,6 @@ protected:
     void log_xefg_post_resize_present(const XeFGPresentationSession::PostResizePresentDecision& decision,
         IDXGISwapChain3* swap_chain, const char* kind, void* original_fn) const;
     bool external_binding_matches(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source, bool xefg_observe_only) const;
-    bool replace_xefg_binding(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, bool observe_only, const char* reason, XeFGBinding::RuntimeIdentity runtime);
     void sync_xefg_binding_aliases() noexcept;
 
     ID3D12Device4* m_device{ nullptr };
