@@ -197,9 +197,6 @@ public:
     XeFGBinding& binding() noexcept { return m_binding; }
     const XeFGBinding& binding() const noexcept { return m_binding; }
 
-    XeFGResizeLifecycle& resize_lifecycle() noexcept { return m_resize_lifecycle; }
-    const XeFGResizeLifecycle& resize_lifecycle() const noexcept { return m_resize_lifecycle; }
-
     XeFGDetachedState& detached_state() noexcept { return m_detached_state; }
     const XeFGDetachedState& detached_state() const noexcept { return m_detached_state; }
 
@@ -276,7 +273,6 @@ public:
         bool observe_only,
         XeFGBinding::RuntimeIdentity runtime) noexcept;
 
-    bool render_boundary_logged() const noexcept { return m_render_boundary_logged; }
     void set_render_boundary_logged(bool value) noexcept { m_render_boundary_logged = value; }
 
 private:

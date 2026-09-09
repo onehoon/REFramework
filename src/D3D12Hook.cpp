@@ -232,38 +232,6 @@ D3D12Hook* D3D12Hook::current_xefg_handoff_target() noexcept {
     return g_d3d12_hook;
 }
 
-bool D3D12Hook::has_active_xefg_instance_binding() const noexcept {
-    return has_consistent_active_xefg_binding();
-}
-
-bool D3D12Hook::has_consistent_active_xefg_binding() const noexcept {
-    return m_xefg_session.consistent_with(get_xefg_physical_binding_view());
-}
-
-bool D3D12Hook::has_xefg_monitor_state() const noexcept {
-    return m_xefg_session.has_monitor_state(is_xefg_source());
-}
-
-XeFGMonitorBindingKey D3D12Hook::get_xefg_monitor_binding_key() const noexcept {
-    return m_xefg_session.monitor_binding_key(
-        m_swapchain_hook != nullptr ? m_swapchain_hook->get_instance().ptr() : nullptr);
-}
-
-XeFGHookMonitorState::TimeoutClass D3D12Hook::note_xefg_monitor_timeout() noexcept {
-    return m_xefg_session.note_monitor_timeout(
-        m_swapchain_hook != nullptr ? m_swapchain_hook->get_instance().ptr() : nullptr,
-        m_present_entry_count.load(std::memory_order_relaxed),
-        get_last_present_age_ms());
-}
-
-bool D3D12Hook::note_xefg_monitor_action(const char* action) noexcept {
-    return m_xefg_session.note_monitor_action(action);
-}
-
-void D3D12Hook::clear_xefg_monitor_state() noexcept {
-    m_xefg_session.clear_monitor_state();
-}
-
 XeFGPresentationSession::PhysicalBindingView D3D12Hook::get_xefg_physical_binding_view() const noexcept {
     return {
         m_hooked,
@@ -1284,7 +1252,7 @@ bool D3D12Hook::unhook() {
 
     clear_xefg_resize_transition_hold("unhook");
     m_xefg_session.detached_state() = {};
-    clear_xefg_monitor_state();
+    m_xefg_session.clear_monitor_state();
 
     if (!m_hooked && !m_xefg_session.binding().complete()) {
         return true;
