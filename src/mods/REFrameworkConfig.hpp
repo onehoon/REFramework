@@ -1,14 +1,18 @@
 #pragma once
 
+#include <chrono>
+
 #include "Mod.hpp"
 
 class REFrameworkConfig : public Mod {
 public:
     static inline constexpr std::string_view REFRAMEWORK_CONFIG_NAME{ "re2_fw_config.txt" };
+    static inline constexpr std::string_view DEBUG_LOG_CONFIG_NAME{ "REFrameworkConfig_DebugLog" };
     static inline constexpr std::string_view UI_MONITOR_WIDTH_CONFIG_NAME{ "REFrameworkConfig_UIMonitorWidth" };
     static inline constexpr std::string_view UI_MONITOR_HEIGHT_CONFIG_NAME{ "REFrameworkConfig_UIMonitorHeight" };
     static inline constexpr std::string_view UI_FONT_SIZE_CONFIG_NAME{ "REFrameworkConfig_UIFontSize" };
     static std::shared_ptr<REFrameworkConfig>& get();
+    static void bootstrap_xefg_debug_log() noexcept;
 
 public:
     std::string_view get_name() const override {
@@ -48,6 +52,7 @@ private:
     ModKey::Ptr m_menu_key{ ModKey::create(generate_name("MenuKey_V2"), VK_INSERT) };
     ModToggle::Ptr m_menu_open{ ModToggle::create(generate_name("MenuOpen"), true) };
     ModToggle::Ptr m_remember_menu_state{ ModToggle::create(generate_name("RememberMenuState"), false) };
+    ModToggle::Ptr m_debug_log{ ModToggle::create(DEBUG_LOG_CONFIG_NAME, false) };
 #if defined(RE8) && !defined(REFRAMEWORK_UNIVERSAL)
     ModToggle::Ptr m_always_show_cursor{ ModToggle::create(generate_name("DrawCursorWithMenuOpen"), true) };
 #else
@@ -58,6 +63,8 @@ private:
     ModInt32::Ptr m_ui_monitor_width{ModInt32::create(UI_MONITOR_WIDTH_CONFIG_NAME, 0)};
     ModInt32::Ptr m_ui_monitor_height{ModInt32::create(UI_MONITOR_HEIGHT_CONFIG_NAME, 0)};
     ModFloat::Ptr m_ui_font_size{ModFloat::create(UI_FONT_SIZE_CONFIG_NAME, 0.0f)};
+    bool m_startup_menu_auto_hide_done{false};
+    std::chrono::steady_clock::time_point m_startup_menu_open_time{};
     std::vector<std::string> fonts{};
     ModComboString::Ptr m_font_file{};
 
@@ -65,6 +72,7 @@ private:
         *m_menu_key,
         *m_menu_open,
         *m_remember_menu_state,
+        *m_debug_log,
         *m_always_show_cursor,
         *m_show_cursor_key,
         *m_font_size,

@@ -1,10 +1,30 @@
 #include "../REFramework.hpp"
 
 #include "REFrameworkConfig.hpp"
+#include "../compatibility/xefg/XeFGCompatibility.hpp"
+
+namespace {
+constexpr auto STARTUP_MENU_AUTO_HIDE_DELAY = std::chrono::seconds{3};
+}
 
 std::shared_ptr<REFrameworkConfig>& REFrameworkConfig::get() {
      static std::shared_ptr<REFrameworkConfig> instance{std::make_shared<REFrameworkConfig>()};
      return instance;
+}
+
+void REFrameworkConfig::bootstrap_xefg_debug_log() noexcept {
+    bool enabled = false;
+
+    try {
+        const utility::Config config{
+            (REFramework::get_persistent_dir() / REFRAMEWORK_CONFIG_NAME).string()
+        };
+        enabled = config.get<bool>(std::string{DEBUG_LOG_CONFIG_NAME}).value_or(false);
+    } catch (...) {
+        // Diagnostic configuration must never prevent REFramework startup.
+    }
+
+    XeFGCompatibility::set_debug_log_enabled(enabled);
 }
 
 std::optional<std::string> REFrameworkConfig::on_initialize() {
@@ -45,6 +65,10 @@ void REFrameworkConfig::on_draw_ui() {
     changed |= m_menu_key->draw("Menu Key");
     changed |= m_show_cursor_key->draw("Show Cursor Key");
     changed |= m_remember_menu_state->draw("Remember Menu Open/Closed State");
+    if (m_debug_log->draw("Debug Log")) {
+        XeFGCompatibility::set_debug_log_enabled(m_debug_log->value());
+        changed = true;
+    }
     changed |= m_always_show_cursor->draw("Draw Cursor With Menu Open");
 
     if (m_font_file->draw("Font")) {
@@ -77,12 +101,34 @@ void REFrameworkConfig::on_frame() {
     if (m_show_cursor_key->is_key_down_once()) {
         m_always_show_cursor->toggle();
     }
+
+    if (m_startup_menu_auto_hide_done) {
+        return;
+    }
+
+    if (m_remember_menu_state->value() || !g_framework->is_drawing_ui()) {
+        m_startup_menu_auto_hide_done = true;
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (m_startup_menu_open_time == std::chrono::steady_clock::time_point{}) {
+        m_startup_menu_open_time = now;
+        return;
+    }
+
+    if (now - m_startup_menu_open_time >= STARTUP_MENU_AUTO_HIDE_DELAY) {
+        m_startup_menu_auto_hide_done = true;
+        g_framework->set_draw_ui(false, false);
+    }
 }
 
 void REFrameworkConfig::on_config_load(const utility::Config& cfg) {
     for (IModValue& option : m_options) {
         option.config_load(cfg);
     }
+
+    XeFGCompatibility::set_debug_log_enabled(m_debug_log->value());
 
     if (m_remember_menu_state->value()) {
         g_framework->set_draw_ui(m_menu_open->value(), false);

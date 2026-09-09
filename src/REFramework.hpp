@@ -4,6 +4,7 @@
 #include <unordered_set>
 #include <filesystem>
 #include <map>
+#include <string_view>
 
 #include <spdlog/spdlog.h>
 #include <imgui.h>
@@ -77,7 +78,9 @@ public:
     void on_post_present_d3d11();
     void on_frame_d3d12();
     void on_post_present_d3d12();
+    void note_present_activity();
     void on_reset();
+    void log_d3d12_resize_snapshot(std::string_view stage, uint64_t event_id) const;
 
     void patch_set_cursor_pos();
     void remove_set_cursor_pos_patch();
