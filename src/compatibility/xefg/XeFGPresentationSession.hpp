@@ -62,6 +62,17 @@ struct XeFGDetachedState {
 
 class XeFGPresentationSession {
 public:
+    struct PhysicalBindingView {
+        bool hook_active{};
+        bool phase1{};
+        bool xefg_source{};
+        bool swapchain_hook_present{};
+        IDXGISwapChain3* renderer_swapchain{};
+        ID3D12CommandQueue* renderer_queue{};
+        ID3D12Device4* renderer_device{};
+        void* hook_target{};
+    };
+
     XeFGPresentationSession() = default;
 
     XeFGBinding& binding() noexcept { return m_binding; }
@@ -73,11 +84,19 @@ public:
     XeFGDetachedState& detached_state() noexcept { return m_detached_state; }
     const XeFGDetachedState& detached_state() const noexcept { return m_detached_state; }
 
-    XeFGHookMonitorState& monitor_state() noexcept { return m_monitor_state; }
-    const XeFGHookMonitorState& monitor_state() const noexcept { return m_monitor_state; }
-
-    const char* last_monitor_action() const noexcept { return m_last_monitor_action; }
-    void set_last_monitor_action(const char* action) noexcept { m_last_monitor_action = action; }
+    bool has_monitor_state(bool xefg_source) const noexcept;
+    bool detached_uncertain() const noexcept { return m_detached_state.active; }
+    bool consistent_with(const PhysicalBindingView& physical) const noexcept;
+    XeFGMonitorBindingKey monitor_binding_key(void* hook_target) const noexcept;
+    XeFGHookMonitorState::TimeoutClass note_monitor_timeout(
+        void* hook_target,
+        uint64_t present_entry_count,
+        int64_t present_age_ms) noexcept;
+    uint32_t monitor_timeout_count() const noexcept {
+        return m_monitor_state.consecutive_timeouts();
+    }
+    bool note_monitor_action(const char* action) noexcept;
+    void clear_monitor_state() noexcept;
 
     bool render_boundary_logged() const noexcept { return m_render_boundary_logged; }
     void set_render_boundary_logged(bool value) noexcept { m_render_boundary_logged = value; }

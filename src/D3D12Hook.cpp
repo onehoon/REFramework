@@ -239,50 +239,44 @@ bool D3D12Hook::has_active_xefg_instance_binding() const noexcept {
 }
 
 bool D3D12Hook::has_consistent_active_xefg_binding() const noexcept {
-    return m_hooked
-        && !m_is_phase_1
-        && m_swapchain_source == SwapchainSource::XeFGInternal
-        && m_xefg_session.binding().active()
-        && m_swapchain_hook != nullptr
-        && m_xefg_session.binding().aliases_match(m_swap_chain, m_command_queue, m_device)
-        && m_swapchain_hook->get_instance().ptr() == m_xefg_session.binding().swapchain();
+    return m_xefg_session.consistent_with(get_xefg_physical_binding_view());
 }
 
 bool D3D12Hook::has_xefg_monitor_state() const noexcept {
-    return m_xefg_session.detached_state().active
-        || m_xefg_session.binding().active()
-        || m_swapchain_source == SwapchainSource::XeFGInternal;
+    return m_xefg_session.has_monitor_state(is_xefg_source());
 }
 
 XeFGMonitorBindingKey D3D12Hook::get_xefg_monitor_binding_key() const noexcept {
-    const auto snapshot = m_xefg_session.binding().lifecycle_snapshot();
-    return {
-        snapshot.generation,
-        snapshot.runtime.slot,
-        snapshot.runtime.context,
-        snapshot.swapchain,
-        m_swapchain_hook != nullptr ? m_swapchain_hook->get_instance().ptr() : nullptr,
-    };
+    return m_xefg_session.monitor_binding_key(
+        m_swapchain_hook != nullptr ? m_swapchain_hook->get_instance().ptr() : nullptr);
 }
 
 XeFGHookMonitorState::TimeoutClass D3D12Hook::note_xefg_monitor_timeout() noexcept {
-    return m_xefg_session.monitor_state().note_timeout(
-        get_xefg_monitor_binding_key(),
+    return m_xefg_session.note_monitor_timeout(
+        m_swapchain_hook != nullptr ? m_swapchain_hook->get_instance().ptr() : nullptr,
         m_present_entry_count.load(std::memory_order_relaxed),
         get_last_present_age_ms());
 }
 
 bool D3D12Hook::note_xefg_monitor_action(const char* action) noexcept {
-    if (m_xefg_session.last_monitor_action() == action) {
-        return false;
-    }
-    m_xefg_session.set_last_monitor_action(action);
-    return true;
+    return m_xefg_session.note_monitor_action(action);
 }
 
 void D3D12Hook::clear_xefg_monitor_state() noexcept {
-    m_xefg_session.monitor_state().clear();
-    m_xefg_session.set_last_monitor_action(nullptr);
+    m_xefg_session.clear_monitor_state();
+}
+
+XeFGPresentationSession::PhysicalBindingView D3D12Hook::get_xefg_physical_binding_view() const noexcept {
+    return {
+        m_hooked,
+        m_is_phase_1,
+        is_xefg_source(),
+        m_swapchain_hook != nullptr,
+        m_swap_chain,
+        m_command_queue,
+        m_device,
+        m_swapchain_hook != nullptr ? m_swapchain_hook->get_instance().ptr() : nullptr,
+    };
 }
 
 bool D3D12Hook::detach_xefg_binding_for_runtime_transition(

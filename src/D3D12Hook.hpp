@@ -171,12 +171,13 @@ protected:
     bool has_active_xefg_instance_binding() const noexcept;
     bool has_consistent_active_xefg_binding() const noexcept;
     bool has_xefg_monitor_state() const noexcept;
-    bool has_xefg_detached_state() const noexcept { return m_xefg_session.detached_state().active; }
+    bool has_xefg_detached_state() const noexcept { return m_xefg_session.detached_uncertain(); }
     XeFGMonitorBindingKey get_xefg_monitor_binding_key() const noexcept;
     XeFGHookMonitorState::TimeoutClass note_xefg_monitor_timeout() noexcept;
-    uint32_t get_xefg_timeout_count() const noexcept { return m_xefg_session.monitor_state().consecutive_timeouts(); }
+    uint32_t get_xefg_timeout_count() const noexcept { return m_xefg_session.monitor_timeout_count(); }
     bool note_xefg_monitor_action(const char* action) noexcept;
     void clear_xefg_monitor_state() noexcept;
+    XeFGPresentationSession::PhysicalBindingView get_xefg_physical_binding_view() const noexcept;
     bool is_xefg_source() const noexcept { return m_swapchain_source == SwapchainSource::XeFGInternal; }
     bool is_tracked_xefg_instance(IDXGISwapChain3* swapchain) const noexcept;
     bool is_xefg_render_capable() const noexcept { return is_xefg_source() && !m_xefg_session.binding().observe_only(); }
