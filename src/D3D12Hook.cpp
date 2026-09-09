@@ -1588,9 +1588,10 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
     const auto xefg_present = d3d12->m_xefg_session.evaluate_present_policy(
         d3d12->is_xefg_source(),
         static_cast<bool>(d3d12->m_on_present));
-    const auto post_resize_ordinal = d3d12->is_xefg_source()
-        ? d3d12->log_xefg_post_resize_present(swap_chain, kind, original_present)
-        : 0;
+    const auto post_resize = d3d12->m_xefg_session.consume_post_resize_present(
+        xefg_present,
+        XeFGCompatibility::is_debug_log_enabled());
+    d3d12->log_xefg_post_resize_present(post_resize, swap_chain, kind, original_present);
 
     if (xefg_present.log_first_render_boundary) {
         if (XeFGCompatibility::is_debug_log_enabled()) spdlog::info("[XeFG][P2.1Probe] render_callback = enter, present_call = {}", present_call);
@@ -1610,12 +1611,12 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
     }
 
     if (!xefg_present.suppress_render_callbacks && d3d12->m_on_present) {
-        if (post_resize_ordinal == 1 && g_framework != nullptr) {
+        if (post_resize.capture_renderer_snapshots && g_framework != nullptr) {
             g_framework->log_d3d12_resize_snapshot("present_pre_render_callback", xefg_present.resize_event_id);
         }
         d3d12->m_on_present(*d3d12);
 
-        if (post_resize_ordinal == 1 && g_framework != nullptr) {
+        if (post_resize.capture_renderer_snapshots && g_framework != nullptr) {
             g_framework->log_d3d12_resize_snapshot("present_post_render_callback", xefg_present.resize_event_id);
         }
 
@@ -1776,14 +1777,18 @@ void D3D12Hook::log_xefg_resize_event(uint64_t event_id, XefgResizeEventKind kin
     }
 }
 
-uint32_t D3D12Hook::log_xefg_post_resize_present(IDXGISwapChain3* swap_chain, const char* kind, void* original_fn) {
-    const auto sample = m_xefg_session.resize_lifecycle().consume_post_resize_present_sample();
-    if (!sample.has_value() || !XeFGCompatibility::is_debug_log_enabled()) return 0;
+void D3D12Hook::log_xefg_post_resize_present(
+    const XeFGPresentationSession::PostResizePresentDecision& decision,
+    IDXGISwapChain3* swap_chain,
+    const char* kind,
+    void* original_fn) const {
+    if (!decision.emit_present_after_resize_log || !decision.sample.has_value()) return;
+    const auto& sample = *decision.sample;
     spdlog::info("[XeFG][ResizeLifecycle] event_id = {}, kind = {}, stage = present_after_resize, present_ordinal = {}, elapsed_ms_since_resize = {}, thread_id = {}, swapchain = 0x{:x}, tracked_swapchain = 0x{:x}, hook_instance = 0x{:x}, owned_swapchain = 0x{:x}, binding_generation = {}, command_queue = 0x{:x}, device = 0x{:x}, original_fn = 0x{:x}, original_owner = {}",
-        sample->event_id,
+        sample.event_id,
         kind,
-        sample->ordinal,
-        sample->elapsed.count(),
+        sample.ordinal,
+        sample.elapsed.count(),
         GetCurrentThreadId(),
         reinterpret_cast<uintptr_t>(swap_chain),
         reinterpret_cast<uintptr_t>(m_swap_chain),
@@ -1794,7 +1799,6 @@ uint32_t D3D12Hook::log_xefg_post_resize_present(IDXGISwapChain3* swap_chain, co
         reinterpret_cast<uintptr_t>(m_device),
         reinterpret_cast<uintptr_t>(original_fn),
         describe_address(original_fn));
-    return sample->ordinal;
 }
 
 HRESULT WINAPI D3D12Hook::present1(IDXGISwapChain1* swap_chain, UINT sync_interval, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters) {

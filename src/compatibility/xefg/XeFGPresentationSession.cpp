@@ -179,6 +179,25 @@ XeFGPresentationSession::PresentDecision XeFGPresentationSession::evaluate_prese
     return result;
 }
 
+XeFGPresentationSession::PostResizePresentDecision
+XeFGPresentationSession::consume_post_resize_present(
+    const PresentDecision& present,
+    bool diagnostics_enabled) noexcept {
+    PostResizePresentDecision result{};
+    if (!present.xefg_source) {
+        return result;
+    }
+
+    result.sample = m_resize_lifecycle.consume_post_resize_present_sample();
+    if (!result.sample.has_value() || !diagnostics_enabled) {
+        return result;
+    }
+
+    result.emit_present_after_resize_log = true;
+    result.capture_renderer_snapshots = result.sample->ordinal == 1;
+    return result;
+}
+
 uint32_t XeFGPresentationSession::note_suppressed_present(
     const PresentDecision& decision) noexcept {
     if (!decision.xefg_source || !decision.resize_hold_active) {
