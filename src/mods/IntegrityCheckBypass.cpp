@@ -272,9 +272,13 @@ bool neutralize_redirect_target(void* entry, const AntiDebugRedirectSnapshot& ex
 }
 
 bool restore_entry_if_unchanged(void* entry, const std::vector<uint8_t>& original, const std::array<uint8_t, kAntiDebugEntrySize>& expected_entry) {
-    if (original.size() < expected_entry.size()) {
+    constexpr SIZE_T restore_size = kAntiDebugEntrySize;
+    if (original.size() < restore_size) {
         return false;
     }
+
+    std::array<uint8_t, restore_size> original_entry{};
+    std::copy_n(original.begin(), restore_size, original_entry.begin());
 
     std::array<uint8_t, kAntiDebugEntrySize> current_entry{};
     if (!safe_read(entry, current_entry.data(), current_entry.size()) || current_entry != expected_entry) {
@@ -282,16 +286,33 @@ bool restore_entry_if_unchanged(void* entry, const std::vector<uint8_t>& origina
     }
 
     DWORD old_protection{};
-    if (!VirtualProtect(entry, original.size(), PAGE_EXECUTE_READWRITE, &old_protection)) {
+    if (!VirtualProtect(entry, restore_size, PAGE_EXECUTE_READWRITE, &old_protection)) {
         return false;
     }
 
-    std::copy(original.begin(), original.end(), reinterpret_cast<uint8_t*>(entry));
-    const auto flush_succeeded = FlushInstructionCache(GetCurrentProcess(), entry, original.size()) != FALSE;
+    std::copy(original_entry.begin(), original_entry.end(), reinterpret_cast<uint8_t*>(entry));
+    const auto flush_succeeded = FlushInstructionCache(GetCurrentProcess(), entry, restore_size) != FALSE;
 
     DWORD restored_protection{};
-    const auto protection_restore_succeeded = VirtualProtect(entry, original.size(), old_protection, &restored_protection) != FALSE;
-    return flush_succeeded && protection_restore_succeeded;
+    const auto protection_restore_succeeded = VirtualProtect(entry, restore_size, old_protection, &restored_protection) != FALSE;
+    if (flush_succeeded && protection_restore_succeeded) {
+        return true;
+    }
+
+    // Roll back only if the bytes are still the ones written by this transaction.
+    DWORD rollback_old_protection{};
+    if (VirtualProtect(entry, restore_size, PAGE_EXECUTE_READWRITE, &rollback_old_protection)) {
+        std::array<uint8_t, restore_size> after_failure{};
+        if (safe_read(entry, after_failure.data(), after_failure.size()) && after_failure == original_entry) {
+            std::copy(expected_entry.begin(), expected_entry.end(), reinterpret_cast<uint8_t*>(entry));
+            FlushInstructionCache(GetCurrentProcess(), entry, restore_size);
+        }
+
+        DWORD ignored_protection{};
+        VirtualProtect(entry, restore_size, old_protection, &ignored_protection);
+    }
+
+    return false;
 }
 
 }
