@@ -92,6 +92,12 @@ public:
         uint64_t hold_trigger_event_id{};
     };
 
+    struct PostResizePresentDecision {
+        std::optional<XeFGResizeLifecycle::PostResizePresentSample> sample{};
+        bool emit_present_after_resize_log{};
+        bool capture_renderer_snapshots{};
+    };
+
     enum class RuntimeDetachMatch : uint8_t {
         None,
         ExactRuntime,
@@ -164,6 +170,9 @@ public:
     PresentDecision evaluate_present_policy(
         bool xefg_source,
         bool render_callback_available) const noexcept;
+    PostResizePresentDecision consume_post_resize_present(
+        const PresentDecision& present,
+        bool diagnostics_enabled) noexcept;
     uint32_t note_suppressed_present(const PresentDecision& decision) noexcept;
     void mark_render_boundary_logged(const PresentDecision& decision) noexcept;
 

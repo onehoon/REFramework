@@ -197,7 +197,8 @@ protected:
     void complete_xefg_resize_transition_hold(uint64_t completion_event_id, XefgResizeEventKind completion_kind, HRESULT result);
     void clear_xefg_resize_transition_hold(const char* reason);
     void log_xefg_resize_event(uint64_t event_id, XefgResizeEventKind kind, const char* stage, IDXGISwapChain3* swap_chain, void* original_fn, HRESULT result = S_OK, bool has_result = false) const;
-    uint32_t log_xefg_post_resize_present(IDXGISwapChain3* swap_chain, const char* kind, void* original_fn);
+    void log_xefg_post_resize_present(const XeFGPresentationSession::PostResizePresentDecision& decision,
+        IDXGISwapChain3* swap_chain, const char* kind, void* original_fn) const;
     bool external_binding_matches(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, SwapchainSource source, bool xefg_observe_only) const;
     bool replace_xefg_binding(IDXGISwapChain3* swapchain, ID3D12CommandQueue* command_queue, bool observe_only, const char* reason, XeFGBinding::RuntimeIdentity runtime);
     void sync_xefg_binding_aliases() noexcept;
