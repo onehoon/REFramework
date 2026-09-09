@@ -83,6 +83,15 @@ public:
         bool action_changed{};
     };
 
+    struct PresentDecision {
+        bool xefg_source{};
+        bool resize_hold_active{};
+        bool suppress_render_callbacks{};
+        bool log_first_render_boundary{};
+        uint64_t resize_event_id{};
+        uint64_t hold_trigger_event_id{};
+    };
+
     enum class RuntimeDetachMatch : uint8_t {
         None,
         ExactRuntime,
@@ -151,6 +160,12 @@ public:
     void complete_runtime_detach() noexcept;
     DestroyReconciliation evaluate_destroy_result(size_t runtime_slot, void* context, int32_t result) const noexcept;
     void commit_destroy_reconciliation(const DestroyReconciliation& reconciliation) noexcept;
+
+    PresentDecision evaluate_present_policy(
+        bool xefg_source,
+        bool render_callback_available) const noexcept;
+    uint32_t note_suppressed_present(const PresentDecision& decision) noexcept;
+    void mark_render_boundary_logged(const PresentDecision& decision) noexcept;
 
     bool render_boundary_logged() const noexcept { return m_render_boundary_logged; }
     void set_render_boundary_logged(bool value) noexcept { m_render_boundary_logged = value; }

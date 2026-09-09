@@ -1585,46 +1585,43 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
         return result;
     }
 
-    const auto xefg_resize_transition_hold = d3d12->is_xefg_resize_hold_active();
-    const auto suppress_render_callbacks = d3d12->should_suppress_xefg_render_callbacks();
+    const auto xefg_present = d3d12->m_xefg_session.evaluate_present_policy(
+        d3d12->is_xefg_source(),
+        static_cast<bool>(d3d12->m_on_present));
     const auto post_resize_ordinal = d3d12->is_xefg_source()
         ? d3d12->log_xefg_post_resize_present(swap_chain, kind, original_present)
         : 0;
-    const auto log_render_boundary = d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
-        && !suppress_render_callbacks
-        && d3d12->m_on_present
-        && !d3d12->m_xefg_session.render_boundary_logged();
 
-    if (log_render_boundary) {
+    if (xefg_present.log_first_render_boundary) {
         if (XeFGCompatibility::is_debug_log_enabled()) spdlog::info("[XeFG][P2.1Probe] render_callback = enter, present_call = {}", present_call);
     }
 
-    if (xefg_resize_transition_hold) {
-        const auto suppressed_present = d3d12->note_xefg_suppressed_present();
+    if (xefg_present.resize_hold_active) {
+        const auto suppressed_present = d3d12->m_xefg_session.note_suppressed_present(xefg_present);
         if (suppressed_present <= 3) {
             if (XeFGCompatibility::is_debug_log_enabled()) spdlog::info(
                 "[XeFG][ResizeHold] action = suppress_present, trigger_event_id = {}, "
                 "suppressed_present = {}, kind = {}, present_call = {}",
-                d3d12->m_xefg_session.resize_lifecycle().hold_trigger_event_id(),
+                xefg_present.hold_trigger_event_id,
                 suppressed_present,
                 kind,
                 present_call);
         }
     }
 
-    if (!suppress_render_callbacks && d3d12->m_on_present) {
+    if (!xefg_present.suppress_render_callbacks && d3d12->m_on_present) {
         if (post_resize_ordinal == 1 && g_framework != nullptr) {
-            g_framework->log_d3d12_resize_snapshot("present_pre_render_callback", d3d12->m_xefg_session.resize_lifecycle().event_id());
+            g_framework->log_d3d12_resize_snapshot("present_pre_render_callback", xefg_present.resize_event_id);
         }
         d3d12->m_on_present(*d3d12);
 
         if (post_resize_ordinal == 1 && g_framework != nullptr) {
-            g_framework->log_d3d12_resize_snapshot("present_post_render_callback", d3d12->m_xefg_session.resize_lifecycle().event_id());
+            g_framework->log_d3d12_resize_snapshot("present_post_render_callback", xefg_present.resize_event_id);
         }
 
-        if (log_render_boundary) {
+        if (xefg_present.log_first_render_boundary) {
             if (XeFGCompatibility::is_debug_log_enabled()) spdlog::info("[XeFG][P2.1Probe] render_callback = returned, present_call = {}", present_call);
-            d3d12->m_xefg_session.set_render_boundary_logged(true);
+            d3d12->m_xefg_session.mark_render_boundary_logged(xefg_present);
         }
     }
 
@@ -1646,7 +1643,7 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
             static_cast<uint32_t>(result), static_cast<uint32_t>(device_removed_reason));
     }
 
-    if (suppress_render_callbacks) {
+    if (xefg_present.suppress_render_callbacks) {
         // present_common already holds hook_monitor_mutex. Keep the monitor
         // alive without running renderer, GPU commit, or mod callbacks.
         g_framework->note_present_activity();

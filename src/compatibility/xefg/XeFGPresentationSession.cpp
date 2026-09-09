@@ -160,6 +160,41 @@ void XeFGPresentationSession::commit_destroy_reconciliation(
     clear_monitor_state();
 }
 
+XeFGPresentationSession::PresentDecision XeFGPresentationSession::evaluate_present_policy(
+    bool xefg_source,
+    bool render_callback_available) const noexcept {
+    PresentDecision result{};
+    result.xefg_source = xefg_source;
+    if (!xefg_source) {
+        return result;
+    }
+
+    result.resize_hold_active = m_resize_lifecycle.suppress_renderer();
+    result.suppress_render_callbacks = m_binding.observe_only() || result.resize_hold_active;
+    result.log_first_render_boundary = !result.suppress_render_callbacks
+        && render_callback_available
+        && !m_render_boundary_logged;
+    result.resize_event_id = m_resize_lifecycle.event_id();
+    result.hold_trigger_event_id = m_resize_lifecycle.hold_trigger_event_id();
+    return result;
+}
+
+uint32_t XeFGPresentationSession::note_suppressed_present(
+    const PresentDecision& decision) noexcept {
+    if (!decision.xefg_source || !decision.resize_hold_active) {
+        return 0;
+    }
+
+    return m_resize_lifecycle.note_suppressed_present();
+}
+
+void XeFGPresentationSession::mark_render_boundary_logged(
+    const PresentDecision& decision) noexcept {
+    if (decision.xefg_source && decision.log_first_render_boundary) {
+        m_render_boundary_logged = true;
+    }
+}
+
 XeFGHookMonitorState::TimeoutClass XeFGHookMonitorState::note_timeout(
     const XeFGMonitorBindingKey& key,
     uint64_t present_entry_count,
