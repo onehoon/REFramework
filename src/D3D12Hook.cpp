@@ -464,7 +464,9 @@ bool D3D12Hook::apply_xefg_binding_request(
         prepared = prepare_xefg_instance_hook(next_swapchain.Get());
         if (!prepared.ready()) {
             if (plan.disposition == XeFGPresentationSession::CandidateDisposition::NoActiveBinding) {
-                spdlog::warn("[XeFG][Bind] initial hook preparation failed; active binding left unchanged");
+                spdlog::warn(
+                    "[XeFG][Bind] initial hook preparation failed; active binding left unchanged, reason = {}",
+                    prepared.failure_reason != nullptr ? prepared.failure_reason : "unknown");
             } else {
                 log_xefg_rebind("failed", prepared.failure_reason, plan.previous.generation,
                     m_swap_chain, swapchain, m_command_queue, command_queue,
