@@ -287,6 +287,37 @@ void XeFGPresentationSession::mark_render_boundary_logged(
     }
 }
 
+XeFGPresentationSession::ResizeEventDecision XeFGPresentationSession::begin_resize_event(
+    bool xefg_source,
+    bool tracked_instance,
+    bool top_level,
+    XeFGResizeLifecycle::EventKind kind) noexcept {
+    ResizeEventDecision result{};
+    result.kind = kind;
+    if (!xefg_source || !tracked_instance || !top_level) {
+        return result;
+    }
+
+    result.event_id = m_resize_lifecycle.begin(kind);
+    result.active = result.event_id != 0;
+    return result;
+}
+
+bool XeFGPresentationSession::should_reset_renderer_for_resize_buffers1(
+    bool resize_callback_available) const noexcept {
+    return !m_binding.observe_only() && resize_callback_available;
+}
+
+XeFGPresentationSession::ResizeDiagnosticSnapshot
+XeFGPresentationSession::resize_diagnostic_snapshot() const noexcept {
+    return {
+        m_binding.swapchain(),
+        m_binding.generation(),
+        m_binding.observe_only(),
+        m_resize_lifecycle.last_kind(),
+    };
+}
+
 XeFGHookMonitorState::TimeoutClass XeFGHookMonitorState::note_timeout(
     const XeFGMonitorBindingKey& key,
     uint64_t present_entry_count,
