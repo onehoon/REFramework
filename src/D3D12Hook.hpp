@@ -116,8 +116,8 @@ public:
 
     int64_t get_last_present_age_ms() const noexcept;
 
-    uint64_t get_xefg_last_resize_event_id() const { return m_xefg_resize_lifecycle.event_id(); }
-    uint64_t get_xefg_binding_generation() const { return m_xefg_binding.generation(); }
+    uint64_t get_xefg_last_resize_event_id() const { return m_xefg_session.resize_lifecycle().event_id(); }
+    uint64_t get_xefg_binding_generation() const { return m_xefg_session.binding().generation(); }
     const char* get_xefg_last_resize_kind() const;
 
     static uint32_t get_command_queue_offset_for_diagnostics() {
@@ -139,11 +139,11 @@ public:
 	}
 
     bool is_xefg_observe_only() const {
-        return m_xefg_binding.observe_only();
+        return m_xefg_session.binding().observe_only();
     }
 
     XeFGBinding::RuntimeLifecycleSnapshot get_xefg_lifecycle_snapshot() const noexcept {
-        return m_xefg_binding.lifecycle_snapshot();
+        return m_xefg_session.binding().lifecycle_snapshot();
     }
 
     static D3D12Hook* current_xefg_handoff_target() noexcept;
@@ -171,20 +171,20 @@ protected:
     bool has_active_xefg_instance_binding() const noexcept;
     bool has_consistent_active_xefg_binding() const noexcept;
     bool has_xefg_monitor_state() const noexcept;
-    bool has_xefg_detached_state() const noexcept { return m_xefg_detached_state.active; }
+    bool has_xefg_detached_state() const noexcept { return m_xefg_session.detached_state().active; }
     XeFGMonitorBindingKey get_xefg_monitor_binding_key() const noexcept;
     XeFGHookMonitorState::TimeoutClass note_xefg_monitor_timeout() noexcept;
-    uint32_t get_xefg_timeout_count() const noexcept { return m_xefg_monitor_state.consecutive_timeouts(); }
+    uint32_t get_xefg_timeout_count() const noexcept { return m_xefg_session.monitor_state().consecutive_timeouts(); }
     bool note_xefg_monitor_action(const char* action) noexcept;
     void clear_xefg_monitor_state() noexcept;
     bool is_xefg_source() const noexcept { return m_swapchain_source == SwapchainSource::XeFGInternal; }
     bool is_tracked_xefg_instance(IDXGISwapChain3* swapchain) const noexcept;
-    bool is_xefg_render_capable() const noexcept { return is_xefg_source() && !m_xefg_binding.observe_only(); }
-    bool is_xefg_resize_hold_active() const noexcept { return is_xefg_source() && m_xefg_resize_lifecycle.suppress_renderer(); }
+    bool is_xefg_render_capable() const noexcept { return is_xefg_source() && !m_xefg_session.binding().observe_only(); }
+    bool is_xefg_resize_hold_active() const noexcept { return is_xefg_source() && m_xefg_session.resize_lifecycle().suppress_renderer(); }
     bool should_suppress_xefg_render_callbacks() const noexcept {
-        return is_xefg_source() && (m_xefg_binding.observe_only() || m_xefg_resize_lifecycle.suppress_renderer());
+        return is_xefg_source() && (m_xefg_session.binding().observe_only() || m_xefg_session.resize_lifecycle().suppress_renderer());
     }
-    uint32_t note_xefg_suppressed_present() noexcept { return m_xefg_resize_lifecycle.note_suppressed_present(); }
+    uint32_t note_xefg_suppressed_present() noexcept { return m_xefg_session.resize_lifecycle().note_suppressed_present(); }
     uint64_t begin_tracked_xefg_resize_event(IDXGISwapChain3* swapchain, XeFGResizeLifecycle::EventKind kind, bool top_level);
     void hook_impl();
 	static HRESULT WINAPI present1(IDXGISwapChain1* swap_chain, UINT sync_interval, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters);
@@ -205,11 +205,7 @@ protected:
     IDXGISwapChain3* m_swapchain_0{};
     IDXGISwapChain3* m_swapchain_1{};
     ID3D12CommandQueue* m_command_queue{ nullptr };
-    XeFGBinding m_xefg_binding{};
-    XeFGResizeLifecycle m_xefg_resize_lifecycle{};
-    XeFGDetachedState m_xefg_detached_state{};
-    XeFGHookMonitorState m_xefg_monitor_state{};
-    const char* m_last_xefg_monitor_action{};
+    XeFGPresentationSession m_xefg_session{};
     UINT m_display_width{ NULL };
     UINT m_display_height{ NULL };
     UINT m_render_width{ NULL };
@@ -221,7 +217,6 @@ protected:
     bool m_using_proton_swapchain{ false };
     bool m_using_frame_generation_swapchain{ false };
 	SwapchainSource m_swapchain_source{ SwapchainSource::Native };
-	bool m_xefg_p21_render_boundary_logged{ false };
     bool m_hooked{ false };
     bool m_is_phase_1{ true };
     bool m_inside_present{false};

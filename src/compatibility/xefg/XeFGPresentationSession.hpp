@@ -7,6 +7,7 @@
 #include <dxgi1_4.h>
 
 #include "XeFGBinding.hpp"
+#include "XeFGResizeLifecycle.hpp"
 
 struct XeFGMonitorBindingKey {
     uint64_t generation{};
@@ -62,4 +63,30 @@ struct XeFGDetachedState {
 class XeFGPresentationSession {
 public:
     XeFGPresentationSession() = default;
+
+    XeFGBinding& binding() noexcept { return m_binding; }
+    const XeFGBinding& binding() const noexcept { return m_binding; }
+
+    XeFGResizeLifecycle& resize_lifecycle() noexcept { return m_resize_lifecycle; }
+    const XeFGResizeLifecycle& resize_lifecycle() const noexcept { return m_resize_lifecycle; }
+
+    XeFGDetachedState& detached_state() noexcept { return m_detached_state; }
+    const XeFGDetachedState& detached_state() const noexcept { return m_detached_state; }
+
+    XeFGHookMonitorState& monitor_state() noexcept { return m_monitor_state; }
+    const XeFGHookMonitorState& monitor_state() const noexcept { return m_monitor_state; }
+
+    const char* last_monitor_action() const noexcept { return m_last_monitor_action; }
+    void set_last_monitor_action(const char* action) noexcept { m_last_monitor_action = action; }
+
+    bool render_boundary_logged() const noexcept { return m_render_boundary_logged; }
+    void set_render_boundary_logged(bool value) noexcept { m_render_boundary_logged = value; }
+
+private:
+    XeFGBinding m_binding{};
+    XeFGResizeLifecycle m_resize_lifecycle{};
+    XeFGDetachedState m_detached_state{};
+    XeFGHookMonitorState m_monitor_state{};
+    const char* m_last_monitor_action{};
+    bool m_render_boundary_logged{};
 };
