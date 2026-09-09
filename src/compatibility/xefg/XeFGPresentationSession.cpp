@@ -318,6 +318,118 @@ XeFGPresentationSession::resize_diagnostic_snapshot() const noexcept {
     };
 }
 
+XeFGPresentationSession::CandidatePlan XeFGPresentationSession::plan_candidate(
+    const PhysicalBindingView& physical,
+    IDXGISwapChain3* candidate_swapchain,
+    ID3D12CommandQueue* candidate_queue,
+    bool candidate_observe_only) const noexcept {
+    CandidatePlan plan{};
+    plan.previous = m_binding.lifecycle_snapshot();
+
+    if (candidate_swapchain == nullptr || candidate_queue == nullptr) {
+        return plan;
+    }
+
+    const bool active_xefg_path = physical.hook_active
+        && physical.xefg_source
+        && plan.previous.active;
+    if (!active_xefg_path) {
+        plan.disposition = CandidateDisposition::NoActiveBinding;
+        plan.reason = "no_active_binding";
+        return plan;
+    }
+
+    const auto change = m_binding.compare(
+        candidate_swapchain,
+        candidate_queue,
+        candidate_observe_only);
+    if (!change.changed()) {
+        plan.disposition = CandidateDisposition::Identical;
+        plan.reason = "identical";
+        return plan;
+    }
+
+    if (!physical.swapchain_hook_present || physical.renderer_swapchain == nullptr) {
+        plan.reason = "active_physical_binding_unavailable";
+        return plan;
+    }
+
+    plan.reason = change.reason();
+    plan.disposition = physical.renderer_swapchain == candidate_swapchain
+        ? CandidateDisposition::SameSwapchainUpdate
+        : CandidateDisposition::ChangedSwapchainReplacement;
+    return plan;
+}
+
+XeFGPresentationSession::CandidateCommitResult
+XeFGPresentationSession::commit_identical_candidate(
+    const CandidatePlan& plan,
+    XeFGBinding::RuntimeIdentity runtime) noexcept {
+    CandidateCommitResult result{};
+    if (plan.disposition != CandidateDisposition::Identical) {
+        return result;
+    }
+
+    m_binding.refresh_runtime_identity(runtime);
+    m_detached_state = {};
+    clear_monitor_state();
+    result.committed = true;
+    result.generation = m_binding.generation();
+    return result;
+}
+
+XeFGPresentationSession::CandidateCommitResult
+XeFGPresentationSession::commit_prepared_candidate(
+    const CandidatePlan& plan,
+    IDXGISwapChain3* candidate_swapchain,
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue,
+    Microsoft::WRL::ComPtr<ID3D12Device4> device,
+    bool observe_only,
+    XeFGBinding::RuntimeIdentity runtime) noexcept {
+    CandidateCommitResult result{};
+    switch (plan.disposition) {
+    case CandidateDisposition::NoActiveBinding:
+        m_binding.clear();
+        m_binding.commit_initial(
+            candidate_swapchain,
+            std::move(queue),
+            std::move(device),
+            observe_only,
+            runtime);
+        result.clear_resize_hold = true;
+        result.resize_hold_reason = "external_bind";
+        break;
+    case CandidateDisposition::SameSwapchainUpdate:
+        m_binding.commit_same_swapchain_update(
+            std::move(queue),
+            std::move(device),
+            observe_only,
+            runtime);
+        result.clear_resize_hold = true;
+        result.resize_hold_reason = "binding_replaced";
+        break;
+    case CandidateDisposition::ChangedSwapchainReplacement:
+        m_binding.commit_replacement(
+            candidate_swapchain,
+            std::move(queue),
+            std::move(device),
+            observe_only,
+            runtime);
+        result.clear_resize_hold = true;
+        result.resize_hold_reason = "binding_replaced";
+        break;
+    default:
+        return result;
+    }
+
+    m_render_boundary_logged = false;
+    m_detached_state = {};
+    clear_monitor_state();
+    result.committed = true;
+    result.generation = m_binding.generation();
+    return result;
+}
+
 XeFGHookMonitorState::TimeoutClass XeFGHookMonitorState::note_timeout(
     const XeFGMonitorBindingKey& key,
     uint64_t present_entry_count,
