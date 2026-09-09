@@ -116,8 +116,8 @@ public:
 
     int64_t get_last_present_age_ms() const noexcept;
 
-    uint64_t get_xefg_last_resize_event_id() const { return m_xefg_session.resize_lifecycle().event_id(); }
-    uint64_t get_xefg_binding_generation() const { return m_xefg_session.binding().generation(); }
+    uint64_t get_xefg_last_resize_event_id() const { return m_xefg_session.last_resize_event_id(); }
+    uint64_t get_xefg_binding_generation() const { return m_xefg_session.resize_diagnostic_snapshot().binding_generation; }
     const char* get_xefg_last_resize_kind() const;
 
     static uint32_t get_command_queue_offset_for_diagnostics() {
@@ -181,18 +181,11 @@ protected:
     XeFGPresentationSession::MonitorEvaluation evaluate_xefg_monitor_timeout(bool runtime_transition_active) noexcept;
     bool is_xefg_source() const noexcept { return m_swapchain_source == SwapchainSource::XeFGInternal; }
     bool is_tracked_xefg_instance(IDXGISwapChain3* swapchain) const noexcept;
-    bool is_xefg_render_capable() const noexcept { return is_xefg_source() && !m_xefg_session.binding().observe_only(); }
-    bool is_xefg_resize_hold_active() const noexcept { return is_xefg_source() && m_xefg_session.resize_lifecycle().suppress_renderer(); }
-    bool should_suppress_xefg_render_callbacks() const noexcept {
-        return is_xefg_source() && (m_xefg_session.binding().observe_only() || m_xefg_session.resize_lifecycle().suppress_renderer());
-    }
-    uint32_t note_xefg_suppressed_present() noexcept { return m_xefg_session.resize_lifecycle().note_suppressed_present(); }
     uint64_t begin_tracked_xefg_resize_event(IDXGISwapChain3* swapchain, XeFGResizeLifecycle::EventKind kind, bool top_level);
     void hook_impl();
 	static HRESULT WINAPI present1(IDXGISwapChain1* swap_chain, UINT sync_interval, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters);
     static HRESULT present_common(IDXGISwapChain3* swap_chain, const char* kind, void* original_present, std::function<HRESULT()> original_call, bool allow_phase_transition);
     bool apply_xefg_candidate(const XeFGBindingCandidate& candidate);
-    uint64_t begin_xefg_resize_event(XefgResizeEventKind kind);
     void arm_xefg_resize_transition_hold(uint64_t event_id, bool renderer_reset_performed);
     void complete_xefg_resize_transition_hold(uint64_t completion_event_id, XefgResizeEventKind completion_kind, HRESULT result);
     void clear_xefg_resize_transition_hold(const char* reason);

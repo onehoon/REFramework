@@ -98,6 +98,19 @@ public:
         bool capture_renderer_snapshots{};
     };
 
+    struct ResizeEventDecision {
+        bool active{};
+        uint64_t event_id{};
+        XeFGResizeLifecycle::EventKind kind{XeFGResizeLifecycle::EventKind::None};
+    };
+
+    struct ResizeDiagnosticSnapshot {
+        IDXGISwapChain3* binding_swapchain{};
+        uint64_t binding_generation{};
+        bool observe_only{};
+        XeFGResizeLifecycle::EventKind last_kind{XeFGResizeLifecycle::EventKind::None};
+    };
+
     struct ResizeHoldSnapshot {
         bool active{};
         uint64_t trigger_event_id{};
@@ -216,6 +229,15 @@ public:
     ResizeHoldClearDecision clear_resize_hold(const char* reason) noexcept;
     uint32_t note_suppressed_present(const PresentDecision& decision) noexcept;
     void mark_render_boundary_logged(const PresentDecision& decision) noexcept;
+
+    ResizeEventDecision begin_resize_event(
+        bool xefg_source,
+        bool tracked_instance,
+        bool top_level,
+        XeFGResizeLifecycle::EventKind kind) noexcept;
+    bool should_reset_renderer_for_resize_buffers1(bool resize_callback_available) const noexcept;
+    ResizeDiagnosticSnapshot resize_diagnostic_snapshot() const noexcept;
+    uint64_t last_resize_event_id() const noexcept { return m_resize_lifecycle.event_id(); }
 
     bool render_boundary_logged() const noexcept { return m_render_boundary_logged; }
     void set_render_boundary_logged(bool value) noexcept { m_render_boundary_logged = value; }

@@ -1655,10 +1655,6 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
     return result;
 }
 
-uint64_t D3D12Hook::begin_xefg_resize_event(XefgResizeEventKind kind) {
-    return m_xefg_session.resize_lifecycle().begin(kind);
-}
-
 bool D3D12Hook::is_tracked_xefg_instance(IDXGISwapChain3* swapchain) const noexcept {
     return swapchain != nullptr
         && is_xefg_source()
@@ -1667,10 +1663,12 @@ bool D3D12Hook::is_tracked_xefg_instance(IDXGISwapChain3* swapchain) const noexc
 }
 
 uint64_t D3D12Hook::begin_tracked_xefg_resize_event(IDXGISwapChain3* swapchain, XefgResizeEventKind kind, bool top_level) {
-    if (!top_level || !is_tracked_xefg_instance(swapchain)) {
-        return 0;
-    }
-    return begin_xefg_resize_event(kind);
+    const auto decision = m_xefg_session.begin_resize_event(
+        is_xefg_source(),
+        is_tracked_xefg_instance(swapchain),
+        top_level,
+        kind);
+    return decision.event_id;
 }
 
 void D3D12Hook::arm_xefg_resize_transition_hold(uint64_t event_id, bool renderer_reset_performed) {
@@ -1739,7 +1737,7 @@ void D3D12Hook::clear_xefg_resize_transition_hold(const char* reason) {
 }
 
 const char* D3D12Hook::get_xefg_last_resize_kind() const {
-    return resize_kind_name(m_xefg_session.resize_lifecycle().last_kind());
+    return resize_kind_name(m_xefg_session.resize_diagnostic_snapshot().last_kind);
 }
 
 void D3D12Hook::log_xefg_resize_event(uint64_t event_id, XefgResizeEventKind kind, const char* stage,
@@ -1753,24 +1751,25 @@ void D3D12Hook::log_xefg_resize_event(uint64_t event_id, XefgResizeEventKind kin
     }
 
     const auto hook_instance = m_swapchain_hook != nullptr ? m_swapchain_hook->get_instance().ptr() : nullptr;
+    const auto semantic = m_xefg_session.resize_diagnostic_snapshot();
     const auto owner = describe_address(original_fn);
     if (has_result) {
         spdlog::info("[XeFG][ResizeLifecycle] event_id = {}, kind = {}, stage = {}, thread_id = {}, swapchain = 0x{:x}, swapchain_identity = 0x{:x}, tracked_swapchain = 0x{:x}, hook_instance = 0x{:x}, owned_swapchain = 0x{:x}, binding_generation = {}, command_queue = 0x{:x}, device = 0x{:x}, observe_only = {}, original_fn = 0x{:x}, original_owner = {}, result = 0x{:08x}",
             event_id, resize_kind_name(kind), stage, GetCurrentThreadId(),
             reinterpret_cast<uintptr_t>(swap_chain), reinterpret_cast<uintptr_t>(identity.Get()),
         reinterpret_cast<uintptr_t>(m_swap_chain), reinterpret_cast<uintptr_t>(hook_instance),
-            reinterpret_cast<uintptr_t>(m_xefg_session.binding().swapchain()), m_xefg_session.binding().generation(),
+            reinterpret_cast<uintptr_t>(semantic.binding_swapchain), semantic.binding_generation,
             reinterpret_cast<uintptr_t>(m_command_queue), reinterpret_cast<uintptr_t>(m_device),
-            m_xefg_session.binding().observe_only(), reinterpret_cast<uintptr_t>(original_fn), owner,
+            semantic.observe_only, reinterpret_cast<uintptr_t>(original_fn), owner,
             static_cast<uint32_t>(result));
     } else {
         spdlog::info("[XeFG][ResizeLifecycle] event_id = {}, kind = {}, stage = {}, thread_id = {}, swapchain = 0x{:x}, swapchain_identity = 0x{:x}, tracked_swapchain = 0x{:x}, hook_instance = 0x{:x}, owned_swapchain = 0x{:x}, binding_generation = {}, command_queue = 0x{:x}, device = 0x{:x}, observe_only = {}, original_fn = 0x{:x}, original_owner = {}",
             event_id, resize_kind_name(kind), stage, GetCurrentThreadId(),
             reinterpret_cast<uintptr_t>(swap_chain), reinterpret_cast<uintptr_t>(identity.Get()),
         reinterpret_cast<uintptr_t>(m_swap_chain), reinterpret_cast<uintptr_t>(hook_instance),
-            reinterpret_cast<uintptr_t>(m_xefg_session.binding().swapchain()), m_xefg_session.binding().generation(),
+            reinterpret_cast<uintptr_t>(semantic.binding_swapchain), semantic.binding_generation,
             reinterpret_cast<uintptr_t>(m_command_queue), reinterpret_cast<uintptr_t>(m_device),
-            m_xefg_session.binding().observe_only(), reinterpret_cast<uintptr_t>(original_fn), owner);
+            semantic.observe_only, reinterpret_cast<uintptr_t>(original_fn), owner);
     }
 }
 
@@ -1781,6 +1780,7 @@ void D3D12Hook::log_xefg_post_resize_present(
     void* original_fn) const {
     if (!decision.emit_present_after_resize_log || !decision.sample.has_value()) return;
     const auto& sample = *decision.sample;
+    const auto semantic = m_xefg_session.resize_diagnostic_snapshot();
     spdlog::info("[XeFG][ResizeLifecycle] event_id = {}, kind = {}, stage = present_after_resize, present_ordinal = {}, elapsed_ms_since_resize = {}, thread_id = {}, swapchain = 0x{:x}, tracked_swapchain = 0x{:x}, hook_instance = 0x{:x}, owned_swapchain = 0x{:x}, binding_generation = {}, command_queue = 0x{:x}, device = 0x{:x}, original_fn = 0x{:x}, original_owner = {}",
         sample.event_id,
         kind,
@@ -1790,8 +1790,8 @@ void D3D12Hook::log_xefg_post_resize_present(
         reinterpret_cast<uintptr_t>(swap_chain),
         reinterpret_cast<uintptr_t>(m_swap_chain),
         reinterpret_cast<uintptr_t>(m_swapchain_hook != nullptr ? m_swapchain_hook->get_instance().ptr() : nullptr),
-        reinterpret_cast<uintptr_t>(m_xefg_session.binding().swapchain()),
-        m_xefg_session.binding().generation(),
+        reinterpret_cast<uintptr_t>(semantic.binding_swapchain),
+        semantic.binding_generation,
         reinterpret_cast<uintptr_t>(m_command_queue),
         reinterpret_cast<uintptr_t>(m_device),
         reinterpret_cast<uintptr_t>(original_fn),
@@ -1969,7 +1969,8 @@ HRESULT WINAPI D3D12Hook::resize_buffers1(IDXGISwapChain3* swap_chain, UINT buff
         return nested_result;
     }
 
-    const auto event_id = d3d12->begin_xefg_resize_event(D3D12Hook::XefgResizeEventKind::ResizeBuffers1);
+    const auto event_id = d3d12->begin_tracked_xefg_resize_event(
+        swap_chain, D3D12Hook::XefgResizeEventKind::ResizeBuffers1, true);
     d3d12->log_xefg_resize_event(event_id, D3D12Hook::XefgResizeEventKind::ResizeBuffers1, "enter",
         swap_chain, resize_buffers1_original);
     if (XeFGCompatibility::is_debug_log_enabled()) spdlog::info("[XeFG][ResizeLifecycle] event_id = {}, kind = ResizeBuffers1, buffer_count = {}, width = {}, height = {}, format = {}, flags = 0x{:x}, creation_node_mask = 0x{:x}, present_queues = 0x{:x}",
@@ -1980,7 +1981,8 @@ HRESULT WINAPI D3D12Hook::resize_buffers1(IDXGISwapChain3* swap_chain, UINT buff
     d3d12->m_display_width = width;
     d3d12->m_display_height = height;
 
-    const auto should_reset_renderer = !d3d12->m_xefg_session.binding().observe_only() && static_cast<bool>(d3d12->m_on_resize_buffers);
+    const auto should_reset_renderer = d3d12->m_xefg_session.should_reset_renderer_for_resize_buffers1(
+        static_cast<bool>(d3d12->m_on_resize_buffers));
     if (XeFGCompatibility::is_debug_log_enabled()) spdlog::info("[XeFG][ResizeBuffers1] stage = enter, swapchain = 0x{:x}, buffer_count = {}, width = {}, height = {}, format = {}, flags = 0x{:x}, creation_node_mask = 0x{:x}, present_queues = 0x{:x}, pre_reset = {}",
         reinterpret_cast<uintptr_t>(swap_chain),
         buffer_count,
