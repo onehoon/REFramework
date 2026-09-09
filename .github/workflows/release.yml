@@ -87,5 +87,9 @@ jobs:
           name: ${{format('REFramework Fork Release {0} ({1})', github.run_number, github.sha)}}
           tag: ${{format('fork-release-{0}-{1}', github.run_number, github.sha)}}
           artifacts: ${{github.workspace}}/artifact/REFramework.zip
-          makeLatest: false
+          body: |
+            [Try to use custom OptiScaler with this custom REF](https://github.com/onehoon/OptiScaler/releases/tag/unsigned-ci)
+
+            ### Only for Capcom games
+          makeLatest: true
           allowUpdates: false
