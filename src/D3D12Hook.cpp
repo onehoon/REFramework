@@ -1614,6 +1614,9 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
         ++g_present_depth;
         const auto result = original_call();
         --g_present_depth;
+        if (g_framework != nullptr && d3d12->is_xefg_source()) {
+            g_framework->note_present_activity();
+        }
         d3d12->m_inside_present = false;
         return result;
     }
