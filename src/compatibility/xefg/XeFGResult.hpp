@@ -8,6 +8,10 @@ constexpr bool succeeded(int32_t result) noexcept {
     return result >= 0;
 }
 
+constexpr bool destroy_completed(int32_t result) noexcept {
+    return result == 0;
+}
+
 constexpr bool failed(int32_t result) noexcept {
     return result < 0;
 }
