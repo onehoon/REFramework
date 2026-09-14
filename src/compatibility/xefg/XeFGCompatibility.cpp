@@ -3,6 +3,7 @@
 #include <chrono>
 #include <mutex>
 #include <tlhelp32.h>
+#include <wrl/client.h>
 
 #include <spdlog/spdlog.h>
 
@@ -251,6 +252,98 @@ void XeFGCompatibility::end_runtime_transition() noexcept {
     }
 }
 
+XeFGCompatibility::ProxyRetireStatus XeFGCompatibility::prepare_for_public_proxy_retire(
+    IUnknown* public_proxy,
+    void* xefg_context,
+    HWND hwnd) noexcept {
+    try {
+        if (public_proxy == nullptr || xefg_context == nullptr) {
+            if (is_debug_log_enabled()) {
+                spdlog::info("[XeFG][ProxyRetire] action = blocked, reason = invalid_argument, public_proxy = 0x{:x}, context = 0x{:x}, hwnd = 0x{:x}",
+                    reinterpret_cast<uintptr_t>(public_proxy),
+                    reinterpret_cast<uintptr_t>(xefg_context),
+                    reinterpret_cast<uintptr_t>(hwnd));
+            }
+            return ProxyRetireStatus::Blocked;
+        }
+
+        // The caller still owns the final public-proxy reference. Keep it
+        // alive while renderer reset and hook removal release REF state.
+        Microsoft::WRL::ComPtr<IUnknown> public_proxy_keepalive{public_proxy};
+        (void)public_proxy_keepalive;
+
+        if (g_framework == nullptr) {
+            return ProxyRetireStatus::SafeNotTracked;
+        }
+
+        std::scoped_lock lifecycle_lock{g_framework->get_hook_monitor_mutex()};
+        auto* hook = D3D12Hook::current_xefg_handoff_target();
+        if (hook == nullptr) {
+            return ProxyRetireStatus::SafeNotTracked;
+        }
+
+        const auto binding = hook->get_xefg_lifecycle_snapshot();
+        if (!binding.active) {
+            return ProxyRetireStatus::SafeNotTracked;
+        }
+
+        const bool context_matches = binding.runtime.slot != XeFGBinding::kInvalidRuntimeSlot
+            && binding.runtime.context != nullptr
+            && binding.runtime.context == xefg_context;
+        const bool hwnd_matches = hwnd == nullptr
+            || binding.runtime.hwnd == nullptr
+            || binding.runtime.hwnd == hwnd;
+        if (!context_matches || !hwnd_matches) {
+            if (is_debug_log_enabled()) {
+                spdlog::info("[XeFG][ProxyRetire] action = blocked, reason = runtime_identity_mismatch, public_proxy = 0x{:x}, context = 0x{:x}, hwnd = 0x{:x}, binding_context = 0x{:x}, binding_hwnd = 0x{:x}, runtime_slot = {}",
+                    reinterpret_cast<uintptr_t>(public_proxy_keepalive.Get()),
+                    reinterpret_cast<uintptr_t>(xefg_context),
+                    reinterpret_cast<uintptr_t>(hwnd),
+                    reinterpret_cast<uintptr_t>(binding.runtime.context),
+                    reinterpret_cast<uintptr_t>(binding.runtime.hwnd),
+                    runtime_slot_for_log(binding.runtime.slot));
+            }
+            return ProxyRetireStatus::Blocked;
+        }
+
+        XeFGCandidateHandoff::discard_pending_for_runtime_transition(
+            binding.runtime.slot,
+            binding.runtime.context,
+            binding.runtime.hwnd,
+            false,
+            "proxy_retire");
+
+        const bool detached = hook->detach_xefg_binding_for_runtime_transition(
+            binding.runtime.slot,
+            binding.runtime.context,
+            binding.runtime.hwnd,
+            false,
+            "proxy_retire");
+        if (!detached) {
+            if (is_debug_log_enabled()) {
+                spdlog::info("[XeFG][ProxyRetire] action = blocked, reason = detach_failed, public_proxy = 0x{:x}, context = 0x{:x}, hwnd = 0x{:x}, runtime_slot = {}",
+                    reinterpret_cast<uintptr_t>(public_proxy_keepalive.Get()),
+                    reinterpret_cast<uintptr_t>(xefg_context),
+                    reinterpret_cast<uintptr_t>(hwnd),
+                    runtime_slot_for_log(binding.runtime.slot));
+            }
+            return ProxyRetireStatus::Blocked;
+        }
+
+        if (is_debug_log_enabled()) {
+            spdlog::info("[XeFG][ProxyRetire] action = detached, public_proxy = 0x{:x}, binding_swapchain = 0x{:x}, context = 0x{:x}, generation = {}, runtime_slot = {}",
+                reinterpret_cast<uintptr_t>(public_proxy_keepalive.Get()),
+                reinterpret_cast<uintptr_t>(binding.swapchain),
+                reinterpret_cast<uintptr_t>(binding.runtime.context),
+                binding.generation,
+                runtime_slot_for_log(binding.runtime.slot));
+        }
+        return ProxyRetireStatus::SafeDetached;
+    } catch (...) {
+        return ProxyRetireStatus::Blocked;
+    }
+}
+
 XeFGMonitorAction XeFGCompatibility::evaluate_hook_monitor_timeout(D3D12Hook& hook) noexcept {
     const auto evaluation = hook.evaluate_xefg_monitor_timeout(is_runtime_transition_active());
     const auto action = monitor_action_from_disposition(evaluation.disposition);
@@ -397,4 +490,20 @@ int32_t XeFGCompatibility::dispatch_destroy(size_t slot, void* context) {
     }
     log_runtime_lifecycle("destroy_return", slot, module, context, nullptr, result, true, &binding_before_destroy);
     return result;
+}
+
+extern "C" __declspec(dllexport)
+uint32_t WINAPI REFramework_XeFG_PreRetireSwapchainV1(
+    IUnknown* public_proxy,
+    void* xefg_context,
+    HWND hwnd) noexcept {
+    try {
+        return static_cast<uint32_t>(
+            XeFGCompatibility::prepare_for_public_proxy_retire(
+                public_proxy,
+                xefg_context,
+                hwnd));
+    } catch (...) {
+        return static_cast<uint32_t>(XeFGCompatibility::ProxyRetireStatus::Blocked);
+    }
 }

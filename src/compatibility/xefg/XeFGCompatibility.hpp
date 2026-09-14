@@ -21,6 +21,12 @@ enum class XeFGMonitorAction : uint8_t {
 
 class XeFGCompatibility {
 public:
+    enum class ProxyRetireStatus : uint32_t {
+        SafeNotTracked = 0,
+        SafeDetached = 1,
+        Blocked = 2,
+    };
+
     static void mark_probe_pending() noexcept;
     static void on_module_loaded(HMODULE module, std::wstring_view base_name, std::wstring_view full_path);
     static void process_pending_work();
@@ -32,6 +38,10 @@ public:
     static bool is_runtime_transition_active() noexcept;
     static void begin_runtime_transition() noexcept;
     static void end_runtime_transition() noexcept;
+    static ProxyRetireStatus prepare_for_public_proxy_retire(
+        IUnknown* public_proxy,
+        void* xefg_context,
+        HWND hwnd) noexcept;
 
     class RuntimeTransitionScope {
     public:
@@ -52,3 +62,9 @@ private:
     static std::atomic<bool> s_debug_log_enabled;
     static std::atomic<uint32_t> s_runtime_transition_depth;
 };
+
+extern "C" __declspec(dllexport)
+uint32_t WINAPI REFramework_XeFG_PreRetireSwapchainV1(
+    IUnknown* public_proxy,
+    void* xefg_context,
+    HWND hwnd) noexcept;
