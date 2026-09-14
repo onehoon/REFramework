@@ -145,7 +145,7 @@ XeFGPresentationSession::DestroyReconciliation XeFGPresentationSession::evaluate
     int32_t result) const noexcept {
     return {
         m_detached_state.active
-            && xefg_result::succeeded(result)
+            && xefg_result::destroy_completed(result)
             && m_detached_state.previous_runtime.slot == runtime_slot
             && m_detached_state.previous_runtime.context == context,
         m_detached_state.previous_generation,
