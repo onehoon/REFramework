@@ -101,6 +101,38 @@ void* read_vtable_slot(void** vtable, size_t slot) {
     return vtable[slot];
 }
 
+template <typename Fn>
+Fn resolve_late_swapchain_target(IUnknown* swapchain, size_t slot, Fn self) noexcept {
+    if (swapchain == nullptr || !is_readable(swapchain, sizeof(void*))) {
+        return nullptr;
+    }
+
+    auto** vtable = *reinterpret_cast<void***>(swapchain);
+    const auto target = read_vtable_slot(vtable, slot);
+    if (target == nullptr || target == reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(self))) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<Fn>(target);
+}
+
+std::string describe_address(void* address);
+
+void log_late_callback(std::string_view kind, IUnknown* swapchain, size_t slot, void* target, const char* action, const char* reason = nullptr) {
+    if (!XeFGCompatibility::is_debug_log_enabled()) {
+        return;
+    }
+
+    spdlog::info("[XeFG][LateCallback] kind = {}, action = {}, swapchain = 0x{:x}, slot = {}, target = 0x{:x}, owner = {}, reason = {}",
+        kind,
+        action,
+        reinterpret_cast<uintptr_t>(swapchain),
+        slot,
+        reinterpret_cast<uintptr_t>(target),
+        describe_address(target),
+        reason != nullptr ? reason : "none");
+}
+
 std::string describe_address(void* address) {
     if (address == nullptr) {
         return "unknown";
@@ -1345,12 +1377,33 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
 
     std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
 
+    using PresentFn = decltype(D3D12Hook::present)*;
+    const auto forward_late = [&]() -> HRESULT {
+        const auto target = resolve_late_swapchain_target<PresentFn>(swap_chain, 8, &D3D12Hook::present);
+        if (target != nullptr) {
+            log_late_callback("Present", swap_chain, 8,
+                reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(target)),
+                "forward_restored_vtable");
+            return target(swap_chain, sync_interval, flags, r9);
+        }
+
+        log_late_callback("Present", swap_chain, 8, nullptr, "blocked", "no_safe_target");
+        return E_FAIL;
+    };
+
     auto d3d12 = g_d3d12_hook;
+    if (d3d12 == nullptr || swap_chain == nullptr) {
+        return forward_late();
+    }
+
+    if ((d3d12->m_is_phase_1 && d3d12->m_present_hook == nullptr)
+        || (!d3d12->m_is_phase_1 && d3d12->m_swapchain_hook == nullptr)) {
+        return forward_late();
+    }
 
     // XeFG Present and Present1 share the direct-binding lifecycle. Keep the
     // established native phase-1/instance path below unchanged.
     if (d3d12 != nullptr && !d3d12->m_is_phase_1 && d3d12->m_swapchain_source == SwapchainSource::XeFGInternal && d3d12->m_swapchain_hook != nullptr) {
-        using PresentFn = decltype(D3D12Hook::present)*;
         const auto present_fn = d3d12->m_swapchain_hook->get_method<PresentFn>(8);
         return present_common(swap_chain, "Present", reinterpret_cast<void*>(present_fn), [swap_chain, sync_interval, flags, r9, present_fn]() {
             return present_fn(swap_chain, sync_interval, flags, r9);
@@ -1845,12 +1898,25 @@ HRESULT WINAPI D3D12Hook::present1(IDXGISwapChain1* swap_chain, UINT sync_interv
     // its vtable hook, then let present_common re-enter it recursively.
     std::scoped_lock lifecycle_lock{g_framework->get_hook_monitor_mutex()};
 
+    using Present1Fn = decltype(D3D12Hook::present1)*;
+    const auto forward_late = [&]() -> HRESULT {
+        const auto target = resolve_late_swapchain_target<Present1Fn>(swap_chain, 22, &D3D12Hook::present1);
+        if (target != nullptr) {
+            log_late_callback("Present1", swap_chain, 22,
+                reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(target)),
+                "forward_restored_vtable");
+            return target(swap_chain, sync_interval, flags, parameters);
+        }
+
+        log_late_callback("Present1", swap_chain, 22, nullptr, "blocked", "no_safe_target");
+        return E_FAIL;
+    };
+
     auto d3d12 = g_d3d12_hook;
     if (d3d12 == nullptr || d3d12->m_swapchain_hook == nullptr || swap_chain == nullptr) {
-        return E_FAIL;
+        return forward_late();
     }
 
-    using Present1Fn = decltype(D3D12Hook::present1)*;
     const auto original = d3d12->m_swapchain_hook->get_method<Present1Fn>(22);
     Microsoft::WRL::ComPtr<IDXGISwapChain3> swap_chain3;
     if (FAILED(swap_chain->QueryInterface(IID_PPV_ARGS(&swap_chain3)))) {
@@ -1871,6 +1937,25 @@ HRESULT WINAPI D3D12Hook::resize_buffers(IDXGISwapChain3* swap_chain, UINT buffe
 
     std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
 
+    using ResizeBuffersFn = decltype(D3D12Hook::resize_buffers)*;
+    const auto forward_late = [&]() -> HRESULT {
+        const auto target = resolve_late_swapchain_target<ResizeBuffersFn>(swap_chain, 13, &D3D12Hook::resize_buffers);
+        if (target != nullptr) {
+            log_late_callback("ResizeBuffers", swap_chain, 13,
+                reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(target)),
+                "forward_restored_vtable");
+            return target(swap_chain, buffer_count, width, height, new_format, swap_chain_flags);
+        }
+
+        log_late_callback("ResizeBuffers", swap_chain, 13, nullptr, "blocked", "no_safe_target");
+        return E_FAIL;
+    };
+
+    auto d3d12 = g_d3d12_hook;
+    if (d3d12 == nullptr || d3d12->m_swapchain_hook == nullptr || swap_chain == nullptr) {
+        return forward_late();
+    }
+
     spdlog::info("D3D12 resize buffers called");
     spdlog::info(" Parameters: buffer_count {} width {} height {} new_format {} swap_chain_flags {}", buffer_count, width, height, new_format, swap_chain_flags);
 
@@ -1889,7 +1974,6 @@ HRESULT WINAPI D3D12Hook::resize_buffers(IDXGISwapChain3* swap_chain, UINT buffe
         spdlog::error("Failed to print callstack: unknown exception");
     }
 
-    auto d3d12 = g_d3d12_hook;
     //auto& hook = d3d12->m_resize_buffers_hook;
     //auto resize_buffers_fn = hook->get_original<decltype(D3D12Hook::resize_buffers)*>();
 
@@ -1987,12 +2071,25 @@ HRESULT WINAPI D3D12Hook::resize_buffers1(IDXGISwapChain3* swap_chain, UINT buff
 
     std::scoped_lock lifecycle_lock{g_framework->get_hook_monitor_mutex()};
 
+    using ResizeBuffers1Fn = decltype(D3D12Hook::resize_buffers1)*;
+    const auto forward_late = [&]() -> HRESULT {
+        const auto target = resolve_late_swapchain_target<ResizeBuffers1Fn>(swap_chain, 39, &D3D12Hook::resize_buffers1);
+        if (target != nullptr) {
+            log_late_callback("ResizeBuffers1", swap_chain, 39,
+                reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(target)),
+                "forward_restored_vtable");
+            return target(swap_chain, buffer_count, width, height, new_format, swap_chain_flags, creation_node_mask, present_queues);
+        }
+
+        log_late_callback("ResizeBuffers1", swap_chain, 39, nullptr, "blocked", "no_safe_target");
+        return E_FAIL;
+    };
+
     auto* d3d12 = g_d3d12_hook;
     if (d3d12 == nullptr || d3d12->m_swapchain_hook == nullptr || swap_chain == nullptr) {
-        return E_FAIL;
+        return forward_late();
     }
 
-    using ResizeBuffers1Fn = decltype(D3D12Hook::resize_buffers1)*;
     const auto original = d3d12->m_swapchain_hook->get_method<ResizeBuffers1Fn>(39);
     const auto resize_buffers1_original = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(original));
     if (!d3d12->is_tracked_xefg_instance(swap_chain)) {
@@ -2067,6 +2164,25 @@ HRESULT WINAPI D3D12Hook::resize_target(IDXGISwapChain3* swap_chain, const DXGI_
 
     std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
 
+    using ResizeTargetFn = decltype(D3D12Hook::resize_target)*;
+    const auto forward_late = [&]() -> HRESULT {
+        const auto target = resolve_late_swapchain_target<ResizeTargetFn>(swap_chain, 14, &D3D12Hook::resize_target);
+        if (target != nullptr) {
+            log_late_callback("ResizeTarget", swap_chain, 14,
+                reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(target)),
+                "forward_restored_vtable");
+            return target(swap_chain, new_target_parameters);
+        }
+
+        log_late_callback("ResizeTarget", swap_chain, 14, nullptr, "blocked", "no_safe_target");
+        return E_FAIL;
+    };
+
+    auto d3d12 = g_d3d12_hook;
+    if (d3d12 == nullptr || d3d12->m_swapchain_hook == nullptr || swap_chain == nullptr) {
+        return forward_late();
+    }
+
     spdlog::info("D3D12 resize target called");
     spdlog::info(" Parameters: new_target_parameters {:x}", (uintptr_t)new_target_parameters);
 
@@ -2085,7 +2201,6 @@ HRESULT WINAPI D3D12Hook::resize_target(IDXGISwapChain3* swap_chain, const DXGI_
         spdlog::error("Failed to print callstack: unknown exception");
     }
 
-    auto d3d12 = g_d3d12_hook;
     //auto resize_target_fn = d3d12->m_resize_target_hook->get_original<decltype(D3D12Hook::resize_target)*>();
 
     HWND swapchain_wnd{nullptr};
