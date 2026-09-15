@@ -31,6 +31,14 @@ thread_local bool g_inside_d3d12_hook = false;
 
 namespace {
 
+struct XeFGFactoryTransitionState {
+    uint32_t in_flight{};
+    bool rehook_required{};
+    uint64_t sequence{};
+};
+
+XeFGFactoryTransitionState g_xefg_factory_transition{};
+
 void log_xefg_rebind(std::string_view stage, const char* reason, uint64_t generation, IDXGISwapChain3* old_swapchain, IDXGISwapChain3* new_swapchain, ID3D12CommandQueue* old_queue, ID3D12CommandQueue* new_queue, bool old_observe_only, bool new_observe_only) {
     if (stage == "failed") {
         spdlog::warn("[XeFG][Rebind] stage = failed, reason = {}, generation = {}", reason, generation);
@@ -791,17 +799,60 @@ HRESULT WINAPI D3D12Hook::create_swapchain(IDXGIFactory4* factory, IUnknown* dev
         std::this_thread::yield();
     }
 
-    std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
+    auto do_not_hook = g_framework->acquire_do_not_hook_d3d();
+    std::unique_lock lifecycle_lock{g_framework->get_hook_monitor_mutex()};
 
-    bool hook_was_nullptr = g_d3d12_hook == nullptr;
+    auto* current_hook = g_d3d12_hook;
+    const bool hook_was_nullptr = current_hook == nullptr;
+    const bool active_xefg = current_hook != nullptr
+        && current_hook->get_xefg_lifecycle_snapshot().active;
+    const bool split_factory_transition = active_xefg
+        || g_xefg_factory_transition.in_flight != 0;
+    uint64_t transition_sequence{};
+    if (split_factory_transition) {
+        transition_sequence = ++g_xefg_factory_transition.sequence;
+        ++g_xefg_factory_transition.in_flight;
+        if (XeFGCompatibility::is_debug_log_enabled()) {
+            spdlog::info("[D3D12][FactoryTransition] sequence = {}, stage = enter, split = true, in_flight = {}, active_xefg = {}, thread_id = {}",
+                transition_sequence,
+                g_xefg_factory_transition.in_flight,
+                active_xefg,
+                GetCurrentThreadId());
+        }
+    }
 
-    if (g_d3d12_hook != nullptr && g_framework->get_d3d12_hook() != nullptr) {
+    if (current_hook != nullptr && g_framework->get_d3d12_hook() != nullptr) {
+        if (split_factory_transition) {
+            g_xefg_factory_transition.rehook_required = true;
+        }
+
         spdlog::info("[D3D12][HookLifecycle] action = unhook, reason = swapchain_reset_recreate");
         g_framework->on_reset(); // Needed to prevent a crash due to resources hanging around
-        g_d3d12_hook->unhook(); // Removes all vtable hooks
+        current_hook->unhook(); // Removes all vtable hooks
+    }
+
+    if (split_factory_transition) {
+        if (XeFGCompatibility::is_debug_log_enabled()) {
+            spdlog::info("[D3D12][FactoryTransition] sequence = {}, stage = downstream_enter, monitor_released = true, in_flight = {}, thread_id = {}",
+                transition_sequence,
+                g_xefg_factory_transition.in_flight,
+                GetCurrentThreadId());
+        }
+        lifecycle_lock.unlock();
     }
 
     const auto result = create_swap_chain_fn(factory, device, hwnd, desc, p_fullscreen_desc, p_restrict_to_output, swap_chain);
+
+    if (split_factory_transition) {
+        lifecycle_lock.lock();
+        if (XeFGCompatibility::is_debug_log_enabled()) {
+            spdlog::info("[D3D12][FactoryTransition] sequence = {}, stage = downstream_return, result = 0x{:08x}, in_flight = {}, thread_id = {}",
+                transition_sequence,
+                static_cast<uint32_t>(result),
+                g_xefg_factory_transition.in_flight,
+                GetCurrentThreadId());
+        }
+    }
 
     if (XeFGCompatibility::is_debug_log_enabled() && SUCCEEDED(result) && swap_chain != nullptr && *swap_chain != nullptr) {
         static std::atomic<uint64_t> candidate_sequence{0};
@@ -849,8 +900,34 @@ HRESULT WINAPI D3D12Hook::create_swapchain(IDXGIFactory4* factory, IUnknown* dev
         }
     }
 
-    // rather than waiting on the hook monitor to notice the hook isn't working
-    if (!hook_was_nullptr) {
+    if (split_factory_transition) {
+        if (g_xefg_factory_transition.in_flight == 0) {
+            spdlog::error("[D3D12][FactoryTransition] stage = invalid_exit, sequence = {}, reason = in_flight_underflow",
+                transition_sequence);
+            g_xefg_factory_transition.rehook_required = false;
+        } else {
+            --g_xefg_factory_transition.in_flight;
+
+            if (g_xefg_factory_transition.in_flight == 0
+                && g_xefg_factory_transition.rehook_required) {
+                g_xefg_factory_transition.rehook_required = false;
+
+                if (g_d3d12_hook == nullptr && g_framework->get_d3d12_hook() != nullptr) {
+                    if (XeFGCompatibility::is_debug_log_enabled()) {
+                        spdlog::info("[D3D12][FactoryTransition] sequence = {}, stage = rehook, reason = final_in_flight_exit, thread_id = {}",
+                            transition_sequence,
+                            GetCurrentThreadId());
+                    }
+                    g_framework->hook_d3d12();
+                } else if (XeFGCompatibility::is_debug_log_enabled()) {
+                    spdlog::info("[D3D12][FactoryTransition] sequence = {}, stage = rehook_skipped, reason = current_hook_already_present, thread_id = {}",
+                        transition_sequence,
+                        GetCurrentThreadId());
+                }
+            }
+        }
+    } else if (!hook_was_nullptr) {
+        // Preserve the legacy non-XeFG path.
         g_framework->hook_d3d12();
     }
 
