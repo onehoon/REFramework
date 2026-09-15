@@ -1378,16 +1378,16 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
     std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
 
     using PresentFn = decltype(D3D12Hook::present)*;
-    const auto forward_late = [&]() -> HRESULT {
+    const auto forward_late = [&](const char* reason = nullptr) -> HRESULT {
         const auto target = resolve_late_swapchain_target<PresentFn>(swap_chain, 8, &D3D12Hook::present);
         if (target != nullptr) {
             log_late_callback("Present", swap_chain, 8,
                 reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(target)),
-                "forward_restored_vtable");
+                "forward_restored_vtable", reason);
             return target(swap_chain, sync_interval, flags, r9);
         }
 
-        log_late_callback("Present", swap_chain, 8, nullptr, "blocked", "no_safe_target");
+        log_late_callback("Present", swap_chain, 8, nullptr, "blocked", reason != nullptr ? reason : "no_safe_target");
         return E_FAIL;
     };
 
@@ -1396,9 +1396,15 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
         return forward_late();
     }
 
+    const bool different_xefg_instance = !d3d12->m_is_phase_1
+        && d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
+        && (d3d12->m_swapchain_hook == nullptr
+            || swap_chain != d3d12->m_swapchain_hook->get_instance());
+
     if ((d3d12->m_is_phase_1 && d3d12->m_present_hook == nullptr)
-        || (!d3d12->m_is_phase_1 && d3d12->m_swapchain_hook == nullptr)) {
-        return forward_late();
+        || (!d3d12->m_is_phase_1 && d3d12->m_swapchain_hook == nullptr)
+        || different_xefg_instance) {
+        return forward_late(different_xefg_instance ? "different_xefg_instance" : nullptr);
     }
 
     // XeFG Present and Present1 share the direct-binding lifecycle. Keep the
@@ -1899,16 +1905,16 @@ HRESULT WINAPI D3D12Hook::present1(IDXGISwapChain1* swap_chain, UINT sync_interv
     std::scoped_lock lifecycle_lock{g_framework->get_hook_monitor_mutex()};
 
     using Present1Fn = decltype(D3D12Hook::present1)*;
-    const auto forward_late = [&]() -> HRESULT {
+    const auto forward_late = [&](const char* reason = nullptr) -> HRESULT {
         const auto target = resolve_late_swapchain_target<Present1Fn>(swap_chain, 22, &D3D12Hook::present1);
         if (target != nullptr) {
             log_late_callback("Present1", swap_chain, 22,
                 reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(target)),
-                "forward_restored_vtable");
+                "forward_restored_vtable", reason);
             return target(swap_chain, sync_interval, flags, parameters);
         }
 
-        log_late_callback("Present1", swap_chain, 22, nullptr, "blocked", "no_safe_target");
+        log_late_callback("Present1", swap_chain, 22, nullptr, "blocked", reason != nullptr ? reason : "no_safe_target");
         return E_FAIL;
     };
 
@@ -1917,12 +1923,22 @@ HRESULT WINAPI D3D12Hook::present1(IDXGISwapChain1* swap_chain, UINT sync_interv
         return forward_late();
     }
 
-    const auto original = d3d12->m_swapchain_hook->get_method<Present1Fn>(22);
     Microsoft::WRL::ComPtr<IDXGISwapChain3> swap_chain3;
     if (FAILED(swap_chain->QueryInterface(IID_PPV_ARGS(&swap_chain3)))) {
+        if (d3d12->m_swapchain_source == SwapchainSource::XeFGInternal) {
+            return forward_late("identity_query_failed");
+        }
+
+        const auto original = d3d12->m_swapchain_hook->get_method<Present1Fn>(22);
         return original(swap_chain, sync_interval, flags, parameters);
     }
 
+    if (d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
+        && swap_chain3.Get() != d3d12->m_swapchain_hook->get_instance()) {
+        return forward_late("different_xefg_instance");
+    }
+
+    const auto original = d3d12->m_swapchain_hook->get_method<Present1Fn>(22);
     return present_common(swap_chain3.Get(), "Present1", reinterpret_cast<void*>(original), [swap_chain, sync_interval, flags, parameters, original]() {
         return original(swap_chain, sync_interval, flags, parameters);
     }, false);
@@ -1938,22 +1954,27 @@ HRESULT WINAPI D3D12Hook::resize_buffers(IDXGISwapChain3* swap_chain, UINT buffe
     std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
 
     using ResizeBuffersFn = decltype(D3D12Hook::resize_buffers)*;
-    const auto forward_late = [&]() -> HRESULT {
+    const auto forward_late = [&](const char* reason = nullptr) -> HRESULT {
         const auto target = resolve_late_swapchain_target<ResizeBuffersFn>(swap_chain, 13, &D3D12Hook::resize_buffers);
         if (target != nullptr) {
             log_late_callback("ResizeBuffers", swap_chain, 13,
                 reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(target)),
-                "forward_restored_vtable");
+                "forward_restored_vtable", reason);
             return target(swap_chain, buffer_count, width, height, new_format, swap_chain_flags);
         }
 
-        log_late_callback("ResizeBuffers", swap_chain, 13, nullptr, "blocked", "no_safe_target");
+        log_late_callback("ResizeBuffers", swap_chain, 13, nullptr, "blocked", reason != nullptr ? reason : "no_safe_target");
         return E_FAIL;
     };
 
     auto d3d12 = g_d3d12_hook;
     if (d3d12 == nullptr || d3d12->m_swapchain_hook == nullptr || swap_chain == nullptr) {
         return forward_late();
+    }
+
+    if (d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
+        && swap_chain != d3d12->m_swapchain_hook->get_instance()) {
+        return forward_late("different_xefg_instance");
     }
 
     spdlog::info("D3D12 resize buffers called");
@@ -2072,22 +2093,27 @@ HRESULT WINAPI D3D12Hook::resize_buffers1(IDXGISwapChain3* swap_chain, UINT buff
     std::scoped_lock lifecycle_lock{g_framework->get_hook_monitor_mutex()};
 
     using ResizeBuffers1Fn = decltype(D3D12Hook::resize_buffers1)*;
-    const auto forward_late = [&]() -> HRESULT {
+    const auto forward_late = [&](const char* reason = nullptr) -> HRESULT {
         const auto target = resolve_late_swapchain_target<ResizeBuffers1Fn>(swap_chain, 39, &D3D12Hook::resize_buffers1);
         if (target != nullptr) {
             log_late_callback("ResizeBuffers1", swap_chain, 39,
                 reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(target)),
-                "forward_restored_vtable");
+                "forward_restored_vtable", reason);
             return target(swap_chain, buffer_count, width, height, new_format, swap_chain_flags, creation_node_mask, present_queues);
         }
 
-        log_late_callback("ResizeBuffers1", swap_chain, 39, nullptr, "blocked", "no_safe_target");
+        log_late_callback("ResizeBuffers1", swap_chain, 39, nullptr, "blocked", reason != nullptr ? reason : "no_safe_target");
         return E_FAIL;
     };
 
     auto* d3d12 = g_d3d12_hook;
     if (d3d12 == nullptr || d3d12->m_swapchain_hook == nullptr || swap_chain == nullptr) {
         return forward_late();
+    }
+
+    if (d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
+        && swap_chain != d3d12->m_swapchain_hook->get_instance()) {
+        return forward_late("different_xefg_instance");
     }
 
     const auto original = d3d12->m_swapchain_hook->get_method<ResizeBuffers1Fn>(39);
@@ -2165,22 +2191,27 @@ HRESULT WINAPI D3D12Hook::resize_target(IDXGISwapChain3* swap_chain, const DXGI_
     std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
 
     using ResizeTargetFn = decltype(D3D12Hook::resize_target)*;
-    const auto forward_late = [&]() -> HRESULT {
+    const auto forward_late = [&](const char* reason = nullptr) -> HRESULT {
         const auto target = resolve_late_swapchain_target<ResizeTargetFn>(swap_chain, 14, &D3D12Hook::resize_target);
         if (target != nullptr) {
             log_late_callback("ResizeTarget", swap_chain, 14,
                 reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(target)),
-                "forward_restored_vtable");
+                "forward_restored_vtable", reason);
             return target(swap_chain, new_target_parameters);
         }
 
-        log_late_callback("ResizeTarget", swap_chain, 14, nullptr, "blocked", "no_safe_target");
+        log_late_callback("ResizeTarget", swap_chain, 14, nullptr, "blocked", reason != nullptr ? reason : "no_safe_target");
         return E_FAIL;
     };
 
     auto d3d12 = g_d3d12_hook;
     if (d3d12 == nullptr || d3d12->m_swapchain_hook == nullptr || swap_chain == nullptr) {
         return forward_late();
+    }
+
+    if (d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
+        && swap_chain != d3d12->m_swapchain_hook->get_instance()) {
+        return forward_late("different_xefg_instance");
     }
 
     spdlog::info("D3D12 resize target called");
