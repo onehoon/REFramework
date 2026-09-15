@@ -1923,19 +1923,15 @@ HRESULT WINAPI D3D12Hook::present1(IDXGISwapChain1* swap_chain, UINT sync_interv
         return forward_late();
     }
 
-    Microsoft::WRL::ComPtr<IDXGISwapChain3> swap_chain3;
-    if (FAILED(swap_chain->QueryInterface(IID_PPV_ARGS(&swap_chain3)))) {
-        if (d3d12->m_swapchain_source == SwapchainSource::XeFGInternal) {
-            return forward_late("identity_query_failed");
-        }
-
-        const auto original = d3d12->m_swapchain_hook->get_method<Present1Fn>(22);
-        return original(swap_chain, sync_interval, flags, parameters);
+    if (d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
+        && reinterpret_cast<void*>(swap_chain) != d3d12->m_swapchain_hook->get_instance().ptr()) {
+        return forward_late("different_xefg_instance");
     }
 
-    if (d3d12->m_swapchain_source == SwapchainSource::XeFGInternal
-        && swap_chain3.Get() != d3d12->m_swapchain_hook->get_instance()) {
-        return forward_late("different_xefg_instance");
+    Microsoft::WRL::ComPtr<IDXGISwapChain3> swap_chain3;
+    if (FAILED(swap_chain->QueryInterface(IID_PPV_ARGS(&swap_chain3)))) {
+        const auto original = d3d12->m_swapchain_hook->get_method<Present1Fn>(22);
+        return original(swap_chain, sync_interval, flags, parameters);
     }
 
     const auto original = d3d12->m_swapchain_hook->get_method<Present1Fn>(22);
