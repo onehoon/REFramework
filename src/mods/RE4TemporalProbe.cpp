@@ -14,6 +14,8 @@
 #include <sdk/types/REComponent.hpp>
 #include <utility/Module.hpp>
 
+#include "D3D12Hook.hpp"
+
 namespace {
 constexpr uint32_t MAX_SAMPLES = re4_temporal_probe::MAX_SAMPLES;
 
@@ -111,6 +113,98 @@ void log_re4_rtv_layout_probe(uint32_t sample, const char* scenario, sdk::render
             offset,
             candidate,
             type_name.empty() ? "<unknown>" : type_name);
+    }
+}
+
+void log_re4_output_target_correlation(
+    uint32_t sample,
+    const char* scenario,
+    sdk::renderer::RenderTargetView* rtv,
+    void* output_target_state) {
+    if (!sdk::GameIdentity::get().is_re4() || sample != 1 || rtv == nullptr || output_target_state == nullptr) {
+        return;
+    }
+
+    auto* hook = D3D12Hook::current_xefg_handoff_target();
+    auto* swap_chain = hook != nullptr ? hook->get_swap_chain() : nullptr;
+    if (swap_chain == nullptr) {
+        spdlog::info(
+            "[RE4TemporalProbe] sample={} scenario='{}' phase=EndRendering outputTargetCorrelation rtv={:p} outputTargetState={:p} swapChain=null",
+            sample,
+            scenario,
+            static_cast<void*>(rtv),
+            output_target_state);
+        return;
+    }
+
+    DXGI_SWAP_CHAIN_DESC swap_desc{};
+    if (FAILED(swap_chain->GetDesc(&swap_desc))) {
+        spdlog::info(
+            "[RE4TemporalProbe] sample={} scenario='{}' phase=EndRendering outputTargetCorrelation rtv={:p} outputTargetState={:p} swapChain={:p} getDesc=failed",
+            sample,
+            scenario,
+            static_cast<void*>(rtv),
+            output_target_state,
+            static_cast<void*>(swap_chain));
+        return;
+    }
+
+    const auto current_index = swap_chain->GetCurrentBackBufferIndex();
+    spdlog::info(
+        "[RE4TemporalProbe] sample={} scenario='{}' phase=EndRendering outputTargetCorrelation rtv={:p} outputTargetState={:p} swapChain={:p} bufferCount={} currentIndex={}",
+        sample,
+        scenario,
+        static_cast<void*>(rtv),
+        output_target_state,
+        static_cast<void*>(swap_chain),
+        swap_desc.BufferCount,
+        current_index);
+
+    constexpr uintptr_t SCAN_BEGIN = 0x0;
+    constexpr uintptr_t SCAN_END = 0x200;
+
+    for (UINT buffer_index = 0; buffer_index < swap_desc.BufferCount && buffer_index < 8; ++buffer_index) {
+        Microsoft::WRL::ComPtr<ID3D12Resource> backbuffer{};
+        if (FAILED(swap_chain->GetBuffer(buffer_index, IID_PPV_ARGS(&backbuffer))) || backbuffer == nullptr) {
+            continue;
+        }
+
+        const auto backbuffer_ptr = reinterpret_cast<uintptr_t>(backbuffer.Get());
+        bool matched{false};
+
+        for (uintptr_t offset = SCAN_BEGIN; offset <= SCAN_END; offset += sizeof(void*)) {
+            auto* slot = reinterpret_cast<uintptr_t*>(reinterpret_cast<uintptr_t>(output_target_state) + offset);
+            if (IsBadReadPtr(slot, sizeof(uintptr_t))) {
+                continue;
+            }
+
+            uintptr_t value{};
+            try {
+                value = *slot;
+            } catch (...) {
+                continue;
+            }
+
+            if (value == backbuffer_ptr) {
+                matched = true;
+                spdlog::info(
+                    "[RE4TemporalProbe] sample={} scenario='{}' phase=EndRendering outputTargetCorrelation backbufferIndex={} backbuffer={:p} matchOffset=0x{:x}",
+                    sample,
+                    scenario,
+                    buffer_index,
+                    static_cast<void*>(backbuffer.Get()),
+                    offset);
+            }
+        }
+
+        if (!matched) {
+            spdlog::info(
+                "[RE4TemporalProbe] sample={} scenario='{}' phase=EndRendering outputTargetCorrelation backbufferIndex={} backbuffer={:p} matchOffset=none",
+                sample,
+                scenario,
+                buffer_index,
+                static_cast<void*>(backbuffer.Get()));
+        }
     }
 }
 
@@ -394,6 +488,7 @@ void RE4TemporalProbe::on_pre_application_entry(void* entry, const char* name, s
             : nullptr;
 
         log_re4_rtv_layout_probe(sample, scenario, output_rtv.get());
+        log_re4_output_target_correlation(sample, scenario, output_rtv.get(), rtv_target_state.get());
 
         spdlog::info(
             "[RE4TemporalProbe] endSample={} scenario='{}' phase=EndRendering sceneIndex={} scene={:p} viewId={} prepareOutput={:p} outputState={:p} outputRTV0={:p} outputTexture={:p} rtvTargetState={:p}",
