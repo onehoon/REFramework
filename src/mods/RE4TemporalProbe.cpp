@@ -1,5 +1,6 @@
 #include "RE4TemporalProbe.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <string>
