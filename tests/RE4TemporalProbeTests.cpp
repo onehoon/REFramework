@@ -8,9 +8,15 @@ int main() {
     using namespace re4_temporal_probe;
     int scene{};
 
-    CHECK(!should_process_scene(false, &scene));
-    CHECK(!should_process_scene(true, nullptr));
-    CHECK(should_process_scene(true, &scene));
+    CHECK(!should_process_scene(false, true, &scene));
+    CHECK(!should_process_scene(true, false, &scene));
+    CHECK(!should_process_scene(true, true, nullptr));
+    CHECK(should_process_scene(true, true, &scene));
+
+    CHECK(!should_process_end_rendering(false, true, "EndRendering"));
+    CHECK(!should_process_end_rendering(true, false, "EndRendering"));
+    CHECK(!should_process_end_rendering(true, true, "BeginRendering"));
+    CHECK(should_process_end_rendering(true, true, "EndRendering"));
 
     CHECK(!is_primary_scene(false, true, true));
     CHECK(!is_primary_scene(true, false, true));
