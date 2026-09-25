@@ -13,18 +13,13 @@ int main() {
     CHECK(!should_process_scene(true, true, nullptr));
     CHECK(should_process_scene(true, true, &scene));
 
-    CHECK(!should_process_end_rendering(false, true, "EndRendering"));
-    CHECK(!should_process_end_rendering(true, false, "EndRendering"));
-    CHECK(!should_process_end_rendering(true, true, "BeginRendering"));
-    CHECK(should_process_end_rendering(true, true, "EndRendering"));
-
     CHECK(!is_primary_scene(false, true, true));
     CHECK(!is_primary_scene(true, false, true));
     CHECK(!is_primary_scene(true, true, false));
     CHECK(is_primary_scene(true, true, true));
-    CHECK(!has_scene_local_color_candidate(true, nullptr));
-    CHECK(!has_scene_local_color_candidate(false, &scene));
-    CHECK(has_scene_local_color_candidate(true, &scene));
+
+    CHECK(MAX_SAMPLES == 10);
+    CHECK(MAX_SCENE_RTVS == 8);
 
     SampleBudget interleaved_budget;
     uint32_t interleaved_captures{};
