@@ -13,12 +13,10 @@ public:
 
     void on_draw_ui() override;
     void on_scene_layer_draw(sdk::renderer::layer::Scene* layer, void* render_context) override;
-    void on_pre_application_entry(void* entry, const char* name, size_t hash) override;
 
 private:
     std::atomic<bool> m_enabled{false};
     std::atomic<int> m_scenario{0};
     std::atomic<uint32_t> m_non_primary_scene_callbacks{0};
     re4_temporal_probe::SampleBudget m_sample_budget;
-    re4_temporal_probe::SampleBudget m_end_render_sample_budget;
 };
