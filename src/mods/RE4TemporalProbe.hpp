@@ -5,6 +5,7 @@
 #include <sdk/Renderer.hpp>
 
 #include "Mod.hpp"
+#include "RE4TemporalProbeSupport.hpp"
 
 class RE4TemporalProbe final : public Mod {
 public:
@@ -16,6 +17,5 @@ public:
 private:
     std::atomic<bool> m_enabled{false};
     std::atomic<int> m_scenario{0};
-    std::atomic<uint32_t> m_scene_draw_callbacks{0};
-    std::atomic<uint32_t> m_samples{0};
+    re4_temporal_probe::SampleBudget m_sample_budget;
 };

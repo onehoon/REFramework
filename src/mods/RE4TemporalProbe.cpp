@@ -12,9 +12,7 @@
 #include <sdk/types/REComponent.hpp>
 
 namespace {
-constexpr uint32_t SAMPLE_INTERVAL_CALLBACKS = 60;
-constexpr uint32_t MAX_SAMPLES = 240;
-constexpr uint32_t MAX_SCENE_LAYERS = 32;
+constexpr uint32_t MAX_SAMPLES = re4_temporal_probe::MAX_SAMPLES;
 
 constexpr std::array<const char*, 5> SCENARIOS{
     "Static screen",
@@ -30,18 +28,6 @@ const char* scenario_name(int index) {
     }
 
     return SCENARIOS[index];
-}
-
-uint32_t reserve_sample(std::atomic<uint32_t>& samples) {
-    auto current = samples.load(std::memory_order_relaxed);
-
-    while (current < MAX_SAMPLES) {
-        if (samples.compare_exchange_weak(current, current + 1, std::memory_order_relaxed)) {
-            return current + 1;
-        }
-    }
-
-    return 0;
 }
 
 void log_resource(
@@ -109,34 +95,37 @@ void RE4TemporalProbe::on_draw_ui() {
         m_scenario.store(scenario, std::memory_order_relaxed);
     }
 
-    ImGui::Text("Scene draw callbacks: %u", m_scene_draw_callbacks.load(std::memory_order_relaxed));
-    ImGui::Text("Samples: %u / %u", m_samples.load(std::memory_order_relaxed), MAX_SAMPLES);
+    ImGui::Text("Scene draw callbacks: %u", m_sample_budget.callback_count());
+    ImGui::Text("Samples: %u / %u", m_sample_budget.sample_count(), MAX_SAMPLES);
     ImGui::TextWrapped("One bounded sample per 60 Scene draw callbacks. Read the REFramework log for candidate object/resource pointers and descriptors.");
 
     if (ImGui::Button("Reset capture budget")) {
-        m_scene_draw_callbacks.store(0, std::memory_order_relaxed);
-        m_samples.store(0, std::memory_order_relaxed);
+        m_sample_budget.reset();
     }
 }
 
 void RE4TemporalProbe::on_scene_layer_draw(sdk::renderer::layer::Scene* layer, void* render_context) {
     (void)render_context;
 
-    if (!m_enabled.load(std::memory_order_relaxed) || layer == nullptr) {
+    if (!re4_temporal_probe::should_process_scene(m_enabled.load(std::memory_order_relaxed), layer)) {
         return;
     }
 
-    const auto callback = m_scene_draw_callbacks.fetch_add(1, std::memory_order_relaxed);
-    if (callback % SAMPLE_INTERVAL_CALLBACKS != 0) {
+    if (!m_sample_budget.should_sample_callback()) {
         return;
     }
 
-    const auto sample = reserve_sample(m_samples);
+    const auto sample = m_sample_budget.reserve_sample();
     if (sample == 0) {
         return;
     }
 
     const auto scenario = scenario_name(m_scenario.load(std::memory_order_relaxed));
+    const auto view_id = layer->get_view_id();
+    const auto scene_enabled = layer->is_enabled();
+    const auto has_main_camera = layer->has_main_camera();
+    const auto fully_rendered = layer->is_fully_rendered();
+    const auto primary_scene = re4_temporal_probe::is_primary_scene(scene_enabled, has_main_camera, fully_rendered);
     auto* camera = layer->get_camera();
     auto* renderer = sdk::renderer::get_renderer();
     const auto frame = renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
@@ -153,44 +142,16 @@ void RE4TemporalProbe::on_scene_layer_draw(sdk::renderer::layer::Scene* layer, v
 
     sdk::renderer::layer::PrepareOutput* prepare_output{};
     sdk::renderer::RenderLayer* prepare_parent{};
-    uint32_t scene_layer_count{};
-    if (prepare_output_type != nullptr) {
+    if (primary_scene && prepare_output_type != nullptr) {
         if (auto* type = prepare_output_type->get_type(); type != nullptr) {
-            if (render_output != nullptr) {
-                auto& scene_layers = render_output->get_scene_layers();
-                auto bounded_scene_layer_count = scene_layers.num < scene_layers.num_allocated
-                    ? scene_layers.num
-                    : scene_layers.num_allocated;
-                if (bounded_scene_layer_count > MAX_SCENE_LAYERS) {
-                    bounded_scene_layer_count = MAX_SCENE_LAYERS;
-                }
-                scene_layer_count = (uint32_t)bounded_scene_layer_count;
-
-                for (uint32_t i = 0; i < scene_layer_count && scene_layers.elements != nullptr; ++i) {
-                    auto* candidate_scene = scene_layers.elements[i];
-                    if (candidate_scene == nullptr) {
-                        continue;
-                    }
-
-                    const auto result = candidate_scene->find_layer_recursive(type);
-                    if (const auto slot = std::get<1>(result); slot != nullptr) {
-                        prepare_output = static_cast<sdk::renderer::layer::PrepareOutput*>(*slot);
-                        prepare_parent = std::get<0>(result);
-                        break;
-                    }
-                }
+            const auto result = layer->find_layer_recursive(type);
+            if (const auto slot = std::get<1>(result); slot != nullptr && *slot != nullptr) {
+                prepare_output = static_cast<sdk::renderer::layer::PrepareOutput*>(*slot);
+                prepare_parent = std::get<0>(result);
             }
-
-            // PrepareOutput may be a sibling of the Scene layer in the renderer tree.
-            if (prepare_output == nullptr) {
-                auto* root = sdk::renderer::get_root_layer();
-                if (root != nullptr) {
-                    const auto result = root->find_layer_recursive(type);
-                    if (const auto slot = std::get<1>(result); slot != nullptr) {
-                        prepare_output = static_cast<sdk::renderer::layer::PrepareOutput*>(*slot);
-                        prepare_parent = std::get<0>(result);
-                    }
-                }
+            if (!re4_temporal_probe::has_scene_local_color_candidate(primary_scene, prepare_output)) {
+                prepare_output = nullptr;
+                prepare_parent = nullptr;
             }
         }
     }
@@ -200,28 +161,35 @@ void RE4TemporalProbe::on_scene_layer_draw(sdk::renderer::layer::Scene* layer, v
     auto* output_texture = output_rtv.has_value() ? output_rtv->get_texture_d3d12().get() : nullptr;
     auto* output_resource = output_state != nullptr ? output_state->get_native_resource_d3d12() : nullptr;
 
-    auto* depth_texture = layer->get_depth_stencil();
-    auto* depth_resource = layer->get_depth_stencil_d3d12();
-    auto* velocity_state = layer->get_motion_vectors_state();
+    auto* depth_texture = primary_scene ? layer->get_depth_stencil() : nullptr;
+    auto* depth_resource = primary_scene ? layer->get_depth_stencil_d3d12() : nullptr;
+    auto* velocity_state = primary_scene ? layer->get_motion_vectors_state() : nullptr;
+    auto velocity_rtv = velocity_state != nullptr ? velocity_state->get_rtv(0) : sdk::intrusive_ptr<sdk::renderer::RenderTargetView>{};
+    auto* velocity_texture = velocity_rtv.has_value() ? velocity_rtv->get_texture_d3d12().get() : nullptr;
     auto* velocity_resource = velocity_state != nullptr ? velocity_state->get_native_resource_d3d12() : nullptr;
 
     spdlog::info(
-        "[RE4TemporalProbe] sample={} scenario='{}' frame={} scene={:p} camera={:p} renderOutput={:p} renderOutputSceneLayers={} prepareParent={:p} prepareOutput={:p} outputState={:p} outputRTV0={:p} depthTexture={:p} velocityState={:p}",
+        "[RE4TemporalProbe] sample={} scenario='{}' frame={} scene={:p} viewId={} sceneEnabled={} hasMainCamera={} fullyRendered={} primaryScene={} camera={:p} renderOutput={:p} prepareParent={:p} prepareOutput={:p} outputState={:p} outputRTV0={:p} depthTexture={:p} velocityState={:p} velocityRTV0={:p}",
         sample,
         scenario,
         frame.has_value() ? std::to_string(*frame) : "unknown",
         static_cast<void*>(layer),
+        view_id,
+        scene_enabled,
+        has_main_camera,
+        fully_rendered,
+        primary_scene,
         static_cast<void*>(camera),
         static_cast<void*>(render_output),
-        scene_layer_count,
         static_cast<void*>(prepare_parent),
         static_cast<void*>(prepare_output),
         static_cast<void*>(output_state),
         static_cast<void*>(output_rtv.get()),
         static_cast<void*>(depth_texture),
-        static_cast<void*>(velocity_state));
+        static_cast<void*>(velocity_state),
+        static_cast<void*>(velocity_rtv.get()));
 
     log_resource(sample, scenario, "color_candidate", output_texture, output_resource);
     log_resource(sample, scenario, "depth_candidate", depth_texture, depth_resource);
-    log_resource(sample, scenario, "motion_vector_candidate", nullptr, velocity_resource);
+    log_resource(sample, scenario, "motion_vector_candidate", velocity_texture, velocity_resource);
 }
