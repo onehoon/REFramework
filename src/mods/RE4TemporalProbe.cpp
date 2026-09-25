@@ -10,7 +10,9 @@
 
 #include <sdk/GameIdentity.hpp>
 #include <sdk/RETypeDefinition.hpp>
+#include <sdk/RETypes.hpp>
 #include <sdk/types/REComponent.hpp>
+#include <utility/Module.hpp>
 
 namespace {
 constexpr uint32_t MAX_SAMPLES = re4_temporal_probe::MAX_SAMPLES;
@@ -29,6 +31,87 @@ const char* scenario_name(int index) {
     }
 
     return SCENARIOS[index];
+}
+
+std::string_view try_get_re_type_name(void* object) {
+    // RE4-only diagnostic helper. Never use this as a generic layout rule.
+    if (object == nullptr || IsBadReadPtr(object, sizeof(void*))) {
+        return {};
+    }
+
+    try {
+        const auto vtable = *reinterpret_cast<uintptr_t**>(object);
+        if (vtable == nullptr || IsBadReadPtr(vtable, sizeof(uintptr_t) * 4)) {
+            return {};
+        }
+
+        constexpr size_t GET_TYPEINFO_FN_INDEX = 3; // RE4 / TDB 71
+        const auto get_typeinfo_fn = vtable[GET_TYPEINFO_FN_INDEX];
+        if (get_typeinfo_fn == 0 ||
+            IsBadReadPtr(reinterpret_cast<void*>(get_typeinfo_fn), 3) ||
+            !utility::get_module_within(get_typeinfo_fn)) {
+            return {};
+        }
+
+        const auto* bytes = reinterpret_cast<const uint8_t*>(get_typeinfo_fn);
+        if (bytes[0] != 0x48 || bytes[1] != 0x8B || bytes[2] != 0x05) {
+            return {};
+        }
+
+        using type_info_fn_t = sdk::RETypeCLR* (*)();
+        const auto type_info = reinterpret_cast<type_info_fn_t>(get_typeinfo_fn)();
+        if (type_info == nullptr || IsBadReadPtr(type_info, sizeof(void*))) {
+            return {};
+        }
+
+        const auto type_name = type_info->get_type_name();
+        if (type_name == nullptr || IsBadReadPtr(type_name, 1)) {
+            return {};
+        }
+
+        return type_name;
+    } catch (...) {
+        return {};
+    }
+}
+
+void log_re4_rtv_layout_probe(uint32_t sample, const char* scenario, sdk::renderer::RenderTargetView* rtv) {
+    if (!sdk::GameIdentity::get().is_re4() || sample != 1 || rtv == nullptr) {
+        return;
+    }
+
+    // Narrow, read-only scan around the historically expected DX12 tail.
+    // This intentionally does not mutate the shared RenderTargetView accessor yet.
+    constexpr uintptr_t BEGIN = 0x80;
+    constexpr uintptr_t END = 0xE0;
+
+    for (uintptr_t offset = BEGIN; offset <= END; offset += sizeof(void*)) {
+        void* candidate{};
+
+        try {
+            auto slot = reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(rtv) + offset);
+            if (IsBadReadPtr(slot, sizeof(void*))) {
+                continue;
+            }
+            candidate = *slot;
+        } catch (...) {
+            continue;
+        }
+
+        if (candidate == nullptr) {
+            continue;
+        }
+
+        const auto type_name = try_get_re_type_name(candidate);
+        spdlog::info(
+            "[RE4TemporalProbe] sample={} scenario='{}' phase=EndRendering rtvLayoutProbe rtv={:p} offset=0x{:x} candidate={:p} type='{}'",
+            sample,
+            scenario,
+            static_cast<void*>(rtv),
+            offset,
+            candidate,
+            type_name.empty() ? "<unknown>" : type_name);
+    }
 }
 
 void log_resource(
@@ -309,6 +392,8 @@ void RE4TemporalProbe::on_pre_application_entry(void* entry, const char* name, s
         auto* rtv_target_resource = rtv_target_state.has_value()
             ? rtv_target_state->get_native_resource_d3d12()
             : nullptr;
+
+        log_re4_rtv_layout_probe(sample, scenario, output_rtv.get());
 
         spdlog::info(
             "[RE4TemporalProbe] endSample={} scenario='{}' phase=EndRendering sceneIndex={} scene={:p} viewId={} prepareOutput={:p} outputState={:p} outputRTV0={:p} outputTexture={:p} rtvTargetState={:p}",
