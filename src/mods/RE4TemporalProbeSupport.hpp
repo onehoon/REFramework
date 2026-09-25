@@ -6,7 +6,7 @@
 
 namespace re4_temporal_probe {
 inline constexpr uint32_t SAMPLE_INTERVAL_CALLBACKS = 60;
-inline constexpr uint32_t MAX_SAMPLES = 240;
+inline constexpr uint32_t MAX_SAMPLES = 30;
 inline constexpr uint32_t MAX_NON_PRIMARY_SCENE_DIAGNOSTICS = 8;
 inline constexpr uint32_t MAX_END_RENDER_SCENES = 4;
 
