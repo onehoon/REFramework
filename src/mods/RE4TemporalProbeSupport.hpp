@@ -9,6 +9,7 @@ inline constexpr uint32_t MAX_SAMPLES = 10;
 inline constexpr uint32_t MAX_NON_PRIMARY_SCENE_DIAGNOSTICS = 8;
 inline constexpr uint32_t MAX_SCENE_RTVS = 8;
 inline constexpr uint32_t MAX_POST_EFFECT_RTVS = 8;
+inline constexpr uint32_t MAX_OVERLAY_RTVS = 8;
 
 // Defense in depth: the diagnostic and the future bridge are RE4-only.
 // Registration is also gated in Mods.cpp, but callbacks must remain inert if
@@ -18,6 +19,10 @@ inline constexpr bool should_process_scene(bool is_re4, bool capture_enabled, co
 }
 
 inline constexpr bool should_process_post_effect(bool is_re4, bool capture_enabled, const void* layer, const void* render_context) noexcept {
+    return is_re4 && capture_enabled && layer != nullptr && render_context != nullptr;
+}
+
+inline constexpr bool should_process_overlay(bool is_re4, bool capture_enabled, const void* layer, const void* render_context) noexcept {
     return is_re4 && capture_enabled && layer != nullptr && render_context != nullptr;
 }
 
