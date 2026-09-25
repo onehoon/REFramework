@@ -116,6 +116,27 @@ void log_re4_rtv_layout_probe(uint32_t sample, const char* scenario, sdk::render
     }
 }
 
+void* get_re4_output_target_state_diagnostic(sdk::renderer::RenderTargetView* rtv) {
+    if (!sdk::GameIdentity::get().is_re4() || rtv == nullptr) {
+        return nullptr;
+    }
+
+    // RE4 1.5.9.0 runtime evidence identifies rtv + 0x98 as
+    // via.render.OutputTargetState. Keep this probe-only and title-specific;
+    // do not generalize it into the shared RenderTargetView accessor yet.
+    constexpr uintptr_t RE4_OUTPUT_TARGET_STATE_OFFSET = 0x98;
+    auto* slot = reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(rtv) + RE4_OUTPUT_TARGET_STATE_OFFSET);
+    if (IsBadReadPtr(slot, sizeof(void*))) {
+        return nullptr;
+    }
+
+    try {
+        return *slot;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 void log_re4_output_target_correlation(
     uint32_t sample,
     const char* scenario,
@@ -480,18 +501,15 @@ void RE4TemporalProbe::on_pre_application_entry(void* entry, const char* name, s
         auto* output_texture = output_rtv.has_value() ? output_rtv->get_texture_d3d12().get() : nullptr;
         auto* output_resource = output_state != nullptr ? output_state->get_native_resource_d3d12() : nullptr;
 
-        auto rtv_target_state = output_rtv.has_value()
-            ? output_rtv->get_target_state_d3d12()
-            : sdk::intrusive_ptr<sdk::renderer::TargetState>{};
-        auto* rtv_target_resource = rtv_target_state.has_value()
-            ? rtv_target_state->get_native_resource_d3d12()
+        auto* output_target_state = output_rtv.has_value()
+            ? get_re4_output_target_state_diagnostic(output_rtv.get())
             : nullptr;
 
         log_re4_rtv_layout_probe(sample, scenario, output_rtv.get());
-        log_re4_output_target_correlation(sample, scenario, output_rtv.get(), rtv_target_state.get());
+        log_re4_output_target_correlation(sample, scenario, output_rtv.get(), output_target_state);
 
         spdlog::info(
-            "[RE4TemporalProbe] endSample={} scenario='{}' phase=EndRendering sceneIndex={} scene={:p} viewId={} prepareOutput={:p} outputState={:p} outputRTV0={:p} outputTexture={:p} rtvTargetState={:p}",
+            "[RE4TemporalProbe] endSample={} scenario='{}' phase=EndRendering sceneIndex={} scene={:p} viewId={} prepareOutput={:p} outputState={:p} outputRTV0={:p} outputTexture={:p} outputTargetState={:p}",
             sample,
             scenario,
             i,
@@ -501,11 +519,8 @@ void RE4TemporalProbe::on_pre_application_entry(void* entry, const char* name, s
             static_cast<void*>(output_state),
             static_cast<void*>(output_rtv.get()),
             static_cast<void*>(output_texture),
-            static_cast<void*>(rtv_target_state.get()));
+            output_target_state);
 
         log_resource(sample, scenario, "end_render_color_candidate", output_texture, output_resource);
-        if (rtv_target_state.has_value()) {
-            log_resource(sample, scenario, "end_render_color_rtv_target", nullptr, rtv_target_resource);
-        }
     }
 }
