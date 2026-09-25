@@ -1494,6 +1494,8 @@ if(REF_BUILD_FRAMEWORK AND CMAKE_SIZEOF_VOID_P EQUAL 8) # build-framework
 		"src/mods/MethodDatabase.hpp"
 		"src/mods/PluginLoader.cpp"
 		"src/mods/PluginLoader.hpp"
+		"src/mods/RE4TemporalProbe.cpp"
+		"src/mods/RE4TemporalProbe.hpp"
 		"src/mods/REFrameworkConfig.cpp"
 		"src/mods/REFrameworkConfig.hpp"
 		"src/mods/Scene.cpp"
