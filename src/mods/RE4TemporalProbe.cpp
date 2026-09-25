@@ -28,6 +28,15 @@ const char* scenario_name(int index) {
     return SCENARIOS[index];
 }
 
+ID3D12Resource* get_native_resource(sdk::renderer::Texture* texture) {
+    if (texture == nullptr) {
+        return nullptr;
+    }
+
+    auto* container = texture->get_d3d12_resource_container();
+    return container != nullptr ? container->get_native_resource() : nullptr;
+}
+
 void log_resource(
     uint32_t sample,
     const char* scenario,
@@ -76,90 +85,21 @@ void log_resource(
         (uint32_t)desc.Flags);
 }
 
-void log_scene_render_targets(
-    uint32_t sample,
-    const char* scenario,
-    void* render_context,
-    ID3D12Resource* depth_resource,
-    ID3D12Resource* velocity_resource) {
-    if (!sdk::GameIdentity::get().is_re4() || render_context == nullptr) {
-        return;
+int32_t matching_scene_rtv_index(
+    ID3D12Resource* resource,
+    const std::array<std::atomic<uintptr_t>, 4>& scene_resources) {
+    if (resource == nullptr) {
+        return -1;
     }
 
-    auto* context = static_cast<sdk::renderer::RenderContext*>(render_context);
-    auto* target_state = context->get_render_target();
-
-    if (target_state == nullptr) {
-        spdlog::info(
-            "[RE4TemporalProbe] sample={} scenario='{}' sceneTarget currentTargetState=null",
-            sample,
-            scenario);
-        return;
-    }
-
-    const auto rtv_count = target_state->get_rtv_count();
-    const auto bounded_count = rtv_count < re4_temporal_probe::MAX_SCENE_RTVS
-        ? rtv_count
-        : re4_temporal_probe::MAX_SCENE_RTVS;
-
-    spdlog::info(
-        "[RE4TemporalProbe] sample={} scenario='{}' sceneTarget renderContext={:p} currentTargetState={:p} rtvCount={} boundedCount={}",
-        sample,
-        scenario,
-        render_context,
-        static_cast<void*>(target_state),
-        rtv_count,
-        bounded_count);
-
-    for (uint32_t i = 0; i < bounded_count; ++i) {
-        auto rtv = target_state->get_rtv((int32_t)i);
-        if (!rtv.has_value()) {
-            spdlog::info(
-                "[RE4TemporalProbe] sample={} scenario='{}' sceneTarget rtvIndex={} rtv=null",
-                sample,
-                scenario,
-                i);
-            continue;
-        }
-
-        auto texture = rtv->get_texture_d3d12();
-        auto* texture_ptr = texture.get();
-        ID3D12Resource* resource{};
-
-        if (texture_ptr != nullptr) {
-            if (auto* container = texture_ptr->get_d3d12_resource_container(); container != nullptr) {
-                resource = container->get_native_resource();
-            }
-        }
-
-        const auto& rtv_desc = rtv->get_desc();
-        spdlog::info(
-            "[RE4TemporalProbe] sample={} scenario='{}' sceneTarget rtvIndex={} rtv={:p} rtvFormat={} rtvDimension={} texture={:p} nativeResource={:p} matchesDepth={} matchesVelocity={}",
-            sample,
-            scenario,
-            i,
-            static_cast<void*>(rtv.get()),
-            rtv_desc.format,
-            rtv_desc.dimension,
-            static_cast<void*>(texture_ptr),
-            static_cast<void*>(resource),
-            resource != nullptr && resource == depth_resource,
-            resource != nullptr && resource == velocity_resource);
-
-        if (texture_ptr != nullptr || resource != nullptr) {
-            const auto role = i == 0 ? "scene_rtv0_candidate" : "scene_rtv_candidate";
-            log_resource(sample, scenario, role, texture_ptr, resource);
+    const auto value = reinterpret_cast<uintptr_t>(resource);
+    for (size_t i = 0; i < scene_resources.size(); ++i) {
+        if (scene_resources[i].load(std::memory_order_relaxed) == value) {
+            return static_cast<int32_t>(i);
         }
     }
 
-    if (rtv_count > re4_temporal_probe::MAX_SCENE_RTVS) {
-        spdlog::info(
-            "[RE4TemporalProbe] sample={} scenario='{}' sceneTarget truncatedRtvCount={} maxLogged={}",
-            sample,
-            scenario,
-            rtv_count,
-            re4_temporal_probe::MAX_SCENE_RTVS);
-    }
+    return -1;
 }
 }
 
@@ -182,11 +122,18 @@ void RE4TemporalProbe::on_draw_ui() {
     ImGui::Text("Primary Scene callbacks: %u", m_sample_budget.callback_count());
     ImGui::Text("Non-primary Scene callbacks: %u", m_non_primary_scene_callbacks.load(std::memory_order_relaxed));
     ImGui::Text("Scene samples: %u / %u", m_sample_budget.sample_count(), MAX_SAMPLES);
-    ImGui::TextWrapped("One bounded sample per 60 eligible callbacks. RE4-only. Logs current Scene RenderContext RTVs plus known Depth/Velocity anchors.");
+    ImGui::Text("PostEffect samples: %u / %u", m_post_effect_sample_budget.sample_count(), MAX_SAMPLES);
+    ImGui::TextWrapped("RE4-only passive probe. Scene MRTs are G-buffer evidence; PostEffect TargetStates are sampled separately to find a later scene-color candidate.");
 
     if (ImGui::Button("Reset capture budget")) {
         m_non_primary_scene_callbacks.store(0, std::memory_order_relaxed);
         m_sample_budget.reset();
+        m_post_effect_sample_budget.reset();
+        m_last_depth_resource.store(0, std::memory_order_relaxed);
+        m_last_velocity_resource.store(0, std::memory_order_relaxed);
+        for (auto& resource : m_last_scene_rtv_resources) {
+            resource.store(0, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -240,6 +187,12 @@ void RE4TemporalProbe::on_scene_layer_draw(sdk::renderer::layer::Scene* layer, v
     auto* velocity_texture = velocity_rtv.has_value() ? velocity_rtv->get_texture_d3d12().get() : nullptr;
     auto* velocity_resource = velocity_state != nullptr ? velocity_state->get_native_resource_d3d12() : nullptr;
 
+    m_last_depth_resource.store(reinterpret_cast<uintptr_t>(depth_resource), std::memory_order_relaxed);
+    m_last_velocity_resource.store(reinterpret_cast<uintptr_t>(velocity_resource), std::memory_order_relaxed);
+    for (auto& resource : m_last_scene_rtv_resources) {
+        resource.store(0, std::memory_order_relaxed);
+    }
+
     spdlog::info(
         "[RE4TemporalProbe] sample={} scenario='{}' frame={} scene={:p} viewId={} sceneEnabled={} hasMainCamera={} fullyRendered={} primaryScene={} camera={:p} renderContext={:p} depthTexture={:p} velocityState={:p} velocityRTV0={:p}",
         sample,
@@ -259,5 +212,166 @@ void RE4TemporalProbe::on_scene_layer_draw(sdk::renderer::layer::Scene* layer, v
 
     log_resource(sample, scenario, "depth_candidate", depth_texture, depth_resource);
     log_resource(sample, scenario, "motion_vector_candidate", velocity_texture, velocity_resource);
-    log_scene_render_targets(sample, scenario, render_context, depth_resource, velocity_resource);
+
+    if (render_context == nullptr) {
+        spdlog::info(
+            "[RE4TemporalProbe] sample={} scenario='{}' sceneTarget renderContext=null",
+            sample,
+            scenario);
+        return;
+    }
+
+    auto* context = static_cast<sdk::renderer::RenderContext*>(render_context);
+    auto* target_state = context->get_render_target();
+    if (target_state == nullptr) {
+        spdlog::info(
+            "[RE4TemporalProbe] sample={} scenario='{}' sceneTarget currentTargetState=null",
+            sample,
+            scenario);
+        return;
+    }
+
+    const auto rtv_count = target_state->get_rtv_count();
+    const auto bounded_count = (std::min)(rtv_count, re4_temporal_probe::MAX_SCENE_RTVS);
+
+    spdlog::info(
+        "[RE4TemporalProbe] sample={} scenario='{}' sceneTarget renderContext={:p} currentTargetState={:p} rtvCount={} boundedCount={}",
+        sample,
+        scenario,
+        render_context,
+        static_cast<void*>(target_state),
+        rtv_count,
+        bounded_count);
+
+    for (uint32_t i = 0; i < bounded_count; ++i) {
+        auto rtv = target_state->get_rtv((int32_t)i);
+        if (!rtv.has_value()) {
+            spdlog::info(
+                "[RE4TemporalProbe] sample={} scenario='{}' sceneTarget rtvIndex={} rtv=null",
+                sample,
+                scenario,
+                i);
+            continue;
+        }
+
+        auto texture = rtv->get_texture_d3d12();
+        auto* texture_ptr = texture.get();
+        auto* resource = get_native_resource(texture_ptr);
+
+        if (i < m_last_scene_rtv_resources.size()) {
+            m_last_scene_rtv_resources[i].store(reinterpret_cast<uintptr_t>(resource), std::memory_order_relaxed);
+        }
+
+        const auto& rtv_desc = rtv->get_desc();
+        spdlog::info(
+            "[RE4TemporalProbe] sample={} scenario='{}' sceneTarget rtvIndex={} rtv={:p} rtvFormat={} rtvDimension={} texture={:p} nativeResource={:p} matchesDepth={} matchesVelocity={}",
+            sample,
+            scenario,
+            i,
+            static_cast<void*>(rtv.get()),
+            rtv_desc.format,
+            rtv_desc.dimension,
+            static_cast<void*>(texture_ptr),
+            static_cast<void*>(resource),
+            resource != nullptr && resource == depth_resource,
+            resource != nullptr && resource == velocity_resource);
+
+        if (texture_ptr != nullptr || resource != nullptr) {
+            const auto role = i == 0 ? "scene_rtv0_candidate" : "scene_rtv_candidate";
+            log_resource(sample, scenario, role, texture_ptr, resource);
+        }
+    }
+}
+
+void RE4TemporalProbe::on_post_effect_layer_draw(sdk::renderer::layer::PostEffect* layer, void* render_context) {
+    if (!re4_temporal_probe::should_process_post_effect(
+            sdk::GameIdentity::get().is_re4(),
+            m_enabled.load(std::memory_order_relaxed),
+            layer,
+            render_context)) {
+        return;
+    }
+
+    if (!m_post_effect_sample_budget.should_sample_callback()) {
+        return;
+    }
+
+    const auto sample = m_post_effect_sample_budget.reserve_sample();
+    if (sample == 0) {
+        return;
+    }
+
+    const auto scenario = scenario_name(m_scenario.load(std::memory_order_relaxed));
+    auto* renderer = sdk::renderer::get_renderer();
+    const auto frame = renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
+    auto* context = static_cast<sdk::renderer::RenderContext*>(render_context);
+    auto* target_state = context->get_render_target();
+    auto* parent = layer->get_parent();
+
+    if (target_state == nullptr) {
+        spdlog::info(
+            "[RE4TemporalProbe] postSample={} scenario='{}' frame={} postEffectTarget layer={:p} parent={:p} renderContext={:p} currentTargetState=null",
+            sample,
+            scenario,
+            frame.has_value() ? std::to_string(*frame) : "unknown",
+            static_cast<void*>(layer),
+            static_cast<void*>(parent),
+            render_context);
+        return;
+    }
+
+    const auto rtv_count = target_state->get_rtv_count();
+    const auto bounded_count = (std::min)(rtv_count, re4_temporal_probe::MAX_POST_EFFECT_RTVS);
+    const auto depth_anchor = reinterpret_cast<ID3D12Resource*>(m_last_depth_resource.load(std::memory_order_relaxed));
+    const auto velocity_anchor = reinterpret_cast<ID3D12Resource*>(m_last_velocity_resource.load(std::memory_order_relaxed));
+
+    spdlog::info(
+        "[RE4TemporalProbe] postSample={} scenario='{}' frame={} postEffectTarget layer={:p} parent={:p} renderContext={:p} currentTargetState={:p} rtvCount={} boundedCount={} depthAnchor={:p} velocityAnchor={:p}",
+        sample,
+        scenario,
+        frame.has_value() ? std::to_string(*frame) : "unknown",
+        static_cast<void*>(layer),
+        static_cast<void*>(parent),
+        render_context,
+        static_cast<void*>(target_state),
+        rtv_count,
+        bounded_count,
+        static_cast<void*>(depth_anchor),
+        static_cast<void*>(velocity_anchor));
+
+    for (uint32_t i = 0; i < bounded_count; ++i) {
+        auto rtv = target_state->get_rtv((int32_t)i);
+        if (!rtv.has_value()) {
+            spdlog::info(
+                "[RE4TemporalProbe] postSample={} scenario='{}' postEffectTarget rtvIndex={} rtv=null",
+                sample,
+                scenario,
+                i);
+            continue;
+        }
+
+        auto texture = rtv->get_texture_d3d12();
+        auto* texture_ptr = texture.get();
+        auto* resource = get_native_resource(texture_ptr);
+        const auto scene_rtv_index = matching_scene_rtv_index(resource, m_last_scene_rtv_resources);
+        const auto& rtv_desc = rtv->get_desc();
+
+        spdlog::info(
+            "[RE4TemporalProbe] postSample={} scenario='{}' postEffectTarget rtvIndex={} rtv={:p} rtvFormat={} rtvDimension={} texture={:p} nativeResource={:p} matchesDepth={} matchesVelocity={} matchesSceneRtvIndex={}",
+            sample,
+            scenario,
+            i,
+            static_cast<void*>(rtv.get()),
+            rtv_desc.format,
+            rtv_desc.dimension,
+            static_cast<void*>(texture_ptr),
+            static_cast<void*>(resource),
+            resource != nullptr && resource == depth_anchor,
+            resource != nullptr && resource == velocity_anchor,
+            scene_rtv_index);
+
+        if (texture_ptr != nullptr || resource != nullptr) {
+            log_resource(sample, scenario, "post_effect_rtv_candidate", texture_ptr, resource);
+        }
+    }
 }
