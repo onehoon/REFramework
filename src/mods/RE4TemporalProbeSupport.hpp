@@ -2,14 +2,23 @@
 
 #include <atomic>
 #include <cstdint>
+#include <string_view>
 
 namespace re4_temporal_probe {
 inline constexpr uint32_t SAMPLE_INTERVAL_CALLBACKS = 60;
 inline constexpr uint32_t MAX_SAMPLES = 240;
 inline constexpr uint32_t MAX_NON_PRIMARY_SCENE_DIAGNOSTICS = 8;
+inline constexpr uint32_t MAX_END_RENDER_SCENES = 4;
 
-inline constexpr bool should_process_scene(bool capture_enabled, const void* scene) noexcept {
-    return capture_enabled && scene != nullptr;
+// Defense in depth: the diagnostic and the future bridge are RE4-only.
+// Registration is also gated in Mods.cpp, but callbacks must remain inert if
+// this object is ever instantiated in another title by mistake.
+inline constexpr bool should_process_scene(bool is_re4, bool capture_enabled, const void* scene) noexcept {
+    return is_re4 && capture_enabled && scene != nullptr;
+}
+
+inline constexpr bool should_process_end_rendering(bool is_re4, bool capture_enabled, std::string_view entry_name) noexcept {
+    return is_re4 && capture_enabled && entry_name == "EndRendering";
 }
 
 inline constexpr bool is_primary_scene(bool enabled, bool has_main_camera, bool fully_rendered) noexcept {
