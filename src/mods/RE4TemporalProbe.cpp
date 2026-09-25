@@ -381,9 +381,7 @@ void RE4TemporalProbe::on_post_effect_layer_draw(sdk::renderer::layer::PostEffec
 
         if (rtv_count == 1 && i == 0 && resource != nullptr) {
             const auto resource_desc = resource->GetDesc();
-            if (resource_desc.Width == 2560 &&
-                resource_desc.Height == 1440 &&
-                resource_desc.Format == DXGI_FORMAT_R11G11B10_FLOAT) {
+            if (resource_desc.Format == DXGI_FORMAT_R11G11B10_FLOAT) {
                 m_last_post_effect_resource.store(reinterpret_cast<uintptr_t>(resource), std::memory_order_relaxed);
                 m_last_post_effect_frame.store(frame.value_or(0), std::memory_order_relaxed);
 
