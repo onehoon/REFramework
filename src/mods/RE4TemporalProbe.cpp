@@ -124,17 +124,21 @@ void RE4TemporalProbe::on_draw_ui() {
     ImGui::Text("Non-primary Scene callbacks: %u", m_non_primary_scene_callbacks.load(std::memory_order_relaxed));
     ImGui::Text("Scene samples: %u / %u", m_sample_budget.sample_count(), MAX_SAMPLES);
     ImGui::Text("PostEffect samples: %u / %u", m_post_effect_sample_budget.sample_count(), MAX_SAMPLES);
-    ImGui::TextWrapped("RE4-only passive probe. Scene MRTs are G-buffer evidence; PostEffect TargetStates are sampled separately to find a later scene-color candidate.");
+    ImGui::Text("Overlay samples: %u / %u", m_overlay_sample_budget.sample_count(), MAX_SAMPLES);
+    ImGui::TextWrapped("RE4-only passive probe. The PostEffect R11G11B10_FLOAT target is the current Color candidate; Overlay is sampled separately to prove the pre-HUD boundary.");
 
     if (ImGui::Button("Reset capture budget")) {
         m_non_primary_scene_callbacks.store(0, std::memory_order_relaxed);
         m_sample_budget.reset();
         m_post_effect_sample_budget.reset();
+        m_overlay_sample_budget.reset();
         m_last_depth_resource.store(0, std::memory_order_relaxed);
         m_last_velocity_resource.store(0, std::memory_order_relaxed);
         for (auto& resource : m_last_scene_rtv_resources) {
             resource.store(0, std::memory_order_relaxed);
         }
+        m_last_post_effect_resource.store(0, std::memory_order_relaxed);
+        m_last_post_effect_frame.store(0, std::memory_order_relaxed);
     }
 }
 
@@ -373,6 +377,131 @@ void RE4TemporalProbe::on_post_effect_layer_draw(sdk::renderer::layer::PostEffec
 
         if (texture_ptr != nullptr || resource != nullptr) {
             log_resource(sample, scenario, "post_effect_rtv_candidate", texture_ptr, resource);
+        }
+
+        if (rtv_count == 1 && i == 0 && resource != nullptr) {
+            const auto resource_desc = resource->GetDesc();
+            if (resource_desc.Width == 2560 &&
+                resource_desc.Height == 1440 &&
+                resource_desc.Format == DXGI_FORMAT_R11G11B10_FLOAT) {
+                m_last_post_effect_resource.store(reinterpret_cast<uintptr_t>(resource), std::memory_order_relaxed);
+                m_last_post_effect_frame.store(frame.value_or(0), std::memory_order_relaxed);
+
+                spdlog::info(
+                    "[RE4TemporalProbe] postSample={} scenario='{}' postEffectColorAnchor frame={} nativeResource={:p} format={} size={}x{}",
+                    sample,
+                    scenario,
+                    frame.has_value() ? std::to_string(*frame) : "unknown",
+                    static_cast<void*>(resource),
+                    (uint32_t)resource_desc.Format,
+                    resource_desc.Width,
+                    resource_desc.Height);
+            }
+        }
+    }
+}
+
+void RE4TemporalProbe::on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* render_context) {
+    if (!re4_temporal_probe::should_process_overlay(
+            sdk::GameIdentity::get().is_re4(),
+            m_enabled.load(std::memory_order_relaxed),
+            layer,
+            render_context)) {
+        return;
+    }
+
+    if (!m_overlay_sample_budget.should_sample_callback()) {
+        return;
+    }
+
+    const auto sample = m_overlay_sample_budget.reserve_sample();
+    if (sample == 0) {
+        return;
+    }
+
+    const auto scenario = scenario_name(m_scenario.load(std::memory_order_relaxed));
+    auto* renderer = sdk::renderer::get_renderer();
+    const auto frame = renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
+    auto* context = static_cast<sdk::renderer::RenderContext*>(render_context);
+    auto* target_state = context->get_render_target();
+    auto* parent = layer->get_parent();
+
+    const auto post_effect_resource =
+        reinterpret_cast<ID3D12Resource*>(m_last_post_effect_resource.load(std::memory_order_relaxed));
+    const auto post_effect_frame = m_last_post_effect_frame.load(std::memory_order_relaxed);
+    const auto same_frame = frame.has_value() && post_effect_frame != 0 && *frame == post_effect_frame;
+    const auto depth_anchor =
+        reinterpret_cast<ID3D12Resource*>(m_last_depth_resource.load(std::memory_order_relaxed));
+    const auto velocity_anchor =
+        reinterpret_cast<ID3D12Resource*>(m_last_velocity_resource.load(std::memory_order_relaxed));
+
+    if (target_state == nullptr) {
+        spdlog::info(
+            "[RE4TemporalProbe] overlaySample={} scenario='{}' frame={} overlayTarget layer={:p} parent={:p} renderContext={:p} currentTargetState=null postEffectFrame={} sameFrame={} postEffectResource={:p}",
+            sample,
+            scenario,
+            frame.has_value() ? std::to_string(*frame) : "unknown",
+            static_cast<void*>(layer),
+            static_cast<void*>(parent),
+            render_context,
+            post_effect_frame,
+            same_frame,
+            static_cast<void*>(post_effect_resource));
+        return;
+    }
+
+    const auto rtv_count = target_state->get_rtv_count();
+    const auto bounded_count = (std::min)(rtv_count, re4_temporal_probe::MAX_OVERLAY_RTVS);
+
+    spdlog::info(
+        "[RE4TemporalProbe] overlaySample={} scenario='{}' frame={} overlayTarget layer={:p} parent={:p} renderContext={:p} currentTargetState={:p} rtvCount={} boundedCount={} postEffectFrame={} sameFrame={} postEffectResource={:p}",
+        sample,
+        scenario,
+        frame.has_value() ? std::to_string(*frame) : "unknown",
+        static_cast<void*>(layer),
+        static_cast<void*>(parent),
+        render_context,
+        static_cast<void*>(target_state),
+        rtv_count,
+        bounded_count,
+        post_effect_frame,
+        same_frame,
+        static_cast<void*>(post_effect_resource));
+
+    for (uint32_t i = 0; i < bounded_count; ++i) {
+        auto rtv = target_state->get_rtv((int32_t)i);
+        if (!rtv.has_value()) {
+            spdlog::info(
+                "[RE4TemporalProbe] overlaySample={} scenario='{}' overlayTarget rtvIndex={} rtv=null",
+                sample,
+                scenario,
+                i);
+            continue;
+        }
+
+        auto texture = rtv->get_texture_d3d12();
+        auto* texture_ptr = texture.get();
+        auto* resource = get_native_resource(texture_ptr);
+        const auto scene_rtv_index = matching_scene_rtv_index(resource, m_last_scene_rtv_resources);
+        const auto& rtv_desc = rtv->get_desc();
+
+        spdlog::info(
+            "[RE4TemporalProbe] overlaySample={} scenario='{}' overlayTarget rtvIndex={} rtv={:p} rtvFormat={} rtvDimension={} texture={:p} nativeResource={:p} matchesPostEffect={} matchesDepth={} matchesVelocity={} matchesSceneRtvIndex={}",
+            sample,
+            scenario,
+            i,
+            static_cast<void*>(rtv.get()),
+            rtv_desc.format,
+            rtv_desc.dimension,
+            static_cast<void*>(texture_ptr),
+            static_cast<void*>(resource),
+            resource != nullptr && resource == post_effect_resource,
+            resource != nullptr && resource == depth_anchor,
+            resource != nullptr && resource == velocity_anchor,
+            scene_rtv_index);
+
+        if (texture_ptr != nullptr || resource != nullptr) {
+            log_resource(sample, scenario, "overlay_rtv_candidate", texture_ptr, resource);
         }
     }
 }
