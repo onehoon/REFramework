@@ -6,6 +6,7 @@
 namespace re4_temporal_probe {
 inline constexpr uint32_t SAMPLE_INTERVAL_CALLBACKS = 60;
 inline constexpr uint32_t MAX_SAMPLES = 240;
+inline constexpr uint32_t MAX_NON_PRIMARY_SCENE_DIAGNOSTICS = 8;
 
 inline constexpr bool should_process_scene(bool capture_enabled, const void* scene) noexcept {
     return capture_enabled && scene != nullptr;
@@ -55,4 +56,8 @@ private:
     std::atomic<uint32_t> m_scene_draw_callbacks{0};
     std::atomic<uint32_t> m_samples{0};
 };
+
+inline bool should_sample_primary_scene(bool primary_scene, SampleBudget& budget) {
+    return primary_scene && budget.should_sample_callback();
+}
 }

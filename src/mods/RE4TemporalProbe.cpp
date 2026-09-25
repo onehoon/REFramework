@@ -95,11 +95,13 @@ void RE4TemporalProbe::on_draw_ui() {
         m_scenario.store(scenario, std::memory_order_relaxed);
     }
 
-    ImGui::Text("Scene draw callbacks: %u", m_sample_budget.callback_count());
+    ImGui::Text("Primary Scene callbacks: %u", m_sample_budget.callback_count());
+    ImGui::Text("Non-primary Scene callbacks: %u", m_non_primary_scene_callbacks.load(std::memory_order_relaxed));
     ImGui::Text("Samples: %u / %u", m_sample_budget.sample_count(), MAX_SAMPLES);
-    ImGui::TextWrapped("One bounded sample per 60 Scene draw callbacks. Read the REFramework log for candidate object/resource pointers and descriptors.");
+    ImGui::TextWrapped("One bounded sample per 60 primary Scene draw callbacks. Read the REFramework log for candidate object/resource pointers and descriptors.");
 
     if (ImGui::Button("Reset capture budget")) {
+        m_non_primary_scene_callbacks.store(0, std::memory_order_relaxed);
         m_sample_budget.reset();
     }
 }
@@ -111,7 +113,28 @@ void RE4TemporalProbe::on_scene_layer_draw(sdk::renderer::layer::Scene* layer, v
         return;
     }
 
-    if (!m_sample_budget.should_sample_callback()) {
+    const auto view_id = layer->get_view_id();
+    const auto scene_enabled = layer->is_enabled();
+    const auto has_main_camera = layer->has_main_camera();
+    const auto fully_rendered = layer->is_fully_rendered();
+    const auto primary_scene = re4_temporal_probe::is_primary_scene(scene_enabled, has_main_camera, fully_rendered);
+
+    if (!primary_scene) {
+        const auto diagnostic_index = m_non_primary_scene_callbacks.fetch_add(1, std::memory_order_relaxed);
+        if (diagnostic_index % re4_temporal_probe::SAMPLE_INTERVAL_CALLBACKS == 0 &&
+            diagnostic_index / re4_temporal_probe::SAMPLE_INTERVAL_CALLBACKS < re4_temporal_probe::MAX_NON_PRIMARY_SCENE_DIAGNOSTICS) {
+            spdlog::info(
+                "[RE4TemporalProbe] scene_eligibility scene={:p} viewId={} sceneEnabled={} hasMainCamera={} fullyRendered={} primaryScene=false",
+                static_cast<void*>(layer),
+                view_id,
+                scene_enabled,
+                has_main_camera,
+                fully_rendered);
+        }
+        return;
+    }
+
+    if (!re4_temporal_probe::should_sample_primary_scene(primary_scene, m_sample_budget)) {
         return;
     }
 
@@ -121,11 +144,6 @@ void RE4TemporalProbe::on_scene_layer_draw(sdk::renderer::layer::Scene* layer, v
     }
 
     const auto scenario = scenario_name(m_scenario.load(std::memory_order_relaxed));
-    const auto view_id = layer->get_view_id();
-    const auto scene_enabled = layer->is_enabled();
-    const auto has_main_camera = layer->has_main_camera();
-    const auto fully_rendered = layer->is_fully_rendered();
-    const auto primary_scene = re4_temporal_probe::is_primary_scene(scene_enabled, has_main_camera, fully_rendered);
     auto* camera = layer->get_camera();
     auto* renderer = sdk::renderer::get_renderer();
     const auto frame = renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
@@ -142,16 +160,20 @@ void RE4TemporalProbe::on_scene_layer_draw(sdk::renderer::layer::Scene* layer, v
 
     sdk::renderer::layer::PrepareOutput* prepare_output{};
     sdk::renderer::RenderLayer* prepare_parent{};
+    sdk::renderer::layer::PrepareOutput* recursive_prepare_fallback{};
+    sdk::renderer::RenderLayer* recursive_prepare_parent{};
     if (primary_scene && prepare_output_type != nullptr) {
         if (auto* type = prepare_output_type->get_type(); type != nullptr) {
-            const auto result = layer->find_layer_recursive(type);
-            if (const auto slot = std::get<1>(result); slot != nullptr && *slot != nullptr) {
+            if (auto* slot = layer->find_layer(type); slot != nullptr && *slot != nullptr) {
                 prepare_output = static_cast<sdk::renderer::layer::PrepareOutput*>(*slot);
-                prepare_parent = std::get<0>(result);
+                prepare_parent = layer;
             }
             if (!re4_temporal_probe::has_scene_local_color_candidate(primary_scene, prepare_output)) {
-                prepare_output = nullptr;
-                prepare_parent = nullptr;
+                const auto result = layer->find_layer_recursive(type);
+                if (const auto slot = std::get<1>(result); slot != nullptr && *slot != nullptr) {
+                    recursive_prepare_fallback = static_cast<sdk::renderer::layer::PrepareOutput*>(*slot);
+                    recursive_prepare_parent = std::get<0>(result);
+                }
             }
         }
     }
@@ -161,6 +183,11 @@ void RE4TemporalProbe::on_scene_layer_draw(sdk::renderer::layer::Scene* layer, v
     auto* output_texture = output_rtv.has_value() ? output_rtv->get_texture_d3d12().get() : nullptr;
     auto* output_resource = output_state != nullptr ? output_state->get_native_resource_d3d12() : nullptr;
 
+    auto* recursive_fallback_state = recursive_prepare_fallback != nullptr ? recursive_prepare_fallback->get_output_state() : nullptr;
+    auto recursive_fallback_rtv = recursive_fallback_state != nullptr ? recursive_fallback_state->get_rtv(0) : sdk::intrusive_ptr<sdk::renderer::RenderTargetView>{};
+    auto* recursive_fallback_texture = recursive_fallback_rtv.has_value() ? recursive_fallback_rtv->get_texture_d3d12().get() : nullptr;
+    auto* recursive_fallback_resource = recursive_fallback_state != nullptr ? recursive_fallback_state->get_native_resource_d3d12() : nullptr;
+
     auto* depth_texture = primary_scene ? layer->get_depth_stencil() : nullptr;
     auto* depth_resource = primary_scene ? layer->get_depth_stencil_d3d12() : nullptr;
     auto* velocity_state = primary_scene ? layer->get_motion_vectors_state() : nullptr;
@@ -169,7 +196,7 @@ void RE4TemporalProbe::on_scene_layer_draw(sdk::renderer::layer::Scene* layer, v
     auto* velocity_resource = velocity_state != nullptr ? velocity_state->get_native_resource_d3d12() : nullptr;
 
     spdlog::info(
-        "[RE4TemporalProbe] sample={} scenario='{}' frame={} scene={:p} viewId={} sceneEnabled={} hasMainCamera={} fullyRendered={} primaryScene={} camera={:p} renderOutput={:p} prepareParent={:p} prepareOutput={:p} outputState={:p} outputRTV0={:p} depthTexture={:p} velocityState={:p} velocityRTV0={:p}",
+        "[RE4TemporalProbe] sample={} scenario='{}' frame={} scene={:p} viewId={} sceneEnabled={} hasMainCamera={} fullyRendered={} primaryScene={} camera={:p} renderOutput={:p} prepareParent={:p} prepareOutput={:p} recursivePrepareParent={:p} recursivePrepareFallback={:p} outputState={:p} outputRTV0={:p} depthTexture={:p} velocityState={:p} velocityRTV0={:p}",
         sample,
         scenario,
         frame.has_value() ? std::to_string(*frame) : "unknown",
@@ -183,6 +210,8 @@ void RE4TemporalProbe::on_scene_layer_draw(sdk::renderer::layer::Scene* layer, v
         static_cast<void*>(render_output),
         static_cast<void*>(prepare_parent),
         static_cast<void*>(prepare_output),
+        static_cast<void*>(recursive_prepare_parent),
+        static_cast<void*>(recursive_prepare_fallback),
         static_cast<void*>(output_state),
         static_cast<void*>(output_rtv.get()),
         static_cast<void*>(depth_texture),
@@ -190,6 +219,9 @@ void RE4TemporalProbe::on_scene_layer_draw(sdk::renderer::layer::Scene* layer, v
         static_cast<void*>(velocity_rtv.get()));
 
     log_resource(sample, scenario, "color_candidate", output_texture, output_resource);
+    if (recursive_prepare_fallback != nullptr) {
+        log_resource(sample, scenario, "color_candidate_recursive_fallback", recursive_fallback_texture, recursive_fallback_resource);
+    }
     log_resource(sample, scenario, "depth_candidate", depth_texture, depth_resource);
     log_resource(sample, scenario, "motion_vector_candidate", velocity_texture, velocity_resource);
 }

@@ -17,5 +17,6 @@ public:
 private:
     std::atomic<bool> m_enabled{false};
     std::atomic<int> m_scenario{0};
+    std::atomic<uint32_t> m_non_primary_scene_callbacks{0};
     re4_temporal_probe::SampleBudget m_sample_budget;
 };
