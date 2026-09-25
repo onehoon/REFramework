@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 #include <d3d12.h>
 #include <spdlog/spdlog.h>
@@ -97,19 +98,24 @@ void RE4TemporalProbe::on_draw_ui() {
 
     ImGui::Text("Primary Scene callbacks: %u", m_sample_budget.callback_count());
     ImGui::Text("Non-primary Scene callbacks: %u", m_non_primary_scene_callbacks.load(std::memory_order_relaxed));
-    ImGui::Text("Samples: %u / %u", m_sample_budget.sample_count(), MAX_SAMPLES);
-    ImGui::TextWrapped("One bounded sample per 60 primary Scene draw callbacks. Read the REFramework log for candidate object/resource pointers and descriptors.");
+    ImGui::Text("Scene samples: %u / %u", m_sample_budget.sample_count(), MAX_SAMPLES);
+    ImGui::Text("EndRendering samples: %u / %u", m_end_render_sample_budget.sample_count(), MAX_SAMPLES);
+    ImGui::TextWrapped("One bounded sample per 60 eligible callbacks. The diagnostic is RE4-only and remains passive.");
 
     if (ImGui::Button("Reset capture budget")) {
         m_non_primary_scene_callbacks.store(0, std::memory_order_relaxed);
         m_sample_budget.reset();
+        m_end_render_sample_budget.reset();
     }
 }
 
 void RE4TemporalProbe::on_scene_layer_draw(sdk::renderer::layer::Scene* layer, void* render_context) {
     (void)render_context;
 
-    if (!re4_temporal_probe::should_process_scene(m_enabled.load(std::memory_order_relaxed), layer)) {
+    if (!re4_temporal_probe::should_process_scene(
+            sdk::GameIdentity::get().is_re4(),
+            m_enabled.load(std::memory_order_relaxed),
+            layer)) {
         return;
     }
 
@@ -224,4 +230,102 @@ void RE4TemporalProbe::on_scene_layer_draw(sdk::renderer::layer::Scene* layer, v
     }
     log_resource(sample, scenario, "depth_candidate", depth_texture, depth_resource);
     log_resource(sample, scenario, "motion_vector_candidate", velocity_texture, velocity_resource);
+}
+
+
+void RE4TemporalProbe::on_pre_application_entry(void* entry, const char* name, size_t hash) {
+    (void)entry;
+    (void)hash;
+
+    const auto entry_name = name != nullptr ? std::string_view{name} : std::string_view{};
+    if (!re4_temporal_probe::should_process_end_rendering(
+            sdk::GameIdentity::get().is_re4(),
+            m_enabled.load(std::memory_order_relaxed),
+            entry_name)) {
+        return;
+    }
+
+    if (!m_end_render_sample_budget.should_sample_callback()) {
+        return;
+    }
+
+    const auto sample = m_end_render_sample_budget.reserve_sample();
+    if (sample == 0) {
+        return;
+    }
+
+    const auto scenario = scenario_name(m_scenario.load(std::memory_order_relaxed));
+    auto* renderer = sdk::renderer::get_renderer();
+    const auto frame = renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
+    auto* output_layer = sdk::renderer::get_output_layer();
+
+    if (output_layer == nullptr) {
+        spdlog::info(
+            "[RE4TemporalProbe] endSample={} scenario='{}' phase=EndRendering frame={} outputLayer=null",
+            sample,
+            scenario,
+            frame.has_value() ? std::to_string(*frame) : "unknown");
+        return;
+    }
+
+    auto scene_layers = output_layer->find_fully_rendered_scene_layers();
+    spdlog::info(
+        "[RE4TemporalProbe] endSample={} scenario='{}' phase=EndRendering frame={} outputLayer={:p} fullyRenderedScenes={}",
+        sample,
+        scenario,
+        frame.has_value() ? std::to_string(*frame) : "unknown",
+        static_cast<void*>(output_layer),
+        scene_layers.size());
+
+    static auto prepare_output_type = sdk::find_type_definition("via.render.layer.PrepareOutput");
+    if (prepare_output_type == nullptr) {
+        return;
+    }
+
+    auto* prepare_type = prepare_output_type->get_type();
+    if (prepare_type == nullptr) {
+        return;
+    }
+
+    for (size_t i = 0; i < scene_layers.size() && i < re4_temporal_probe::MAX_END_RENDER_SCENES; ++i) {
+        auto* scene = scene_layers[i];
+        if (scene == nullptr) {
+            continue;
+        }
+
+        sdk::renderer::layer::PrepareOutput* prepare_output{};
+        if (auto* slot = scene->find_layer(prepare_type); slot != nullptr && *slot != nullptr) {
+            prepare_output = static_cast<sdk::renderer::layer::PrepareOutput*>(*slot);
+        }
+
+        auto* output_state = prepare_output != nullptr ? prepare_output->get_output_state() : nullptr;
+        auto output_rtv = output_state != nullptr ? output_state->get_rtv(0) : sdk::intrusive_ptr<sdk::renderer::RenderTargetView>{};
+        auto* output_texture = output_rtv.has_value() ? output_rtv->get_texture_d3d12().get() : nullptr;
+        auto* output_resource = output_state != nullptr ? output_state->get_native_resource_d3d12() : nullptr;
+
+        auto rtv_target_state = output_rtv.has_value()
+            ? output_rtv->get_target_state_d3d12()
+            : sdk::intrusive_ptr<sdk::renderer::TargetState>{};
+        auto* rtv_target_resource = rtv_target_state.has_value()
+            ? rtv_target_state->get_native_resource_d3d12()
+            : nullptr;
+
+        spdlog::info(
+            "[RE4TemporalProbe] endSample={} scenario='{}' phase=EndRendering sceneIndex={} scene={:p} viewId={} prepareOutput={:p} outputState={:p} outputRTV0={:p} outputTexture={:p} rtvTargetState={:p}",
+            sample,
+            scenario,
+            i,
+            static_cast<void*>(scene),
+            scene->get_view_id(),
+            static_cast<void*>(prepare_output),
+            static_cast<void*>(output_state),
+            static_cast<void*>(output_rtv.get()),
+            static_cast<void*>(output_texture),
+            static_cast<void*>(rtv_target_state.get()));
+
+        log_resource(sample, scenario, "end_render_color_candidate", output_texture, output_resource);
+        if (rtv_target_state.has_value()) {
+            log_resource(sample, scenario, "end_render_color_rtv_target", nullptr, rtv_target_resource);
+        }
+    }
 }
