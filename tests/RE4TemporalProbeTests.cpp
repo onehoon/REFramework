@@ -7,11 +7,19 @@
 int main() {
     using namespace re4_temporal_probe;
     int scene{};
+    int post_effect{};
+    int render_context{};
 
     CHECK(!should_process_scene(false, true, &scene));
     CHECK(!should_process_scene(true, false, &scene));
     CHECK(!should_process_scene(true, true, nullptr));
     CHECK(should_process_scene(true, true, &scene));
+
+    CHECK(!should_process_post_effect(false, true, &post_effect, &render_context));
+    CHECK(!should_process_post_effect(true, false, &post_effect, &render_context));
+    CHECK(!should_process_post_effect(true, true, nullptr, &render_context));
+    CHECK(!should_process_post_effect(true, true, &post_effect, nullptr));
+    CHECK(should_process_post_effect(true, true, &post_effect, &render_context));
 
     CHECK(!is_primary_scene(false, true, true));
     CHECK(!is_primary_scene(true, false, true));
@@ -20,6 +28,7 @@ int main() {
 
     CHECK(MAX_SAMPLES == 10);
     CHECK(MAX_SCENE_RTVS == 8);
+    CHECK(MAX_POST_EFFECT_RTVS == 8);
 
     SampleBudget interleaved_budget;
     uint32_t interleaved_captures{};
