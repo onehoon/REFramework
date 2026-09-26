@@ -84,6 +84,8 @@ void RE4TemporalProbe::on_draw_ui() {
         m_latest_view_frame.store(0, std::memory_order_relaxed);
         m_latest_view_width.store(0, std::memory_order_relaxed);
         m_latest_view_height.store(0, std::memory_order_relaxed);
+        m_latest_original_view_width.store(0, std::memory_order_relaxed);
+        m_latest_original_view_height.store(0, std::memory_order_relaxed);
         m_size_pair_sample.store(0, std::memory_order_relaxed);
         m_size_pair_frame.store(0, std::memory_order_relaxed);
     }
@@ -115,15 +117,8 @@ void RE4TemporalProbe::on_view_get_size(REManagedObject* scene_view, float* resu
     m_latest_view_frame.store(frame.value_or(0), std::memory_order_relaxed);
     m_latest_view_width.store(re4_temporal_probe::TEST_RENDER_WIDTH, std::memory_order_relaxed);
     m_latest_view_height.store(re4_temporal_probe::TEST_RENDER_HEIGHT, std::memory_order_relaxed);
-
-    spdlog::info(
-        "[RE4TemporalProbe] viewSizeOverride frame={} sceneView={:p} original={}x{} overridden={}x{}",
-        frame.has_value() ? std::to_string(*frame) : "unknown",
-        static_cast<void*>(scene_view),
-        original_width,
-        original_height,
-        re4_temporal_probe::TEST_RENDER_WIDTH,
-        re4_temporal_probe::TEST_RENDER_HEIGHT);
+    m_latest_original_view_width.store(static_cast<uint32_t>(original_width + 0.5f), std::memory_order_relaxed);
+    m_latest_original_view_height.store(static_cast<uint32_t>(original_height + 0.5f), std::memory_order_relaxed);
 }
 
 bool RE4TemporalProbe::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* render_context) {
@@ -173,6 +168,8 @@ bool RE4TemporalProbe::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* 
     const auto view_frame = m_latest_view_frame.load(std::memory_order_relaxed);
     const auto view_width = m_latest_view_width.load(std::memory_order_relaxed);
     const auto view_height = m_latest_view_height.load(std::memory_order_relaxed);
+    const auto original_view_width = m_latest_original_view_width.load(std::memory_order_relaxed);
+    const auto original_view_height = m_latest_original_view_height.load(std::memory_order_relaxed);
     const auto view_same_frame = frame.has_value() && view_frame != 0 && *frame == view_frame;
 
     D3D12Hook* d3d12{};
@@ -229,12 +226,14 @@ bool RE4TemporalProbe::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* 
         temporal_extents_aligned);
 
     spdlog::info(
-        "[RE4TemporalProbe] sizeSample={} scenario='{}' engineView sceneView={:p} viewFrame={} sameFrame={} viewSize={}x{}",
+        "[RE4TemporalProbe] sizeSample={} scenario='{}' engineView sceneView={:p} viewFrame={} sameFrame={} originalViewSize={}x{} overriddenViewSize={}x{}",
         sample,
         scenario,
         static_cast<void*>(view_ptr),
         view_frame,
         view_same_frame,
+        original_view_width,
+        original_view_height,
         view_width,
         view_height);
 
