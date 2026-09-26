@@ -7,53 +7,41 @@
 int main() {
     using namespace re4_temporal_probe;
 
-    int overlay{};
-    int render_context{};
-    int scene_view{};
-    float view_size[2]{1920.0f, 1080.0f};
+    int scene{};
+    int camera{};
+    float projection[16]{};
 
-    CHECK(!should_process_overlay(false, true, &overlay, &render_context));
-    CHECK(!should_process_overlay(true, false, &overlay, &render_context));
-    CHECK(!should_process_overlay(true, true, nullptr, &render_context));
-    CHECK(!should_process_overlay(true, true, &overlay, nullptr));
-    CHECK(should_process_overlay(true, true, &overlay, &render_context));
+    CHECK(!should_process_scene_update(false, true, &scene));
+    CHECK(!should_process_scene_update(true, false, &scene));
+    CHECK(!should_process_scene_update(true, true, nullptr));
+    CHECK(should_process_scene_update(true, true, &scene));
 
-    CHECK(!should_process_view_size(false, true, &scene_view, view_size));
-    CHECK(!should_process_view_size(true, false, &scene_view, view_size));
-    CHECK(!should_process_view_size(true, true, nullptr, view_size));
-    CHECK(!should_process_view_size(true, true, &scene_view, nullptr));
-    CHECK(should_process_view_size(true, true, &scene_view, view_size));
+    CHECK(!should_process_camera_projection(false, true, &camera, projection));
+    CHECK(!should_process_camera_projection(true, false, &camera, projection));
+    CHECK(!should_process_camera_projection(true, true, nullptr, projection));
+    CHECK(!should_process_camera_projection(true, true, &camera, nullptr));
+    CHECK(should_process_camera_projection(true, true, &camera, projection));
 
-    CHECK(MAX_SAMPLES == 10);
-    CHECK(TEST_RENDER_WIDTH == 1920);
-    CHECK(TEST_RENDER_HEIGHT == 1080);
+    CHECK(MAX_TEMPORAL_SAMPLES == 32);
 
-    SampleBudget budget;
-    CHECK(budget.callback_count() == 0);
+    FrameBudget budget;
     CHECK(budget.sample_count() == 0);
+    CHECK(budget.reserve_frame(0) == 0);
 
-    uint32_t captures{};
-    for (uint32_t callback = 0; callback < SAMPLE_INTERVAL_CALLBACKS * 2; ++callback) {
-        if (budget.should_sample_callback()) {
-            CHECK(budget.reserve_sample() != 0);
-            ++captures;
-        }
+    CHECK(budget.reserve_frame(100) == 1);
+    CHECK(budget.reserve_frame(100) == 0);
+    CHECK(budget.reserve_frame(101) == 2);
+
+    for (uint32_t i = 3; i <= MAX_TEMPORAL_SAMPLES; ++i) {
+        CHECK(budget.reserve_frame(99 + i) == i);
     }
 
-    CHECK(budget.callback_count() == SAMPLE_INTERVAL_CALLBACKS * 2);
-    CHECK(captures == 2);
-    CHECK(budget.sample_count() == 2);
+    CHECK(budget.reserve_frame(1000) == 0);
+    CHECK(budget.sample_count() == MAX_TEMPORAL_SAMPLES);
 
     budget.reset();
-    CHECK(budget.callback_count() == 0);
     CHECK(budget.sample_count() == 0);
-
-    for (uint32_t sample = 1; sample <= MAX_SAMPLES; ++sample) {
-        CHECK(budget.reserve_sample() == sample);
-    }
-
-    CHECK(budget.reserve_sample() == 0);
-    CHECK(budget.sample_count() == MAX_SAMPLES);
+    CHECK(budget.reserve_frame(2000) == 1);
 
     return 0;
 }
