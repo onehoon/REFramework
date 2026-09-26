@@ -36,6 +36,19 @@ private:
     std::atomic<int> m_scenario{0};
 
     re4_temporal_probe::FrameBudget m_temporal_budget;
+    re4_temporal_probe::FrameBudget m_reset_watch_budget;
+
+    bool m_reset_witness_valid{false};
+    uint32_t m_reset_previous_frame{0};
+    uintptr_t m_reset_previous_scene{0};
+    uintptr_t m_reset_previous_scene_info{0};
+    uintptr_t m_reset_previous_camera{0};
+    uintptr_t m_reset_previous_depth{0};
+    uintptr_t m_reset_previous_velocity{0};
+    uintptr_t m_reset_previous_color{0};
+    uint32_t m_reset_previous_width{0};
+    uint32_t m_reset_previous_height{0};
+    Matrix4x4f m_reset_previous_view{};
 
     std::atomic<uintptr_t> m_camera_ptr{0};
     std::atomic<uint32_t> m_camera_frame{0};
