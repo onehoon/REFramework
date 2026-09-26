@@ -12,6 +12,7 @@
 #include <sdk/GameIdentity.hpp>
 #include <sdk/Math.hpp>
 #include <sdk/SceneManager.hpp>
+#include <sdk/RETypeDB.hpp>
 
 #include "REFramework.hpp"
 
@@ -149,6 +150,13 @@ void RE4TemporalProbe::reset_temporal_state() {
     m_camera_frame.store(0, std::memory_order_relaxed);
     m_camera_p20.store(0.0f, std::memory_order_relaxed);
     m_camera_p21.store(0.0f, std::memory_order_relaxed);
+    m_camera_p22.store(0.0f, std::memory_order_relaxed);
+    m_camera_p23.store(0.0f, std::memory_order_relaxed);
+    m_camera_p32.store(0.0f, std::memory_order_relaxed);
+    m_camera_p33.store(0.0f, std::memory_order_relaxed);
+    m_camera_near.store(0.0f, std::memory_order_relaxed);
+    m_camera_far.store(0.0f, std::memory_order_relaxed);
+    m_camera_clip_valid.store(false, std::memory_order_relaxed);
 
     m_history_valid.fill(false);
     m_previous_scene_frame.fill(0);
@@ -561,10 +569,9 @@ void RE4TemporalProbe::on_draw_ui() {
     ImGui::TextWrapped(
         "RE4-only diagnostic. For Camera pan right/left/up/down, samples 1-4 are warm-up and samples 5-20 "
         "read a 3x3 VelocityTarget grid. Pan continuously in the selected direction during capture. "
-        "Historical W/2,-H/2 motion scaling remains a candidate and is compared against an independent "
-        "rotation-only screen reprojection from adjacent unjittered camera-matrix pairs. Clicking Reset may "
-        "briefly interrupt camera input; ignore that initial low-motion interval and evaluate the resumed "
-        "steady-motion frames by their logged frame IDs.");
+        "MV semantics are closed at W/2,-H/2. The probe now also logs primary Camera near/far and compares "
+        "Camera/SceneInfo Z-projection terms against normal and inverted D3D depth formulas. Static screen is "
+        "sufficient for the next depth-convention capture; directional MV readback remains available for regression.");
 
     if (ImGui::Button("Reset directional capture")) {
         reset_temporal_state();
@@ -595,6 +602,33 @@ void RE4TemporalProbe::on_camera_get_projection_matrix(REManagedObject* camera, 
     m_camera_frame.store(*frame, std::memory_order_relaxed);
     m_camera_p20.store((*result)[2][0], std::memory_order_relaxed);
     m_camera_p21.store((*result)[2][1], std::memory_order_relaxed);
+    m_camera_p22.store((*result)[2][2], std::memory_order_relaxed);
+    m_camera_p23.store((*result)[2][3], std::memory_order_relaxed);
+    m_camera_p32.store((*result)[3][2], std::memory_order_relaxed);
+    m_camera_p33.store((*result)[3][3], std::memory_order_relaxed);
+
+    static auto via_camera = sdk::find_type_definition("via.Camera");
+    static auto get_near_clip_plane_method =
+        via_camera != nullptr ? via_camera->get_method("get_NearClipPlane") : nullptr;
+    static auto get_far_clip_plane_method =
+        via_camera != nullptr ? via_camera->get_method("get_FarClipPlane") : nullptr;
+
+    bool clip_valid = false;
+    float near_plane = 0.0f;
+    float far_plane = 0.0f;
+
+    if (get_near_clip_plane_method != nullptr && get_far_clip_plane_method != nullptr) {
+        near_plane = get_near_clip_plane_method->call<float>(sdk::get_thread_context(), camera);
+        far_plane = get_far_clip_plane_method->call<float>(sdk::get_thread_context(), camera);
+        clip_valid =
+            std::isfinite(near_plane) &&
+            std::isfinite(far_plane) &&
+            re4_temporal_probe::valid_clip_planes(near_plane, far_plane);
+    }
+
+    m_camera_near.store(near_plane, std::memory_order_relaxed);
+    m_camera_far.store(far_plane, std::memory_order_relaxed);
+    m_camera_clip_valid.store(clip_valid, std::memory_order_relaxed);
 }
 
 void RE4TemporalProbe::on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* render_context) {
@@ -661,6 +695,13 @@ void RE4TemporalProbe::on_scene_layer_update(sdk::renderer::layer::Scene* layer,
     const auto camera_same_frame = camera_frame == *frame;
     const auto camera_p20 = m_camera_p20.load(std::memory_order_relaxed);
     const auto camera_p21 = m_camera_p21.load(std::memory_order_relaxed);
+    const auto camera_p22 = m_camera_p22.load(std::memory_order_relaxed);
+    const auto camera_p23 = m_camera_p23.load(std::memory_order_relaxed);
+    const auto camera_p32 = m_camera_p32.load(std::memory_order_relaxed);
+    const auto camera_p33 = m_camera_p33.load(std::memory_order_relaxed);
+    const auto camera_near = m_camera_near.load(std::memory_order_relaxed);
+    const auto camera_far = m_camera_far.load(std::memory_order_relaxed);
+    const auto camera_clip_valid = m_camera_clip_valid.load(std::memory_order_relaxed);
 
     spdlog::info(
         "[RE4TemporalProbe] jitterFrame sample={} scenario='{}' frame={} phase={} "
@@ -708,6 +749,82 @@ void RE4TemporalProbe::on_scene_layer_update(sdk::renderer::layer::Scene* layer,
         const auto previous_scene_frame = m_previous_scene_frame[i];
 
         if (i == 0) {
+            const auto normal_depth =
+                re4_temporal_probe::normal_depth_terms(camera_near, camera_far);
+            const auto inverted_depth =
+                re4_temporal_probe::inverted_depth_terms(camera_near, camera_far);
+            const re4_temporal_probe::PerspectiveDepthTerms camera_depth{
+                camera_p22,
+                camera_p32,
+            };
+            const re4_temporal_probe::PerspectiveDepthTerms scene_depth{
+                current_projection[2][2],
+                current_projection[3][2],
+            };
+
+            const auto camera_normal_error = camera_clip_valid
+                ? re4_temporal_probe::depth_terms_error(camera_depth, normal_depth)
+                : 0.0f;
+            const auto camera_inverted_error = camera_clip_valid
+                ? re4_temporal_probe::depth_terms_error(camera_depth, inverted_depth)
+                : 0.0f;
+            const auto scene_normal_error = camera_clip_valid
+                ? re4_temporal_probe::depth_terms_error(scene_depth, normal_depth)
+                : 0.0f;
+            const auto scene_inverted_error = camera_clip_valid
+                ? re4_temporal_probe::depth_terms_error(scene_depth, inverted_depth)
+                : 0.0f;
+
+            const auto scene_depth_inference =
+                !camera_clip_valid ? "unknown"
+                : scene_inverted_error < scene_normal_error ? "inverted"
+                : scene_normal_error < scene_inverted_error ? "normal"
+                : "ambiguous";
+
+            const auto projection_y = current_projection[1][1];
+            const auto vertical_fov_radians =
+                std::isfinite(projection_y) && std::abs(projection_y) > 0.000001f
+                ? 2.0f * std::atan(1.0f / projection_y)
+                : 0.0f;
+
+            spdlog::info(
+                "[RE4TemporalProbe] depthProjection sample={} scenario='{}' frame={} "
+                "cameraFrame={} cameraSameFrame={} clipValid={} near={:.9f} far={:.9f} "
+                "camera={{p22={:.9f},p23={:.9f},p32={:.9f},p33={:.9f}}} "
+                "scene={{p22={:.9f},p23={:.9f},p32={:.9f},p33={:.9f},p11={:.9f}}} "
+                "expectedNormal={{p22={:.9f},p32={:.9f}}} "
+                "expectedInverted={{p22={:.9f},p32={:.9f}}} "
+                "errors={{cameraNormal={:.9f},cameraInverted={:.9f},"
+                "sceneNormal={:.9f},sceneInverted={:.9f}}} "
+                "sceneDepthInference={} verticalFovRadians={:.9f}",
+                sample,
+                scenario,
+                *frame,
+                camera_frame,
+                camera_same_frame,
+                camera_clip_valid,
+                camera_near,
+                camera_far,
+                camera_p22,
+                camera_p23,
+                camera_p32,
+                camera_p33,
+                current_projection[2][2],
+                current_projection[2][3],
+                current_projection[3][2],
+                current_projection[3][3],
+                projection_y,
+                normal_depth.p22,
+                normal_depth.p32,
+                inverted_depth.p22,
+                inverted_depth.p32,
+                camera_normal_error,
+                camera_inverted_error,
+                scene_normal_error,
+                scene_inverted_error,
+                scene_depth_inference,
+                vertical_fov_radians);
+
             m_expected_rotation_reprojection_previous_frame = previous_scene_frame;
             m_expected_rotation_reprojection_frame = *frame;
             m_expected_rotation_reprojection_valid = false;
