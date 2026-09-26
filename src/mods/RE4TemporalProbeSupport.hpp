@@ -40,6 +40,39 @@ struct MotionPixelCandidate {
     float y{};
 };
 
+struct ScreenPoint {
+    float x{};
+    float y{};
+};
+
+inline constexpr ScreenPoint pixel_to_ndc(
+    ScreenPoint pixel,
+    uint32_t width,
+    uint32_t height) noexcept {
+    if (width == 0 || height == 0) {
+        return {};
+    }
+
+    return {
+        (2.0f * pixel.x / static_cast<float>(width)) - 1.0f,
+        1.0f - (2.0f * pixel.y / static_cast<float>(height)),
+    };
+}
+
+inline constexpr ScreenPoint ndc_to_pixel(
+    ScreenPoint ndc,
+    uint32_t width,
+    uint32_t height) noexcept {
+    if (width == 0 || height == 0) {
+        return {};
+    }
+
+    return {
+        (ndc.x + 1.0f) * 0.5f * static_cast<float>(width),
+        (1.0f - ndc.y) * 0.5f * static_cast<float>(height),
+    };
+}
+
 inline constexpr MotionPixelCandidate historical_motion_pixel_candidate(
     float r_snorm,
     float g_snorm,
