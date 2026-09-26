@@ -730,6 +730,7 @@ HRESULT STDMETHODCALLTYPE RE4TemporalProbe::recording_reset_hook(
     }
 
     if (tracked &&
+        self->m_recording_capture_open.load(std::memory_order_relaxed) &&
         self->m_enabled.load(std::memory_order_relaxed) &&
         re4_temporal_probe::is_recording_function_scenario(
             self->m_scenario.load(std::memory_order_relaxed))) {
@@ -835,12 +836,14 @@ void STDMETHODCALLTYPE RE4TemporalProbe::recording_resource_barrier_hook(
         }
     }
 
-    if (tracked) {
+    if (tracked &&
+        self->m_recording_capture_open.load(std::memory_order_relaxed)) {
         std::scoped_lock lock{self->m_recording_mutex};
         ++self->m_recording_list_states[key].legacy_barrier_calls;
     }
 
     if (tracked &&
+        self->m_recording_capture_open.load(std::memory_order_relaxed) &&
         self->m_enabled.load(std::memory_order_relaxed) &&
         re4_temporal_probe::is_recording_function_scenario(
             self->m_scenario.load(std::memory_order_relaxed)) &&
@@ -944,12 +947,14 @@ void STDMETHODCALLTYPE RE4TemporalProbe::recording_enhanced_barrier_hook(
         }
     }
 
-    if (tracked) {
+    if (tracked &&
+        self->m_recording_capture_open.load(std::memory_order_relaxed)) {
         std::scoped_lock lock{self->m_recording_mutex};
         ++self->m_recording_list_states[key].enhanced_barrier_calls;
     }
 
     if (tracked &&
+        self->m_recording_capture_open.load(std::memory_order_relaxed) &&
         self->m_enabled.load(std::memory_order_relaxed) &&
         re4_temporal_probe::is_recording_function_scenario(
             self->m_scenario.load(std::memory_order_relaxed)) &&
