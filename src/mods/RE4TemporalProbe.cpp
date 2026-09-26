@@ -18,7 +18,7 @@
 #include "REFramework.hpp"
 
 namespace {
-constexpr std::array<const char*, 13> SCENARIOS{
+constexpr std::array<const char*, 14> SCENARIOS{
     "Static screen",
     "Camera pan right",
     "Camera pan left",
@@ -32,6 +32,7 @@ constexpr std::array<const char*, 13> SCENARIOS{
     "D3D12 execution ordering",
     "D3D12 resource states",
     "D3D12 interface provenance",
+    "D3D12 recording functions",
 };
 
 constexpr std::array<const char*, 6> LOAD_STATE_SINGLETONS{
@@ -367,6 +368,7 @@ void RE4TemporalProbe::reset_temporal_state() {
     m_execution_order_budget.reset();
     m_resource_state_budget.reset();
     m_interface_provenance_budget.reset();
+    m_recording_function_budget.reset();
     m_execution_boundary_frame.store(0, std::memory_order_relaxed);
     m_execution_boundary_sample.store(0, std::memory_order_relaxed);
     m_execution_submit_count.store(0, std::memory_order_relaxed);
@@ -391,6 +393,21 @@ void RE4TemporalProbe::reset_temporal_state() {
         m_interface_logged_lists.clear();
         m_interface_last_submit_frame = 0;
         m_interface_submit_ordinal = 0;
+    }
+    m_recording_capture_open.store(false, std::memory_order_relaxed);
+    m_recording_boundary_frame.store(0, std::memory_order_relaxed);
+    m_recording_boundary_sample.store(0, std::memory_order_relaxed);
+    m_recording_event_sequence.store(0, std::memory_order_relaxed);
+    m_recording_color.store(0, std::memory_order_relaxed);
+    m_recording_depth.store(0, std::memory_order_relaxed);
+    m_recording_velocity.store(0, std::memory_order_relaxed);
+    {
+        std::scoped_lock lock{m_recording_mutex};
+        m_recording_tracked_lists.clear();
+        m_recording_list_states.clear();
+        m_recording_active_by_thread.clear();
+        m_recording_last_submit_frame = 0;
+        m_recording_submit_ordinal = 0;
     }
     m_reset_witness_valid = false;
     m_reset_previous_frame = 0;
@@ -1470,6 +1487,8 @@ void RE4TemporalProbe::on_draw_ui() {
 
     int scenario = m_scenario.load(std::memory_order_relaxed);
     if (ImGui::Combo("Capture scenario", &scenario, SCENARIOS.data(), (int)SCENARIOS.size())) {
+        release_resource_command_list_hooks();
+        release_recording_function_hooks();
         reset_temporal_state();
         m_scenario.store(scenario, std::memory_order_relaxed);
         spdlog::info(
@@ -1502,6 +1521,11 @@ void RE4TemporalProbe::on_draw_ui() {
             "Interface-provenance samples: %u / %u",
             m_interface_provenance_budget.sample_count(),
             re4_temporal_probe::INTERFACE_PROVENANCE_MAX_SAMPLES);
+    } else if (re4_temporal_probe::is_recording_function_scenario(scenario)) {
+        ImGui::Text(
+            "Recording-function samples: %u / %u",
+            m_recording_function_budget.sample_count(),
+            re4_temporal_probe::RECORDING_FUNCTION_MAX_SAMPLES);
     } else {
         ImGui::Text(
             "Jitter samples: %u / %u",
@@ -1510,11 +1534,11 @@ void RE4TemporalProbe::on_draw_ui() {
     }
 
     ImGui::TextWrapped(
-        "RE4-only diagnostic. Capture 24 showed that instance-vtable hooks on submitted base-interface pointers "
-        "do not observe the real repeated recording path. For Gate H Capture 25, select D3D12 interface provenance. "
-        "The probe remains observe-only: it records whole-frame DIRECT submissions, canonical IUnknown identity, "
-        "GraphicsCommandList 0-7 interface pointers/vtables, legacy Close/Reset/ResourceBarrier implementation "
-        "addresses, and the GraphicsCommandList7 enhanced Barrier implementation when supported.");
+        "RE4-only diagnostic. Capture 25 proves the submitted base pointer and GraphicsCommandList 0-7 public "
+        "interfaces share one pointer/vtable and that GCL7 is supported. For Gate H Capture 26, select D3D12 "
+        "recording functions. The probe installs shared implementation-level hooks for Close, Reset, legacy "
+        "ResourceBarrier, and GCL7 enhanced Barrier, but logs only DIRECT lists actually observed on the active "
+        "RE4 queue. It remains observe-only and does not alter barriers or issue GPU work.");
 
     if (ImGui::Button("Reset capture")) {
         reset_temporal_state();
