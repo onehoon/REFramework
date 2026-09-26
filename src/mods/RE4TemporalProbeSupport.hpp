@@ -11,11 +11,13 @@ inline constexpr uint32_t LOAD_STATE_SCENARIO = 9;
 inline constexpr uint32_t EXECUTION_ORDER_SCENARIO = 10;
 inline constexpr uint32_t RESOURCE_STATE_SCENARIO = 11;
 inline constexpr uint32_t INTERFACE_PROVENANCE_SCENARIO = 12;
+inline constexpr uint32_t RECORDING_FUNCTION_SCENARIO = 13;
 inline constexpr uint32_t RESET_WATCH_MAX_SAMPLES = 4096;
 inline constexpr uint32_t LOAD_STATE_MAX_SAMPLES = 8192;
 inline constexpr uint32_t EXECUTION_ORDER_MAX_SAMPLES = 64;
 inline constexpr uint32_t RESOURCE_STATE_MAX_SAMPLES = 64;
 inline constexpr uint32_t INTERFACE_PROVENANCE_MAX_SAMPLES = 64;
+inline constexpr uint32_t RECORDING_FUNCTION_MAX_SAMPLES = 64;
 inline constexpr uint32_t JITTER_PHASE_COUNT = 4;
 inline constexpr uint32_t MV_READBACK_FIRST_SAMPLE = 5;
 inline constexpr uint32_t MV_READBACK_SAMPLE_COUNT = 16;
@@ -49,6 +51,10 @@ inline constexpr bool is_resource_state_scenario(int scenario) noexcept {
 
 inline constexpr bool is_interface_provenance_scenario(int scenario) noexcept {
     return scenario == static_cast<int>(INTERFACE_PROVENANCE_SCENARIO);
+}
+
+inline constexpr bool is_recording_function_scenario(int scenario) noexcept {
+    return scenario == static_cast<int>(RECORDING_FUNCTION_SCENARIO);
 }
 
 inline constexpr bool is_horizontal_mv_scenario(int scenario) noexcept {
