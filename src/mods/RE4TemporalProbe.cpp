@@ -427,6 +427,7 @@ void RE4TemporalProbe::reset_temporal_state() {
     m_output_copy_boundary_frame.store(0, std::memory_order_relaxed);
     m_output_copy_boundary_sample.store(0, std::memory_order_relaxed);
     m_output_copy_event_sequence.store(0, std::memory_order_relaxed);
+    m_output_copy_boundary_event_base.store(0, std::memory_order_relaxed);
     m_output_copy_color.store(0, std::memory_order_relaxed);
     {
         std::scoped_lock lock{m_output_copy_mutex};
@@ -838,6 +839,7 @@ HRESULT STDMETHODCALLTYPE RE4TemporalProbe::recording_close_hook(
     }
 
     if (tracked &&
+        self->m_recording_capture_open.load(std::memory_order_relaxed) &&
         self->m_enabled.load(std::memory_order_relaxed) &&
         re4_temporal_probe::is_recording_function_scenario(
             self->m_scenario.load(std::memory_order_relaxed))) {
