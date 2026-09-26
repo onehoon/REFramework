@@ -18,7 +18,15 @@ inline constexpr uint64_t MV_READBACK_BUFFER_SIZE =
     MV_SAMPLE_POINT_COUNT * MV_READBACK_POINT_STRIDE;
 
 inline constexpr bool is_directional_mv_scenario(int scenario) noexcept {
+    return scenario >= 1 && scenario <= 4;
+}
+
+inline constexpr bool is_horizontal_mv_scenario(int scenario) noexcept {
     return scenario == 1 || scenario == 2;
+}
+
+inline constexpr bool is_vertical_mv_scenario(int scenario) noexcept {
+    return scenario == 3 || scenario == 4;
 }
 
 inline constexpr bool should_readback_mv_sample(int scenario, uint32_t sample) noexcept {
