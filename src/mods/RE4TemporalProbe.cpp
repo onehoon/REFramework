@@ -621,18 +621,25 @@ bool RE4TemporalProbe::ensure_recording_function_hooks(ID3D12CommandList* comman
 
     auto* close_impl = interface_method(gcl0.Get(), 9);
     auto* reset_impl = interface_method(gcl0.Get(), 10);
+    auto* copy_texture_region_impl = interface_method(gcl0.Get(), 16);
+    auto* copy_resource_impl = interface_method(gcl0.Get(), 17);
     auto* legacy_barrier_impl = interface_method(gcl0.Get(), 26);
     auto* enhanced_barrier_impl = interface_method(gcl7.Get(), 80);
 
     if (close_impl == nullptr ||
         reset_impl == nullptr ||
+        copy_texture_region_impl == nullptr ||
+        copy_resource_impl == nullptr ||
         legacy_barrier_impl == nullptr ||
         enhanced_barrier_impl == nullptr) {
         spdlog::error(
             "[RE4TemporalProbe] recordingFunctionHook missing implementation "
-            "close={:p} reset={:p} legacyBarrier={:p} enhancedBarrier={:p}",
+            "close={:p} reset={:p} copyTextureRegion={:p} copyResource={:p} "
+            "legacyBarrier={:p} enhancedBarrier={:p}",
             close_impl,
             reset_impl,
+            copy_texture_region_impl,
+            copy_resource_impl,
             legacy_barrier_impl,
             enhanced_barrier_impl);
         return false;
@@ -644,6 +651,12 @@ bool RE4TemporalProbe::ensure_recording_function_hooks(ID3D12CommandList* comman
     auto reset_hook = std::make_unique<FunctionHook>(
         Address{reset_impl},
         Address{reinterpret_cast<void*>(&RE4TemporalProbe::recording_reset_hook)});
+    auto copy_texture_region_hook = std::make_unique<FunctionHook>(
+        Address{copy_texture_region_impl},
+        Address{reinterpret_cast<void*>(&RE4TemporalProbe::recording_copy_texture_region_hook)});
+    auto copy_resource_hook = std::make_unique<FunctionHook>(
+        Address{copy_resource_impl},
+        Address{reinterpret_cast<void*>(&RE4TemporalProbe::recording_copy_resource_hook)});
     auto legacy_barrier_hook = std::make_unique<FunctionHook>(
         Address{legacy_barrier_impl},
         Address{reinterpret_cast<void*>(&RE4TemporalProbe::recording_resource_barrier_hook)});
@@ -653,6 +666,8 @@ bool RE4TemporalProbe::ensure_recording_function_hooks(ID3D12CommandList* comman
 
     if (!close_hook->create() ||
         !reset_hook->create() ||
+        !copy_texture_region_hook->create() ||
+        !copy_resource_hook->create() ||
         !legacy_barrier_hook->create() ||
         !enhanced_barrier_hook->create()) {
         spdlog::error("[RE4TemporalProbe] recordingFunctionHook failed to install shared hooks");
@@ -663,6 +678,10 @@ bool RE4TemporalProbe::ensure_recording_function_hooks(ID3D12CommandList* comman
         reinterpret_cast<CommandListCloseFn>(close_hook->get_original());
     m_recording_reset_original =
         reinterpret_cast<CommandListResetFn>(reset_hook->get_original());
+    m_recording_copy_texture_region_original =
+        reinterpret_cast<CommandListCopyTextureRegionFn>(copy_texture_region_hook->get_original());
+    m_recording_copy_resource_original =
+        reinterpret_cast<CommandListCopyResourceFn>(copy_resource_hook->get_original());
     m_recording_resource_barrier_original =
         reinterpret_cast<CommandListResourceBarrierFn>(legacy_barrier_hook->get_original());
     m_recording_enhanced_barrier_original =
@@ -670,11 +689,15 @@ bool RE4TemporalProbe::ensure_recording_function_hooks(ID3D12CommandList* comman
 
     if (m_recording_close_original == nullptr ||
         m_recording_reset_original == nullptr ||
+        m_recording_copy_texture_region_original == nullptr ||
+        m_recording_copy_resource_original == nullptr ||
         m_recording_resource_barrier_original == nullptr ||
         m_recording_enhanced_barrier_original == nullptr) {
         spdlog::error("[RE4TemporalProbe] recordingFunctionHook missing trampoline");
         m_recording_close_original = nullptr;
         m_recording_reset_original = nullptr;
+        m_recording_copy_texture_region_original = nullptr;
+        m_recording_copy_resource_original = nullptr;
         m_recording_resource_barrier_original = nullptr;
         m_recording_enhanced_barrier_original = nullptr;
         return false;
@@ -682,15 +705,19 @@ bool RE4TemporalProbe::ensure_recording_function_hooks(ID3D12CommandList* comman
 
     m_recording_close_hook = std::move(close_hook);
     m_recording_reset_hook = std::move(reset_hook);
+    m_recording_copy_texture_region_hook = std::move(copy_texture_region_hook);
+    m_recording_copy_resource_hook = std::move(copy_resource_hook);
     m_recording_resource_barrier_hook = std::move(legacy_barrier_hook);
     m_recording_enhanced_barrier_hook = std::move(enhanced_barrier_hook);
     m_recording_hooks_ready.store(true, std::memory_order_release);
 
     spdlog::info(
         "[RE4TemporalProbe] recordingFunctionHook close={:p} reset={:p} "
-        "legacyBarrier={:p} enhancedBarrier={:p}",
+        "copyTextureRegion={:p} copyResource={:p} legacyBarrier={:p} enhancedBarrier={:p}",
         close_impl,
         reset_impl,
+        copy_texture_region_impl,
+        copy_resource_impl,
         legacy_barrier_impl,
         enhanced_barrier_impl);
     return true;
@@ -701,11 +728,15 @@ void RE4TemporalProbe::release_recording_function_hooks() {
 
     m_recording_enhanced_barrier_hook.reset();
     m_recording_resource_barrier_hook.reset();
+    m_recording_copy_resource_hook.reset();
+    m_recording_copy_texture_region_hook.reset();
     m_recording_reset_hook.reset();
     m_recording_close_hook.reset();
 
     m_recording_close_original = nullptr;
     m_recording_reset_original = nullptr;
+    m_recording_copy_texture_region_original = nullptr;
+    m_recording_copy_resource_original = nullptr;
     m_recording_resource_barrier_original = nullptr;
     m_recording_enhanced_barrier_original = nullptr;
 }
