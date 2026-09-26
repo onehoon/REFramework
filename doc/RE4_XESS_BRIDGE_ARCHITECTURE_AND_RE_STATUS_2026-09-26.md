@@ -476,6 +476,91 @@ Current conclusion:
 
 This proves ordering and semantic resource identity. It does **not** independently prove pixel content (for example, whether an unrelated earlier UI pass could have touched the same resource). A content-sensitive or command-list provenance probe should be added only if later implementation behavior gives a concrete reason to doubt the engine-level boundary.
 
+### Capture 10 — native render/display-size baseline verified
+
+The render/display-size correlation probe was run against PR #58 test merge commit:
+
+~~~text
+1ab01c015b8d429353685ad474f6809e7193fb0b
+~~~
+
+Fifty complete size snapshots were collected:
+
+~~~text
+Static screen      10/10
+Camera pan         10/10
+Character motion   10/10
+HUD/menu on        20/20
+~~~
+
+Every sample preserved the production Color invariant and temporal-input extent alignment:
+
+~~~text
+Color / HDR / PostMain = 2560x1440
+Depth                  = 2560x1440
+Velocity               = 2560x1440
+
+colorInvariant          = true       50/50
+temporalExtentsAligned  = true       50/50
+~~~
+
+The passive `via.SceneView.get_Size` callback correlated to the exact same render-frame ID in every sample:
+
+~~~text
+SceneView.get_Size = 2560x1440
+sameFrame          = true       50/50
+~~~
+
+The active native DXGI output path was also 2560x1440 for all samples:
+
+~~~text
+swapchain DXGI desc = 2560x1440
+swap format         = 28 / R8G8B8A8_UNORM
+buffer count        = 3
+D3D12Hook display   = 2560x1440
+D3D12Hook render hint = 2560x1440
+~~~
+
+This establishes a clean **native-resolution baseline**:
+
+~~~text
+SceneView.get_Size
+    ==
+HDR/PostMain Color extent
+    ==
+Depth extent
+    ==
+Velocity extent
+    ==
+native swapchain/display extent
+    ==
+2560x1440
+~~~
+
+The key limitation is that render and display sizes are identical in this baseline. Capture 10 therefore proves frame correlation and native-size consistency, but it does **not yet prove** that `SceneView.get_Size` is the authoritative internal render-size control when render resolution diverges from display resolution.
+
+Overlay/UI behavior remains independently useful. In the HUD/menu-on captures, the post-Overlay current working target was a distinct 1920x1080 `B8G8R8A8_UNORM` surface in 18/20 samples while Overlay main/HDR/PostMain remained 2560x1440. This confirms that UI working-target resolution can differ from both the scene temporal-input extent and the final native output extent.
+
+The D3D12Hook `renderWidth/renderHeight` values are not treated as authoritative engine render-size evidence: they are existing hook-side hints populated through DXGI resize/target events. Production render-size logic should prefer the engine `SceneView.get_Size` relationship plus actual Color/Depth/Velocity resource extents.
+
+Next decisive validation:
+
+1. keep display/swapchain at 2560x1440;
+2. use a controlled RE4 configuration that lowers internal rendering resolution without the probe itself mutating render size;
+3. capture the same size signals;
+4. determine whether `SceneView.get_Size` and Color/Depth/Velocity move together while DXGI output remains 2560x1440.
+
+Expected proof shape:
+
+~~~text
+SceneView.get_Size      = lower internal extent
+Color / Depth / Velocity = same lower internal extent
+swapchain/display       = 2560x1440
+Overlay/UI working size = independently observed
+~~~
+
+If this relationship is observed, `SceneView.get_Size` can be promoted to the engine render-size source for the future XeSS bridge. If only the resources shrink while SceneView remains at display size, a different engine render-size source must be identified.
+
 ---
 
 ## 9. Current HUD/UI boundary model
@@ -659,19 +744,38 @@ If later XeSS integration shows actual UI contamination or another contradiction
 
 ### Gate B — Render size vs display size
 
-Need to distinguish and control:
+Current status from capture 10:
 
-- actual internal scene render resolution;
-- HDR/PostMain extent;
-- Depth extent;
-- Velocity extent;
-- display/output resolution;
-- swapchain resolution;
-- Overlay/UI resolution.
+- native `SceneView.get_Size` = **2560x1440** in 50/50 same-frame samples;
+- HDR/PostMain Color = **2560x1440** in 50/50 samples;
+- Depth = **2560x1440** in 50/50 samples;
+- Velocity = **2560x1440** in 50/50 samples;
+- `temporalExtentsAligned=true` in 50/50 samples;
+- native DXGI swapchain/display = **2560x1440** in 50/50 samples;
+- HUD/menu-on can still use a separate **1920x1080** Overlay working surface.
 
-Current captures were commonly 2560×1440 scene resources with a 1920×1080 Overlay surface, which demonstrates that resource dimensions cannot be inferred from the desktop/swapchain path alone.
+This proves the native-resolution baseline and validates `SceneView.get_Size` as a frame-correlated size witness, but render and display sizes were identical. It does not yet prove which signal is authoritative when internal rendering is intentionally lower than output resolution.
 
-For XeSS, prove the intended low-resolution render extent and display-resolution output extent under controlled scaling.
+Next required controlled test:
+
+- keep swapchain/display at 2560x1440;
+- lower RE4 internal render resolution through a controlled game configuration, not through probe mutation;
+- verify whether `SceneView.get_Size`, Color, Depth, and Velocity move to the same lower extent;
+- verify that swapchain/display remains 2560x1440;
+- continue observing Overlay/UI working-target extent separately.
+
+Do not promote D3D12Hook `renderWidth/renderHeight` to the production render-size source; those values are hook-side DXGI resize hints, not independently proven engine scene size.
+
+Gate B closes when the project can name, without guessing:
+
+~~~text
+authoritative internal render size
+authoritative display/output size
+Color/Depth/Velocity extent relationship
+Overlay/UI working-size relationship
+~~~
+
+and can reproduce that relationship in at least one render/display split configuration before any bridge-controlled render-size override is introduced.
 
 ### Gate C — Jitter
 
@@ -958,7 +1062,8 @@ Use broad D3D12 tracing only as a last resort. The old ATSBridge trace produced 
 | PrepareOutput presentation ownership | **HIGH** | Exact swapchain buffer identity |
 | Pre-Overlay engine boundary | **HIGH** | Capture 9: Overlay main == HDR/PostMain before original Overlay draw in 50/50 paired samples |
 | Complete pixel-level HUDlessness | **MEDIUM / deferred** | No contradiction observed; content-sensitive proof only if later integration requires it |
-| Render/display scaling semantics | **LOW / pending** | Not yet controlled for XeSS |
+| Native render/display baseline | **HIGH** | Capture 10: SceneView + Color/Depth/Velocity + native DXGI output all 2560x1440 in 50/50 samples |
+| Render/display split semantics | **MEDIUM / active** | Need controlled lower internal render resolution while display remains fixed |
 | Jitter | **LOW / pending** | Historical method known, current-build proof pending |
 | MV scale/sign/jitter semantics | **LOW / pending** | Identity proven, semantics pending |
 | Depth inversion | **LOW / pending** | Resource proven, convention pending |
@@ -1000,10 +1105,27 @@ Next implementation work should:
 
 ### 18.2 Prove render-size path
 
-- reproduce native-size behavior first;
-- then lower render size under bridge control;
-- verify Color/Depth/Velocity alignment;
-- keep UI/display resolution independent.
+Capture 10 completes the native-size baseline:
+
+~~~text
+SceneView.get_Size
+    ==
+Color / Depth / Velocity extent
+    ==
+native swapchain/display
+    ==
+2560x1440
+~~~
+
+Next:
+
+- keep swapchain/display fixed at 2560x1440;
+- lower internal RE4 render resolution through a controlled game-side configuration first;
+- do **not** use the diagnostic itself to force render size yet;
+- verify whether `SceneView.get_Size` tracks the lower Color/Depth/Velocity extent on the same render frame;
+- keep Overlay/UI working-target extent as an independent signal;
+- only after the split relationship is proven should the bridge begin implementing its own render-size override;
+- fail closed if Color/Depth/Velocity extents do not remain mutually aligned.
 
 ### 18.3 Prove jitter and MV semantics together
 
@@ -1133,6 +1255,6 @@ OutputTargetState
 swapchain backbuffers
 ~~~
 
-Capture 9 identifies `on_pre_overlay_layer_draw()` as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. The production goal is to insert standard XeSS SR there, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
+Capture 9 identifies `on_pre_overlay_layer_draw()` as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Capture 10 adds the native-resolution baseline: `SceneView.get_Size`, Color, Depth, Velocity, and the native 2560x1440 output all agree on the same frame, while UI working surfaces may independently remain 1920x1080. The next decision point is a controlled render/display split test before any bridge-controlled render-size override is implemented. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
 
 Until the remaining gates are proven, the diagnostic stays passive and no production XeSS dispatch is enabled.
