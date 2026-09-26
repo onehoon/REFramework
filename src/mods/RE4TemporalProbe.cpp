@@ -704,7 +704,7 @@ bool RE4TemporalProbe::on_pre_overlay_layer_draw(
     }
 
     auto* motion_state = scene->get_motion_vectors_state();
-    auto* rtv = motion_state != nullptr ? motion_state->get_rtv(0) : nullptr;
+    auto rtv = motion_state != nullptr ? motion_state->get_rtv(0) : nullptr;
     if (rtv == nullptr) {
         spdlog::error(
             "[RE4TemporalProbe] mvSnapshot sample={} frame={} VelocityTarget RTV0 is null",
