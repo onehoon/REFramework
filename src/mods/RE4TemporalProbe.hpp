@@ -41,6 +41,7 @@ private:
     void log_command_list_interfaces(ID3D12CommandList* command_list);
     bool ensure_recording_function_hooks(ID3D12CommandList* command_list);
     void release_recording_function_hooks();
+    void refresh_output_copy_swapchain_buffers();
     bool ensure_bridge_order_resources();
     void release_bridge_order_resources();
     bool submit_bridge_order_empty_list(uint32_t sample, uint32_t frame);
@@ -77,6 +78,18 @@ private:
         ID3D12GraphicsCommandList7* command_list,
         UINT32 num_barrier_groups,
         const D3D12_BARRIER_GROUP* barrier_groups);
+    static void STDMETHODCALLTYPE recording_copy_texture_region_hook(
+        ID3D12GraphicsCommandList* command_list,
+        const D3D12_TEXTURE_COPY_LOCATION* dst,
+        UINT dst_x,
+        UINT dst_y,
+        UINT dst_z,
+        const D3D12_TEXTURE_COPY_LOCATION* src,
+        const D3D12_BOX* src_box);
+    static void STDMETHODCALLTYPE recording_copy_resource_hook(
+        ID3D12GraphicsCommandList* command_list,
+        ID3D12Resource* dst,
+        ID3D12Resource* src);
 
     std::atomic<bool> m_enabled{false};
     std::atomic<int> m_scenario{0};
@@ -89,6 +102,7 @@ private:
     re4_temporal_probe::FrameBudget m_interface_provenance_budget;
     re4_temporal_probe::FrameBudget m_recording_function_budget;
     re4_temporal_probe::FrameBudget m_bridge_order_budget;
+    re4_temporal_probe::FrameBudget m_output_copy_budget;
 
     bool m_reset_witness_valid{false};
     uint32_t m_reset_previous_frame{0};
@@ -131,6 +145,18 @@ private:
         ID3D12GraphicsCommandList7*,
         UINT32,
         const D3D12_BARRIER_GROUP*);
+    using CommandListCopyTextureRegionFn = void (STDMETHODCALLTYPE*)(
+        ID3D12GraphicsCommandList*,
+        const D3D12_TEXTURE_COPY_LOCATION*,
+        UINT,
+        UINT,
+        UINT,
+        const D3D12_TEXTURE_COPY_LOCATION*,
+        const D3D12_BOX*);
+    using CommandListCopyResourceFn = void (STDMETHODCALLTYPE*)(
+        ID3D12GraphicsCommandList*,
+        ID3D12Resource*,
+        ID3D12Resource*);
 
     struct ResourceCommandListHookState {
         std::unique_ptr<VtableHook> hook{};
@@ -184,10 +210,14 @@ private:
     std::unique_ptr<FunctionHook> m_recording_reset_hook{};
     std::unique_ptr<FunctionHook> m_recording_resource_barrier_hook{};
     std::unique_ptr<FunctionHook> m_recording_enhanced_barrier_hook{};
+    std::unique_ptr<FunctionHook> m_recording_copy_texture_region_hook{};
+    std::unique_ptr<FunctionHook> m_recording_copy_resource_hook{};
     CommandListCloseFn m_recording_close_original{nullptr};
     CommandListResetFn m_recording_reset_original{nullptr};
     CommandListResourceBarrierFn m_recording_resource_barrier_original{nullptr};
     CommandListEnhancedBarrierFn m_recording_enhanced_barrier_original{nullptr};
+    CommandListCopyTextureRegionFn m_recording_copy_texture_region_original{nullptr};
+    CommandListCopyResourceFn m_recording_copy_resource_original{nullptr};
     std::atomic<bool> m_recording_hooks_ready{false};
     std::atomic<bool> m_recording_capture_open{false};
     std::atomic<uint32_t> m_recording_boundary_frame{0};
@@ -218,6 +248,17 @@ private:
     std::atomic<uint64_t> m_bridge_order_skipped_count{0};
     uint32_t m_bridge_order_last_submit_frame{0};
     uint32_t m_bridge_order_submit_ordinal{0};
+
+    std::mutex m_output_copy_mutex{};
+    std::unordered_set<uintptr_t> m_output_copy_tracked_resources{};
+    std::unordered_set<uintptr_t> m_output_copy_swapchain_buffers{};
+    std::atomic<bool> m_output_copy_capture_open{false};
+    std::atomic<uint32_t> m_output_copy_boundary_frame{0};
+    std::atomic<uint32_t> m_output_copy_boundary_sample{0};
+    std::atomic<uint64_t> m_output_copy_event_sequence{0};
+    std::atomic<uintptr_t> m_output_copy_color{0};
+    uint32_t m_output_copy_last_submit_frame{0};
+    uint32_t m_output_copy_submit_ordinal{0};
 
     std::atomic<uintptr_t> m_camera_ptr{0};
     std::atomic<uint32_t> m_camera_frame{0};
