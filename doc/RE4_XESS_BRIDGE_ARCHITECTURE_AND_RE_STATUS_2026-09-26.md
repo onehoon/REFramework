@@ -622,6 +622,84 @@ displayWidth / displayHeight
 
 Gate B is considered **closed** for architecture and implementation planning. Production XeSS quality selection can later translate a XeSS quality setting into the requested SceneView input extent without exposing or depending on RE Engine `ImageQualityRate`.
 
+### Capture 12 — native projection jitter baseline is zero
+
+The consecutive-frame projection probe was run against PR #58 test merge commit:
+
+~~~text
+320dafd33336a411e32fe96ac089f2b78de80835
+~~~
+
+A total of 160 complete temporal samples were captured:
+
+~~~text
+Static screen      32
+Camera pan         32
+Character motion   32
+HUD/menu on        64
+~~~
+
+Across all 160 samples:
+
+~~~text
+SceneInfo projection[2][0] = 0.0
+SceneInfo projection[2][1] = 0.0
+frameDelta p20             = 0.0
+frameDelta p21             = 0.0
+~~~
+
+This remained true during active camera motion. Camera pan changed `old_view_projection_matrix` substantially frame-to-frame, while projection `[2][0]/[2][1]` remained zero. Therefore camera/view motion is cleanly separable from projection jitter in the current AA/upscaler-off baseline.
+
+The primary Camera projection and primary Scene projection were correlated on the exact same render frame in all samples:
+
+~~~text
+cameraSameFrame       = true   160/160
+cameraMatchesScene    = true   160/160
+Scene p20 - Camera p20 = 0     160/160
+Scene p21 - Camera p21 = 0     160/160
+~~~
+
+All six SceneInfo variants historically modified by pd-upscaler also had identical zero X/Y projection offsets in all samples:
+
+~~~text
+main
+depthDistortion
+filter
+jitterDisable
+jitterDisablePost
+zPrepass
+~~~
+
+This establishes the current-build baseline required before bridge-controlled jitter is introduced.
+
+A separate depth-projection relationship was also observed consistently in 160/160 samples:
+
+~~~text
+Camera:
+    p22 ~= -1.000000954
+    p32 ~= -0.010000009
+
+SceneInfo:
+    p22 ~= +0.000000954
+    p32 ~= +0.010000009
+~~~
+
+The X/Y projection terms match exactly, while the depth terms are transformed by the engine. This is useful evidence for Gate E, but is not by itself sufficient to mark depth as inverted without further depth-specific validation.
+
+VelocityTarget remained stable at:
+
+~~~text
+2560x1440
+DXGI_FORMAT_R16G16B16A16_SNORM
+flags = RT | UAV
+~~~
+
+Current conclusion:
+
+> In the controlled AA/upscaler-off configuration, RE4 contributes no native projection jitter. Bridge-controlled temporal upscaling must therefore generate, apply, track, and report its own jitter sequence.
+
+The next diagnostic stage may safely introduce a known deterministic jitter pattern because the zero-jitter baseline is now proven.
+
 ---
 
 ## 9. Current HUD/UI boundary model
@@ -843,21 +921,34 @@ Production rules:
 
 ### Gate C — Jitter
 
-**Status: ACTIVE.**
+**Status: BASELINE PROVEN; deterministic injection active next.**
 
-The next diagnostic now captures consecutive-frame SceneInfo and Camera projection state without mutation.
+Capture 12 proves that the current AA/upscaler-off RE4 path has zero native X/Y projection jitter:
 
-Need to establish:
+~~~text
+SceneInfo projection[2][0] = 0
+SceneInfo projection[2][1] = 0
+~~~
 
-- whether current AA-off RE4 has any native projection jitter at all;
-- whether SceneInfo projection differs from Camera `get_ProjectionMatrix`;
-- which SceneInfo variants must receive a future injected jitter;
-- exact X/Y sign and matrix convention;
-- normalization against proven render width/height;
-- phase progression once bridge-controlled jitter is introduced;
-- that the exact jitter sent to XeSS is the jitter actually applied to RE4 for that frame.
+for 160/160 samples, including camera motion.
 
-Historical pd-upscaler modified projection matrix `[2][0]` / `[2][1]` for six SceneInfo variants. Capture 12 should first verify the current-build baseline before any jitter mutation is reintroduced.
+It also proves that the primary Camera and primary Scene share the same X/Y projection offsets on the same frame, and that all six historical SceneInfo variants begin from the same zero-jitter baseline.
+
+Next controlled step:
+
+- use a simple four-phase **diagnostic-only ±0.5 pixel** sequence;
+- derive normalized projection offsets using the proven render extent;
+- follow the historical REFramework temporal-upscaler convention:
+  - matrix X offset = `2 * jitterPixelX / renderWidth`;
+  - matrix Y offset = `-2 * jitterPixelY / renderHeight`;
+- apply the same current-frame projection offset to the current projection and the previous-frame projection used to rebuild `old_view_projection_matrix`;
+- apply it consistently to main, depth-distortion, filter, jitter-disable, jitter-disable-post, and Z-prepass SceneInfo;
+- recompute inverse projection, view-projection, and inverse view-projection after mutation;
+- log requested pixel jitter, normalized matrix jitter, before/after projection offsets, and rebuilt history.
+
+This step is still diagnostic. It does not yet establish the final XeSS jitter phase sequence; it only validates the RE4 injection convention and history handling.
+
+Gate C closes when the injected projection values and rebuilt history are observed exactly as requested across consecutive frames.
 
 ### Gate D — Motion-vector semantics
 
@@ -1185,21 +1276,21 @@ display size = active DXGI swapchain/output size
 
 Color, Depth, and Velocity must continue to match the selected render size. Do not add `ImageQualityRate` control unless later runtime evidence requires it.
 
-### 18.3 Prove jitter and MV semantics together
+### 18.3 Prove jitter, then MV semantics
 
-Do not validate them independently if the engine couples them.
+Capture 12 closes the native-jitter baseline: current AA/upscaler-off RE4 has zero projection jitter.
 
-Log one authoritative per-frame record containing:
+Next:
 
-~~~text
-frame
-render size
-jitter x/y
-projection offsets
-velocity resource
-velocity scale x/y
-camera matrices
-~~~
+1. inject a four-phase diagnostic-only ±0.5 pixel jitter sequence into all six verified SceneInfo variants;
+2. mirror the historical pd-upscaler history treatment by applying the same current jitter to the previous projection used for `old_view_projection_matrix`;
+3. verify exact current projection offsets and rebuilt history across consecutive frames;
+4. only after injection semantics are proven, use the narrowest possible VelocityTarget content-sensitive measurement to determine:
+   - whether jitter is excluded or included in MV;
+   - X/Y sign;
+   - scale;
+   - normalized vs pixel-space interpretation;
+5. do not promote historical MV scale constants to production until current-build evidence confirms them.
 
 ### 18.4 Prove depth/camera/reset
 
