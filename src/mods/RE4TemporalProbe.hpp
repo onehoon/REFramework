@@ -17,6 +17,7 @@
 #include "Mod.hpp"
 #include "RE4TemporalProbeSupport.hpp"
 #include "utility/VtableHook.hpp"
+#include "utility/FunctionHook.hpp"
 
 class RE4TemporalProbe final : public Mod {
 public:
@@ -38,6 +39,8 @@ private:
     void release_mv_readback_resources();
     void perform_mv_readback();
     void log_command_list_interfaces(ID3D12CommandList* command_list);
+    bool ensure_recording_function_hooks(ID3D12CommandList* command_list);
+    void release_recording_function_hooks();
     bool ensure_execution_queue_hook();
     void release_execution_queue_hook();
     bool ensure_resource_command_list_hook(ID3D12GraphicsCommandList* command_list);
@@ -56,6 +59,20 @@ private:
         ID3D12GraphicsCommandList* command_list,
         UINT num_barriers,
         const D3D12_RESOURCE_BARRIER* barriers);
+    static HRESULT STDMETHODCALLTYPE recording_close_hook(
+        ID3D12GraphicsCommandList* command_list);
+    static HRESULT STDMETHODCALLTYPE recording_reset_hook(
+        ID3D12GraphicsCommandList* command_list,
+        ID3D12CommandAllocator* allocator,
+        ID3D12PipelineState* initial_state);
+    static void STDMETHODCALLTYPE recording_resource_barrier_hook(
+        ID3D12GraphicsCommandList* command_list,
+        UINT num_barriers,
+        const D3D12_RESOURCE_BARRIER* barriers);
+    static void STDMETHODCALLTYPE recording_enhanced_barrier_hook(
+        ID3D12GraphicsCommandList7* command_list,
+        UINT32 num_barrier_groups,
+        const D3D12_BARRIER_GROUP* barrier_groups);
 
     std::atomic<bool> m_enabled{false};
     std::atomic<int> m_scenario{0};
@@ -66,6 +83,7 @@ private:
     re4_temporal_probe::FrameBudget m_execution_order_budget;
     re4_temporal_probe::FrameBudget m_resource_state_budget;
     re4_temporal_probe::FrameBudget m_interface_provenance_budget;
+    re4_temporal_probe::FrameBudget m_recording_function_budget;
 
     bool m_reset_witness_valid{false};
     uint32_t m_reset_previous_frame{0};
@@ -104,6 +122,11 @@ private:
         UINT,
         const D3D12_RESOURCE_BARRIER*);
 
+    using CommandListEnhancedBarrierFn = void (STDMETHODCALLTYPE*)(
+        ID3D12GraphicsCommandList7*,
+        UINT32,
+        const D3D12_BARRIER_GROUP*);
+
     struct ResourceCommandListHookState {
         std::unique_ptr<VtableHook> hook{};
         CommandListCloseFn close_original{nullptr};
@@ -140,6 +163,34 @@ private:
     std::atomic<uint32_t> m_interface_boundary_sample{0};
     uint32_t m_interface_last_submit_frame{0};
     uint32_t m_interface_submit_ordinal{0};
+
+    struct RecordingListState {
+        uint64_t generation{0};
+        uint64_t target_barrier_sequence{0};
+    };
+
+    std::mutex m_recording_mutex{};
+    std::unordered_set<uintptr_t> m_recording_tracked_lists{};
+    std::unordered_map<uintptr_t, RecordingListState> m_recording_list_states{};
+    std::unordered_map<uint32_t, std::pair<uintptr_t, uint64_t>> m_recording_active_by_thread{};
+    std::unique_ptr<FunctionHook> m_recording_close_hook{};
+    std::unique_ptr<FunctionHook> m_recording_reset_hook{};
+    std::unique_ptr<FunctionHook> m_recording_resource_barrier_hook{};
+    std::unique_ptr<FunctionHook> m_recording_enhanced_barrier_hook{};
+    CommandListCloseFn m_recording_close_original{nullptr};
+    CommandListResetFn m_recording_reset_original{nullptr};
+    CommandListResourceBarrierFn m_recording_resource_barrier_original{nullptr};
+    CommandListEnhancedBarrierFn m_recording_enhanced_barrier_original{nullptr};
+    std::atomic<bool> m_recording_hooks_ready{false};
+    std::atomic<bool> m_recording_capture_open{false};
+    std::atomic<uint32_t> m_recording_boundary_frame{0};
+    std::atomic<uint32_t> m_recording_boundary_sample{0};
+    std::atomic<uint64_t> m_recording_event_sequence{0};
+    std::atomic<uintptr_t> m_recording_color{0};
+    std::atomic<uintptr_t> m_recording_depth{0};
+    std::atomic<uintptr_t> m_recording_velocity{0};
+    uint32_t m_recording_last_submit_frame{0};
+    uint32_t m_recording_submit_ordinal{0};
 
     std::atomic<uintptr_t> m_camera_ptr{0};
     std::atomic<uint32_t> m_camera_frame{0};
