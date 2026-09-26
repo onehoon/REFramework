@@ -20,7 +20,7 @@ public:
     void on_camera_get_projection_matrix(REManagedObject* camera, Matrix4x4f* result) override;
     void on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* render_context) override;
     bool on_pre_scene_layer_draw(sdk::renderer::layer::Scene* layer, void* render_context) override;
-    bool on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* render_context) override;
+    void on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* render_context) override;
     void on_present() override;
     void on_device_reset() override;
 
