@@ -28,10 +28,12 @@ int main() {
     CHECK(LOAD_STATE_SCENARIO == 9);
     CHECK(EXECUTION_ORDER_SCENARIO == 10);
     CHECK(RESOURCE_STATE_SCENARIO == 11);
+    CHECK(INTERFACE_PROVENANCE_SCENARIO == 12);
     CHECK(RESET_WATCH_MAX_SAMPLES == 4096);
     CHECK(LOAD_STATE_MAX_SAMPLES == 8192);
     CHECK(EXECUTION_ORDER_MAX_SAMPLES == 64);
     CHECK(RESOURCE_STATE_MAX_SAMPLES == 64);
+    CHECK(INTERFACE_PROVENANCE_MAX_SAMPLES == 64);
     CHECK(JITTER_PHASE_COUNT == 4);
     CHECK(MV_READBACK_FIRST_SAMPLE == 5);
     CHECK(MV_READBACK_SAMPLE_COUNT == 16);
@@ -54,6 +56,9 @@ int main() {
     CHECK(!is_resource_state_scenario(10));
     CHECK(is_resource_state_scenario(11));
     CHECK(!is_resource_state_scenario(12));
+    CHECK(!is_interface_provenance_scenario(11));
+    CHECK(is_interface_provenance_scenario(12));
+    CHECK(!is_interface_provenance_scenario(13));
     CHECK(is_horizontal_mv_scenario(1));
     CHECK(is_horizontal_mv_scenario(2));
     CHECK(!is_horizontal_mv_scenario(3));
