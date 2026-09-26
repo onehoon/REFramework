@@ -18,7 +18,7 @@
 #include "REFramework.hpp"
 
 namespace {
-constexpr std::array<const char*, 11> SCENARIOS{
+constexpr std::array<const char*, 12> SCENARIOS{
     "Static screen",
     "Camera pan right",
     "Camera pan left",
@@ -30,6 +30,7 @@ constexpr std::array<const char*, 11> SCENARIOS{
     "Reset/history transition",
     "Load/fade state",
     "D3D12 execution ordering",
+    "D3D12 resource states",
 };
 
 constexpr std::array<const char*, 6> LOAD_STATE_SINGLETONS{
@@ -344,10 +345,23 @@ void RE4TemporalProbe::reset_temporal_state() {
     m_reset_watch_budget.reset();
     m_load_state_budget.reset();
     m_execution_order_budget.reset();
+    m_resource_state_budget.reset();
     m_execution_boundary_frame.store(0, std::memory_order_relaxed);
     m_execution_boundary_sample.store(0, std::memory_order_relaxed);
     m_execution_submit_count.store(0, std::memory_order_relaxed);
     m_execution_boundary_submit_base.store(0, std::memory_order_relaxed);
+    m_resource_boundary_frame.store(0, std::memory_order_relaxed);
+    m_resource_boundary_sample.store(0, std::memory_order_relaxed);
+    m_resource_submit_count.store(0, std::memory_order_relaxed);
+    m_resource_boundary_submit_base.store(0, std::memory_order_relaxed);
+    m_resource_event_sequence.store(0, std::memory_order_relaxed);
+    m_resource_color.store(0, std::memory_order_relaxed);
+    m_resource_depth.store(0, std::memory_order_relaxed);
+    m_resource_velocity.store(0, std::memory_order_relaxed);
+    {
+        std::scoped_lock lock{m_resource_state_mutex};
+        m_resource_active_by_thread.clear();
+    }
     m_reset_witness_valid = false;
     m_reset_previous_frame = 0;
     m_reset_previous_scene = 0;
@@ -925,6 +939,11 @@ void RE4TemporalProbe::on_draw_ui() {
             "Execution-order samples: %u / %u",
             m_execution_order_budget.sample_count(),
             re4_temporal_probe::EXECUTION_ORDER_MAX_SAMPLES);
+    } else if (re4_temporal_probe::is_resource_state_scenario(scenario)) {
+        ImGui::Text(
+            "Resource-state samples: %u / %u",
+            m_resource_state_budget.sample_count(),
+            re4_temporal_probe::RESOURCE_STATE_MAX_SAMPLES);
     } else {
         ImGui::Text(
             "Jitter samples: %u / %u",
@@ -933,10 +952,11 @@ void RE4TemporalProbe::on_draw_ui() {
     }
 
     ImGui::TextWrapped(
-        "RE4-only diagnostic. Gate G is closed by Capture 22. For Gate H Capture 23, select D3D12 execution "
-        "ordering. The probe remains observe-only: it records the pre-Overlay RenderContext/resource boundary and "
-        "hooks only the active DIRECT queue's ExecuteCommandLists instance method to log command-list submission "
-        "between that boundary and Present. It does not issue GPU work, barriers, copies, or XeSS calls.");
+        "RE4-only diagnostic. Capture 23 closed DIRECT queue/list provenance. For Gate H Capture 24, select "
+        "D3D12 resource states. The probe dynamically hooks only DIRECT command lists observed on the active queue, "
+        "tracks Reset/Close recording generations, logs ResourceBarrier only for the current Color/Depth/Velocity "
+        "resources, and correlates the pre-Overlay worker thread with its active list/generation. It remains "
+        "observe-only and issues no GPU work, barriers, copies, or XeSS calls.");
 
     if (ImGui::Button("Reset capture")) {
         reset_temporal_state();
@@ -1023,7 +1043,8 @@ void RE4TemporalProbe::on_scene_layer_update(sdk::renderer::layer::Scene* layer,
     }
 
     const auto scenario_index = m_scenario.load(std::memory_order_relaxed);
-    if (re4_temporal_probe::is_execution_order_scenario(scenario_index)) {
+    if (re4_temporal_probe::is_execution_order_scenario(scenario_index) ||
+        re4_temporal_probe::is_resource_state_scenario(scenario_index)) {
         ensure_execution_queue_hook();
         return;
     }
@@ -1592,7 +1613,8 @@ bool RE4TemporalProbe::on_pre_scene_layer_draw(sdk::renderer::layer::Scene* laye
     const auto scenario = m_scenario.load(std::memory_order_relaxed);
     if (re4_temporal_probe::is_reset_history_scenario(scenario) ||
         re4_temporal_probe::is_load_state_scenario(scenario) ||
-        re4_temporal_probe::is_execution_order_scenario(scenario)) {
+        re4_temporal_probe::is_execution_order_scenario(scenario) ||
+        re4_temporal_probe::is_resource_state_scenario(scenario)) {
         return true;
     }
 
