@@ -659,10 +659,10 @@ void RE4TemporalProbe::on_draw_ui() {
     }
 
     bool enabled = m_enabled.load(std::memory_order_relaxed);
-    if (ImGui::Checkbox("Enable jitter + sparse MV readback test (default off)", &enabled)) {
+    if (ImGui::Checkbox("Enable RE4 temporal diagnostic (default off)", &enabled)) {
         reset_temporal_state();
         m_enabled.store(enabled, std::memory_order_relaxed);
-        spdlog::info("[RE4TemporalProbe] deterministic jitter test {}", enabled ? "enabled" : "disabled");
+        spdlog::info("[RE4TemporalProbe] temporal diagnostic {}", enabled ? "enabled" : "disabled");
     }
 
     int scenario = m_scenario.load(std::memory_order_relaxed);
