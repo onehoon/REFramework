@@ -347,6 +347,7 @@ void RE4TemporalProbe::reset_temporal_state() {
     m_execution_boundary_frame.store(0, std::memory_order_relaxed);
     m_execution_boundary_sample.store(0, std::memory_order_relaxed);
     m_execution_submit_count.store(0, std::memory_order_relaxed);
+    m_execution_boundary_submit_base.store(0, std::memory_order_relaxed);
     m_reset_witness_valid = false;
     m_reset_previous_frame = 0;
     m_reset_previous_scene = 0;
@@ -919,6 +920,11 @@ void RE4TemporalProbe::on_draw_ui() {
             "Load-state samples: %u / %u",
             m_load_state_budget.sample_count(),
             re4_temporal_probe::LOAD_STATE_MAX_SAMPLES);
+    } else if (re4_temporal_probe::is_execution_order_scenario(scenario)) {
+        ImGui::Text(
+            "Execution-order samples: %u / %u",
+            m_execution_order_budget.sample_count(),
+            re4_temporal_probe::EXECUTION_ORDER_MAX_SAMPLES);
     } else {
         ImGui::Text(
             "Jitter samples: %u / %u",
@@ -927,11 +933,10 @@ void RE4TemporalProbe::on_draw_ui() {
     }
 
     ImGui::TextWrapped(
-        "RE4-only diagnostic. Gates D-F are closed. For Gate G Capture 22, select Load/fade state. "
-        "The probe skips diagnostic jitter/readback, records camera pose deltas for up to 8192 frames, and "
-        "reflection-reads integral/enum fields from six RE4 load/fade/state singleton candidates. It logs the "
-        "initial schema/baseline and then only field/object changes. Wait briefly for a gameplay baseline, perform "
-        "one Load Save, then move/rotate normally after loading. No camera-cut threshold is assumed.");
+        "RE4-only diagnostic. Gate G is closed by Capture 22. For Gate H Capture 23, select D3D12 execution "
+        "ordering. The probe remains observe-only: it records the pre-Overlay RenderContext/resource boundary and "
+        "hooks only the active DIRECT queue's ExecuteCommandLists instance method to log command-list submission "
+        "between that boundary and Present. It does not issue GPU work, barriers, copies, or XeSS calls.");
 
     if (ImGui::Button("Reset capture")) {
         reset_temporal_state();
@@ -1018,6 +1023,11 @@ void RE4TemporalProbe::on_scene_layer_update(sdk::renderer::layer::Scene* layer,
     }
 
     const auto scenario_index = m_scenario.load(std::memory_order_relaxed);
+    if (re4_temporal_probe::is_execution_order_scenario(scenario_index)) {
+        ensure_execution_queue_hook();
+        return;
+    }
+
     if (re4_temporal_probe::is_load_state_scenario(scenario_index)) {
         const auto sample = m_load_state_budget.reserve_frame(
             *frame,
@@ -1581,7 +1591,8 @@ bool RE4TemporalProbe::on_pre_scene_layer_draw(sdk::renderer::layer::Scene* laye
 
     const auto scenario = m_scenario.load(std::memory_order_relaxed);
     if (re4_temporal_probe::is_reset_history_scenario(scenario) ||
-        re4_temporal_probe::is_load_state_scenario(scenario)) {
+        re4_temporal_probe::is_load_state_scenario(scenario) ||
+        re4_temporal_probe::is_execution_order_scenario(scenario)) {
         return true;
     }
 
