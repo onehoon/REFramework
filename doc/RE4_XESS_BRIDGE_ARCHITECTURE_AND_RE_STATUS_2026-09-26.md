@@ -1318,62 +1318,168 @@ The XeFG config also has its own default, but that does not remove the producer 
 
 Intel XeSS SR likewise defines normal depth as the default and requires XESS_INIT_FLAG_INVERTED_DEPTH when larger depth values represent nearer geometry.
 
-### Capture 19 objective — close Depth convention and camera projection metadata
+### Capture 19 — Depth convention and camera projection metadata closed
 
-Capture 12 already observed a highly suggestive exact relationship:
+Capture 19 was collected from Google Drive log `19_re2_framework_log.txt`. The embedded local git hash is not used as branch identity; the runtime `depthProjection` signature is authoritative.
 
-~~~text
-Camera projection:
-    p22 ~= -1.000000954
-    p32 ~= -0.010000009
-
-SceneInfo projection:
-    p22 ~= +0.000000954
-    p32 ~= +0.010000009
-~~~
-
-This resembles the same near/far pair encoded once as normal D3D depth and once as reversed/inverted D3D depth.
-
-Capture 19 narrows this to a direct coefficient proof rather than adding a GPU Depth readback.
-
-The probe now reads the primary via.Camera near/far clip planes through reflected engine methods and, on the same render frame, logs:
+The log contains four complete Static-screen runs:
 
 ~~~text
-camera near / far
-Camera projection p22 / p23 / p32 / p33
-SceneInfo projection p22 / p23 / p32 / p33 / p11
-expected normal-depth p22 / p32 from near/far
-expected inverted-depth p22 / p32 from near/far
-Camera error vs normal / inverted
-SceneInfo error vs normal / inverted
-sceneDepthInference
-verticalFovRadians = 2 * atan(1 / SceneInfo projection[1][1])
+Run 1: frames 5674-5705   32 samples
+Run 2: frames 6079-6110   32 samples
+Run 3: frames 6260-6291   32 samples
+Run 4: frames 6469-6500   32 samples
+
+Total depthProjection samples: 128
+jitterDrawCheck:              128 / 128 allVariantsMatch=true
+probe missing/fail errors:    0
 ~~~
 
-The expected right-handed D3D 0..1 depth terms are:
+All 128 depth samples reported:
 
 ~~~text
-normal:
-    p22 = far / (near - far)
-    p32 = far * near / (near - far)
-
-inverted:
-    p22 = near / (far - near)
-    p32 = far * near / (far - near)
+cameraSameFrame = true
+clipValid       = true
+near            = 0.010000000
+far             = 10000.000000000
+sceneDepthInference = inverted
 ~~~
 
-Capture 19 procedure can be minimal:
+Camera projection was bit-stable at the logged precision:
 
-1. select Static screen;
-2. enable/reset the diagnostic;
-3. collect one complete 32-sample run;
-4. confirm cameraSameFrame=true and clipValid=true;
-5. confirm Camera projection matches the normal formula;
-6. confirm SceneInfo projection matches the inverted formula;
-7. confirm perspective structure p23/p33 is stable;
-8. confirm derived vertical FOV is finite/stable.
+~~~text
+p22 = -1.000000954
+p23 = -1.000000000
+p32 = -0.010000009
+p33 =  0.000000000
+~~~
 
-If this relationship holds consistently, close Gate E and the projection portion of Gate F without a Depth texture readback. A sparse depth-content readback remains fallback-only if the projection/clip-plane evidence contradicts itself.
+For near=0.01 and far=10000, the expected normal D3D coefficients are:
+
+~~~text
+p22 = -1.000000954
+p32 = -0.010000010
+~~~
+
+The measured Camera-vs-normal aggregate error was:
+
+~~~text
+0.000000001   (128 / 128)
+~~~
+
+The Camera-vs-inverted error was approximately 1.020001888, so the primary Camera matrix is decisively the normal-depth form.
+
+SceneInfo projection was also stable:
+
+~~~text
+p22 = +0.000000954
+p23 = -1.000000000
+p32 = +0.010000009
+p33 =  0.000000000
+p11 =  2.411319017
+~~~
+
+The expected inverted/reversed D3D coefficients are:
+
+~~~text
+p22 = +0.000001000
+p32 = +0.010000010
+~~~
+
+The measured SceneInfo-vs-inverted aggregate error was:
+
+~~~text
+0.000000047   (128 / 128)
+~~~
+
+while SceneInfo-vs-normal error was approximately 1.020001888.
+
+Therefore the current RE4 SceneInfo/DepthStencilTex render path uses **inverted/reversed depth**. The standard XeSS producer must initialize with:
+
+~~~text
+XESS_INIT_FLAG_INVERTED_DEPTH
+~~~
+
+This is producer-owned information. Upstream OptiScaler `auto` inherits that producer flag for the XeSS path and propagates it to XeFG when `FGInput=Upscaler`; it does not infer the convention from depth-buffer contents.
+
+No GPU Depth texture readback is required for this gate.
+
+Camera metadata is also closed for the tested build:
+
+~~~text
+near  = 0.01
+far   = 10000.0
+
+verticalFovRadians = 0.786246836
+verticalFovDegrees ~= 45.048625
+~~~
+
+The vertical FOV is derived from the SceneInfo projection:
+
+~~~text
+verticalFov = 2 * atan(1 / projection[1][1])
+~~~
+
+Production code should derive current values per frame rather than hardcode the observed 45-degree state, so aiming/cutscene/FOV changes remain correct.
+
+Gate E is **CLOSED**. Gate F is **CLOSED** for the producer contract: near/far are available from primary `via.Camera`, the SceneInfo projection convention is proven, and vertical FOV can be derived per frame from `p11`.
+
+### Capture 20 objective — reset/history transition semantics
+
+The next gate is temporal-history reset policy.
+
+Do not begin with an arbitrary camera-cut threshold. First identify which exact RE4 lifecycle signals change across real transitions.
+
+The diagnostic now has a `Reset/history transition` scenario. In this mode:
+
+- diagnostic jitter injection is skipped;
+- sparse MV readback is skipped;
+- up to 4096 consecutive render frames are observed;
+- each frame logs exact identity/change state for:
+  - Scene layer;
+  - main SceneInfo;
+  - primary camera;
+  - DepthStencilTex;
+  - VelocityTarget;
+  - PostMainTarget/Color;
+  - render width/height;
+  - render-frame continuity;
+- raw camera translation and rotation deltas are logged without classifying them through a guessed cut threshold.
+
+The reset witness records:
+
+~~~text
+first
+frameGap
+sceneChanged
+sceneInfoChanged
+cameraChanged
+depthChanged
+velocityChanged
+colorChanged
+renderSizeChanged
+translationDelta
+rotationDeltaDegrees
+~~~
+
+Capture 20 procedure:
+
+1. select `Reset/history transition`;
+2. click `Reset capture`;
+3. leave normal gameplay/static camera for a short baseline;
+4. perform an ordinary camera move / aim transition so normal pose deltas are represented;
+5. trigger one known destructive transition, preferably Restart Checkpoint or Load Save;
+6. if convenient within the same capture, trigger a known cutscene/camera cut;
+7. keep the log through the first stable gameplay frames after the transition.
+
+Decision rule:
+
+- first valid producer frame always resets XeSS history;
+- render-size or required-resource identity change is a hard reset;
+- scene/SceneInfo/camera identity change is a hard-reset candidate to validate against the transition;
+- render-frame discontinuity is a hard-reset candidate;
+- camera pose deltas are evidence for same-resource camera cuts, but no threshold is accepted until normal movement and a real cut are compared;
+- bridge enable/disable, invalid required input, D3D12 device/swapchain recreation, and production context recreation remain unconditional architectural reset conditions regardless of the Capture 20 result.
 
 The probe still does **not**:
 
@@ -1533,68 +1639,67 @@ No further Depth-assisted reprojection work is required to determine the XeSS MV
 
 ### Gate E — Depth convention
 
-**Status: ACTIVE — Capture 19 prepared.**
+**Status: CLOSED by Capture 19.**
 
-Depth resource identity is already strong. The remaining requirement is to prove whether current RE4 SceneInfo/DepthStencilTex uses normal or reversed depth so the standard XeSS producer can set the correct initialization flag.
+Current RE4 SceneInfo/DepthStencilTex uses inverted/reversed D3D depth.
 
-Important OptiScaler boundary:
-
-- OptiScaler does not inspect depth content and automatically infer normal vs reversed depth for the XeSS producer path;
-- its XeSS hook reads XESS_INIT_FLAG_INVERTED_DEPTH supplied by the producer and maps that to its internal DepthInverted state;
-- user config can override it;
-- with FGInput=Upscaler, the upscaler state is propagated into XeFG automatically.
-
-Therefore REFramework remains responsible for setting the correct XeSS init flag.
-
-Capture 19 uses current-build camera near/far plus Camera/SceneInfo projection coefficients to distinguish the normal and inverted D3D formulas directly. Capture 12 already shows a strong normal-Camera / inverted-SceneInfo signature; the new witness makes the near/far relationship explicit.
-
-If Capture 19 consistently shows:
+Production XeSS rule:
 
 ~~~text
-Camera    ~= normal-depth coefficients
-SceneInfo ~= inverted-depth coefficients
+XESS_INIT_FLAG_INVERTED_DEPTH = set
 ~~~
 
-then production XeSS must set:
+Evidence:
 
-~~~text
-XESS_INIT_FLAG_INVERTED_DEPTH
-~~~
+- primary Camera near/far = 0.01 / 10000.0;
+- Camera Z projection matches the normal-depth formula with aggregate error ~= 1e-9;
+- SceneInfo Z projection matches the inverted-depth formula with aggregate error ~= 4.7e-8;
+- the result is identical across 128/128 samples in four complete runs;
+- `sceneDepthInference=inverted` in 128/128 samples.
 
-A GPU Depth texture content readback is fallback-only if these coefficient relationships fail or become ambiguous.
+OptiScaler does not replace this producer responsibility. Its XeSS `auto` path inherits the producer init flag and can then propagate the state to XeFG.
 
 ### Gate F — Camera parameters
 
-**Status: ACTIVE — partially coupled to Capture 19.**
+**Status: CLOSED by Capture 19 for the producer contract.**
 
-Capture 19 also records:
-
-- current primary-camera near plane;
-- current primary-camera far plane;
-- stable perspective matrix structure;
-- vertical FOV derived from the unjittered SceneInfo projection:
+Current-build validated sources:
 
 ~~~text
-verticalFov = 2 * atan(1 / projection[1][1])
+cameraNear = via.Camera.get_NearClipPlane()
+cameraFar  = via.Camera.get_FarClipPlane()
+
+verticalFov = 2 * atan(1 / SceneInfo.projection[1][1])
 ~~~
 
-This is enough to validate the camera metadata that OptiScaler/XeFG may consume when FGInput=Upscaler.
+Observed static-state values:
 
-Note that native XeSS SR itself primarily needs the correct depth convention/init flag and temporal inputs; near/far/FOV are especially relevant to the downstream FG path and should still be normalized into the canonical temporal-frame contract.
+~~~text
+near  = 0.01
+far   = 10000.0
+verticalFov = 0.786246836 rad ~= 45.048625 deg
+~~~
+
+Do not hardcode the observed FOV. Derive current metadata per frame so aiming, cutscene, and other projection changes propagate naturally.
 
 ### Gate G — Reset/history invalidation
 
-Define when XeSS temporal history resets, including at least:
+**Status: ACTIVE — Capture 20 prepared.**
 
-- first valid frame;
-- resolution/render-size change;
-- swapchain/device recreation;
-- scene/load discontinuity;
-- camera cut/teleport if the game exposes a usable signal;
+Unconditional production reset conditions already include:
+
+- first valid XeSS frame;
 - bridge enable/disable;
-- invalid or missing required input.
+- invalid or missing required temporal input;
+- render-size change;
+- XeSS context recreation;
+- D3D12 device/swapchain recreation.
 
-Never blindly keep history across a destructive transition.
+Capture 20 determines the narrow RE4-side transition signals needed for scene/load/camera discontinuities.
+
+The reset-history witness records Scene/SceneInfo/camera/resource identities, frame continuity, render dimensions, and raw camera pose deltas for up to 4096 frames while leaving diagnostic jitter/MV readback disabled.
+
+Do not invent a camera-cut threshold before Capture 20 compares normal movement against a real load/cut transition.
 
 ### Gate H — D3D12 execution point and resource states
 
@@ -1957,7 +2062,7 @@ The RE4 bridge is ready to begin production XeSS dispatch only when all of the f
 
 The current project is **not yet at this gate**.
 
-The major resource and size-control uncertainty is now substantially closed: HDR/PostMain color, Depth, Velocity, the pre-Overlay engine boundary, SceneView-driven internal render size, Overlay working surfaces, and presentation output are mapped. MV channel mapping, both axis polarities, jitter exclusion, jitter injection mechanics, and absolute W/2,-H/2 scale are now closed through Capture 18. The remaining work is primarily depth/camera semantics, reset/history rules, execution ordering, output integration, and lifecycle.
+The major resource and size-control uncertainty is now substantially closed: HDR/PostMain color, Depth, Velocity, the pre-Overlay engine boundary, SceneView-driven internal render size, Overlay working surfaces, and presentation output are mapped. MV semantics are closed through Capture 18, and Capture 19 closes inverted depth plus near/far/FOV/projection metadata. The remaining work is primarily reset/history rules, D3D12 execution ordering/resource states, output integration, and lifecycle.
 
 ---
 
@@ -1989,6 +2094,6 @@ OutputTargetState
 swapchain backbuffers
 ~~~
 
-Capture 9 identifies on_pre_overlay_layer_draw() as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Capture 10 establishes the native-resolution baseline. Capture 11 then proves that overriding SceneView.get_Size to 1920x1080 moves Color, Depth, and Velocity together while the 2560x1440 DXGI output remains unchanged. Captures 12-16 close render/display control, jitter injection/history, MV jitter exclusion, R=X, G=Y, and both axis polarities. Capture 17 adds the independent rotation-only witness, and Capture 18 closes the absolute MV scale at W/2,-H/2 while rejecting one fixed MV/camera frame offset as the primary source of spatial residuals. Initial zero/low-motion samples immediately after Reset remain a known UI-click input-interruption artifact, not failed directional evidence. Gate D is now closed. The next active gate is Depth/camera projection semantics: Capture 19 will use reflected primary-camera near/far plus Camera/SceneInfo projection coefficients to determine the required XeSS inverted-depth flag and validate vertical FOV without adding a GPU Depth readback unless needed. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
+Capture 9 identifies on_pre_overlay_layer_draw() as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Capture 10 establishes the native-resolution baseline. Capture 11 then proves that overriding SceneView.get_Size to 1920x1080 moves Color, Depth, and Velocity together while the 2560x1440 DXGI output remains unchanged. Captures 12-16 close render/display control, jitter injection/history, MV jitter exclusion, R=X, G=Y, and both axis polarities. Capture 17 adds the independent rotation-only witness, and Capture 18 closes the absolute MV scale at W/2,-H/2 while rejecting one fixed MV/camera frame offset as the primary source of spatial residuals. Initial zero/low-motion samples immediately after Reset remain a known UI-click input-interruption artifact, not failed directional evidence. Gate D is closed. Capture 19 then proves SceneInfo/DepthStencilTex inverted depth in 128/128 samples and closes the producer camera metadata path: near/far come from primary via.Camera and vertical FOV is derived from SceneInfo projection. The next active gate is reset/history invalidation, with Capture 20 prepared as a non-jittering long transition witness. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
 
 Until the remaining gates are proven, the diagnostic stays passive and no production XeSS dispatch is enabled.
