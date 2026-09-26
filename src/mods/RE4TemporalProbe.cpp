@@ -3283,8 +3283,46 @@ void RE4TemporalProbe::on_present() {
                 whole_frame_submits,
                 GetCurrentThreadId());
 
+            m_interface_boundary_sample.store(0, std::memory_order_release);
+            m_interface_boundary_frame.store(0, std::memory_order_relaxed);
+
             if (sample >= re4_temporal_probe::INTERFACE_PROVENANCE_MAX_SAMPLES) {
                 m_interface_capture_open.store(false, std::memory_order_release);
+            }
+        }
+    }
+
+    if (m_enabled.load(std::memory_order_relaxed) &&
+        re4_temporal_probe::is_recording_function_scenario(
+            m_scenario.load(std::memory_order_relaxed))) {
+        const auto sample =
+            m_recording_boundary_sample.load(std::memory_order_relaxed);
+        const auto boundary_frame =
+            m_recording_boundary_frame.load(std::memory_order_relaxed);
+
+        if (sample != 0 && boundary_frame != 0) {
+            uint32_t whole_frame_submits = 0;
+            {
+                std::scoped_lock lock{m_recording_mutex};
+                if (m_recording_last_submit_frame == boundary_frame) {
+                    whole_frame_submits = m_recording_submit_ordinal;
+                }
+            }
+
+            spdlog::info(
+                "[RE4TemporalProbe] recordingPresent sample={} boundaryFrame={} "
+                "wholeFrameObservedSubmits={} hooksReady={} thread={}",
+                sample,
+                boundary_frame,
+                whole_frame_submits,
+                m_recording_hooks_ready.load(std::memory_order_relaxed),
+                GetCurrentThreadId());
+
+            m_recording_boundary_sample.store(0, std::memory_order_release);
+            m_recording_boundary_frame.store(0, std::memory_order_relaxed);
+
+            if (sample >= re4_temporal_probe::RECORDING_FUNCTION_MAX_SAMPLES) {
+                m_recording_capture_open.store(false, std::memory_order_release);
             }
         }
     }
@@ -3326,6 +3364,7 @@ void RE4TemporalProbe::on_device_reset() {
     m_mv_readback_failed = false;
     release_mv_readback_resources();
     release_resource_command_list_hooks();
+    release_recording_function_hooks();
     release_execution_queue_hook();
     reset_temporal_state();
 }
