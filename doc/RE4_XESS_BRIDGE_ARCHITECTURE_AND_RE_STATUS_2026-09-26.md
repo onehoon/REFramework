@@ -1424,62 +1424,159 @@ Production code should derive current values per frame rather than hardcode the 
 
 Gate E is **CLOSED**. Gate F is **CLOSED** for the producer contract: near/far are available from primary `via.Camera`, the SceneInfo projection convention is proven, and vertical FOV can be derived per frame from `p11`.
 
-### Capture 20 objective — reset/history transition semantics
+### Capture 20 — Reset/history transition evidence
 
-The next gate is temporal-history reset policy.
+Capture 20 was collected from Google Drive log `20_re2_framework_log.txt`.
 
-Do not begin with an arbitrary camera-cut threshold. First identify which exact RE4 lifecycle signals change across real transitions.
+User actions for the main run were explicitly:
 
-The diagnostic now has a `Reset/history transition` scenario. In this mode:
+- ordinary character movement;
+- ordinary camera rotation;
+- one **Load Save** operation;
+- no weapon aiming was available yet;
+- no deliberate cutscene/camera-cut test was performed.
 
-- diagnostic jitter injection is skipped;
-- sparse MV readback is skipped;
-- up to 4096 consecutive render frames are observed;
-- each frame logs exact identity/change state for:
-  - Scene layer;
-  - main SceneInfo;
-  - primary camera;
-  - DepthStencilTex;
-  - VelocityTarget;
-  - PostMainTarget/Color;
-  - render width/height;
-  - render-frame continuity;
-- raw camera translation and rotation deltas are logged without classifying them through a guessed cut threshold.
-
-The reset witness records:
+The log contains two reset-witness runs because the diagnostic was reset once:
 
 ~~~text
-first
-frameGap
-sceneChanged
-sceneInfoChanged
-cameraChanged
-depthChanged
-velocityChanged
-colorChanged
-renderSizeChanged
-translationDelta
-rotationDeltaDegrees
+Run 1: 108 frames
+Run 2: 4096 frames, frame 11286 -> 15381
+Total resetWitness lines: 4204
 ~~~
 
-Capture 20 procedure:
+The second run is the production-relevant long capture.
+
+Across all 4096 frames of the main run:
+
+~~~text
+frameGap          = 0
+sceneChanged      = 0
+sceneInfoChanged  = 0
+cameraChanged     = 0
+depthChanged      = 0
+velocityChanged   = 0
+colorChanged      = 0
+renderSizeChanged = 0
+
+Scene pointer unique count     = 1
+SceneInfo pointer unique count = 1
+Camera pointer unique count    = 1
+Depth pointer unique count     = 1
+Velocity pointer unique count  = 1
+Color pointer unique count     = 1
+
+render size = 2560x1440 throughout
+~~~
+
+Therefore **Load Save can reuse the same RE4 Scene, SceneInfo, Camera, Depth, Velocity, and Color objects without a render-frame gap or size change**.
+
+This closes one important negative result:
+
+> Resource/scene/camera identity changes are useful hard-reset conditions when they occur, but they are not sufficient to detect all RE4 temporal-history discontinuities.
+
+Normal-play pose deltas and the Load Save sequence separate strongly in this capture.
+
+Largest ordinary-play observations before the Load Save discontinuity included:
+
+~~~text
+translationDelta ~= 0.989906847 with rotationDeltaDegrees = 0
+ordinary camera rotation max observed ~= 1.564230 deg/frame
+~~~
+
+The approximately 0.99-unit translation occurred during ordinary movement/camera activity. It must **not** be reinterpreted as aiming and demonstrates that a translation-only threshold near 1.0 would be unsafe.
+
+During the single Load Save sequence, two large same-resource pose discontinuities were observed:
+
+~~~text
+sample 3931 / frame 15216
+translationDelta     = 6.555595875
+rotationDeltaDegrees = 31.378658
+
+sample 3998 / frame 15283
+translationDelta     = 2.412585497
+rotationDeltaDegrees = 169.999954
+~~~
+
+At both events every logged identity/size/frame-continuity flag remained false:
+
+~~~text
+frameGap=false
+sceneChanged=false
+sceneInfoChanged=false
+cameraChanged=false
+depthChanged=false
+velocityChanged=false
+colorChanged=false
+renderSizeChanged=false
+~~~
+
+Because the user did not perform a deliberate cutscene or weapon-aim transition, both large jumps are treated as belonging to the **Load Save process**. Their exact internal sub-phase is not assigned from this log alone.
+
+Capture 20 therefore establishes:
+
+- first valid producer frame remains an unconditional reset;
+- render-size/resource/device/context changes remain unconditional hard resets;
+- RE4 Load Save may preserve all relevant object/resource identities;
+- camera-pose discontinuity exists even when all resource identities are stable;
+- translation alone is not a safe discriminator from this evidence;
+- rotation shows strong separation in this run (ordinary max ~=1.56 deg/frame vs Load Save 31.38/170 deg), but no production threshold is accepted yet.
+
+### Capture 21 objective — engine old-view-projection history semantics
+
+Before accepting any camera-cut heuristic, test whether RE Engine already exposes its own temporal-history reset decision through:
+
+~~~text
+SceneInfo::old_view_projection_matrix
+~~~
+
+The `Reset/history transition` scenario now retains Capture 20 identity/pose logging and additionally emits `historyWitness` every frame.
+
+For an exact consecutive frame pair it compares:
+
+~~~text
+engineOldVP = current SceneInfo.old_view_projection_matrix
+
+oldVsPrevious
+    = error(engineOldVP, exact previous-frame current view_projection_matrix)
+
+oldVsCurrent
+    = error(engineOldVP, current-frame view_projection_matrix)
+~~~
+
+Both maximum absolute element error and summed absolute element error are logged, together with a threshold-free nearest relation:
+
+~~~text
+relation =
+    closerToPrevious
+    closerToCurrent
+    equal
+    unavailable
+    invalid
+~~~
+
+No reset/cut threshold is introduced by the probe.
+
+Capture 21 procedure:
 
 1. select `Reset/history transition`;
 2. click `Reset capture`;
-3. leave normal gameplay/static camera for a short baseline;
-4. perform an ordinary camera move / aim transition so normal pose deltas are represented;
-5. trigger one known destructive transition, preferably Restart Checkpoint or Load Save;
-6. if convenient within the same capture, trigger a known cutscene/camera cut;
-7. keep the log through the first stable gameplay frames after the transition.
+3. perform ordinary movement and ordinary camera rotation for several seconds;
+4. perform one **Load Save** early enough that the event remains inside the 4096-frame budget;
+5. keep capturing through the first stable gameplay frames after the load.
 
-Decision rule:
+Weapon aiming is **not required** for this capture.
 
-- first valid producer frame always resets XeSS history;
-- render-size or required-resource identity change is a hard reset;
-- scene/SceneInfo/camera identity change is a hard-reset candidate to validate against the transition;
-- render-frame discontinuity is a hard-reset candidate;
-- camera pose deltas are evidence for same-resource camera cuts, but no threshold is accepted until normal movement and a real cut are compared;
-- bridge enable/disable, invalid required input, D3D12 device/swapchain recreation, and production context recreation remain unconditional architectural reset conditions regardless of the Capture 20 result.
+Desired evidence:
+
+- during ordinary motion, determine whether `oldVP` follows the exact previous-frame VP;
+- at the known Load Save discontinuity, determine whether the engine:
+  - resets `oldVP` toward current VP;
+  - emits another distinct history pattern;
+  - or continues to expose the previous VP with no explicit reset signal.
+
+If the engine provides a deterministic history-reset pattern, use that instead of a camera-angle heuristic.
+
+If it does not, Capture 20's strong rotation separation becomes the basis for a narrowly scoped fallback camera-discontinuity rule, with additional validation before freezing a threshold.
 
 The probe still does **not**:
 
@@ -1684,22 +1781,32 @@ Do not hardcode the observed FOV. Derive current metadata per frame so aiming, c
 
 ### Gate G — Reset/history invalidation
 
-**Status: ACTIVE — Capture 20 prepared.**
+**Status: ACTIVE — Capture 20 partially closes the gate; Capture 21 prepared.**
 
-Unconditional production reset conditions already include:
+Unconditional production reset conditions:
 
 - first valid XeSS frame;
 - bridge enable/disable;
 - invalid or missing required temporal input;
 - render-size change;
+- required-resource identity change;
 - XeSS context recreation;
 - D3D12 device/swapchain recreation.
 
-Capture 20 determines the narrow RE4-side transition signals needed for scene/load/camera discontinuities.
+Capture 20 proves these conditions are **not sufficient by themselves** for RE4 Load Save.
 
-The reset-history witness records Scene/SceneInfo/camera/resource identities, frame continuity, render dimensions, and raw camera pose deltas for up to 4096 frames while leaving diagnostic jitter/MV readback disabled.
+In a 4096-frame run containing ordinary movement/camera rotation plus one Load Save:
 
-Do not invent a camera-cut threshold before Capture 20 compares normal movement against a real load/cut transition.
+- Scene/SceneInfo/Camera/Depth/Velocity/Color identities never changed;
+- render size never changed;
+- no render-frame gap occurred;
+- yet the Load Save sequence produced camera pose jumps of approximately 31.38° / 6.56 units and 170° / 2.41 units;
+- ordinary camera rotation peaked around 1.56°/frame in the same run;
+- an ordinary-play translation of approximately 0.99 units shows translation-only thresholding is unsafe.
+
+Do **not** freeze a camera rotation threshold yet.
+
+Capture 21 now compares `SceneInfo::old_view_projection_matrix` against the exact previous-frame and current-frame view-projection matrices. The preferred production rule is to follow a deterministic engine history-reset signal if RE4 exposes one.
 
 ### Gate H — D3D12 execution point and resource states
 
@@ -1913,10 +2020,10 @@ Use broad D3D12 tracing only as a last resort. The old ATSBridge trace produced 
 | Render/display split semantics | **HIGH / PROVEN** | Internal temporal extent and presentation extent are independently controllable |
 | Jitter | **HIGH / PROVEN** | Capture 12 zero-jitter baseline + Capture 13 six-variant injection/history mechanics |
 | MV channel/sign/jitter semantics | **HIGH / PROVEN** | Captures 14-16: jitter excluded; R=X, G=Y; both axis polarities proven |
-| MV absolute scale | **MEDIUM / active** | Historical W/2,-H/2 candidates; independent rotation-only reprojection witness is next |
-| Depth inversion | **LOW / pending** | Resource proven, convention pending |
-| Near/far/FOV | **LOW / pending** | Historical path known, current proof pending |
-| Reset/history rules | **LOW / pending** | Must be designed/tested |
+| MV absolute scale | **HIGH / PROVEN** | Capture 18 closes W/2,-H/2 absolute scale |
+| Depth inversion | **HIGH / PROVEN** | Capture 19: SceneInfo/DepthStencilTex is inverted/reversed depth in 128/128 samples |
+| Near/far/FOV | **HIGH / PROVEN** | Capture 19: primary Camera near/far + SceneInfo-derived vertical FOV |
+| Reset/history rules | **MEDIUM / active** | Capture 20 proves same-resource Load Save discontinuity; Capture 21 tests engine oldVP reset semantics |
 | Safe XeSS command list / barriers | **LOW / pending** | No production execution yet |
 | Standard XeSS → upstream OptiScaler | **DESIGN LOCKED, runtime pending** | No custom OptiScaler ABI permitted |
 | XeFG through `FGInput=Upscaler` | **pending after SR** | Existing presentation compatibility work remains relevant |
@@ -1978,19 +2085,34 @@ Captures 12-18 close:
 
 The rotation-only witness is no longer a production dependency. It served as an independent proof tool.
 
-### 18.4 Close depth convention + camera metadata
+### 18.4 Depth convention + camera metadata — complete
 
-Capture 19 is now the next runtime test.
+Capture 19 closes:
 
-Use primary via.Camera near/far values and current SceneInfo projection coefficients to prove the D3D depth mapping and derive vertical FOV. Do not add a Depth texture readback unless coefficient evidence is ambiguous.
+- reversed/inverted SceneInfo depth;
+- `XESS_INIT_FLAG_INVERTED_DEPTH`;
+- primary Camera near/far;
+- SceneInfo projection structure;
+- per-frame vertical-FOV derivation.
 
-The standard XeSS producer must set XESS_INIT_FLAG_INVERTED_DEPTH itself when required. OptiScaler auto inherits the producer flag; it is not a substitute for producer-side depth-convention knowledge.
+No GPU Depth readback is required for this gate.
 
-### 18.5 Prove command-list/state insertion
+### 18.5 Close reset/history invalidation
 
-Only now add the narrow D3D12 execution machinery required for XeSS.
+Capture 20 proves that Load Save can preserve all Scene/Camera/resource identities and frame continuity while producing a large camera-pose discontinuity.
 
-### 18.6 Add public XeSS producer
+Capture 21 is the next runtime test:
+
+- compare engine `old_view_projection_matrix` with exact previous/current VP;
+- use ordinary movement/camera rotation as baseline;
+- perform one Load Save;
+- prefer an engine-provided reset pattern over a guessed camera threshold.
+
+### 18.6 Prove command-list/state insertion
+
+Only after Gate G is closed, add the narrow D3D12 execution machinery required for XeSS.
+
+### 18.7 Add public XeSS producer
 
 Call the official XeSS D3D12 API directly.
 
@@ -1998,7 +2120,7 @@ First milestone:
 
 > Correct RE4 XeSS SR using Intel XeSS itself, with HUD/UI preserved outside the upscaled scene path.
 
-### 18.7 Validate upstream OptiScaler
+### 18.8 Validate upstream OptiScaler
 
 With the same producer code:
 
@@ -2009,7 +2131,7 @@ With the same producer code:
 
 No REF-specific OptiScaler patch is allowed to become a requirement.
 
-### 18.8 Validate XeFG
+### 18.9 Validate XeFG
 
 After SR is stable:
 
@@ -2094,6 +2216,6 @@ OutputTargetState
 swapchain backbuffers
 ~~~
 
-Capture 9 identifies on_pre_overlay_layer_draw() as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Capture 10 establishes the native-resolution baseline. Capture 11 then proves that overriding SceneView.get_Size to 1920x1080 moves Color, Depth, and Velocity together while the 2560x1440 DXGI output remains unchanged. Captures 12-16 close render/display control, jitter injection/history, MV jitter exclusion, R=X, G=Y, and both axis polarities. Capture 17 adds the independent rotation-only witness, and Capture 18 closes the absolute MV scale at W/2,-H/2 while rejecting one fixed MV/camera frame offset as the primary source of spatial residuals. Initial zero/low-motion samples immediately after Reset remain a known UI-click input-interruption artifact, not failed directional evidence. Gate D is closed. Capture 19 then proves SceneInfo/DepthStencilTex inverted depth in 128/128 samples and closes the producer camera metadata path: near/far come from primary via.Camera and vertical FOV is derived from SceneInfo projection. The next active gate is reset/history invalidation, with Capture 20 prepared as a non-jittering long transition witness. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
+Capture 9 identifies on_pre_overlay_layer_draw() as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Capture 10 establishes the native-resolution baseline. Capture 11 then proves that overriding SceneView.get_Size to 1920x1080 moves Color, Depth, and Velocity together while the 2560x1440 DXGI output remains unchanged. Captures 12-16 close render/display control, jitter injection/history, MV jitter exclusion, R=X, G=Y, and both axis polarities. Capture 17 adds the independent rotation-only witness, and Capture 18 closes the absolute MV scale at W/2,-H/2 while rejecting one fixed MV/camera frame offset as the primary source of spatial residuals. Initial zero/low-motion samples immediately after Reset remain a known UI-click input-interruption artifact, not failed directional evidence. Gate D is closed. Capture 19 proves SceneInfo/DepthStencilTex inverted depth in 128/128 samples and closes the producer camera metadata path: near/far come from primary via.Camera and vertical FOV is derived from SceneInfo projection. Capture 20 then proves that a real Load Save can preserve Scene/SceneInfo/Camera/Depth/Velocity/Color identity, render size, and render-frame continuity while still producing large camera-history discontinuities. Translation alone is not a safe reset heuristic; rotation separates strongly in this run, but no threshold is frozen. Capture 21 is prepared to test whether SceneInfo.old_view_projection_matrix exposes an engine-native history reset signal. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
 
 Until the remaining gates are proven, the diagnostic stays passive and no production XeSS dispatch is enabled.
