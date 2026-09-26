@@ -25,7 +25,17 @@ int main() {
 
     CHECK(MAX_TEMPORAL_SAMPLES == 32);
     CHECK(JITTER_PHASE_COUNT == 4);
-    CHECK(MAX_MV_READBACK_SAMPLES == 8);
+    CHECK(MV_READBACK_FIRST_SAMPLE == 5);
+    CHECK(MV_READBACK_SAMPLE_COUNT == 16);
+    CHECK(MV_READBACK_LAST_SAMPLE == 20);
+    CHECK(!is_directional_mv_scenario(0));
+    CHECK(is_directional_mv_scenario(1));
+    CHECK(is_directional_mv_scenario(2));
+    CHECK(!is_directional_mv_scenario(3));
+    CHECK(!should_readback_mv_sample(1, 4));
+    CHECK(should_readback_mv_sample(1, 5));
+    CHECK(should_readback_mv_sample(2, 20));
+    CHECK(!should_readback_mv_sample(2, 21));
     CHECK(MV_SAMPLE_GRID_SIZE == 3);
     CHECK(MV_SAMPLE_POINT_COUNT == 9);
     CHECK(MV_READBACK_POINT_STRIDE == 512);
@@ -41,6 +51,10 @@ int main() {
     CHECK(std::abs(decode_snorm16(0)) < 0.0000001f);
     CHECK(std::abs(decode_snorm16(32767) - 1.0f) < 0.0000001f);
     CHECK(std::abs(decode_snorm16(INT16_MIN) + 1.0f) < 0.0000001f);
+
+    const auto candidate = historical_motion_pixel_candidate(0.01f, -0.02f, 2560, 1440);
+    CHECK(std::abs(candidate.x - 12.8f) < 0.0001f);
+    CHECK(std::abs(candidate.y - 14.4f) < 0.0001f);
 
     const auto j1 = jitter_pixels_for_sample(1);
     const auto j2 = jitter_pixels_for_sample(2);
