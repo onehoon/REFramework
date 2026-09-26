@@ -13,6 +13,7 @@ inline constexpr uint32_t RESOURCE_STATE_SCENARIO = 11;
 inline constexpr uint32_t INTERFACE_PROVENANCE_SCENARIO = 12;
 inline constexpr uint32_t RECORDING_FUNCTION_SCENARIO = 13;
 inline constexpr uint32_t BRIDGE_ORDER_SCENARIO = 14;
+inline constexpr uint32_t OUTPUT_COPY_SCENARIO = 15;
 inline constexpr uint32_t RESET_WATCH_MAX_SAMPLES = 4096;
 inline constexpr uint32_t LOAD_STATE_MAX_SAMPLES = 8192;
 inline constexpr uint32_t EXECUTION_ORDER_MAX_SAMPLES = 64;
@@ -20,6 +21,7 @@ inline constexpr uint32_t RESOURCE_STATE_MAX_SAMPLES = 64;
 inline constexpr uint32_t INTERFACE_PROVENANCE_MAX_SAMPLES = 64;
 inline constexpr uint32_t RECORDING_FUNCTION_MAX_SAMPLES = 64;
 inline constexpr uint32_t BRIDGE_ORDER_MAX_SAMPLES = 64;
+inline constexpr uint32_t OUTPUT_COPY_MAX_SAMPLES = 64;
 inline constexpr uint32_t BRIDGE_ORDER_SLOT_COUNT = 8;
 inline constexpr uint32_t JITTER_PHASE_COUNT = 4;
 inline constexpr uint32_t MV_READBACK_FIRST_SAMPLE = 5;
@@ -62,6 +64,10 @@ inline constexpr bool is_recording_function_scenario(int scenario) noexcept {
 
 inline constexpr bool is_bridge_order_scenario(int scenario) noexcept {
     return scenario == static_cast<int>(BRIDGE_ORDER_SCENARIO);
+}
+
+inline constexpr bool is_output_copy_scenario(int scenario) noexcept {
+    return scenario == static_cast<int>(OUTPUT_COPY_SCENARIO);
 }
 
 inline constexpr bool is_horizontal_mv_scenario(int scenario) noexcept {
