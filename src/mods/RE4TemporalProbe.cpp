@@ -13,12 +13,13 @@
 #include <sdk/GameIdentity.hpp>
 #include <sdk/Math.hpp>
 #include <sdk/SceneManager.hpp>
+#include <sdk/REGlobals.hpp>
 #include <sdk/RETypeDB.hpp>
 
 #include "REFramework.hpp"
 
 namespace {
-constexpr std::array<const char*, 9> SCENARIOS{
+constexpr std::array<const char*, 10> SCENARIOS{
     "Static screen",
     "Camera pan right",
     "Camera pan left",
@@ -28,6 +29,16 @@ constexpr std::array<const char*, 9> SCENARIOS{
     "HUD/menu on",
     "HUD/menu off",
     "Reset/history transition",
+    "Load/fade state",
+};
+
+constexpr std::array<const char*, 6> LOAD_STATE_SINGLETONS{
+    "share.FadeManager",
+    "share.SaveDataManager",
+    "share.MainModeManager",
+    "chainsaw.SceneLoadZoneManager",
+    "chainsaw.GameSituationManager",
+    "share.SceneActivateMediator",
 };
 
 constexpr std::array<const char*, 6> SCENE_INFO_NAMES{
@@ -236,11 +247,84 @@ const char* history_relation(
 
     return "equal";
 }
+
+uint32_t integral_field_width(sdk::RETypeDefinition* type) {
+    if (type == nullptr) {
+        return 0;
+    }
+
+    auto* value_type = type;
+    if (type->is_enum()) {
+        value_type = type->get_underlying_type();
+        if (value_type == nullptr) {
+            return 0;
+        }
+    }
+
+    const auto name = value_type->get_full_name();
+    if (name == "System.Boolean" ||
+        name == "System.SByte" ||
+        name == "System.Byte") {
+        return 1;
+    }
+
+    if (name == "System.Char" ||
+        name == "System.Int16" ||
+        name == "System.UInt16") {
+        return 2;
+    }
+
+    if (name == "System.Int32" ||
+        name == "System.UInt32") {
+        return 4;
+    }
+
+    if (name == "System.Int64" ||
+        name == "System.UInt64") {
+        return 8;
+    }
+
+    return 0;
+}
+
+struct IntegralFieldValue {
+    bool valid{};
+    uint32_t width{};
+    uint64_t bits{};
+};
+
+IntegralFieldValue read_integral_field(
+    sdk::REField* field,
+    REManagedObject* object) {
+    if (field == nullptr || field->is_literal()) {
+        return {};
+    }
+
+    auto* field_type = field->get_type();
+    const auto width = integral_field_width(field_type);
+    if (width == 0) {
+        return {};
+    }
+
+    auto* data = field->get_data_raw(object);
+    if (data == nullptr || IsBadReadPtr(data, width)) {
+        return {};
+    }
+
+    uint64_t bits = 0;
+    std::memcpy(&bits, data, width);
+    return {
+        .valid = true,
+        .width = width,
+        .bits = bits,
+    };
+}
 }
 
 void RE4TemporalProbe::reset_temporal_state() {
     m_temporal_budget.reset();
     m_reset_watch_budget.reset();
+    m_load_state_budget.reset();
     m_reset_witness_valid = false;
     m_reset_previous_frame = 0;
     m_reset_previous_scene = 0;
@@ -254,6 +338,12 @@ void RE4TemporalProbe::reset_temporal_state() {
     m_reset_previous_view = {};
     m_reset_previous_view_projection = {};
     m_reset_previous_view_projection_valid = false;
+    m_load_state_witness_valid = false;
+    m_load_state_previous_frame = 0;
+    m_load_state_previous_view = {};
+    m_load_state_objects.clear();
+    m_load_state_values.clear();
+    m_load_state_schema_keys.clear();
     m_camera_ptr.store(0, std::memory_order_relaxed);
     m_camera_frame.store(0, std::memory_order_relaxed);
     m_camera_p20.store(0.0f, std::memory_order_relaxed);
@@ -675,6 +765,11 @@ void RE4TemporalProbe::on_draw_ui() {
             "Reset/history samples: %u / %u",
             m_reset_watch_budget.sample_count(),
             re4_temporal_probe::RESET_WATCH_MAX_SAMPLES);
+    } else if (re4_temporal_probe::is_load_state_scenario(scenario)) {
+        ImGui::Text(
+            "Load-state samples: %u / %u",
+            m_load_state_budget.sample_count(),
+            re4_temporal_probe::LOAD_STATE_MAX_SAMPLES);
     } else {
         ImGui::Text(
             "Jitter samples: %u / %u",
@@ -683,11 +778,11 @@ void RE4TemporalProbe::on_draw_ui() {
     }
 
     ImGui::TextWrapped(
-        "RE4-only diagnostic. Gates D-F are closed. Directional scenarios retain the sparse MV regression path. "
-        "For Gate G Capture 21, select Reset/history transition. Diagnostic jitter/readback stay disabled while "
-        "the probe records scene/camera/resource identity, pose deltas, and compares SceneInfo.old_view_projection "
-        "against the exact previous-frame and current-frame view-projection matrices. Capture ordinary movement/"
-        "camera rotation, then perform one Load Save. No camera-cut threshold is assumed.");
+        "RE4-only diagnostic. Gates D-F are closed. For Gate G Capture 22, select Load/fade state. "
+        "The probe skips diagnostic jitter/readback, records camera pose deltas for up to 8192 frames, and "
+        "reflection-reads integral/enum fields from six RE4 load/fade/state singleton candidates. It logs the "
+        "initial schema/baseline and then only field/object changes. Wait briefly for a gameplay baseline, perform "
+        "one Load Save, then move/rotate normally after loading. No camera-cut threshold is assumed.");
 
     if (ImGui::Button("Reset capture")) {
         reset_temporal_state();
@@ -774,6 +869,171 @@ void RE4TemporalProbe::on_scene_layer_update(sdk::renderer::layer::Scene* layer,
     }
 
     const auto scenario_index = m_scenario.load(std::memory_order_relaxed);
+    if (re4_temporal_probe::is_load_state_scenario(scenario_index)) {
+        const auto sample = m_load_state_budget.reserve_frame(
+            *frame,
+            re4_temporal_probe::LOAD_STATE_MAX_SAMPLES);
+        if (sample == 0) {
+            return;
+        }
+
+        auto* scene_info = layer->get_scene_info();
+        const auto first = !m_load_state_witness_valid;
+        const auto frame_gap =
+            !first &&
+            m_load_state_previous_frame != 0 &&
+            *frame != m_load_state_previous_frame + 1;
+
+        CameraPoseDelta pose_delta{};
+        if (!first && scene_info != nullptr) {
+            pose_delta = camera_pose_delta(
+                m_load_state_previous_view,
+                scene_info->view_matrix);
+        }
+
+        uint32_t manager_count = 0;
+        uint32_t field_count = 0;
+        uint32_t changed_field_count = 0;
+        uint32_t object_change_count = 0;
+
+        auto& globals = reframework::get_globals();
+        for (const auto* manager_name : LOAD_STATE_SINGLETONS) {
+            REManagedObject* object = nullptr;
+            try {
+                object = globals != nullptr ? globals->get(manager_name) : nullptr;
+            } catch (...) {
+                object = nullptr;
+            }
+
+            const auto current_object = reinterpret_cast<uintptr_t>(object);
+            const auto object_key = std::string{manager_name};
+            const auto previous_object = m_load_state_objects.find(object_key);
+            const auto object_changed =
+                previous_object != m_load_state_objects.end() &&
+                previous_object->second != current_object;
+
+            if (previous_object == m_load_state_objects.end() || object_changed) {
+                spdlog::info(
+                    "[RE4TemporalProbe] loadStateObject sample={} frame={} manager={} "
+                    "previous={:p} current={:p} changed={}",
+                    sample,
+                    *frame,
+                    manager_name,
+                    previous_object != m_load_state_objects.end()
+                        ? reinterpret_cast<void*>(previous_object->second)
+                        : nullptr,
+                    object,
+                    object_changed);
+                if (object_changed) {
+                    ++object_change_count;
+                }
+            }
+            m_load_state_objects[object_key] = current_object;
+
+            if (object == nullptr) {
+                continue;
+            }
+
+            ++manager_count;
+            auto* type = object->get_type_definition();
+            for (auto* current_type = type;
+                 current_type != nullptr;
+                 current_type = current_type->get_parent_type()) {
+                for (auto* field : current_type->get_fields()) {
+                    try {
+                        if (field == nullptr || field->get_name() == nullptr) {
+                            continue;
+                        }
+
+                        const auto value = read_integral_field(field, object);
+                        if (!value.valid) {
+                            continue;
+                        }
+
+                        auto* field_type = field->get_type();
+                        auto* declaring_type = field->get_declaring_type();
+                        const auto field_type_name =
+                            field_type != nullptr ? field_type->get_full_name() : std::string{"<null>"};
+                        const auto declaring_type_name =
+                            declaring_type != nullptr ? declaring_type->get_full_name() : std::string{"<null>"};
+
+                        std::string key{manager_name};
+                        key += "|";
+                        key += declaring_type_name;
+                        key += "|";
+                        key += field->get_name();
+
+                        ++field_count;
+
+                        if (m_load_state_schema_keys.insert(key).second) {
+                            spdlog::info(
+                                "[RE4TemporalProbe] loadStateSchema manager={} field={} "
+                                "declaringType={} fieldType={} offset={} static={} enum={} width={} "
+                                "baselineBits=0x{:016x}",
+                                manager_name,
+                                field->get_name(),
+                                declaring_type_name,
+                                field_type_name,
+                                field->get_offset_from_base(),
+                                field->is_static(),
+                                field_type != nullptr && field_type->is_enum(),
+                                value.width,
+                                value.bits);
+                        }
+
+                        const auto previous_value = m_load_state_values.find(key);
+                        if (previous_value != m_load_state_values.end() &&
+                            previous_value->second != value.bits) {
+                            ++changed_field_count;
+                            spdlog::info(
+                                "[RE4TemporalProbe] loadStateChange sample={} frame={} manager={} "
+                                "field={} declaringType={} fieldType={} oldBits=0x{:016x} "
+                                "newBits=0x{:016x} translationDelta={:.9f} rotationDeltaDegrees={:.6f}",
+                                sample,
+                                *frame,
+                                manager_name,
+                                field->get_name(),
+                                declaring_type_name,
+                                field_type_name,
+                                previous_value->second,
+                                value.bits,
+                                pose_delta.translation,
+                                pose_delta.rotation_degrees);
+                        }
+
+                        m_load_state_values[key] = value.bits;
+                    } catch (...) {
+                        continue;
+                    }
+                }
+            }
+        }
+
+        spdlog::info(
+            "[RE4TemporalProbe] loadStateWitness sample={} frame={} first={} frameGap={} "
+            "managerCount={} fieldCount={} changedFields={} objectChanges={} "
+            "poseValid={} translationDelta={:.9f} rotationDeltaDegrees={:.6f}",
+            sample,
+            *frame,
+            first,
+            frame_gap,
+            manager_count,
+            field_count,
+            changed_field_count,
+            object_change_count,
+            pose_delta.valid,
+            pose_delta.translation,
+            pose_delta.rotation_degrees);
+
+        m_load_state_witness_valid = true;
+        m_load_state_previous_frame = *frame;
+        if (scene_info != nullptr) {
+            m_load_state_previous_view = scene_info->view_matrix;
+        }
+
+        return;
+    }
+
     if (re4_temporal_probe::is_reset_history_scenario(scenario_index)) {
         const auto watch_sample = m_reset_watch_budget.reserve_frame(
             *frame,
