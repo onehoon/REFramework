@@ -1169,26 +1169,96 @@ This is independent of the historical W/2,-H/2 conversion because the expected p
 
 It is intentionally a **rotation-only** witness. Use clean stationary-scene camera pans so camera translation, moving geometry, parallax, and foreground/object motion do not become scale evidence.
 
-### Capture 17 objective
+### Capture 17 — rotation-only witness runtime result
 
-Collect clean directional runs, preferably at least one sustained run for each of:
+Capture 17 used repeated directional runs rather than assuming every reset began with uninterrupted camera motion.
+
+Observed capture shape:
 
 ~~~text
-Camera pan right
-Camera pan left
-Camera pan up
-Camera pan down
+Right runs: 4
+Left runs:  5
+Up runs:    2
+Down runs:  2
+
+Total directional runs:       13
+jitterFrame:                  416
+jitterDrawCheck:              416 / 416 allVariantsMatch=true
+MV readback frames:           208
+MV sparse texels:             1,872
+rotationOnlyReprojectionValid 1,872 / 1,872
+probe readback/errors:        0
 ~~~
 
-Primary questions:
+Important operator/test-harness note:
 
-1. Is rotationOnlyReprojectionValid=true throughout samples 5-20?
-2. For broad static-background points, does the historical pixel candidate track the matrix-derived reprojection on the dominant axis?
-3. Is the candidate/reprojection magnitude ratio centered close to 1.0 for both X and Y?
-4. Does candidateMinusReprojection remain small relative to the actual motion magnitude?
-5. Do opposite directions preserve the same scale while reversing sign?
+> The direction key was already being held when **Reset directional capture** was clicked in the REFramework UI. The click temporarily steals/interrupts camera input, so the first few samples of a run can be zero or low motion until gameplay input resumes. Those initial samples are not failed directional runs and must not be used as scale evidence.
 
-Do **not** use moving-character/foreground outliers as proof. If the rotation-only witness consistently agrees on both axes, W/2 and -H/2 can be promoted from historical candidates to current-build absolute MV scale.
+The repeated runs were intentional so each direction would contain a resumed, sustained-motion interval after the UI interaction. Analysis must therefore use the actual MV/reprojection activity and frame IDs, not assume samples 5-20 are uniformly active from their first frame.
+
+Capture 17 provides **strong positive support** for the historical absolute-scale candidates:
+
+~~~text
+motionScaleX =  renderWidth / 2
+motionScaleY = -renderHeight / 2
+~~~
+
+During clean sustained-motion portions, multiple sparse points/runs approach 1:1 agreement between the historical pixel candidate and matrix-derived rotation-only screen displacement, including effective scales near the expected 1280 and -720 values at 2560x1440.
+
+However, agreement is not spatially/run-wise uniform across every active sample. This does **not** reject W/2,-H/2. The current witness attaches each MV frame only to the immediately available current/previous camera-matrix pair, so exact temporal correspondence between the engine VelocityTarget and the camera matrix pair remains an unresolved variable. Because the reset click also creates a sharp stop/restart transition, this timing question should be isolated before adding depth-dependent reprojection.
+
+Gate-D interpretation after Capture 17:
+
+~~~text
+R = X                                      PROVEN
+G = Y                                      PROVEN
+camera right/left polarity                 PROVEN
+camera up/down polarity                    PROVEN
+jitteredMotionVectors = false              PROVEN for tested path
+
+motionScaleX =  renderWidth / 2             STRONGLY SUPPORTED, not closed
+motionScaleY = -renderHeight / 2            STRONGLY SUPPORTED, not closed
+MV <-> camera-matrix temporal alignment     ACTIVE
+~~~
+
+### Capture 18 objective — MV/camera temporal alignment
+
+Before adding Depth to the witness, isolate the exact matrix-pair timing used by VelocityTarget.
+
+The diagnostic now computes and logs the rotation-only reprojection for **every directional sample with valid history**, not only samples 5-20. Each point records the exact matrix pair:
+
+~~~text
+rotationReprojection
+    previousFrame=<P>
+    currentFrame=<C>
+    point=<0..8>
+    pixels={x=...,y=...}
+~~~
+
+The MV readback still captures samples 5-20 and records the same-frame pair attached at snapshot time. Because reprojection continues outside the readback window, offline analysis can compare one MV frame N against adjacent matrix-pair candidates without delaying or retaining VelocityTarget:
+
+~~~text
+prior pair:     currentFrame = N - 1
+same-frame pair currentFrame = N
+next pair:      previousFrame = N   (currentFrame = N + 1)
+~~~
+
+Capture 18 procedure:
+
+1. hold one camera direction continuously before resetting the capture;
+2. click **Reset directional capture** once;
+3. expect a short zero/low-motion interval from the UI click;
+4. do not treat that interval as a failed direction;
+5. evaluate only the resumed sustained-motion interval;
+6. join MV and reprojection records by their explicit frame IDs;
+7. compare the prior/same/next adjacent matrix pairs on the dominant axis for both signs and both axes.
+
+Decision rule:
+
+- if one temporal alignment consistently brings the historical candidate and rotation-only witness into approximately 1:1 agreement across broad static-background points for both X and Y, close W/2,-H/2 and record the discovered frame relationship;
+- if no adjacent pair resolves the active-motion disagreement, then advance to a paired sparse Depth + full world-position reprojection witness to account for camera translation/parallax.
+
+Depth readback is therefore **deferred**, not discarded. Temporal alignment is the narrower unanswered question and should be exhausted first.
 
 The probe still does **not**:
 
@@ -1348,16 +1418,19 @@ motionScaleY candidate = -renderHeight / 2 PENDING absolute proof
 
 Capture 16 closes the remaining channel/polarity question. Its active vertical frames showed G sign consistency of 42/42 for upward motion and 19/19 for downward motion while R remained much smaller.
 
+Capture 17 validates the rotation-only witness plumbing and strongly supports the historical W/2,-H/2 scale, but it also exposes an unresolved timing variable. Initial zero/low-motion frames are explained by the REFramework Reset button temporarily interrupting held gameplay input and are not directional-test failures.
+
 Next controlled diagnostic:
 
-1. retain samples 1-4 warm-up and samples 5-20 sparse readback;
-2. retain all four directional camera scenarios;
-3. compute the new rotation-only screen reprojection from consecutive unjittered current/previous camera matrices at each 3x3 sample coordinate;
-4. log the matrix-derived expected displacement and the residual versus the historical pixel candidate;
-5. use stationary-scene sustained camera rotation;
-6. compare dominant-axis candidate/reprojection magnitude ratio and residual across both axes and opposite directions.
+1. keep the existing 3x3 sparse MV readback for samples 5-20;
+2. compute/log the rotation-only witness for every directional sample with valid history;
+3. record exact previous/current frame IDs for each reprojection pair;
+4. ignore the short click-induced stop/restart interval;
+5. for each sustained-motion MV frame N, compare the prior/same/next adjacent camera-matrix pairs by explicit frame ID;
+6. require one consistent temporal alignment across right/left/up/down before promoting W/2,-H/2 to production values;
+7. only if adjacent-frame alignment does not explain the residuals, add sparse Depth and full translation/parallax-aware reprojection.
 
-If the matrix-derived reprojection independently agrees with the historical candidate on both axes, absolute scale can be closed without relying on plausibility or pd-upscaler history alone.
+This keeps Gate D focused on the narrowest remaining uncertainty and avoids adding depth-dependent machinery before matrix/MV frame correspondence is known.
 
 ### Gate E — Depth convention
 
@@ -1663,9 +1736,9 @@ display size = active DXGI swapchain/output size
 
 Color, Depth, and Velocity must continue to match the selected render size. Do not add `ImageQualityRate` control unless later runtime evidence requires it.
 
-### 18.3 Jitter and MV channel/sign semantics complete; prove absolute scale next
+### 18.3 Jitter and MV channel/sign semantics complete; resolve MV temporal alignment, then close scale
 
-Captures 12-16 establish:
+Captures 12-17 establish:
 
 - native jitter baseline;
 - deterministic RE4 jitter injection;
@@ -1675,15 +1748,20 @@ Captures 12-16 establish:
 - R = X;
 - G = Y;
 - right/left polarity;
-- up/down polarity.
+- up/down polarity;
+- a valid independent rotation-only reprojection witness;
+- strong current-build support for W/2,-H/2.
+
+Capture 17 also establishes a test-procedure artifact: clicking the REFramework reset button while a pan key is held briefly interrupts gameplay camera input. Initial zero/low-motion samples after Reset must therefore be ignored rather than classified as failed directional runs.
 
 Next:
 
-1. use the new rotation-only current/previous camera-matrix reprojection witness;
-2. keep the same samples 5-20 sparse readback window;
-3. run clean sustained right/left/up/down camera rotations in a stationary scene;
-4. compare historical pixel candidates against matrix-derived screen displacement;
-5. require agreement on both magnitude and sign across both axes before promoting W/2,-H/2 to production values.
+1. log the rotation-only reprojection for every directional sample with exact previous/current frame IDs;
+2. keep MV readback on samples 5-20;
+3. use the resumed sustained-motion interval after the Reset click;
+4. compare each MV frame against prior/same/next adjacent camera-matrix pairs;
+5. close W/2,-H/2 only after one temporal relationship is consistent on both axes and both polarities;
+6. if temporal alignment is not sufficient, proceed to paired sparse Depth + full world-position reprojection.
 
 No full-frame dump and no direct barrier on the original VelocityTarget.
 
@@ -1767,7 +1845,7 @@ The RE4 bridge is ready to begin production XeSS dispatch only when all of the f
 
 The current project is **not yet at this gate**.
 
-The major resource and size-control uncertainty is now substantially closed: HDR/PostMain color, Depth, Velocity, the pre-Overlay engine boundary, SceneView-driven internal render size, Overlay working surfaces, and presentation output are mapped. MV channel mapping, both axis polarities, jitter exclusion, and jitter injection mechanics are also closed. The remaining work is primarily MV absolute scale, depth/camera temporal semantics, execution ordering, output integration, and lifecycle.
+The major resource and size-control uncertainty is now substantially closed: HDR/PostMain color, Depth, Velocity, the pre-Overlay engine boundary, SceneView-driven internal render size, Overlay working surfaces, and presentation output are mapped. MV channel mapping, both axis polarities, jitter exclusion, jitter injection mechanics, and rotation-only reprojection plumbing are also closed. Capture 17 strongly supports the historical W/2,-H/2 scale but leaves the exact VelocityTarget-to-camera-matrix frame relationship active. The remaining work is primarily MV temporal alignment/absolute scale, depth/camera semantics, execution ordering, output integration, and lifecycle.
 
 ---
 
@@ -1799,6 +1877,6 @@ OutputTargetState
 swapchain backbuffers
 ~~~
 
-Capture 9 identifies on_pre_overlay_layer_draw() as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Capture 10 establishes the native-resolution baseline. Capture 11 then proves that overriding SceneView.get_Size to 1920x1080 moves Color, Depth, and Velocity together while the 2560x1440 DXGI output remains unchanged. Captures 12-16 close render/display control, jitter injection/history, MV jitter exclusion, R=X, G=Y, and both axis polarities. The next active MV gate is independent absolute-scale proof using the rotation-only camera-matrix reprojection witness. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
+Capture 9 identifies on_pre_overlay_layer_draw() as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Capture 10 establishes the native-resolution baseline. Capture 11 then proves that overriding SceneView.get_Size to 1920x1080 moves Color, Depth, and Velocity together while the 2560x1440 DXGI output remains unchanged. Captures 12-16 close render/display control, jitter injection/history, MV jitter exclusion, R=X, G=Y, and both axis polarities. Capture 17 validates the independent rotation-only reprojection witness across 13 repeated directional runs and strongly supports W/2,-H/2, while also showing that the exact MV-to-camera-matrix temporal alignment must be resolved before absolute scale is declared closed. Initial zero/low-motion samples immediately after Reset are a known UI-click input-interruption artifact, not failed directional evidence. The next active MV gate is adjacent-frame temporal alignment by explicit frame IDs; sparse Depth/full reprojection is the fallback only if that narrower test does not resolve the residuals. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
 
 Until the remaining gates are proven, the diagnostic stays passive and no production XeSS dispatch is enabled.
