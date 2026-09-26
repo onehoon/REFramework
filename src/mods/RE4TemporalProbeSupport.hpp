@@ -40,6 +40,53 @@ struct MotionPixelCandidate {
     float y{};
 };
 
+struct PerspectiveDepthTerms {
+    float p22{};
+    float p32{};
+};
+
+inline constexpr bool valid_clip_planes(float near_plane, float far_plane) noexcept {
+    return near_plane > 0.0f && far_plane > near_plane;
+}
+
+inline constexpr PerspectiveDepthTerms normal_depth_terms(
+    float near_plane,
+    float far_plane) noexcept {
+    if (!valid_clip_planes(near_plane, far_plane)) {
+        return {};
+    }
+
+    const auto denominator = near_plane - far_plane;
+    return {
+        far_plane / denominator,
+        (far_plane * near_plane) / denominator,
+    };
+}
+
+inline constexpr PerspectiveDepthTerms inverted_depth_terms(
+    float near_plane,
+    float far_plane) noexcept {
+    if (!valid_clip_planes(near_plane, far_plane)) {
+        return {};
+    }
+
+    const auto denominator = far_plane - near_plane;
+    return {
+        near_plane / denominator,
+        (far_plane * near_plane) / denominator,
+    };
+}
+
+inline constexpr float absf(float value) noexcept {
+    return value < 0.0f ? -value : value;
+}
+
+inline constexpr float depth_terms_error(
+    PerspectiveDepthTerms actual,
+    PerspectiveDepthTerms expected) noexcept {
+    return absf(actual.p22 - expected.p22) + absf(actual.p32 - expected.p32);
+}
+
 struct ScreenPoint {
     float x{};
     float y{};
