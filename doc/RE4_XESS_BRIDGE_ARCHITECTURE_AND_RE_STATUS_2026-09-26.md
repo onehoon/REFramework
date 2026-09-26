@@ -766,59 +766,67 @@ Pixel identity alone cannot prove that no unrelated earlier UI pass ever touched
 
 ## 10. Current diagnostic PR behavior
 
-Capture 11 closes the render-size discovery gate. The fixed 1920x1080 SceneView override has therefore been removed from the active diagnostic.
+Capture 12 proves the native zero-jitter baseline. The active diagnostic is now a **deterministic projection-jitter injection test** and remains RE4-only and default-off.
 
-The current PR is now a **jitter / projection / motion-vector semantic probe** and remains RE4-only and default-off.
+When enabled, it:
 
-It currently:
+- restricts mutation to the fully rendered primary Scene whose camera matches `sdk::get_primary_camera()`;
+- captures up to 32 consecutive frames per reset;
+- derives the render extent from the proven `VelocityTarget` resource;
+- uses this four-phase diagnostic pixel sequence:
 
-- samples up to **32 consecutive primary Scene frames** per reset rather than one frame every 60 callbacks;
-- records the primary Scene `SceneInfo::projection_matrix` values relevant to jitter and projection interpretation:
-  - `[0][0]`
-  - `[1][1]`
-  - `[2][0]`
-  - `[2][1]`
-  - `[2][2]`
-  - `[2][3]`
-  - `[3][2]`
-  - `[3][3]`;
-- records frame-to-frame deltas for projection `[2][0]` / `[2][1]`;
-- passively records the primary Camera `get_ProjectionMatrix` result on the same render frame when available;
-- compares Scene projection offsets with the same-frame Camera projection offsets;
-- records the current `old_view_projection_matrix[2][0/1]` values as history evidence;
-- records `VelocityTarget` resource identity, extent, format, and flags;
-- records projection offsets for all historical pd-upscaler SceneInfo variants:
-  - main SceneInfo;
-  - depth-distortion SceneInfo;
-  - filter SceneInfo;
-  - jitter-disable SceneInfo;
-  - jitter-disable-post SceneInfo;
-  - Z-prepass SceneInfo.
+~~~text
+phase 0: +0.5, +0.5 px
+phase 1: -0.5, +0.5 px
+phase 2: -0.5, -0.5 px
+phase 3: +0.5, -0.5 px
+~~~
 
-The active probe does **not**:
+- converts pixel jitter to projection offsets with the historical REFramework convention:
 
+~~~text
+matrixJitterX =  2 * pixelJitterX / renderWidth
+matrixJitterY = -2 * pixelJitterY / renderHeight
+~~~
+
+- applies the same current-frame projection offset to all six verified SceneInfo variants:
+  - main;
+  - depth-distortion;
+  - filter;
+  - jitter-disable;
+  - jitter-disable-post;
+  - Z-prepass;
+- rebuilds each `old_view_projection_matrix` from the previous unjittered projection/view pair with the **same current jitter** applied to the previous projection;
+- stores the current unjittered projection/view as history for the next frame;
+- updates current projection, inverse projection, view-projection, and inverse view-projection;
+- records before/after projection offsets, history projection offsets, rebuilt old-VP values, render extent, requested pixel jitter, and normalized matrix jitter;
+- checks again at `on_pre_scene_layer_draw()` that the injected projection values survived from update to draw time.
+
+This mirrors the historical pd-upscaler history treatment intentionally. Applying the same current jitter to both current and previous projection is the mechanism expected to keep projection-jitter delta out of engine-generated motion vectors while still rendering the current frame at the requested jittered sample position.
+
+The current probe does **not**:
+
+- use XeSS-generated jitter phases yet;
+- dispatch XeSS;
+- read back VelocityTarget pixels;
+- claim MV sign/scale/jitter semantics yet;
 - override SceneView/render size;
-- alter `ImageQualityRate`;
-- inject jitter yet;
-- modify any projection matrix;
-- read back VelocityTarget pixels yet;
+- touch `ImageQualityRate`;
 - alter TAA;
-- submit D3D12 work;
-- call XeSS;
+- resize the swapchain;
 - modify OptiScaler;
 - run in non-RE4 games.
 
-The immediate questions for the next runtime capture are:
+The next capture should verify:
 
-1. with the current game AA/upscaler path disabled, are Scene projection `[2][0]` / `[2][1]` stable or naturally jittered across consecutive frames?
-2. does the Scene projection differ from the primary Camera projection on the same frame?
-3. do all SceneInfo variants carry the same projection offsets, or are some intentionally unjittered?
-4. does camera motion change only view/history state while projection offsets remain stable?
-5. is the current VelocityTarget still low-resolution and frame-aligned with the proven render extent?
+1. each requested ±0.5 px phase produces the exact expected normalized matrix offset;
+2. all six SceneInfo variants receive the same phase;
+3. previous-projection history receives the same **current** matrix jitter;
+4. `jitterDrawCheck ... allVariantsMatch=true` on every sampled frame;
+5. primary Camera projection remains an unjittered reference;
+6. VelocityTarget remains present and aligned.
 
-This stage intentionally stops short of claiming MV scale/sign semantics. Resource format and historical pd-upscaler behavior provide a hypothesis, but scale/sign/jitter inclusion require content-sensitive evidence or another independent witness.
-
-If the next capture shows no built-in jitter, the following diagnostic step can inject a known deterministic jitter pattern into the proven SceneInfo set and then test whether VelocityTarget includes or excludes that jitter. Any GPU readback or content-sensitive MV probe should remain narrow and purpose-built.
+Only after these conditions are proven should the diagnostic add a narrow MV-content measurement to determine whether the engine-generated VelocityTarget excludes the injected jitter and to establish MV sign/scale.
 
 ---
 
