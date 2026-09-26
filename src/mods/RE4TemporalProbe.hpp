@@ -4,6 +4,9 @@
 #include <atomic>
 #include <cstdint>
 #include <cstddef>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <wrl.h>
 #include <d3d12.h>
 
@@ -37,6 +40,7 @@ private:
 
     re4_temporal_probe::FrameBudget m_temporal_budget;
     re4_temporal_probe::FrameBudget m_reset_watch_budget;
+    re4_temporal_probe::FrameBudget m_load_state_budget;
 
     bool m_reset_witness_valid{false};
     uint32_t m_reset_previous_frame{0};
@@ -51,6 +55,13 @@ private:
     Matrix4x4f m_reset_previous_view{};
     Matrix4x4f m_reset_previous_view_projection{};
     bool m_reset_previous_view_projection_valid{false};
+
+    bool m_load_state_witness_valid{false};
+    uint32_t m_load_state_previous_frame{0};
+    Matrix4x4f m_load_state_previous_view{};
+    std::unordered_map<std::string, uintptr_t> m_load_state_objects{};
+    std::unordered_map<std::string, uint64_t> m_load_state_values{};
+    std::unordered_set<std::string> m_load_state_schema_keys{};
 
     std::atomic<uintptr_t> m_camera_ptr{0};
     std::atomic<uint32_t> m_camera_frame{0};
