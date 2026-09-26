@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstddef>
 #include <wrl.h>
 #include <d3d12.h>
 
