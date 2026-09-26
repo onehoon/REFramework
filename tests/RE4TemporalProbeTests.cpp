@@ -25,7 +25,9 @@ int main() {
 
     CHECK(MAX_TEMPORAL_SAMPLES == 32);
     CHECK(RESET_HISTORY_SCENARIO == 8);
+    CHECK(LOAD_STATE_SCENARIO == 9);
     CHECK(RESET_WATCH_MAX_SAMPLES == 4096);
+    CHECK(LOAD_STATE_MAX_SAMPLES == 8192);
     CHECK(JITTER_PHASE_COUNT == 4);
     CHECK(MV_READBACK_FIRST_SAMPLE == 5);
     CHECK(MV_READBACK_SAMPLE_COUNT == 16);
@@ -39,6 +41,9 @@ int main() {
     CHECK(!is_reset_history_scenario(7));
     CHECK(is_reset_history_scenario(8));
     CHECK(!is_reset_history_scenario(9));
+    CHECK(!is_load_state_scenario(8));
+    CHECK(is_load_state_scenario(9));
+    CHECK(!is_load_state_scenario(10));
     CHECK(is_horizontal_mv_scenario(1));
     CHECK(is_horizontal_mv_scenario(2));
     CHECK(!is_horizontal_mv_scenario(3));
