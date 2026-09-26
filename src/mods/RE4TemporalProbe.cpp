@@ -4240,6 +4240,69 @@ void RE4TemporalProbe::on_present() {
     }
 
     if (m_enabled.load(std::memory_order_relaxed) &&
+        re4_temporal_probe::is_output_copy_scenario(
+            m_scenario.load(std::memory_order_relaxed))) {
+        const auto sample =
+            m_output_copy_boundary_sample.load(std::memory_order_relaxed);
+        const auto boundary_frame =
+            m_output_copy_boundary_frame.load(std::memory_order_relaxed);
+
+        if (sample != 0 && boundary_frame != 0) {
+            m_output_copy_capture_open.store(false, std::memory_order_release);
+
+            uint32_t whole_frame_submits = 0;
+            size_t tracked_resources = 0;
+            size_t swapchain_buffers = 0;
+            bool reached_swapchain = false;
+
+            {
+                std::scoped_lock lock{m_output_copy_mutex};
+
+                if (m_output_copy_last_submit_frame == boundary_frame) {
+                    whole_frame_submits = m_output_copy_submit_ordinal;
+                }
+
+                tracked_resources = m_output_copy_tracked_resources.size();
+                swapchain_buffers = m_output_copy_swapchain_buffers.size();
+
+                for (const auto resource : m_output_copy_tracked_resources) {
+                    if (m_output_copy_swapchain_buffers.contains(resource)) {
+                        reached_swapchain = true;
+                        break;
+                    }
+                }
+            }
+
+            const auto event_count =
+                m_output_copy_event_sequence.load(std::memory_order_relaxed);
+            const auto event_base =
+                m_output_copy_boundary_event_base.load(std::memory_order_relaxed);
+
+            spdlog::info(
+                "[RE4TemporalProbe] outputCopyPresent sample={} boundaryFrame={} "
+                "wholeFrameObservedSubmits={} eventsSinceBoundary={} "
+                "trackedResources={} swapchainBuffers={} reachedSwapchain={} "
+                "hooksReady={} thread={}",
+                sample,
+                boundary_frame,
+                whole_frame_submits,
+                event_count >= event_base ? event_count - event_base : 0,
+                tracked_resources,
+                swapchain_buffers,
+                reached_swapchain,
+                m_recording_hooks_ready.load(std::memory_order_relaxed),
+                GetCurrentThreadId());
+
+            m_output_copy_boundary_sample.store(0, std::memory_order_release);
+            m_output_copy_boundary_frame.store(0, std::memory_order_relaxed);
+
+            if (sample >= re4_temporal_probe::OUTPUT_COPY_MAX_SAMPLES) {
+                m_output_copy_capture_open.store(false, std::memory_order_release);
+            }
+        }
+    }
+
+    if (m_enabled.load(std::memory_order_relaxed) &&
         re4_temporal_probe::is_interface_provenance_scenario(
             m_scenario.load(std::memory_order_relaxed))) {
         const auto sample =
