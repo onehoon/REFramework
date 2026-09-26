@@ -24,6 +24,8 @@ int main() {
     CHECK(should_process_camera_projection(true, true, &camera, projection));
 
     CHECK(MAX_TEMPORAL_SAMPLES == 32);
+    CHECK(RESET_HISTORY_SCENARIO == 8);
+    CHECK(RESET_WATCH_MAX_SAMPLES == 4096);
     CHECK(JITTER_PHASE_COUNT == 4);
     CHECK(MV_READBACK_FIRST_SAMPLE == 5);
     CHECK(MV_READBACK_SAMPLE_COUNT == 16);
@@ -34,6 +36,9 @@ int main() {
     CHECK(is_directional_mv_scenario(3));
     CHECK(is_directional_mv_scenario(4));
     CHECK(!is_directional_mv_scenario(5));
+    CHECK(!is_reset_history_scenario(7));
+    CHECK(is_reset_history_scenario(8));
+    CHECK(!is_reset_history_scenario(9));
     CHECK(is_horizontal_mv_scenario(1));
     CHECK(is_horizontal_mv_scenario(2));
     CHECK(!is_horizontal_mv_scenario(3));
@@ -132,6 +137,12 @@ int main() {
     budget.reset();
     CHECK(budget.sample_count() == 0);
     CHECK(budget.reserve_frame(2000) == 1);
+
+    FrameBudget long_budget;
+    CHECK(long_budget.reserve_frame(3000, 2) == 1);
+    CHECK(long_budget.reserve_frame(3001, 2) == 2);
+    CHECK(long_budget.reserve_frame(3002, 2) == 0);
+    CHECK(long_budget.sample_count() == 2);
 
     return 0;
 }
