@@ -18,7 +18,7 @@
 #include "REFramework.hpp"
 
 namespace {
-constexpr std::array<const char*, 12> SCENARIOS{
+constexpr std::array<const char*, 13> SCENARIOS{
     "Static screen",
     "Camera pan right",
     "Camera pan left",
@@ -31,6 +31,7 @@ constexpr std::array<const char*, 12> SCENARIOS{
     "Load/fade state",
     "D3D12 execution ordering",
     "D3D12 resource states",
+    "D3D12 interface provenance",
 };
 
 constexpr std::array<const char*, 6> LOAD_STATE_SINGLETONS{
@@ -64,6 +65,25 @@ const char* scenario_name(int index) {
     }
 
     return SCENARIOS[index];
+}
+
+void* interface_vtable(void* value) {
+    if (value == nullptr || IsBadReadPtr(value, sizeof(void*)) != FALSE) {
+        return nullptr;
+    }
+
+    return *reinterpret_cast<void**>(value);
+}
+
+void* interface_method(void* value, size_t index) {
+    auto** vtable = value != nullptr && IsBadReadPtr(value, sizeof(void*)) == FALSE
+        ? *reinterpret_cast<void***>(value)
+        : nullptr;
+    if (vtable == nullptr || IsBadReadPtr(vtable + index, sizeof(void*)) != FALSE) {
+        return nullptr;
+    }
+
+    return vtable[index];
 }
 
 ResourceShape resource_shape(ID3D12Resource* resource) {
@@ -346,6 +366,7 @@ void RE4TemporalProbe::reset_temporal_state() {
     m_load_state_budget.reset();
     m_execution_order_budget.reset();
     m_resource_state_budget.reset();
+    m_interface_provenance_budget.reset();
     m_execution_boundary_frame.store(0, std::memory_order_relaxed);
     m_execution_boundary_sample.store(0, std::memory_order_relaxed);
     m_execution_submit_count.store(0, std::memory_order_relaxed);
@@ -361,6 +382,15 @@ void RE4TemporalProbe::reset_temporal_state() {
     {
         std::scoped_lock lock{m_resource_state_mutex};
         m_resource_active_by_thread.clear();
+    }
+    m_interface_capture_open.store(false, std::memory_order_relaxed);
+    m_interface_boundary_frame.store(0, std::memory_order_relaxed);
+    m_interface_boundary_sample.store(0, std::memory_order_relaxed);
+    {
+        std::scoped_lock lock{m_interface_provenance_mutex};
+        m_interface_logged_lists.clear();
+        m_interface_last_submit_frame = 0;
+        m_interface_submit_ordinal = 0;
     }
     m_reset_witness_valid = false;
     m_reset_previous_frame = 0;
@@ -1300,6 +1330,11 @@ void RE4TemporalProbe::on_draw_ui() {
             "Resource-state samples: %u / %u",
             m_resource_state_budget.sample_count(),
             re4_temporal_probe::RESOURCE_STATE_MAX_SAMPLES);
+    } else if (re4_temporal_probe::is_interface_provenance_scenario(scenario)) {
+        ImGui::Text(
+            "Interface-provenance samples: %u / %u",
+            m_interface_provenance_budget.sample_count(),
+            re4_temporal_probe::INTERFACE_PROVENANCE_MAX_SAMPLES);
     } else {
         ImGui::Text(
             "Jitter samples: %u / %u",
@@ -1308,11 +1343,11 @@ void RE4TemporalProbe::on_draw_ui() {
     }
 
     ImGui::TextWrapped(
-        "RE4-only diagnostic. Capture 23 closed DIRECT queue/list provenance. For Gate H Capture 24, select "
-        "D3D12 resource states. The probe dynamically hooks only DIRECT command lists observed on the active queue, "
-        "tracks Reset/Close recording generations, logs ResourceBarrier only for the current Color/Depth/Velocity "
-        "resources, and correlates the pre-Overlay worker thread with its active list/generation. It remains "
-        "observe-only and issues no GPU work, barriers, copies, or XeSS calls.");
+        "RE4-only diagnostic. Capture 24 showed that instance-vtable hooks on submitted base-interface pointers "
+        "do not observe the real repeated recording path. For Gate H Capture 25, select D3D12 interface provenance. "
+        "The probe remains observe-only: it records whole-frame DIRECT submissions, canonical IUnknown identity, "
+        "GraphicsCommandList 0-7 interface pointers/vtables, legacy Close/Reset/ResourceBarrier implementation "
+        "addresses, and the GraphicsCommandList7 enhanced Barrier implementation when supported.");
 
     if (ImGui::Button("Reset capture")) {
         reset_temporal_state();
