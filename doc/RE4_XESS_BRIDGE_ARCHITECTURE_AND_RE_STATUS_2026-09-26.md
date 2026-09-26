@@ -542,33 +542,55 @@ Pixel identity alone cannot prove that no unrelated earlier UI pass ever touched
 
 ## 10. Current diagnostic PR behavior
 
-The active diagnostic is intentionally passive and default-off.
+Capture 9 ends generic Color/Overlay resource discovery. The active diagnostic is now a **render/display-size correlation probe** and remains passive and default-off.
 
 It currently:
 
 - exists only for RE4;
-- uses existing REFramework layer hooks rather than introducing a second global hook owner;
-- samples primary Scene;
-- records Depth and Velocity;
-- records the Scene MRT set;
-- records PostEffect color;
-- brackets Overlay with pre/post callbacks;
-- records Overlay current target and main target;
-- compares Overlay main to Scene `PostMainTarget` / `HDRTarget`;
+- uses the already verified `on_pre_overlay_layer_draw()` engine boundary;
+- fixes Color semantically to Overlay main == Scene `PostMainTarget` == Scene `HDRTarget`;
+- reads Depth directly from `DepthStencilTex`;
+- reads Velocity directly from `VelocityTarget`;
+- records Color/Depth/Velocity native-resource extents and formats in one frame-local sample;
+- records whether those temporal input extents are aligned;
+- passively records the latest existing `via.SceneView.get_Size` callback result and render-frame ID;
+- records the active D3D12 swapchain `DXGI_SWAP_CHAIN_DESC1` width/height/format/buffer count;
+- records the existing D3D12Hook display-size and render-size hints for comparison, without treating them as authoritative engine render size;
+- pairs a post-Overlay observation on the same frame and records the current working-target extent when available;
 - preserves the original Overlay call by returning `true` from the pre callback;
-- pairs each sampled pre/post Overlay observation exactly once.
+- caps sampling to ten observations per reset.
+
+The old primary-Scene MRT candidate scan, PostEffect candidate scan, and repeated Overlay boundary discovery are removed from the active probe because their semantic questions are already closed.
 
 It does **not**:
 
+- change `SceneView.get_Size`;
+- change render resolution;
+- change `ImageQualityRate`;
+- change TAA or dynamic-resolution settings;
 - submit D3D12 work;
 - issue barriers;
-- modify pixels;
-- read pixels back;
-- alter render size;
+- modify or read back pixels;
 - alter jitter;
 - call XeSS;
 - modify OptiScaler;
 - run in non-RE4 games.
+
+The next runtime log should focus on:
+
+~~~text
+sizeSample=
+color={width=...,height=...}
+depth={width=...,height=...}
+velocity={width=...,height=...}
+temporalExtentsAligned=
+engineView ... viewFrame=... sameFrame=... viewSize=...x...
+dxgi ... swapSize=...x... hookDisplay=...x... hookRenderHint=...x...
+sizeSamplePost=...
+current={width=...,height=...}
+~~~
+
+The goal is to determine which existing engine/DXGI size signals correspond to scene render resolution, display/output resolution, and transient Overlay/UI working-target resolution before any render-size mutation is attempted.
 
 ---
 
