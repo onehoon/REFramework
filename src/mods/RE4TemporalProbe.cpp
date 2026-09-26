@@ -202,12 +202,22 @@ void RE4TemporalProbe::perform_mv_readback() {
         m_velocity_copy = nullptr;
     };
 
+    const auto fail_hold = [this](const char* reason) {
+        spdlog::error(
+            "[RE4TemporalProbe] mvReadback fail-closed reason={}; "
+            "probe disabled and diagnostic clone retained until device reset",
+            reason);
+        m_mv_readback_failed = true;
+        m_enabled.store(false, std::memory_order_relaxed);
+        m_velocity_copy_ready = false;
+    };
+
     if (!ensure_mv_readback_resources()) {
         spdlog::error(
             "[RE4TemporalProbe] mvReadback sample={} frame={} failed to initialize readback resources",
             m_velocity_copy_sample,
             m_velocity_copy_frame);
-        finish();
+        fail_hold("readback_resource_init");
         return;
     }
 
@@ -218,7 +228,7 @@ void RE4TemporalProbe::perform_mv_readback() {
             "[RE4TemporalProbe] mvReadback sample={} frame={} diagnostic clone has no native resource",
             m_velocity_copy_sample,
             m_velocity_copy_frame);
-        finish();
+        fail_hold("clone_native_resource");
         return;
     }
 
@@ -236,7 +246,7 @@ void RE4TemporalProbe::perform_mv_readback() {
             desc.Height,
             static_cast<uint32_t>(desc.Format),
             desc.SampleDesc.Count);
-        finish();
+        fail_hold("clone_desc");
         return;
     }
 
@@ -244,14 +254,14 @@ void RE4TemporalProbe::perform_mv_readback() {
     auto* queue = hook != nullptr ? hook->get_command_queue() : nullptr;
     if (queue == nullptr) {
         spdlog::error("[RE4TemporalProbe] mvReadback missing D3D12 command queue");
-        finish();
+        fail_hold("command_queue");
         return;
     }
 
     if (FAILED(m_mv_command_allocator->Reset()) ||
         FAILED(m_mv_command_list->Reset(m_mv_command_allocator.Get(), nullptr))) {
         spdlog::error("[RE4TemporalProbe] mvReadback failed to reset command objects");
-        finish();
+        fail_hold("command_reset");
         return;
     }
 
@@ -309,7 +319,7 @@ void RE4TemporalProbe::perform_mv_readback() {
 
     if (FAILED(m_mv_command_list->Close())) {
         spdlog::error("[RE4TemporalProbe] mvReadback failed to close command list");
-        finish();
+        fail_hold("command_close");
         return;
     }
 
@@ -328,9 +338,7 @@ void RE4TemporalProbe::perform_mv_readback() {
             "probe disabled and resources retained until device reset",
             static_cast<uint32_t>(signal_result),
             static_cast<uint32_t>(event_result));
-        m_mv_readback_failed = true;
-        m_enabled.store(false, std::memory_order_relaxed);
-        m_velocity_copy_ready = false;
+        fail_hold("fence_arm");
         return;
     }
 
@@ -342,9 +350,7 @@ void RE4TemporalProbe::perform_mv_readback() {
             m_velocity_copy_sample,
             m_velocity_copy_frame,
             wait_result);
-        m_mv_readback_failed = true;
-        m_enabled.store(false, std::memory_order_relaxed);
-        m_velocity_copy_ready = false;
+        fail_hold("fence_wait");
         return;
     }
 
