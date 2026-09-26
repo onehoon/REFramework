@@ -1236,7 +1236,7 @@ bool RE4TemporalProbe::submit_bridge_order_empty_list(uint32_t sample, uint32_t 
         slot.command_list->Reset(slot.allocator.Get(), nullptr);
     if (FAILED(list_reset_result)) {
         std::scoped_lock lock{m_bridge_order_mutex};
-        slot.fence_value = previous_fence;
+        slot.fence_value = UINT64_MAX;
         spdlog::error(
             "[RE4TemporalProbe] bridgeOrder command-list Reset failed sample={} frame={} "
             "slot={} hr=0x{:08x}",
@@ -1250,7 +1250,7 @@ bool RE4TemporalProbe::submit_bridge_order_empty_list(uint32_t sample, uint32_t 
     const auto close_result = slot.command_list->Close();
     if (FAILED(close_result)) {
         std::scoped_lock lock{m_bridge_order_mutex};
-        slot.fence_value = previous_fence;
+        slot.fence_value = UINT64_MAX;
         spdlog::error(
             "[RE4TemporalProbe] bridgeOrder empty-list Close failed sample={} frame={} "
             "slot={} hr=0x{:08x}",
