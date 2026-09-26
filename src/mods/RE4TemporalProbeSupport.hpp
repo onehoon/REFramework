@@ -6,6 +6,8 @@
 
 namespace re4_temporal_probe {
 inline constexpr uint32_t MAX_TEMPORAL_SAMPLES = 32;
+inline constexpr uint32_t RESET_HISTORY_SCENARIO = 8;
+inline constexpr uint32_t RESET_WATCH_MAX_SAMPLES = 4096;
 inline constexpr uint32_t JITTER_PHASE_COUNT = 4;
 inline constexpr uint32_t MV_READBACK_FIRST_SAMPLE = 5;
 inline constexpr uint32_t MV_READBACK_SAMPLE_COUNT = 16;
@@ -19,6 +21,10 @@ inline constexpr uint64_t MV_READBACK_BUFFER_SIZE =
 
 inline constexpr bool is_directional_mv_scenario(int scenario) noexcept {
     return scenario >= 1 && scenario <= 4;
+}
+
+inline constexpr bool is_reset_history_scenario(int scenario) noexcept {
+    return scenario == static_cast<int>(RESET_HISTORY_SCENARIO);
 }
 
 inline constexpr bool is_horizontal_mv_scenario(int scenario) noexcept {
@@ -215,8 +221,8 @@ inline constexpr bool should_process_camera_projection(
 
 class FrameBudget {
 public:
-    uint32_t reserve_frame(uint32_t frame) {
-        if (frame == 0) {
+    uint32_t reserve_frame(uint32_t frame, uint32_t max_samples = MAX_TEMPORAL_SAMPLES) {
+        if (frame == 0 || max_samples == 0) {
             return 0;
         }
 
@@ -225,7 +231,7 @@ public:
             if (m_last_frame.compare_exchange_weak(last, frame, std::memory_order_relaxed)) {
                 auto current = m_samples.load(std::memory_order_relaxed);
 
-                while (current < MAX_TEMPORAL_SAMPLES) {
+                while (current < max_samples) {
                     if (m_samples.compare_exchange_weak(current, current + 1, std::memory_order_relaxed)) {
                         return current + 1;
                     }
