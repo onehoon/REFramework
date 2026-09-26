@@ -1660,8 +1660,83 @@ void RE4TemporalProbe::on_overlay_layer_draw(
         return;
     }
 
-    // Capture directional camera motion only after four warm-up frames.
     const auto scenario = m_scenario.load(std::memory_order_relaxed);
+    if (re4_temporal_probe::is_execution_order_scenario(scenario)) {
+        auto* renderer = sdk::renderer::get_renderer();
+        const auto frame = renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
+        if (!frame.has_value()) {
+            return;
+        }
+
+        const auto sample = m_execution_order_budget.reserve_frame(
+            *frame,
+            re4_temporal_probe::EXECUTION_ORDER_MAX_SAMPLES);
+        if (sample == 0) {
+            m_execution_boundary_sample.store(0, std::memory_order_relaxed);
+            m_execution_boundary_frame.store(0, std::memory_order_relaxed);
+            return;
+        }
+
+        if (!ensure_execution_queue_hook()) {
+            spdlog::error(
+                "[RE4TemporalProbe] executionBoundary sample={} frame={} queueHookUnavailable",
+                sample,
+                *frame);
+            return;
+        }
+
+        auto* scene = static_cast<sdk::renderer::layer::Scene*>(layer->get_parent());
+        auto* context = static_cast<sdk::renderer::RenderContext*>(render_context);
+        auto* current_target = context->get_render_target();
+        auto* current_target_resource =
+            current_target != nullptr ? current_target->get_native_resource_d3d12() : nullptr;
+
+        auto& overlay_main_ref = layer->get_main_target_state();
+        auto* overlay_main = overlay_main_ref.get();
+        auto* overlay_main_resource =
+            overlay_main != nullptr ? overlay_main->get_native_resource_d3d12() : nullptr;
+
+        auto* color = scene != nullptr ? scene->get_post_main_target_d3d12() : nullptr;
+        auto* hdr = scene != nullptr ? scene->get_hdr_target_d3d12() : nullptr;
+        auto* depth = scene != nullptr ? scene->get_depth_stencil_d3d12() : nullptr;
+        auto* velocity = scene != nullptr ? scene->get_motion_vectors_d3d12() : nullptr;
+
+        auto& d3d12 = g_framework->get_d3d12_hook();
+        auto* queue = d3d12 != nullptr ? d3d12->get_command_queue() : nullptr;
+        const auto queue_desc = queue != nullptr ? queue->GetDesc() : D3D12_COMMAND_QUEUE_DESC{};
+
+        const auto submit_base = m_execution_submit_count.load(std::memory_order_relaxed);
+        m_execution_boundary_submit_base.store(submit_base, std::memory_order_relaxed);
+        m_execution_boundary_frame.store(*frame, std::memory_order_relaxed);
+        m_execution_boundary_sample.store(sample, std::memory_order_release);
+
+        spdlog::info(
+            "[RE4TemporalProbe] executionBoundary sample={} frame={} stage=preOverlay "
+            "thread={} renderContext={:p} protectFrame={} delayEnabled={} "
+            "currentTarget={:p} currentResource={:p} overlayMain={:p} overlayMainResource={:p} "
+            "color={:p} hdr={:p} depth={:p} velocity={:p} "
+            "queue={:p} queueType={} submitBase={}",
+            sample,
+            *frame,
+            GetCurrentThreadId(),
+            render_context,
+            context->get_protect_frame(),
+            context->is_delay_enabled(),
+            static_cast<void*>(current_target),
+            static_cast<void*>(current_target_resource),
+            static_cast<void*>(overlay_main),
+            static_cast<void*>(overlay_main_resource),
+            static_cast<void*>(color),
+            static_cast<void*>(hdr),
+            static_cast<void*>(depth),
+            static_cast<void*>(velocity),
+            static_cast<void*>(queue),
+            static_cast<uint32_t>(queue_desc.Type),
+            submit_base);
+        return;
+    }
+
+    // Capture directional camera motion only after four warm-up frames.
     if (!re4_temporal_probe::should_readback_mv_sample(scenario, m_expected_sample) ||
         m_velocity_copy_ready) {
         return;
@@ -1789,6 +1864,29 @@ void RE4TemporalProbe::on_present() {
     if (m_velocity_copy_ready && !m_mv_readback_failed) {
         perform_mv_readback();
     }
+
+    if (m_enabled.load(std::memory_order_relaxed) &&
+        re4_temporal_probe::is_execution_order_scenario(
+            m_scenario.load(std::memory_order_relaxed))) {
+        const auto sample = m_execution_boundary_sample.load(std::memory_order_acquire);
+        const auto boundary_frame = m_execution_boundary_frame.load(std::memory_order_relaxed);
+        if (sample != 0 && boundary_frame != 0) {
+            const auto submit_count = m_execution_submit_count.load(std::memory_order_relaxed);
+            const auto submit_base = m_execution_boundary_submit_base.load(std::memory_order_relaxed);
+
+            spdlog::info(
+                "[RE4TemporalProbe] executionPresent sample={} boundaryFrame={} "
+                "submitsSinceBoundary={} totalObservedSubmits={} thread={}",
+                sample,
+                boundary_frame,
+                submit_count >= submit_base ? submit_count - submit_base : 0,
+                submit_count,
+                GetCurrentThreadId());
+
+            m_execution_boundary_sample.store(0, std::memory_order_release);
+            m_execution_boundary_frame.store(0, std::memory_order_relaxed);
+        }
+    }
 }
 
 void RE4TemporalProbe::on_device_reset() {
@@ -1796,5 +1894,6 @@ void RE4TemporalProbe::on_device_reset() {
     m_velocity_copy = nullptr;
     m_mv_readback_failed = false;
     release_mv_readback_resources();
+    release_execution_queue_hook();
     reset_temporal_state();
 }
