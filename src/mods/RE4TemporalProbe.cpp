@@ -2076,6 +2076,11 @@ void RE4TemporalProbe::on_draw_ui() {
             "Recording-function samples: %u / %u",
             m_recording_function_budget.sample_count(),
             re4_temporal_probe::RECORDING_FUNCTION_MAX_SAMPLES);
+    } else if (re4_temporal_probe::is_bridge_order_scenario(scenario)) {
+        ImGui::Text(
+            "Bridge-order samples: %u / %u",
+            m_bridge_order_budget.sample_count(),
+            re4_temporal_probe::BRIDGE_ORDER_MAX_SAMPLES);
     } else {
         ImGui::Text(
             "Jitter samples: %u / %u",
@@ -2084,11 +2089,11 @@ void RE4TemporalProbe::on_draw_ui() {
     }
 
     ImGui::TextWrapped(
-        "RE4-only diagnostic. Capture 25 proves the submitted base pointer and GraphicsCommandList 0-7 public "
-        "interfaces share one pointer/vtable and that GCL7 is supported. For Gate H Capture 26, select D3D12 "
-        "recording functions. The probe installs shared implementation-level hooks for Close, Reset, legacy "
-        "ResourceBarrier, and GCL7 enhanced Barrier, but logs only DIRECT lists actually observed on the active "
-        "RE4 queue. It remains observe-only and does not alter barriers or issue GPU work.");
+        "RE4-only diagnostic. Capture 26 proves the real repeated recording path uses legacy ResourceBarrier and "
+        "closes the pre-Overlay Color/Depth/Velocity input states. For Gate H Capture 27, select D3D12 bridge "
+        "ordering. The probe submits one REFramework-owned EMPTY DIRECT command list at pre-Overlay using an "
+        "8-slot allocator/list ring and fence-completion-only reuse. It records ordering only: no resource "
+        "barrier, copy, draw, dispatch, or XeSS call is recorded in the bridge list.");
 
     if (ImGui::Button("Reset capture")) {
         reset_temporal_state();
@@ -2178,7 +2183,8 @@ void RE4TemporalProbe::on_scene_layer_update(sdk::renderer::layer::Scene* layer,
     if (re4_temporal_probe::is_execution_order_scenario(scenario_index) ||
         re4_temporal_probe::is_resource_state_scenario(scenario_index) ||
         re4_temporal_probe::is_interface_provenance_scenario(scenario_index) ||
-        re4_temporal_probe::is_recording_function_scenario(scenario_index)) {
+        re4_temporal_probe::is_recording_function_scenario(scenario_index) ||
+        re4_temporal_probe::is_bridge_order_scenario(scenario_index)) {
         ensure_execution_queue_hook();
         return;
     }
@@ -2750,7 +2756,8 @@ bool RE4TemporalProbe::on_pre_scene_layer_draw(sdk::renderer::layer::Scene* laye
         re4_temporal_probe::is_execution_order_scenario(scenario) ||
         re4_temporal_probe::is_resource_state_scenario(scenario) ||
         re4_temporal_probe::is_interface_provenance_scenario(scenario) ||
-        re4_temporal_probe::is_recording_function_scenario(scenario)) {
+        re4_temporal_probe::is_recording_function_scenario(scenario) ||
+        re4_temporal_probe::is_bridge_order_scenario(scenario)) {
         return true;
     }
 
