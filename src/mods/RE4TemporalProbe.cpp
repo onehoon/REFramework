@@ -3713,6 +3713,49 @@ void RE4TemporalProbe::on_present() {
         }
     }
     if (m_enabled.load(std::memory_order_relaxed) &&
+        re4_temporal_probe::is_bridge_order_scenario(
+            m_scenario.load(std::memory_order_relaxed))) {
+        const auto sample =
+            m_bridge_order_boundary_sample.load(std::memory_order_relaxed);
+        const auto boundary_frame =
+            m_bridge_order_boundary_frame.load(std::memory_order_relaxed);
+
+        if (sample != 0 && boundary_frame != 0) {
+            uint32_t whole_frame_submits = 0;
+            {
+                std::scoped_lock lock{m_bridge_order_mutex};
+                if (m_bridge_order_last_submit_frame == boundary_frame) {
+                    whole_frame_submits = m_bridge_order_submit_ordinal;
+                }
+            }
+
+            const auto completed =
+                m_bridge_order_fence != nullptr
+                    ? m_bridge_order_fence->GetCompletedValue()
+                    : 0;
+
+            spdlog::info(
+                "[RE4TemporalProbe] bridgeOrderPresent sample={} boundaryFrame={} "
+                "wholeFrameObservedSubmits={} totalSubmitted={} totalSkipped={} "
+                "fenceCompleted={} thread={}",
+                sample,
+                boundary_frame,
+                whole_frame_submits,
+                m_bridge_order_submitted_count.load(std::memory_order_relaxed),
+                m_bridge_order_skipped_count.load(std::memory_order_relaxed),
+                completed,
+                GetCurrentThreadId());
+
+            m_bridge_order_boundary_sample.store(0, std::memory_order_release);
+            m_bridge_order_boundary_frame.store(0, std::memory_order_relaxed);
+
+            if (sample >= re4_temporal_probe::BRIDGE_ORDER_MAX_SAMPLES) {
+                m_bridge_order_capture_open.store(false, std::memory_order_release);
+            }
+        }
+    }
+
+    if (m_enabled.load(std::memory_order_relaxed) &&
         re4_temporal_probe::is_interface_provenance_scenario(
             m_scenario.load(std::memory_order_relaxed))) {
         const auto sample =
@@ -3819,6 +3862,7 @@ void RE4TemporalProbe::on_device_reset() {
     release_mv_readback_resources();
     release_resource_command_list_hooks();
     release_recording_function_hooks();
+    release_bridge_order_resources();
     release_execution_queue_hook();
     reset_temporal_state();
 }
