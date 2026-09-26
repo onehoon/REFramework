@@ -1042,6 +1042,276 @@ void STDMETHODCALLTYPE RE4TemporalProbe::recording_enhanced_barrier_hook(
         barrier_groups);
 }
 
+
+bool RE4TemporalProbe::ensure_bridge_order_resources() {
+    std::scoped_lock lock{m_bridge_order_mutex};
+
+    bool ready = m_bridge_order_fence != nullptr;
+    for (const auto& slot : m_bridge_order_slots) {
+        ready = ready &&
+            slot.allocator != nullptr &&
+            slot.command_list != nullptr;
+    }
+    if (ready) {
+        return true;
+    }
+
+    if (g_framework == nullptr || !g_framework->is_dx12()) {
+        return false;
+    }
+
+    auto& d3d12 = g_framework->get_d3d12_hook();
+    auto* device = d3d12 != nullptr ? d3d12->get_device() : nullptr;
+    auto* queue = d3d12 != nullptr ? d3d12->get_command_queue() : nullptr;
+    if (device == nullptr || queue == nullptr) {
+        return false;
+    }
+
+    const auto queue_desc = queue->GetDesc();
+    if (queue_desc.Type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        spdlog::error(
+            "[RE4TemporalProbe] bridgeOrder expected DIRECT queue but got type={}",
+            static_cast<uint32_t>(queue_desc.Type));
+        return false;
+    }
+
+    for (auto& slot : m_bridge_order_slots) {
+        slot.allocator.Reset();
+        slot.command_list.Reset();
+        slot.fence_value = 0;
+    }
+    m_bridge_order_fence.Reset();
+    m_bridge_order_next_fence_value = 0;
+    m_bridge_order_next_slot = 0;
+
+    if (FAILED(device->CreateFence(
+            0,
+            D3D12_FENCE_FLAG_NONE,
+            IID_PPV_ARGS(&m_bridge_order_fence)))) {
+        spdlog::error("[RE4TemporalProbe] bridgeOrder failed to create fence");
+        return false;
+    }
+
+    for (uint32_t i = 0; i < m_bridge_order_slots.size(); ++i) {
+        auto& slot = m_bridge_order_slots[i];
+
+        if (FAILED(device->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(&slot.allocator)))) {
+            spdlog::error(
+                "[RE4TemporalProbe] bridgeOrder failed to create allocator slot={}",
+                i);
+            release_bridge_order_resources();
+            return false;
+        }
+
+        if (FAILED(device->CreateCommandList(
+                0,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                slot.allocator.Get(),
+                nullptr,
+                IID_PPV_ARGS(&slot.command_list)))) {
+            spdlog::error(
+                "[RE4TemporalProbe] bridgeOrder failed to create command list slot={}",
+                i);
+            release_bridge_order_resources();
+            return false;
+        }
+
+        if (FAILED(slot.command_list->Close())) {
+            spdlog::error(
+                "[RE4TemporalProbe] bridgeOrder failed to close initial command list slot={}",
+                i);
+            release_bridge_order_resources();
+            return false;
+        }
+    }
+
+    spdlog::info(
+        "[RE4TemporalProbe] bridgeOrderResources slots={} fence={:p} queue={:p}",
+        m_bridge_order_slots.size(),
+        static_cast<void*>(m_bridge_order_fence.Get()),
+        static_cast<void*>(queue));
+    return true;
+}
+
+void RE4TemporalProbe::release_bridge_order_resources() {
+    for (auto& slot : m_bridge_order_slots) {
+        slot.command_list.Reset();
+        slot.allocator.Reset();
+        slot.fence_value = 0;
+    }
+    m_bridge_order_fence.Reset();
+    m_bridge_order_next_fence_value = 0;
+    m_bridge_order_next_slot = 0;
+}
+
+bool RE4TemporalProbe::is_bridge_order_list(ID3D12CommandList* command_list) const {
+    if (command_list == nullptr) {
+        return false;
+    }
+
+    for (const auto& slot : m_bridge_order_slots) {
+        if (slot.command_list.Get() == command_list) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool RE4TemporalProbe::submit_bridge_order_empty_list(uint32_t sample, uint32_t frame) {
+    if (!ensure_bridge_order_resources() ||
+        g_framework == nullptr ||
+        !g_framework->is_dx12()) {
+        return false;
+    }
+
+    auto& d3d12 = g_framework->get_d3d12_hook();
+    auto* queue = d3d12 != nullptr ? d3d12->get_command_queue() : nullptr;
+    if (queue == nullptr || m_bridge_order_fence == nullptr) {
+        return false;
+    }
+
+    const auto completed = m_bridge_order_fence->GetCompletedValue();
+
+    uint32_t slot_index = UINT32_MAX;
+    uint64_t previous_fence = 0;
+    {
+        std::scoped_lock lock{m_bridge_order_mutex};
+
+        for (uint32_t offset = 0;
+             offset < m_bridge_order_slots.size();
+             ++offset) {
+            const auto candidate =
+                (m_bridge_order_next_slot + offset) %
+                static_cast<uint32_t>(m_bridge_order_slots.size());
+            const auto fence_value =
+                m_bridge_order_slots[candidate].fence_value;
+
+            if (fence_value == 0 ||
+                (fence_value != UINT64_MAX && completed >= fence_value)) {
+                slot_index = candidate;
+                previous_fence = fence_value;
+                m_bridge_order_slots[candidate].fence_value = UINT64_MAX;
+                m_bridge_order_next_slot =
+                    (candidate + 1) %
+                    static_cast<uint32_t>(m_bridge_order_slots.size());
+                break;
+            }
+        }
+    }
+
+    if (slot_index == UINT32_MAX) {
+        const auto skipped = m_bridge_order_skipped_count.fetch_add(
+            1,
+            std::memory_order_relaxed) + 1;
+        spdlog::warn(
+            "[RE4TemporalProbe] bridgeOrderSkip sample={} frame={} reason=no_completed_slot "
+            "completedFence={} skipped={}",
+            sample,
+            frame,
+            completed,
+            skipped);
+        return false;
+    }
+
+    auto& slot = m_bridge_order_slots[slot_index];
+
+    const auto allocator_result = slot.allocator->Reset();
+    if (FAILED(allocator_result)) {
+        std::scoped_lock lock{m_bridge_order_mutex};
+        slot.fence_value = previous_fence;
+        spdlog::error(
+            "[RE4TemporalProbe] bridgeOrder allocator Reset failed sample={} frame={} "
+            "slot={} hr=0x{:08x}",
+            sample,
+            frame,
+            slot_index,
+            static_cast<uint32_t>(allocator_result));
+        return false;
+    }
+
+    const auto list_reset_result =
+        slot.command_list->Reset(slot.allocator.Get(), nullptr);
+    if (FAILED(list_reset_result)) {
+        std::scoped_lock lock{m_bridge_order_mutex};
+        slot.fence_value = previous_fence;
+        spdlog::error(
+            "[RE4TemporalProbe] bridgeOrder command-list Reset failed sample={} frame={} "
+            "slot={} hr=0x{:08x}",
+            sample,
+            frame,
+            slot_index,
+            static_cast<uint32_t>(list_reset_result));
+        return false;
+    }
+
+    const auto close_result = slot.command_list->Close();
+    if (FAILED(close_result)) {
+        std::scoped_lock lock{m_bridge_order_mutex};
+        slot.fence_value = previous_fence;
+        spdlog::error(
+            "[RE4TemporalProbe] bridgeOrder empty-list Close failed sample={} frame={} "
+            "slot={} hr=0x{:08x}",
+            sample,
+            frame,
+            slot_index,
+            static_cast<uint32_t>(close_result));
+        return false;
+    }
+
+    ID3D12CommandList* lists[] = {slot.command_list.Get()};
+    queue->ExecuteCommandLists(1, lists);
+
+    UINT64 signal_value = 0;
+    {
+        std::scoped_lock lock{m_bridge_order_mutex};
+        signal_value = ++m_bridge_order_next_fence_value;
+    }
+
+    const auto signal_result =
+        queue->Signal(m_bridge_order_fence.Get(), signal_value);
+    if (FAILED(signal_result)) {
+        std::scoped_lock lock{m_bridge_order_mutex};
+        // The list was already submitted. Never reuse this slot without a
+        // proven completion signal.
+        slot.fence_value = UINT64_MAX;
+        spdlog::error(
+            "[RE4TemporalProbe] bridgeOrder Signal failed sample={} frame={} "
+            "slot={} signal={} hr=0x{:08x}; slot retained",
+            sample,
+            frame,
+            slot_index,
+            signal_value,
+            static_cast<uint32_t>(signal_result));
+        return false;
+    }
+
+    {
+        std::scoped_lock lock{m_bridge_order_mutex};
+        slot.fence_value = signal_value;
+    }
+
+    const auto submitted = m_bridge_order_submitted_count.fetch_add(
+        1,
+        std::memory_order_relaxed) + 1;
+
+    spdlog::info(
+        "[RE4TemporalProbe] bridgeOrderIssue sample={} frame={} slot={} list={:p} "
+        "completedBefore={} previousFence={} signalFence={} submitted={} thread={}",
+        sample,
+        frame,
+        slot_index,
+        static_cast<void*>(slot.command_list.Get()),
+        completed,
+        previous_fence,
+        signal_value,
+        submitted,
+        GetCurrentThreadId());
+    return true;
+}
+
 bool RE4TemporalProbe::ensure_execution_queue_hook() {
     if (m_execution_queue_hook != nullptr && m_execution_queue_original != nullptr) {
         return true;
