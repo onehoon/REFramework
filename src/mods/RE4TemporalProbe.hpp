@@ -17,6 +17,7 @@ public:
     void on_scene_layer_draw(sdk::renderer::layer::Scene* layer, void* render_context) override;
     void on_post_effect_layer_draw(sdk::renderer::layer::PostEffect* layer, void* render_context) override;
     void on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* render_context) override;
+    void on_application_entry(void* entry, const char* name, size_t hash) override;
 
 private:
     std::atomic<bool> m_enabled{false};
@@ -30,6 +31,16 @@ private:
     std::atomic<uintptr_t> m_last_depth_resource{0};
     std::atomic<uintptr_t> m_last_velocity_resource{0};
     std::array<std::atomic<uintptr_t>, 4> m_last_scene_rtv_resources{};
+    std::atomic<uintptr_t> m_last_scene_layer{0};
+    std::atomic<uintptr_t> m_last_post_effect_layer{0};
+    std::atomic<uintptr_t> m_last_post_effect_target_state{0};
+    std::atomic<uintptr_t> m_last_post_effect_texture{0};
     std::atomic<uintptr_t> m_last_post_effect_resource{0};
     std::atomic<uint32_t> m_last_post_effect_frame{0};
+
+    std::atomic<uintptr_t> m_last_overlay_layer{0};
+    std::atomic<uintptr_t> m_last_overlay_target_state{0};
+    std::atomic<uintptr_t> m_last_overlay_texture{0};
+    std::atomic<uintptr_t> m_last_overlay_resource{0};
+    std::atomic<uint32_t> m_last_overlay_frame{0};
 };
