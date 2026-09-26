@@ -83,6 +83,7 @@ private:
     std::atomic<uint32_t> m_execution_boundary_frame{0};
     std::atomic<uint32_t> m_execution_boundary_sample{0};
     std::atomic<uint64_t> m_execution_submit_count{0};
+    std::atomic<uint64_t> m_execution_boundary_submit_base{0};
 
     std::atomic<uintptr_t> m_camera_ptr{0};
     std::atomic<uint32_t> m_camera_frame{0};
