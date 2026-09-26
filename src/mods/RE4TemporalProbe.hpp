@@ -256,6 +256,7 @@ private:
     std::atomic<uint32_t> m_output_copy_boundary_frame{0};
     std::atomic<uint32_t> m_output_copy_boundary_sample{0};
     std::atomic<uint64_t> m_output_copy_event_sequence{0};
+    std::atomic<uint64_t> m_output_copy_boundary_event_base{0};
     std::atomic<uintptr_t> m_output_copy_color{0};
     uint32_t m_output_copy_last_submit_frame{0};
     uint32_t m_output_copy_submit_ordinal{0};
