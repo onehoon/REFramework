@@ -151,6 +151,7 @@ void RE4TemporalProbe::reset_temporal_state() {
     m_camera_p21.store(0.0f, std::memory_order_relaxed);
 
     m_history_valid.fill(false);
+    m_previous_scene_frame.fill(0);
     m_expected_frame = 0;
     m_expected_sample = 0;
     m_expected_matrix_jitter_x = 0.0f;
@@ -158,9 +159,11 @@ void RE4TemporalProbe::reset_temporal_state() {
     m_expected_p20.fill(0.0f);
     m_expected_p21.fill(0.0f);
     m_expected_rotation_reprojection.fill({});
+    m_expected_rotation_reprojection_previous_frame = 0;
     m_expected_rotation_reprojection_frame = 0;
     m_expected_rotation_reprojection_valid = false;
     m_velocity_copy_rotation_reprojection.fill({});
+    m_velocity_copy_rotation_reprojection_previous_frame = 0;
     m_velocity_copy_rotation_reprojection_valid = false;
 }
 
@@ -442,7 +445,7 @@ void RE4TemporalProbe::perform_mv_readback() {
     spdlog::info(
         "[RE4TemporalProbe] mvReadbackBegin sample={} scenario='{}' frame={} phase={} "
         "render={}x{} points={} cloneResource={:p} assumedCloneState=COPY_DEST "
-        "rotationOnlyReprojectionValid={}",
+        "rotationOnlyReprojectionValid={} rotationPair={{previousFrame={},currentFrame={}}}",
         m_velocity_copy_sample,
         scenario_name(m_velocity_copy_scenario),
         m_velocity_copy_frame,
@@ -451,7 +454,9 @@ void RE4TemporalProbe::perform_mv_readback() {
         m_velocity_copy_height,
         re4_temporal_probe::MV_SAMPLE_POINT_COUNT,
         static_cast<void*>(source),
-        m_velocity_copy_rotation_reprojection_valid);
+        m_velocity_copy_rotation_reprojection_valid,
+        m_velocity_copy_rotation_reprojection_previous_frame,
+        m_velocity_copy_frame);
 
     const auto* bytes = static_cast<const uint8_t*>(mapped);
     for (uint32_t i = 0; i < re4_temporal_probe::MV_SAMPLE_POINT_COUNT; ++i) {
@@ -490,7 +495,8 @@ void RE4TemporalProbe::perform_mv_readback() {
             "point={} coord={}x{} raw={{r={},g={},b={},a={}}} "
             "snorm={{r={:.9f},g={:.9f},b={:.9f},a={:.9f}}} "
             "historicalPixelCandidate={{x={:.6f},y={:.6f}}} "
-            "rotationOnlyReprojectionValid={} rotationOnlyReprojection={{x={:.6f},y={:.6f}}} "
+            "rotationOnlyReprojectionValid={} rotationPair={{previousFrame={},currentFrame={}}} "
+            "rotationOnlyReprojection={{x={:.6f},y={:.6f}}} "
             "candidateMinusReprojection={{x={:.6f},y={:.6f}}}",
             m_velocity_copy_sample,
             scenario_name(m_velocity_copy_scenario),
@@ -510,6 +516,8 @@ void RE4TemporalProbe::perform_mv_readback() {
             pixel_candidate.x,
             pixel_candidate.y,
             m_velocity_copy_rotation_reprojection_valid,
+            m_velocity_copy_rotation_reprojection_previous_frame,
+            m_velocity_copy_frame,
             reprojection.x,
             reprojection.y,
             residual.x,
@@ -554,7 +562,9 @@ void RE4TemporalProbe::on_draw_ui() {
         "RE4-only diagnostic. For Camera pan right/left/up/down, samples 1-4 are warm-up and samples 5-20 "
         "read a 3x3 VelocityTarget grid. Pan continuously in the selected direction during capture. "
         "Historical W/2,-H/2 motion scaling remains a candidate and is compared against an independent "
-        "rotation-only screen reprojection from current/previous unjittered camera matrices.");
+        "rotation-only screen reprojection from adjacent unjittered camera-matrix pairs. Clicking Reset may "
+        "briefly interrupt camera input; ignore that initial low-motion interval and evaluate the resumed "
+        "steady-motion frames by their logged frame IDs.");
 
     if (ImGui::Button("Reset directional capture")) {
         reset_temporal_state();
@@ -695,14 +705,21 @@ void RE4TemporalProbe::on_scene_layer_update(sdk::renderer::layer::Scene* layer,
         auto previous_projection = m_history_valid[i] ? m_previous_projection[i] : current_projection;
         const auto previous_view = m_history_valid[i] ? m_previous_view[i] : current_view;
         const auto history_was_valid = m_history_valid[i];
+        const auto previous_scene_frame = m_previous_scene_frame[i];
 
         if (i == 0) {
+            m_expected_rotation_reprojection_previous_frame = previous_scene_frame;
             m_expected_rotation_reprojection_frame = *frame;
             m_expected_rotation_reprojection_valid = false;
             m_expected_rotation_reprojection.fill({});
 
+            // Compute the witness for every directional sample, not only MV readback
+            // samples. That lets post-processing align one MV frame against the
+            // immediately prior/current/next camera-matrix pair by exact frame ID
+            // without delaying or retaining the cloned VelocityTarget.
             if (history_was_valid &&
-                re4_temporal_probe::should_readback_mv_sample(scenario_index, sample)) {
+                previous_scene_frame != 0 &&
+                re4_temporal_probe::is_directional_mv_scenario(scenario_index)) {
                 bool witness_valid = true;
 
                 for (uint32_t point_index = 0;
@@ -723,6 +740,21 @@ void RE4TemporalProbe::on_scene_layer_update(sdk::renderer::layer::Scene* layer,
 
                     witness_valid = witness_valid && witness.valid;
                     m_expected_rotation_reprojection[point_index] = witness.pixels;
+
+                    spdlog::info(
+                        "[RE4TemporalProbe] rotationReprojection sample={} scenario='{}' "
+                        "previousFrame={} currentFrame={} point={} coord={}x{} valid={} "
+                        "pixels={{x={:.6f},y={:.6f}}}",
+                        sample,
+                        scenario,
+                        previous_scene_frame,
+                        *frame,
+                        point_index,
+                        point.x,
+                        point.y,
+                        witness.valid,
+                        witness.pixels.x,
+                        witness.pixels.y);
                 }
 
                 m_expected_rotation_reprojection_valid = witness_valid;
@@ -738,6 +770,7 @@ void RE4TemporalProbe::on_scene_layer_update(sdk::renderer::layer::Scene* layer,
 
         m_previous_projection[i] = current_projection;
         m_previous_view[i] = current_view;
+        m_previous_scene_frame[i] = *frame;
         m_history_valid[i] = true;
 
         info->projection_matrix[2][0] += matrix_jitter.x;
@@ -942,13 +975,15 @@ void RE4TemporalProbe::on_overlay_layer_draw(
     m_velocity_copy_rotation_reprojection_valid =
         m_expected_rotation_reprojection_valid &&
         m_expected_rotation_reprojection_frame == *frame;
+    m_velocity_copy_rotation_reprojection_previous_frame =
+        m_expected_rotation_reprojection_previous_frame;
     m_velocity_copy_rotation_reprojection = m_expected_rotation_reprojection;
     m_velocity_copy_ready = true;
 
     spdlog::info(
         "[RE4TemporalProbe] mvSnapshotQueued sample={} scenario='{}' frame={} "
         "sourceResource={:p} cloneResource={:p} extent={}x{} format={} "
-        "rotationOnlyReprojectionValid={}",
+        "rotationOnlyReprojectionValid={} rotationPair={{previousFrame={},currentFrame={}}}",
         m_velocity_copy_sample,
         scenario_name(scenario),
         m_velocity_copy_frame,
@@ -957,7 +992,9 @@ void RE4TemporalProbe::on_overlay_layer_draw(
         m_velocity_copy_width,
         m_velocity_copy_height,
         static_cast<uint32_t>(desc.Format),
-        m_velocity_copy_rotation_reprojection_valid);
+        m_velocity_copy_rotation_reprojection_valid,
+        m_velocity_copy_rotation_reprojection_previous_frame,
+        m_velocity_copy_frame);
 
 }
 
