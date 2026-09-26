@@ -7,12 +7,41 @@
 namespace re4_temporal_probe {
 inline constexpr uint32_t MAX_TEMPORAL_SAMPLES = 32;
 inline constexpr uint32_t JITTER_PHASE_COUNT = 4;
-inline constexpr uint32_t MAX_MV_READBACK_SAMPLES = 8;
+inline constexpr uint32_t MV_READBACK_FIRST_SAMPLE = 5;
+inline constexpr uint32_t MV_READBACK_SAMPLE_COUNT = 16;
+inline constexpr uint32_t MV_READBACK_LAST_SAMPLE =
+    MV_READBACK_FIRST_SAMPLE + MV_READBACK_SAMPLE_COUNT - 1;
 inline constexpr uint32_t MV_SAMPLE_GRID_SIZE = 3;
 inline constexpr uint32_t MV_SAMPLE_POINT_COUNT = MV_SAMPLE_GRID_SIZE * MV_SAMPLE_GRID_SIZE;
 inline constexpr uint64_t MV_READBACK_POINT_STRIDE = 512;
 inline constexpr uint64_t MV_READBACK_BUFFER_SIZE =
     MV_SAMPLE_POINT_COUNT * MV_READBACK_POINT_STRIDE;
+
+inline constexpr bool is_directional_mv_scenario(int scenario) noexcept {
+    return scenario == 1 || scenario == 2;
+}
+
+inline constexpr bool should_readback_mv_sample(int scenario, uint32_t sample) noexcept {
+    return is_directional_mv_scenario(scenario) &&
+        sample >= MV_READBACK_FIRST_SAMPLE &&
+        sample <= MV_READBACK_LAST_SAMPLE;
+}
+
+struct MotionPixelCandidate {
+    float x{};
+    float y{};
+};
+
+inline constexpr MotionPixelCandidate historical_motion_pixel_candidate(
+    float r_snorm,
+    float g_snorm,
+    uint32_t render_width,
+    uint32_t render_height) noexcept {
+    return {
+        r_snorm * static_cast<float>(render_width) / 2.0f,
+        g_snorm * -static_cast<float>(render_height) / 2.0f,
+    };
+}
 
 struct MVSamplePoint {
     uint32_t x{};
