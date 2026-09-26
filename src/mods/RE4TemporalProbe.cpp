@@ -187,6 +187,55 @@ CameraPoseDelta camera_pose_delta(
         .rotation_degrees = rotation_radians * 57.29577951308232f,
     };
 }
+
+struct MatrixError {
+    bool valid{};
+    float max_abs{};
+    float sum_abs{};
+};
+
+MatrixError matrix_error(const Matrix4x4f& lhs, const Matrix4x4f& rhs) {
+    MatrixError result{.valid = true};
+
+    for (size_t column = 0; column < 4; ++column) {
+        for (size_t row = 0; row < 4; ++row) {
+            const auto a = lhs[column][row];
+            const auto b = rhs[column][row];
+            if (!std::isfinite(a) || !std::isfinite(b)) {
+                return {};
+            }
+
+            const auto error = std::abs(a - b);
+            result.max_abs = std::max(result.max_abs, error);
+            result.sum_abs += error;
+        }
+    }
+
+    return result;
+}
+
+const char* history_relation(
+    bool reference_valid,
+    const MatrixError& old_vs_previous,
+    const MatrixError& old_vs_current) {
+    if (!reference_valid) {
+        return "unavailable";
+    }
+
+    if (!old_vs_previous.valid || !old_vs_current.valid) {
+        return "invalid";
+    }
+
+    if (old_vs_previous.max_abs < old_vs_current.max_abs) {
+        return "closerToPrevious";
+    }
+
+    if (old_vs_current.max_abs < old_vs_previous.max_abs) {
+        return "closerToCurrent";
+    }
+
+    return "equal";
+}
 }
 
 void RE4TemporalProbe::reset_temporal_state() {
@@ -203,6 +252,8 @@ void RE4TemporalProbe::reset_temporal_state() {
     m_reset_previous_width = 0;
     m_reset_previous_height = 0;
     m_reset_previous_view = {};
+    m_reset_previous_view_projection = {};
+    m_reset_previous_view_projection_valid = false;
     m_camera_ptr.store(0, std::memory_order_relaxed);
     m_camera_frame.store(0, std::memory_order_relaxed);
     m_camera_p20.store(0.0f, std::memory_order_relaxed);
@@ -619,16 +670,24 @@ void RE4TemporalProbe::on_draw_ui() {
         m_scenario.store(scenario, std::memory_order_relaxed);
     }
 
-    ImGui::Text(
-        "Jitter samples: %u / %u",
-        m_temporal_budget.sample_count(),
-        re4_temporal_probe::MAX_TEMPORAL_SAMPLES);
+    if (re4_temporal_probe::is_reset_history_scenario(scenario)) {
+        ImGui::Text(
+            "Reset/history samples: %u / %u",
+            m_reset_watch_budget.sample_count(),
+            re4_temporal_probe::RESET_WATCH_MAX_SAMPLES);
+    } else {
+        ImGui::Text(
+            "Jitter samples: %u / %u",
+            m_temporal_budget.sample_count(),
+            re4_temporal_probe::MAX_TEMPORAL_SAMPLES);
+    }
+
     ImGui::TextWrapped(
         "RE4-only diagnostic. Gates D-F are closed. Directional scenarios retain the sparse MV regression path. "
-        "For Gate G, select Reset/history transition: this disables diagnostic jitter/readback and records up to "
-        "4096 consecutive frames of scene/camera/SceneInfo/resource identity, render-size changes, frame gaps, "
-        "and raw camera translation/rotation deltas. Trigger a checkpoint reload/load or a known camera cut while "
-        "the capture is active; no camera-cut threshold is assumed yet.");
+        "For Gate G Capture 21, select Reset/history transition. Diagnostic jitter/readback stay disabled while "
+        "the probe records scene/camera/resource identity, pose deltas, and compares SceneInfo.old_view_projection "
+        "against the exact previous-frame and current-frame view-projection matrices. Capture ordinary movement/"
+        "camera rotation, then perform one Load Save. No camera-cut threshold is assumed.");
 
     if (ImGui::Button("Reset capture")) {
         reset_temporal_state();
@@ -756,6 +815,22 @@ void RE4TemporalProbe::on_scene_layer_update(sdk::renderer::layer::Scene* layer,
             pose_delta = camera_pose_delta(m_reset_previous_view, scene_info->view_matrix);
         }
 
+        const auto history_reference_valid =
+            !first &&
+            !frame_gap &&
+            scene_info != nullptr &&
+            m_reset_previous_view_projection_valid;
+        MatrixError old_vs_previous{};
+        MatrixError old_vs_current{};
+        if (history_reference_valid) {
+            old_vs_previous = matrix_error(
+                scene_info->old_view_projection_matrix,
+                m_reset_previous_view_projection);
+            old_vs_current = matrix_error(
+                scene_info->old_view_projection_matrix,
+                scene_info->view_projection_matrix);
+        }
+
         spdlog::info(
             "[RE4TemporalProbe] resetWitness sample={} frame={} first={} frameGap={} "
             "sceneChanged={} sceneInfoChanged={} cameraChanged={} depthChanged={} "
@@ -785,6 +860,25 @@ void RE4TemporalProbe::on_scene_layer_update(sdk::renderer::layer::Scene* layer,
             static_cast<void*>(velocity_resource),
             static_cast<void*>(color_resource));
 
+        spdlog::info(
+            "[RE4TemporalProbe] historyWitness sample={} frame={} previousFrame={} "
+            "referenceValid={} oldVsPrevious={{valid={},maxAbs={:.9f},sumAbs={:.9f}}} "
+            "oldVsCurrent={{valid={},maxAbs={:.9f},sumAbs={:.9f}}} relation={} "
+            "translationDelta={:.9f} rotationDeltaDegrees={:.6f}",
+            watch_sample,
+            *frame,
+            m_reset_previous_frame,
+            history_reference_valid,
+            old_vs_previous.valid,
+            old_vs_previous.max_abs,
+            old_vs_previous.sum_abs,
+            old_vs_current.valid,
+            old_vs_current.max_abs,
+            old_vs_current.sum_abs,
+            history_relation(history_reference_valid, old_vs_previous, old_vs_current),
+            pose_delta.translation,
+            pose_delta.rotation_degrees);
+
         m_reset_witness_valid = true;
         m_reset_previous_frame = *frame;
         m_reset_previous_scene = current_scene;
@@ -797,6 +891,10 @@ void RE4TemporalProbe::on_scene_layer_update(sdk::renderer::layer::Scene* layer,
         m_reset_previous_height = current_height;
         if (scene_info != nullptr) {
             m_reset_previous_view = scene_info->view_matrix;
+            m_reset_previous_view_projection = scene_info->view_projection_matrix;
+            m_reset_previous_view_projection_valid = true;
+        } else {
+            m_reset_previous_view_projection_valid = false;
         }
 
         return;
