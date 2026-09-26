@@ -18,7 +18,7 @@
 #include "REFramework.hpp"
 
 namespace {
-constexpr std::array<const char*, 15> SCENARIOS{
+constexpr std::array<const char*, 16> SCENARIOS{
     "Static screen",
     "Camera pan right",
     "Camera pan left",
@@ -34,6 +34,7 @@ constexpr std::array<const char*, 15> SCENARIOS{
     "D3D12 interface provenance",
     "D3D12 recording functions",
     "D3D12 bridge ordering",
+    "D3D12 output copy provenance",
 };
 
 constexpr std::array<const char*, 6> LOAD_STATE_SINGLETONS{
@@ -371,6 +372,7 @@ void RE4TemporalProbe::reset_temporal_state() {
     m_interface_provenance_budget.reset();
     m_recording_function_budget.reset();
     m_bridge_order_budget.reset();
+    m_output_copy_budget.reset();
     m_execution_boundary_frame.store(0, std::memory_order_relaxed);
     m_execution_boundary_sample.store(0, std::memory_order_relaxed);
     m_execution_submit_count.store(0, std::memory_order_relaxed);
@@ -420,6 +422,18 @@ void RE4TemporalProbe::reset_temporal_state() {
         std::scoped_lock lock{m_bridge_order_mutex};
         m_bridge_order_last_submit_frame = 0;
         m_bridge_order_submit_ordinal = 0;
+    }
+    m_output_copy_capture_open.store(false, std::memory_order_relaxed);
+    m_output_copy_boundary_frame.store(0, std::memory_order_relaxed);
+    m_output_copy_boundary_sample.store(0, std::memory_order_relaxed);
+    m_output_copy_event_sequence.store(0, std::memory_order_relaxed);
+    m_output_copy_color.store(0, std::memory_order_relaxed);
+    {
+        std::scoped_lock lock{m_output_copy_mutex};
+        m_output_copy_tracked_resources.clear();
+        m_output_copy_swapchain_buffers.clear();
+        m_output_copy_last_submit_frame = 0;
+        m_output_copy_submit_ordinal = 0;
     }
     m_reset_witness_valid = false;
     m_reset_previous_frame = 0;
