@@ -688,55 +688,59 @@ Pixel identity alone cannot prove that no unrelated earlier UI pass ever touched
 
 ## 10. Current diagnostic PR behavior
 
-Capture 9 ends generic Color/Overlay resource discovery. Capture 10 establishes the native-size baseline. The active diagnostic is now a **temporary render/display split test** and remains default-off.
+Capture 11 closes the render-size discovery gate. The fixed 1920x1080 SceneView override has therefore been removed from the active diagnostic.
+
+The current PR is now a **jitter / projection / motion-vector semantic probe** and remains RE4-only and default-off.
 
 It currently:
 
-- exists only for RE4;
-- uses the already verified `on_pre_overlay_layer_draw()` engine boundary;
-- fixes Color semantically to Overlay main == Scene `PostMainTarget` == Scene `HDRTarget`;
-- reads Depth directly from `DepthStencilTex`;
-- reads Velocity directly from `VelocityTarget`;
-- records Color/Depth/Velocity native-resource extents and formats in one frame-local sample;
-- records whether those temporal input extents are aligned;
-- temporarily overrides `via.SceneView.get_Size` to a fixed **1920x1080** only while the diagnostic is enabled;
-- records both the original SceneView size and the overridden size with render-frame correlation;
-- records the active D3D12 swapchain `DXGI_SWAP_CHAIN_DESC1` width/height/format/buffer count;
-- records the existing D3D12Hook display-size and render-size hints for comparison, without treating them as authoritative engine render size;
-- pairs a post-Overlay observation on the same frame and records the current working-target extent when available;
-- preserves the original Overlay call by returning `true` from the pre callback;
-- caps sampling to ten observations per reset.
+- samples up to **32 consecutive primary Scene frames** per reset rather than one frame every 60 callbacks;
+- records the primary Scene `SceneInfo::projection_matrix` values relevant to jitter and projection interpretation:
+  - `[0][0]`
+  - `[1][1]`
+  - `[2][0]`
+  - `[2][1]`
+  - `[2][2]`
+  - `[2][3]`
+  - `[3][2]`
+  - `[3][3]`;
+- records frame-to-frame deltas for projection `[2][0]` / `[2][1]`;
+- passively records the primary Camera `get_ProjectionMatrix` result on the same render frame when available;
+- compares Scene projection offsets with the same-frame Camera projection offsets;
+- records the current `old_view_projection_matrix[2][0/1]` values as history evidence;
+- records `VelocityTarget` resource identity, extent, format, and flags;
+- records projection offsets for all historical pd-upscaler SceneInfo variants:
+  - main SceneInfo;
+  - depth-distortion SceneInfo;
+  - filter SceneInfo;
+  - jitter-disable SceneInfo;
+  - jitter-disable-post SceneInfo;
+  - Z-prepass SceneInfo.
 
-The old primary-Scene MRT candidate scan, PostEffect candidate scan, and repeated Overlay boundary discovery are removed from the active probe because their semantic questions are already closed.
+The active probe does **not**:
 
-It does **not**:
-
-- expose production XeSS quality presets or a production upscaling UI;
-- change `ImageQualityRate`;
-- change TAA or dynamic-resolution settings;
+- override SceneView/render size;
+- alter `ImageQualityRate`;
+- inject jitter yet;
+- modify any projection matrix;
+- read back VelocityTarget pixels yet;
+- alter TAA;
 - submit D3D12 work;
-- issue barriers;
-- modify or read back pixels;
-- alter jitter;
 - call XeSS;
 - modify OptiScaler;
 - run in non-RE4 games.
 
-The next runtime log should focus on:
+The immediate questions for the next runtime capture are:
 
-~~~text
-sizeSample=
-color={width=...,height=...}
-depth={width=...,height=...}
-velocity={width=...,height=...}
-temporalExtentsAligned=
-engineView ... sameFrame=... originalViewSize=...x... overriddenViewSize=1920x1080
-dxgi ... swapSize=...x... hookDisplay=...x... hookRenderHint=...x...
-sizeSamplePost=...
-current={width=...,height=...}
-~~~
+1. with the current game AA/upscaler path disabled, are Scene projection `[2][0]` / `[2][1]` stable or naturally jittered across consecutive frames?
+2. does the Scene projection differ from the primary Camera projection on the same frame?
+3. do all SceneInfo variants carry the same projection offsets, or are some intentionally unjittered?
+4. does camera motion change only view/history state while projection offsets remain stable?
+5. is the current VelocityTarget still low-resolution and frame-aligned with the proven render extent?
 
-The decisive question is whether the fixed SceneView override alone causes Color/Depth/Velocity to move together to 1920x1080 while the DXGI output remains 2560x1440. This is a diagnostic-only causal test, not the final XeSS quality-selection implementation.
+This stage intentionally stops short of claiming MV scale/sign semantics. Resource format and historical pd-upscaler behavior provide a hypothesis, but scale/sign/jitter inclusion require content-sensitive evidence or another independent witness.
+
+If the next capture shows no built-in jitter, the following diagnostic step can inject a known deterministic jitter pattern into the proven SceneInfo set and then test whether VelocityTarget includes or excludes that jitter. Any GPU readback or content-sensitive MV probe should remain narrow and purpose-built.
 
 ---
 
@@ -839,25 +843,29 @@ Production rules:
 
 ### Gate C — Jitter
 
-Need to prove:
+**Status: ACTIVE.**
 
-- the exact RE4 projection matrices that must receive jitter;
-- timing before Scene rendering;
-- X/Y sign convention;
-- normalization convention;
-- relation to current render dimensions;
-- phase progression;
-- that the exact jitter sent to XeSS is the jitter applied to RE4 for that frame.
-
-Historical pd-upscaler modified projection matrix `[2][0]` / `[2][1]`, but current RE4 1.5.9 behavior still needs current-build validation.
-
-### Gate D — Motion-vector semantics
-
-Velocity resource identity is strong, but XeSS also requires correct semantics.
+The next diagnostic now captures consecutive-frame SceneInfo and Camera projection state without mutation.
 
 Need to establish:
 
-- pixel-space vs normalized-space convention;
+- whether current AA-off RE4 has any native projection jitter at all;
+- whether SceneInfo projection differs from Camera `get_ProjectionMatrix`;
+- which SceneInfo variants must receive a future injected jitter;
+- exact X/Y sign and matrix convention;
+- normalization against proven render width/height;
+- phase progression once bridge-controlled jitter is introduced;
+- that the exact jitter sent to XeSS is the jitter actually applied to RE4 for that frame.
+
+Historical pd-upscaler modified projection matrix `[2][0]` / `[2][1]` for six SceneInfo variants. Capture 12 should first verify the current-build baseline before any jitter mutation is reintroduced.
+
+### Gate D — Motion-vector semantics
+
+**Status: ACTIVE, coupled to Gate C.**
+
+Velocity resource identity and render-size behavior are proven. Remaining semantics:
+
+- pixel-space vs normalized/NDC-space convention;
 - X/Y sign;
 - scale;
 - low-resolution vs display-resolution MV;
@@ -870,7 +878,9 @@ motionScaleX = renderWidth / 2
 motionScaleY = -renderHeight / 2
 ~~~
 
-Treat this as a hypothesis until current RE4 behavior is measured.
+and the current VelocityTarget is `R16G16B16A16_SNORM`, which is consistent with an NDC-like hypothesis. This is **not yet current-build proof**.
+
+First capture the no-mutation projection baseline. If needed afterward, use a deterministic bridge-controlled jitter pattern plus the narrowest possible VelocityTarget content/provenance measurement to determine whether jitter is encoded and to validate sign/scale. Do not promote the historical scale constants to production until that evidence exists.
 
 ### Gate E — Depth convention
 
