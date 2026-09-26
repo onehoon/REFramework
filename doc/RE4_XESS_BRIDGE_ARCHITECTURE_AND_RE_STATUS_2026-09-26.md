@@ -1792,87 +1792,262 @@ For current production readiness, Gate G is closed with:
 
 A dedicated cutscene-only capture can be added later if a real non-load cut exposes a contradiction. It no longer blocks proceeding to D3D12 execution-order work.
 
-### Capture 23 objective — D3D12 execution ordering
+### Capture 23 — D3D12 execution ordering result
 
-Gate H begins with an **observe-only** queue-ordering witness.
+Capture 23 was collected in `23_re2_framework_log.txt`.
+
+The diagnostic was reset/re-run four times, producing four complete 64-frame windows:
+
+~~~text
+Run 1: frame 8816 -> 8879
+Run 2: frame 9155 -> 9218
+Run 3: frame 9438 -> 9501
+Run 4: frame 9634 -> 9697
+
+total pre-Overlay samples = 256
+~~~
+
+All four runs produced the same queue/submission topology.
+
+#### Active queue proven
+
+One active command queue was observed throughout:
+
+~~~text
+queue = 0x26362a27760
+queueType = 0 / D3D12_COMMAND_LIST_TYPE_DIRECT
+~~~
+
+The queue address is capture-local evidence only and must never be hardcoded.
+
+Across all 256 pre-Overlay windows:
+
+~~~text
+ExecuteCommandLists calls after pre-Overlay and before Present = exactly 5 / frame
+total ExecuteCommandLists records                             = 1280
+numLists per ExecuteCommandLists                              = 1 in 1280/1280
+submitted command-list type                                   = DIRECT in 1280/1280
+submitsSinceBoundary at Present                               = 5 in 256/256
+~~~
+
+All queue submissions and all Presents were observed on thread `25576`.
+
+The pre-Overlay callbacks themselves were distributed across nine worker threads, proving that the engine-level insertion callback is recorded from worker-side render activity while final queue submission is serialized on a different thread.
+
+#### Temporal resource identity remains stable
+
+Across 256/256 boundaries:
+
+~~~text
+currentResource
+    == Overlay main resource
+    == Scene PostMain/HDR Color
+    == 0x262b2eec420
+
+Depth    = 0x264b63bb1d0
+Velocity = 0x264b63bd810
+~~~
+
+Each of these resource addresses remained unique/stable across the entire Capture 23 session.
+
+Again, the absolute addresses are capture-local evidence only.
+
+#### Command-list pool is deterministic
+
+Exactly ten DIRECT command-list objects were submitted.
+
+Each appeared exactly 128 times across the 1280 submissions.
+
+The capture shows two five-list pools:
+
+~~~text
+Pool A
+A1 0x26447ae66f0
+A2 0x26447ae7080
+A3 0x26449bac310
+A4 0x26446464640
+A5 0x26449baf2e0
+
+Pool B
+B1 0x262b2f91750
+B2 0x264b5e681a0
+B3 0x264b5ce70c0
+B4 0x264b5ce8d70
+B5 0x264b5cf9930
+~~~
+
+The exact per-frame submit order was deterministic for all 256 frames:
+
+~~~text
+frame % 4 == 0
+A5 -> A4 -> A3 -> A2 -> A1
+
+frame % 4 == 1
+B5 -> B4 -> B3 -> B2 -> B1
+
+frame % 4 == 2
+A1 -> A2 -> A3 -> A4 -> A5
+
+frame % 4 == 3
+B1 -> B2 -> B3 -> B4 -> B5
+~~~
+
+This pattern is useful as a provenance witness, not as a production rule. Production code must discover the active command-list objects dynamically and must not depend on these addresses or on a hardcoded modulo-4 sequence.
+
+### Gate H decision after Capture 23
+
+Capture 23 closes the first two Gate H sub-gates:
+
+- **DIRECT queue provenance: CLOSED**;
+- **submitted command-list pool/order provenance: CLOSED**.
+
+Still open:
+
+- which command list/generation is actively being recorded when the verified pre-Overlay callback executes;
+- explicit Color/Depth/Velocity resource states at that point;
+- exact target-resource transitions before/after the insertion point;
+- output UAV state and restoration strategy;
+- eventual XeSS submission/fence integration.
+
+A new standalone command list should still **not** be introduced yet.
+
+### Capture 24 objective — target resource states on real game command lists
 
 New scenario:
 
 ~~~text
-D3D12 execution ordering
+D3D12 resource states
 ~~~
 
-The probe:
+Capture 24 is still observe-only.
 
-- performs no XeSS call;
-- performs no ResourceBarrier;
-- performs no copy;
-- submits no diagnostic command list;
-- does not mutate Color/Depth/Velocity;
-- installs an instance-local hook only on the active DIRECT command queue's `ExecuteCommandLists[10]`;
-- opens a capture window at the verified pre-Overlay callback;
-- records command-list submissions between that boundary and Present for 64 frames.
+It does not hardcode the ten Capture 23 pointers. Instead, the already-proven active DIRECT queue dynamically discovers the command lists that RE4 actually submits in the current run.
 
-At the pre-Overlay boundary it records:
+For each discovered DIRECT graphics command list, the probe installs an instance-local Vtable hook on:
 
 ~~~text
-executionBoundary
-    frame/sample
-    thread
-    RenderContext pointer
-    RenderContext protectFrame
-    delayEnabled
-    current TargetState/resource
-    Overlay main TargetState/resource
-    PostMain/HDR Color
+ID3D12GraphicsCommandList::Close           [9]
+ID3D12GraphicsCommandList::Reset           [10]
+ID3D12GraphicsCommandList::ResourceBarrier [26]
+~~~
+
+The hook does **not** alter the call arguments or issue any new D3D12 command.
+
+#### Recording generation
+
+Each successful `Reset` increments a per-list recording generation.
+
+The probe logs:
+
+~~~text
+resourceReset
+    list
+    generation
+    allocator
+    initial pipeline state
+    recording thread
+
+resourceClose
+    list
+    generation
+    HRESULT
+    recording thread
+~~~
+
+This prevents barriers from different reuses of the same command-list object from being conflated.
+
+#### Narrow barrier filter
+
+`ResourceBarrier` logging is filtered to the current semantic temporal resources only:
+
+~~~text
+Color    = Scene PostMain/HDR
+Depth    = Scene DepthStencilTex
+Velocity = Scene VelocityTarget
+~~~
+
+For a matching transition it records:
+
+~~~text
+resourceBarrier
+    list
+    generation
+    per-generation barrier sequence
+    recording thread
+    target = Color | Depth | Velocity
+    resource
+    subresource
+    StateBefore
+    StateAfter
+    barrier flags
+~~~
+
+A matching UAV barrier is also recorded.
+
+No unrelated-resource barrier is logged.
+
+#### Identify the exact list active at pre-Overlay
+
+A successful `Reset` associates the recording thread with that list/generation until `Close`.
+
+At the verified pre-Overlay callback, Capture 24 records:
+
+~~~text
+resourceBoundary
+    sample/frame
+    worker thread
+    activeList
+    activeGeneration
+    activeBarrierSeq
+    tracked-list count
+    Color/HDR
     Depth
     Velocity
-    active queue pointer/type
+    active DIRECT queue
 ~~~
 
-Queue submission records:
+The queue submission hook then records:
 
 ~~~text
-executionSubmit
-    submit id
-    boundary frame/sample
+resourceSubmit
+    sample/frame
+    list
+    generation
     queue/type
-    num command lists
-    thread
-
-executionList
-    submit id
-    list index
-    ID3D12CommandList pointer
-    command-list type
+    actual Execute order
 ~~~
 
-Present closes each window with:
+Present closes the frame window with `resourcePresent`.
+
+This allows the analysis to join:
 
 ~~~text
-executionPresent
-    sample
-    boundary frame
-    submitsSinceBoundary
-    totalObservedSubmits
+Reset -> target barriers -> pre-Overlay boundary -> remaining barriers -> Close
+       -> ExecuteCommandLists order -> Present
 ~~~
 
-Capture 23 procedure:
+for the same list object and recording generation.
 
-1. use the controlled baseline configuration;
+The first few frames are expected to be hook-discovery warm-up while the two RE4 command-list pools are first encountered. The full 64-frame budget is intentionally much larger than that warm-up.
+
+Capture 24 procedure:
+
+1. use the same controlled baseline configuration;
 2. enter stable gameplay;
-3. select `D3D12 execution ordering`;
+3. select `D3D12 resource states`;
 4. click `Reset capture`;
-5. leave the camera mostly still and let all **64 samples** complete;
-6. no Load Save, menu transition, resize, Alt+Tab, or OptiScaler/XeFG validation is needed for this capture.
+5. keep the camera/gameplay mostly still;
+6. allow all **64 samples** to complete;
+7. do not Load Save, open menus, resize, Alt+Tab, or start OptiScaler/XeFG validation during this capture.
 
 Decision target:
 
-- prove the pre-Overlay callback is associated with the active DIRECT queue;
-- identify which real game command-list objects are submitted after the boundary and before Present;
-- determine whether the list set/order is stable enough to justify a narrower ResourceBarrier witness in Capture 24.
+- identify the real DIRECT command list/generation active at pre-Overlay;
+- reconstruct explicit Color/Depth/Velocity transitions in actual GPU submission order;
+- determine the state immediately usable by a future XeSS call and the state the game expects afterward;
+- decide whether production XeSS can execute on the engine's active list or whether a later, explicitly ordered bridge list is required.
 
-Do **not** hook ResourceBarrier yet. Capture 23 first establishes command-list provenance and ordering with the least invasive D3D12 observation.
+Do not allocate an XeSS output or issue a diagnostic transition yet.
 
 The probe still does **not**:
 
@@ -2121,27 +2296,30 @@ Non-load cutscene/teleport hardening may later use another explicit engine signa
 
 ### Gate H — D3D12 execution point and resource states
 
-**Status: ACTIVE — Capture 23 prepared.**
+**Status: ACTIVE — queue/list provenance closed by Capture 23; target-state Capture 24 prepared.**
 
-The final producer needs a real `ID3D12GraphicsCommandList*` on the correct DIRECT queue.
+Capture 23 proves:
 
-Gate H must prove:
+- the relevant queue is DIRECT;
+- pre-Overlay is followed by exactly five single-list DIRECT submissions before Present in 256/256 frames;
+- the submitted set is a deterministic two-pool, ten-object command-list system in the captured session;
+- queue submission and Present are serialized on one thread while the pre-Overlay callback is reached from worker recording threads;
+- Color/HDR, Depth, and Velocity identities remain stable through the observation window.
 
-- exact command-list provenance at the pre-Overlay boundary;
-- submission ordering relative to pre-Overlay and Present;
-- Color/Depth/Velocity resource states at XeSS execution;
-- output UAV state;
+Do not hardcode capture-local queue/list pointers or the observed modulo-4 ordering.
+
+Gate H still must prove:
+
+- the exact list/generation active at the pre-Overlay callback;
+- explicit Color/Depth/Velocity states at that insertion point;
 - required transitions and restoration;
-- submission/fence ordering;
-- resource lifetime through execution and resize.
+- XeSS output UAV state;
+- submission/fence ordering for the future XeSS work;
+- resource lifetime through resize/device reset.
 
-Capture 23 deliberately starts with queue/list provenance only.
+Capture 24 dynamically hooks only the submitted DIRECT command-list instances and observes their `Reset`, target-resource `ResourceBarrier`, and `Close` calls. The pre-Overlay worker thread is correlated to the currently recording list/generation, then joined to actual `ExecuteCommandLists` order.
 
-It hooks the active queue instance's `ExecuteCommandLists` method and records submissions only during the pre-Overlay→Present window. It issues no GPU work and performs no ResourceBarrier.
-
-If Capture 23 identifies a stable game command-list set/order, Capture 24 will hook only the identified graphics-command-list instances long enough to observe ResourceBarrier transitions for the already-known Color/Depth/Velocity resources.
-
-Do not jump directly to a new standalone command list or queue submission path before this provenance is known.
+The probe remains observe-only. It does not insert a barrier or submit work.
 
 ### Gate I — XeSS output integration
 
@@ -2343,7 +2521,8 @@ Use broad D3D12 tracing only as a last resort. The old ATSBridge trace produced 
 | Depth inversion | **HIGH / PROVEN** | Capture 19: SceneInfo/DepthStencilTex is inverted/reversed depth in 128/128 samples |
 | Near/far/FOV | **HIGH / PROVEN** | Capture 19: primary Camera near/far + SceneInfo-derived vertical FOV |
 | Reset/history rules | **HIGH / PROVEN** | Capture 22: repeated _Pause + dynamic InhibitBit load window; two loads + quit negative control |
-| Safe XeSS command list / barriers | **LOW / active** | Capture 23 prepared for pre-Overlay -> Present DIRECT queue/list provenance |
+| DIRECT queue/list provenance | **HIGH / PROVEN** | Capture 23: 256/256 frames, five DIRECT single-list submits, deterministic ten-list pool |
+| Safe XeSS input states / barriers | **MEDIUM / active** | Capture 24 prepared for per-generation target ResourceBarrier reconstruction |
 | Standard XeSS → upstream OptiScaler | **DESIGN LOCKED, runtime pending** | No custom OptiScaler ABI permitted |
 | XeFG through `FGInput=Upscaler` | **pending after SR** | Existing presentation compatibility work remains relevant |
 
@@ -2431,14 +2610,22 @@ Use the explicit RE4 load window rather than a camera threshold for Load Save.
 
 ### 18.6 Prove command-list/state insertion
 
-Capture 23 is the next runtime test:
+Capture 23 closes queue/list provenance:
 
-- log the verified pre-Overlay RenderContext/resource boundary;
-- observe active DIRECT-queue `ExecuteCommandLists`;
-- identify submitted real game command lists between pre-Overlay and Present;
-- establish stable list/order provenance before any ResourceBarrier hook.
+- active queue is DIRECT;
+- 256/256 pre-Overlay frames are followed by exactly five single-list DIRECT submissions before Present;
+- ten command-list objects form two deterministic five-list pools in the captured run;
+- all capture-local pointers/order patterns remain diagnostics only and must not be hardcoded.
 
-Capture 24, only if Capture 23 supports it, will add narrow ResourceBarrier observation for Color/Depth/Velocity.
+Capture 24 is the next runtime test:
+
+- dynamically hook only DIRECT lists observed on the active queue;
+- track each list reuse by successful Reset generation;
+- record only Color/Depth/Velocity ResourceBarrier transitions/UAV barriers;
+- identify the list/generation active on the pre-Overlay worker thread;
+- join that recording generation to the actual ExecuteCommandLists order and Present.
+
+Do not add production barriers or XeSS execution until this state reconstruction is complete.
 
 ### 18.7 Add public XeSS producer
 
@@ -2512,7 +2699,7 @@ The RE4 bridge is ready to begin production XeSS dispatch only when all of the f
 
 The current project is **not yet at this gate**.
 
-The major resource and size-control uncertainty is now substantially closed: HDR/PostMain color, Depth, Velocity, the pre-Overlay engine boundary, SceneView-driven internal render size, Overlay working surfaces, and presentation output are mapped. MV semantics are closed through Capture 18, Capture 19 closes inverted depth plus near/far/FOV/projection metadata, and Capture 22 closes the current Load Save reset/history gate. The remaining work is primarily D3D12 execution ordering/resource states, output integration, and lifecycle.
+The major resource and size-control uncertainty is now substantially closed: HDR/PostMain color, Depth, Velocity, the pre-Overlay engine boundary, SceneView-driven internal render size, Overlay working surfaces, and presentation output are mapped. MV semantics are closed through Capture 18, Capture 19 closes inverted depth plus near/far/FOV/projection metadata, Capture 22 closes the current Load Save reset/history gate, and Capture 23 closes DIRECT queue/submitted-list provenance. The remaining work is primarily exact target resource states at the insertion point, output integration, and lifecycle.
 
 ---
 
@@ -2544,6 +2731,6 @@ OutputTargetState
 swapchain backbuffers
 ~~~
 
-Capture 9 identifies on_pre_overlay_layer_draw() as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Capture 10 establishes the native-resolution baseline. Capture 11 then proves that overriding SceneView.get_Size to 1920x1080 moves Color, Depth, and Velocity together while the 2560x1440 DXGI output remains unchanged. Captures 12-16 close render/display control, jitter injection/history, MV jitter exclusion, R=X, G=Y, and both axis polarities. Capture 17 adds the independent rotation-only witness, and Capture 18 closes the absolute MV scale at W/2,-H/2 while rejecting one fixed MV/camera frame offset as the primary source of spatial residuals. Initial zero/low-motion samples immediately after Reset remain a known UI-click input-interruption artifact, not failed directional evidence. Gate D is closed. Capture 19 proves SceneInfo/DepthStencilTex inverted depth in 128/128 samples and closes the producer camera metadata path: near/far come from primary via.Camera and vertical FOV is derived from SceneInfo projection. Capture 20 then proves that a real Load Save can preserve Scene/SceneInfo/Camera/Depth/Velocity/Color identity, render size, and render-frame continuity while still producing large camera-history discontinuities. Translation alone is not a safe reset heuristic; rotation separates strongly in this run, but no threshold is frozen. Capture 21 proves SceneInfo.old_view_projection_matrix does not expose a Load Save reset signal. Capture 22 then closes the current Load Save reset gate: two independent loads repeat the same SceneLoadZone pause window, history remains unstable after pause release, and GameSituation inhibit restoration marks the stable post-load return; the final quit path provides a negative control without a SceneLoadZone pause rise. Capture 23 is prepared to begin Gate H by observing the active DIRECT queue's command-list submissions between the verified pre-Overlay boundary and Present. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
+Capture 9 identifies on_pre_overlay_layer_draw() as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Capture 10 establishes the native-resolution baseline. Capture 11 then proves that overriding SceneView.get_Size to 1920x1080 moves Color, Depth, and Velocity together while the 2560x1440 DXGI output remains unchanged. Captures 12-16 close render/display control, jitter injection/history, MV jitter exclusion, R=X, G=Y, and both axis polarities. Capture 17 adds the independent rotation-only witness, and Capture 18 closes the absolute MV scale at W/2,-H/2 while rejecting one fixed MV/camera frame offset as the primary source of spatial residuals. Initial zero/low-motion samples immediately after Reset remain a known UI-click input-interruption artifact, not failed directional evidence. Gate D is closed. Capture 19 proves SceneInfo/DepthStencilTex inverted depth in 128/128 samples and closes the producer camera metadata path: near/far come from primary via.Camera and vertical FOV is derived from SceneInfo projection. Capture 20 then proves that a real Load Save can preserve Scene/SceneInfo/Camera/Depth/Velocity/Color identity, render size, and render-frame continuity while still producing large camera-history discontinuities. Translation alone is not a safe reset heuristic; rotation separates strongly in this run, but no threshold is frozen. Capture 21 proves SceneInfo.old_view_projection_matrix does not expose a Load Save reset signal. Capture 22 then closes the current Load Save reset gate: two independent loads repeat the same SceneLoadZone pause window, history remains unstable after pause release, and GameSituation inhibit restoration marks the stable post-load return; the final quit path provides a negative control without a SceneLoadZone pause rise. Capture 23 closes the first Gate H provenance step: four complete 64-frame runs show one active DIRECT queue, exactly five single-list DIRECT submissions between pre-Overlay and Present in all 256 frames, and a deterministic ten-command-list/two-pool reuse pattern. Capture 24 is prepared to identify the exact recording generation active at pre-Overlay and reconstruct only Color/Depth/Velocity ResourceBarrier transitions before those real lists are submitted. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
 
 Until the remaining gates are proven, the diagnostic stays passive and no production XeSS dispatch is enabled.
