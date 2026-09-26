@@ -2348,138 +2348,224 @@ Still open:
 - output UAV state and final XeSS output integration;
 - resize/device-reset lifecycle for bridge-owned execution resources.
 
-### Capture 27 objective — REFramework-owned empty DIRECT-list ordering
+### Capture 27 — REFramework-owned empty DIRECT-list ordering closed
 
-New scenario:
+Capture 27 was collected in `27_re2_framework_log.txt`.
 
-~~~text
-D3D12 bridge ordering
-~~~
-
-Capture 27 introduces the smallest possible active GPU-ordering witness.
-
-It **does not** record any barrier, copy, draw, dispatch, or XeSS command.
-
-At the verified pre-Overlay boundary the diagnostic submits one REFramework-owned, already-empty DIRECT command list to the same active DIRECT queue.
-
-Expected stable ordering:
+The log contains two complete 64-frame runs:
 
 ~~~text
-engine DIRECT submit 1
-engine DIRECT submit 2
-
-pre-Overlay boundary
-
-REF-owned EMPTY DIRECT submit
-
-engine DIRECT submit 3
-engine DIRECT submit 4
-engine DIRECT submit 5
-engine DIRECT submit 6
-engine DIRECT submit 7
-
-Present
+Run 1: frame 16173 -> 16236
+Run 2: frame 16583 -> 16646
 ~~~
 
-The existing seven engine submits should therefore become **eight total queue submissions per stable frame**, with exactly one submit classified as probe-owned.
-
-#### Diagnostic ownership
-
-Capture 27 allocates probe-owned D3D12 execution objects only:
-
-- one fence;
-- eight DIRECT command allocators;
-- eight empty DIRECT command lists.
-
-The slot count is intentionally larger than normal queue latency.
-
-Each slot stores the fence value of its last submission.
-
-A slot may be Reset/reused only when:
+Across the two runs:
 
 ~~~text
-fence.GetCompletedValue() >= slot.lastFenceValue
+bridgeOrderBoundary        = 128
+bridgeOrderIssue           = 128
+bridgeOrderBoundaryResult  = 128
+bridgeOrderPresent         = 128
+bridgeOrderSubmit          = 1020
+bridgeOrderList            = 1020
+bridgeOrderSkip            = 0
 ~~~
 
-The probe does not wait for GPU completion.
+Every `bridgeOrderBoundaryResult` reports a successful bridge submission and zero skipped frames.
 
-If all eight slots are still in flight, the frame is skipped and logged instead of stalling the game or illegally resetting an in-flight allocator.
+No bridge-order allocator Reset, command-list Reset, Close, queue Signal, device-removal, or rendering-failure record is present.
 
-After recording the empty list:
+#### Stable whole-frame ordering proven
+
+The first sample of each run begins observation at pre-Overlay, so it sees the bridge-owned submission followed by the five already-known post-boundary engine submissions:
 
 ~~~text
-Reset allocator
-Reset list
-Close immediately
-ExecuteCommandLists
-queue Signal(fence, newValue)
+sample 1:
+    ordinal 1 = REF-owned empty list
+    ordinal 2..6 = engine
 ~~~
 
-No resource is referenced by the list.
-
-A failed command-list Reset, Close, or queue Signal permanently retains that slot for the remainder of the diagnostic session rather than risking unsafe reuse.
-
-#### Capture records
-
-Capture 27 logs:
-
-~~~text
-bridgeOrderResources
-bridgeOrderBoundary
-bridgeOrderSubmit
-bridgeOrderList
-bridgeOrderIssue
-bridgeOrderBoundaryResult
-bridgeOrderPresent
-bridgeOrderSkip
-~~~
-
-The queue hook classifies each submitted list with:
-
-~~~text
-probeOwned = true | false
-~~~
-
-and keeps a whole-frame ordinal counter.
-
-The first sample may only observe the bridge submit plus the five later engine submits because capture opens at pre-Overlay.
-
-From sample 2 onward, the expected shape is:
+From sample 2 through sample 64 in both runs — **126/126 stable frames** — the complete queue topology is:
 
 ~~~text
 ordinal 1 = engine
 ordinal 2 = engine
+
+pre-Overlay boundary
+
 ordinal 3 = REF-owned empty list
+
 ordinal 4 = engine
 ordinal 5 = engine
 ordinal 6 = engine
 ordinal 7 = engine
 ordinal 8 = engine
+
+Present
 ~~~
 
-Capture 27 procedure:
+Exactly one submitted list is classified as probe-owned in every stable frame, always at ordinal 3.
+
+Therefore the REFramework-owned list is deterministically inserted after the two pre-Overlay engine submissions and before the five existing post-boundary engine submissions.
+
+The original engine topology is preserved around the injected empty list.
+
+#### Fence-safe allocator/list reuse proven
+
+Capture 27 uses eight REFramework-owned DIRECT allocator/list slots.
+
+Observed slot order is the intended ring:
+
+~~~text
+0,1,2,3,4,5,6,7,0,1,2,3,...
+~~~
+
+Fence signal values progress continuously:
+
+~~~text
+Run 1: 1  -> 64
+Run 2: 65 -> 128
+~~~
+
+The second manual `Reset capture` resets capture counters but intentionally retains the already-created bridge execution resources and their fence timeline.
+
+For all **120 actual slot-reuse events**:
+
+~~~text
+completedBefore >= previousFence
+completedBefore - previousFence = 7
+~~~
+
+No allocator/list slot is reset while its prior GPU work is still in flight.
+
+At Present, the bridge fence has reached the just-issued signal value in **128/128 frames**.
+
+The eight-slot design therefore has substantial observed headroom in this stable RE4 path and does not require a CPU/GPU wait.
+
+#### Gate H decision
+
+Capture 27 closes the final Gate H ordering/lifetime question.
+
+Production planning can now use:
+
+~~~text
+RE4 engine submits 1-2
+        ↓
+verified pre-Overlay HDR/PostMain boundary
+        ↓
+REFramework-owned DIRECT command list
+        ↓
+RE4 engine submits 3-7
+        ↓
+Present
+~~~
+
+Combined with Capture 26:
+
+- REFramework owns the XeSS command allocator/list;
+- the bridge uses the same active RE4 DIRECT queue;
+- Color/Depth/Velocity states at the insertion boundary are known;
+- required input restoration is known;
+- allocator/list reuse is fence-gated and nonblocking;
+- no engine-owned recording list needs to be adopted or extended.
+
+**Gate H is CLOSED.**
+
+### Capture 28 objective — post-Overlay output copy provenance
+
+Gate I is now the active production gate.
+
+Capture 26 already showed that the semantic HDR/PostMain Color resource later enters a `COPY_SOURCE` state. Before allocating a real XeSS output or replacing an engine target, Capture 28 traces the existing copy path so output integration is selected from current-build evidence rather than the historical pd-upscaler path.
+
+New scenario:
+
+~~~text
+D3D12 output copy provenance
+~~~
+
+Capture 28 is fully observe-only.
+
+It adds shared implementation-level observers for:
+
+~~~text
+ID3D12GraphicsCommandList::CopyTextureRegion
+ID3D12GraphicsCommandList::CopyResource
+~~~
+
+The method addresses are resolved dynamically from live submitted RE4 DIRECT command lists. No process-local address is hardcoded.
+
+At each pre-Overlay boundary the probe seeds a per-frame resource graph with:
+
+~~~text
+Color
+    = Scene::PostMainTarget
+    = Scene::HDRTarget
+    = Overlay main native resource
+~~~
+
+It also snapshots the active swapchain buffer identities using normal scoped `GetBuffer()` references.
+
+When a post-boundary copy touches a currently tracked resource, both source and destination are added to the tracked set. This lets the diagnostic follow a chain such as:
+
+~~~text
+HDR/PostMain Color
+    -> intermediate A
+    -> intermediate B
+    -> swapchain buffer
+~~~
+
+without logging unrelated full-frame copy traffic.
+
+Primary records:
+
+~~~text
+outputCopyBoundary
+outputCopySubmit
+outputCopySubmitList
+outputCopy
+outputCopyPresent
+~~~
+
+Each `outputCopy` record identifies:
+
+- CopyResource vs CopyTextureRegion;
+- source/destination native resource;
+- whether either side is the original Color;
+- whether either side was already in the tracked chain;
+- whether either side is an active swapchain buffer;
+- source/destination width, height, format, and flags;
+- for CopyTextureRegion, copy-location type/subresource and destination coordinates.
+
+At Present the probe summarizes:
+
+~~~text
+eventsSinceBoundary
+trackedResources
+swapchainBuffers
+reachedSwapchain
+wholeFrameObservedSubmits
+~~~
+
+The first frame remains hook/list discovery warm-up. Repeated submitted-list pools should make later frames authoritative.
+
+Capture 28 procedure:
 
 1. enter stable gameplay;
-2. select `D3D12 bridge ordering`;
+2. select `D3D12 output copy provenance`;
 3. click `Reset capture`;
 4. keep gameplay/camera mostly still;
 5. allow all **64 samples** to complete;
-6. do not Load Save, open menus, resize, Alt+Tab, or run OptiScaler/XeFG validation.
+6. do not Load Save, open menus, resize, Alt+Tab, or enable OptiScaler/XeFG validation.
 
-Acceptance target:
+Decision target:
 
-- 64 bridge-owned empty-list submissions;
-- zero skipped frames;
-- no Reset/Close/Signal failures;
-- from sample 2 onward, exactly eight total submits per frame;
-- exactly one probe-owned submit at ordinal 3;
-- five original engine submits remain after the bridge list;
-- fence completion advances and slots are reused only after their fence value is complete;
-- no crash, device removal, or render corruption.
+- determine whether HDR/PostMain Color is copied directly to a swapchain buffer or through intermediate resources;
+- identify every repeated copy edge in that path;
+- identify the copy API and subresource shape;
+- record the intermediate resource formats/extents/flags;
+- identify the earliest safe current-build integration point for a display-resolution XeSS result while preserving RE4 Overlay/UI composition.
 
-If this succeeds, Gate H command-list ownership and queue ordering can be considered closed for production planning.
-
-The next production-facing gate is then Gate I: allocate and integrate a real display-resolution XeSS output resource while preserving RE4 Overlay/UI composition.
+Do not replace a target or dispatch XeSS in Capture 28.
 
 The probe still does **not**:
 
@@ -2728,7 +2814,7 @@ Non-load cutscene/teleport hardening may later use another explicit engine signa
 
 ### Gate H — D3D12 execution point and resource states
 
-**Status: ACTIVE — input states/barrier contract closed by Capture 26; bridge-owned queue ordering Capture 27 prepared.**
+**Status: CLOSED by Captures 26-27.**
 
 Captures 23-25 close DIRECT queue/list/whole-frame/public-interface provenance.
 
@@ -2743,28 +2829,47 @@ Capture 26 closes the actual recording and input-state questions:
 - RE4 restores those same states for the next-frame boundary;
 - the pre-Overlay callback thread does not expose an active engine-owned D3D12 recording list.
 
-Production implication:
+Capture 27 then proves the safe bridge-owned execution model:
 
-> REFramework should own the command allocator/list used for XeSS execution.
+- 128/128 REFramework empty DIRECT-list submissions succeed across two runs;
+- zero skipped frames and zero bridge-order failures;
+- sample 2-64 in both runs = 126/126 frames with exactly eight whole-frame submissions;
+- the REF-owned list is exactly ordinal 3 in all 126 stable frames;
+- the two original pre-boundary engine submits and five original post-boundary engine submits remain in place;
+- eight allocator/list slots cycle deterministically;
+- all 120 reused slots are reset only after their previous fence has completed;
+- Present observes the current bridge fence signal complete in 128/128 frames.
 
-The remaining Gate H question is the safe queue ordering and lifetime of that bridge-owned list.
+Production rule:
 
-Capture 27 submits a probe-owned **empty** DIRECT list at pre-Overlay using an eight-slot allocator/list ring and one fence. Slots are reused only after their prior fence value is complete; the probe never waits for the GPU and skips rather than reusing an in-flight allocator.
+> Record XeSS work into a REFramework-owned DIRECT command list at pre-Overlay, submit it on the existing active RE4 DIRECT queue, and reuse bridge-owned allocators/lists only after their fence value is complete.
 
-No resource state is modified in Capture 27.
-
-If the expected stable `2 engine + 1 bridge + 5 engine` ordering is proven without skipped/in-flight reuse or rendering regressions, Gate H can be closed for production planning except for output-resource state details that belong to Gate I.
+No engine-owned command list needs to be modified.
 
 ### Gate I — XeSS output integration
 
-Decide and prove:
+**Status: ACTIVE — Capture 28 prepared for current-build output-copy provenance.**
+
+Still decide and prove:
 
 - who allocates the display-resolution XeSS output resource;
-- where it is inserted back into the RE4 output path;
-- how the original UI composition remains intact;
+- which current RE4 resource or copy edge should consume that result;
+- how the original Overlay/UI composition remains intact;
+- output resource state transitions;
 - resource lifetime and resize behavior.
 
-The preferred design is for REFramework to own bridge resources it allocates and to release only those references.
+Capture 26 shows HDR/PostMain Color later enters `COPY_SOURCE`, so Capture 28 traces `CopyResource` and `CopyTextureRegion` edges beginning from the semantic Color resource and propagates that resource graph toward the active swapchain buffers.
+
+This is intentionally narrower than blindly reproducing historical pd-upscaler behavior.
+
+Historical pd-upscaler remains a concept oracle only. Current RE4 1.5.9 runtime evidence determines the actual integration point.
+
+The preferred ownership rule remains:
+
+- REFramework allocates and releases only bridge-owned XeSS resources;
+- engine resources remain borrowed;
+- swapchain resources remain owned by the presentation path;
+- no foreign COM reference draining or padding is permitted.
 
 ### Gate J — OptiScaler / XeFG validation
 
@@ -2962,7 +3067,9 @@ Use broad D3D12 tracing only as a last resort. The old ATSBridge trace produced 
 | Actual barrier API usage | **HIGH / PROVEN** | Capture 26: repeated legacy ResourceBarrier use; zero enhanced Barrier calls |
 | Pre-Overlay input states | **HIGH / PROVEN** | Capture 26: Color=0xC0, Depth=0xE0, Velocity=0x04 in 122/122 post-warm-up boundaries |
 | RE4 input-state restoration | **HIGH / PROVEN** | Capture 26: recurring post-boundary transitions restore Color=0xC0, Depth=0xE0, Velocity=0x04 |
-| Bridge-owned command-list ordering | **MEDIUM / active** | Capture 27 prepared with empty DIRECT list + fence-safe 8-slot reuse |
+| Bridge-owned command-list ordering | **HIGH / PROVEN** | Capture 27: 126/126 stable frames = 2 engine + 1 REF + 5 engine; 128/128 bridge submits; skip=0 |
+| Bridge allocator/list fence lifetime | **HIGH / PROVEN** | Capture 27: all 120 slot reuses occur only after prior fence completion; 128/128 Present fences complete |
+| Output copy provenance | **MEDIUM / active** | Capture 28 prepared to trace Color copy edges and swapchain reachability |
 | Standard XeSS → upstream OptiScaler | **DESIGN LOCKED, runtime pending** | No custom OptiScaler ABI permitted |
 | XeFG through `FGInput=Upscaler` | **pending after SR** | Existing presentation compatibility work remains relevant |
 
@@ -3048,35 +3155,56 @@ Captures 20-22 establish:
 
 Use the explicit RE4 load window rather than a camera threshold for Load Save.
 
-### 18.6 Prove command-list/state insertion
+### 18.6 Prove command-list/state insertion — complete
 
-Captures 23-25 close queue/list/whole-frame/public-interface provenance.
+Captures 23-27 close Gate H.
 
-Capture 26 closes the resource-state half of Gate H:
+Final production model:
 
-- shared implementation hooks observe the real repeated Reset/Close lifecycle;
-- RE4 uses legacy ResourceBarrier in the captured active render path;
-- no enhanced Barrier call is observed;
-- post-warm-up pre-Overlay states are stable at Color=0xC0, Depth=0xE0, Velocity=0x04;
-- the post-boundary engine graph restores the same states for the next frame;
-- pre-Overlay does not provide an active engine-owned recording list on its callback thread.
+~~~text
+RE4 engine queue submit 1
+RE4 engine queue submit 2
+        ↓
+pre-Overlay HDR/PostMain boundary
+        ↓
+REF-owned DIRECT list
+    - explicit input transitions
+    - XeSS execution later
+    - required restoration
+        ↓
+RE4 engine queue submit 3
+RE4 engine queue submit 4
+RE4 engine queue submit 5
+RE4 engine queue submit 6
+RE4 engine queue submit 7
+        ↓
+Present
+~~~
 
-Therefore production XeSS execution should use a REFramework-owned allocator/list.
+Known insertion-point states:
 
-Capture 27 is the next runtime test:
+~~~text
+Color     = 0xC0
+Depth     = 0xE0
+Velocity  = 0x04
+~~~
 
-- create an eight-slot probe-owned DIRECT allocator/list ring and one fence;
-- at pre-Overlay, record an **empty** list and submit it to the active RE4 DIRECT queue;
-- Signal a unique fence value after the empty submission;
-- reuse a slot only after its previous fence value is complete;
-- never wait for the GPU;
-- skip rather than reuse an in-flight slot;
-- classify engine vs probe-owned lists in the existing queue hook;
-- verify the stable whole-frame order becomes two engine submits, one bridge submit, then five engine submits.
+Allocator/list lifetime is bridge-owned and fence-gated.
 
-No barrier, resource reference, copy, draw, dispatch, or XeSS call belongs in Capture 27.
+No production work should append into an engine-owned command list.
 
-If Capture 27 succeeds, close Gate H command-list ownership/order and proceed to Gate I output-resource integration.
+### 18.6.1 Prove output-copy integration path
+
+Before public XeSS dispatch, run Capture 28:
+
+- observe shared `CopyTextureRegion` and `CopyResource` calls;
+- seed each frame from HDR/PostMain Color;
+- propagate only copy-connected resource identities;
+- label active swapchain-buffer hits;
+- record resource descs and subresource/region information;
+- choose the earliest evidence-backed output integration edge that preserves Overlay/UI composition.
+
+Do not replace an engine target in this capture.
 
 ### 18.7 Add public XeSS producer
 
@@ -3150,7 +3278,7 @@ The RE4 bridge is ready to begin production XeSS dispatch only when all of the f
 
 The current project is **not yet at this gate**.
 
-The major resource and size-control uncertainty is now substantially closed: HDR/PostMain color, Depth, Velocity, the pre-Overlay engine boundary, SceneView-driven internal render size, Overlay working surfaces, and presentation output are mapped. MV semantics are closed through Capture 18, Capture 19 closes inverted depth plus near/far/FOV/projection metadata, Capture 22 closes the current Load Save reset/history gate, Capture 23 closes post-boundary DIRECT queue/list provenance, Capture 24 extends that to a stable seven-submit whole-frame topology while rejecting the submitted-base instance-vtable assumption, Capture 25 closes public GCL0-GCL7 interface/shared-method provenance, and Capture 26 closes the actual legacy-barrier path plus stable pre-Overlay Color/Depth/Velocity states. The remaining Gate H work is the ordering/lifetime proof for a bridge-owned command list; after that the focus moves to XeSS output integration and lifecycle.
+The major resource and size-control uncertainty is now substantially closed: HDR/PostMain color, Depth, Velocity, the pre-Overlay engine boundary, SceneView-driven internal render size, Overlay working surfaces, and presentation output are mapped. MV semantics are closed through Capture 18, Capture 19 closes inverted depth plus near/far/FOV/projection metadata, Capture 22 closes the current Load Save reset/history gate, Capture 23 closes post-boundary DIRECT queue/list provenance, Capture 24 extends that to a stable seven-submit whole-frame topology while rejecting the submitted-base instance-vtable assumption, Capture 25 closes public GCL0-GCL7 interface/shared-method provenance, Capture 26 closes the actual legacy-barrier path plus stable pre-Overlay Color/Depth/Velocity states, and Capture 27 closes REFramework-owned command-list ordering plus fence-safe allocator/list lifetime. Gate H is now closed. The remaining implementation-readiness work is Gate I output integration/resource lifetime, followed by standard XeSS producer validation and upstream OptiScaler/XeFG validation.
 
 ---
 
@@ -3182,6 +3310,6 @@ OutputTargetState
 swapchain backbuffers
 ~~~
 
-Capture 9 identifies on_pre_overlay_layer_draw() as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Capture 10 establishes the native-resolution baseline. Capture 11 then proves that overriding SceneView.get_Size to 1920x1080 moves Color, Depth, and Velocity together while the 2560x1440 DXGI output remains unchanged. Captures 12-16 close render/display control, jitter injection/history, MV jitter exclusion, R=X, G=Y, and both axis polarities. Capture 17 adds the independent rotation-only witness, and Capture 18 closes the absolute MV scale at W/2,-H/2 while rejecting one fixed MV/camera frame offset as the primary source of spatial residuals. Initial zero/low-motion samples immediately after Reset remain a known UI-click input-interruption artifact, not failed directional evidence. Gate D is closed. Capture 19 proves SceneInfo/DepthStencilTex inverted depth in 128/128 samples and closes the producer camera metadata path: near/far come from primary via.Camera and vertical FOV is derived from SceneInfo projection. Capture 20 then proves that a real Load Save can preserve Scene/SceneInfo/Camera/Depth/Velocity/Color identity, render size, and render-frame continuity while still producing large camera-history discontinuities. Translation alone is not a safe reset heuristic; rotation separates strongly in this run, but no threshold is frozen. Capture 21 proves SceneInfo.old_view_projection_matrix does not expose a Load Save reset signal. Capture 22 then closes the current Load Save reset gate: two independent loads repeat the same SceneLoadZone pause window, history remains unstable after pause release, and GameSituation inhibit restoration marks the stable post-load return; the final quit path provides a negative control without a SceneLoadZone pause rise. Capture 23 closes the first Gate H provenance step: four complete 64-frame runs show one active DIRECT queue, exactly five single-list DIRECT submissions between pre-Overlay and Present in all 256 frames, and a deterministic ten-command-list/two-pool reuse pattern. Capture 24 shows that the stable whole frame contains seven DIRECT submits (two before pre-Overlay plus five after), while the submitted-base instance-vtable hook misses the repeated recording lifecycle. Capture 25 rejects the public-interface-alias explanation and proves shared Close/Reset/legacy ResourceBarrier/GCL7 Barrier implementations. Capture 26 then observes those shared functions directly: repeated Reset/Close is proven, the active RE4 path uses legacy ResourceBarrier rather than enhanced Barrier, and the stable post-warm-up pre-Overlay input states are Color=0xC0, Depth=0xE0, Velocity=0x04 in 122/122 boundaries across two runs. The engine later restores those same states, while the pre-Overlay worker callback itself does not expose an active engine-owned recording list. Capture 27 is therefore prepared to validate a REFramework-owned empty DIRECT list inserted at pre-Overlay with fence-safe nonblocking allocator reuse before any XeSS command is recorded. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
+Capture 9 identifies on_pre_overlay_layer_draw() as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Capture 10 establishes the native-resolution baseline. Capture 11 then proves that overriding SceneView.get_Size to 1920x1080 moves Color, Depth, and Velocity together while the 2560x1440 DXGI output remains unchanged. Captures 12-16 close render/display control, jitter injection/history, MV jitter exclusion, R=X, G=Y, and both axis polarities. Capture 17 adds the independent rotation-only witness, and Capture 18 closes the absolute MV scale at W/2,-H/2 while rejecting one fixed MV/camera frame offset as the primary source of spatial residuals. Initial zero/low-motion samples immediately after Reset remain a known UI-click input-interruption artifact, not failed directional evidence. Gate D is closed. Capture 19 proves SceneInfo/DepthStencilTex inverted depth in 128/128 samples and closes the producer camera metadata path: near/far come from primary via.Camera and vertical FOV is derived from SceneInfo projection. Capture 20 then proves that a real Load Save can preserve Scene/SceneInfo/Camera/Depth/Velocity/Color identity, render size, and render-frame continuity while still producing large camera-history discontinuities. Translation alone is not a safe reset heuristic; rotation separates strongly in this run, but no threshold is frozen. Capture 21 proves SceneInfo.old_view_projection_matrix does not expose a Load Save reset signal. Capture 22 then closes the current Load Save reset gate: two independent loads repeat the same SceneLoadZone pause window, history remains unstable after pause release, and GameSituation inhibit restoration marks the stable post-load return; the final quit path provides a negative control without a SceneLoadZone pause rise. Capture 23 closes the first Gate H provenance step: four complete 64-frame runs show one active DIRECT queue, exactly five single-list DIRECT submissions between pre-Overlay and Present in all 256 frames, and a deterministic ten-command-list/two-pool reuse pattern. Capture 24 shows that the stable whole frame contains seven DIRECT submits (two before pre-Overlay plus five after), while the submitted-base instance-vtable hook misses the repeated recording lifecycle. Capture 25 rejects the public-interface-alias explanation and proves shared Close/Reset/legacy ResourceBarrier/GCL7 Barrier implementations. Capture 26 observes those shared functions directly: repeated Reset/Close is proven, the active RE4 path uses legacy ResourceBarrier rather than enhanced Barrier, and the stable post-warm-up pre-Overlay input states are Color=0xC0, Depth=0xE0, Velocity=0x04 in 122/122 boundaries across two runs. Capture 27 closes Gate H completely: two independent 64-frame runs produce 128/128 successful REF-owned empty-list submissions with zero skips, while all 126 post-warm-up frames preserve a deterministic 2-engine + 1-REF + 5-engine submit topology; every one of the 120 slot reuses occurs only after its prior fence value is complete. Gate I is now active. Capture 28 is prepared to trace the current-build CopyResource/CopyTextureRegion chain beginning from HDR/PostMain Color toward the active swapchain buffers before any real XeSS output resource is inserted. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
 
 Until the remaining gates are proven, the diagnostic stays passive and no production XeSS dispatch is enabled.
