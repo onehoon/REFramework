@@ -59,7 +59,6 @@ private:
     uint32_t m_velocity_copy_height{0};
     int m_velocity_copy_scenario{0};
     bool m_velocity_copy_ready{false};
-    uint32_t m_last_mv_readback_sample{0};
 
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_mv_command_allocator{};
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_mv_command_list{};
