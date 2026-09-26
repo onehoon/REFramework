@@ -25,6 +25,22 @@ int main() {
 
     CHECK(MAX_TEMPORAL_SAMPLES == 32);
     CHECK(JITTER_PHASE_COUNT == 4);
+    CHECK(MAX_MV_READBACK_SAMPLES == 8);
+    CHECK(MV_SAMPLE_GRID_SIZE == 3);
+    CHECK(MV_SAMPLE_POINT_COUNT == 9);
+    CHECK(MV_READBACK_POINT_STRIDE == 512);
+    CHECK(MV_READBACK_BUFFER_SIZE == 4608);
+
+    const auto p0 = mv_sample_point(0, 2560, 1440);
+    const auto p4 = mv_sample_point(4, 2560, 1440);
+    const auto p8 = mv_sample_point(8, 2560, 1440);
+    CHECK(p0.x == 640 && p0.y == 360);
+    CHECK(p4.x == 1280 && p4.y == 720);
+    CHECK(p8.x == 1920 && p8.y == 1080);
+
+    CHECK(std::abs(decode_snorm16(0)) < 0.0000001f);
+    CHECK(std::abs(decode_snorm16(32767) - 1.0f) < 0.0000001f);
+    CHECK(std::abs(decode_snorm16(INT16_MIN) + 1.0f) < 0.0000001f);
 
     const auto j1 = jitter_pixels_for_sample(1);
     const auto j2 = jitter_pixels_for_sample(2);
