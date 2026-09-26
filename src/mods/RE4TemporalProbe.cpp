@@ -62,7 +62,7 @@ void RE4TemporalProbe::on_draw_ui() {
     }
 
     bool enabled = m_enabled.load(std::memory_order_relaxed);
-    if (ImGui::Checkbox("Enable passive size capture (default off)", &enabled)) {
+    if (ImGui::Checkbox("Enable 1920x1080 render-size test (default off)", &enabled)) {
         m_enabled.store(enabled, std::memory_order_relaxed);
         spdlog::info("[RE4TemporalProbe] capture {}", enabled ? "enabled" : "disabled");
     }
@@ -75,8 +75,8 @@ void RE4TemporalProbe::on_draw_ui() {
     ImGui::Text("Overlay callbacks: %u", m_size_sample_budget.callback_count());
     ImGui::Text("Size samples: %u / %u", m_size_sample_budget.sample_count(), MAX_SAMPLES);
     ImGui::TextWrapped(
-        "RE4-only passive size probe. Color is fixed to Overlay main == Scene HDR/PostMain at pre-Overlay; "
-        "the probe correlates scene inputs, SceneView size, DXGI output size, and post-Overlay working-target size.");
+        "RE4-only temporary split test. When enabled, SceneView.get_Size is overridden to 1920x1080; "
+        "swapchain/output are not resized. The probe checks whether Color/Depth/Velocity follow the overridden extent.");
 
     if (ImGui::Button("Reset capture budget")) {
         m_size_sample_budget.reset();
@@ -105,10 +105,25 @@ void RE4TemporalProbe::on_view_get_size(REManagedObject* scene_view, float* resu
     auto* renderer = sdk::renderer::get_renderer();
     const auto frame = renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
 
+    const auto original_width = result[0];
+    const auto original_height = result[1];
+
+    result[0] = static_cast<float>(re4_temporal_probe::TEST_RENDER_WIDTH);
+    result[1] = static_cast<float>(re4_temporal_probe::TEST_RENDER_HEIGHT);
+
     m_latest_scene_view.store(reinterpret_cast<uintptr_t>(scene_view), std::memory_order_relaxed);
     m_latest_view_frame.store(frame.value_or(0), std::memory_order_relaxed);
-    m_latest_view_width.store(static_cast<uint32_t>(result[0] + 0.5f), std::memory_order_relaxed);
-    m_latest_view_height.store(static_cast<uint32_t>(result[1] + 0.5f), std::memory_order_relaxed);
+    m_latest_view_width.store(re4_temporal_probe::TEST_RENDER_WIDTH, std::memory_order_relaxed);
+    m_latest_view_height.store(re4_temporal_probe::TEST_RENDER_HEIGHT, std::memory_order_relaxed);
+
+    spdlog::info(
+        "[RE4TemporalProbe] viewSizeOverride frame={} sceneView={:p} original={}x{} overridden={}x{}",
+        frame.has_value() ? std::to_string(*frame) : "unknown",
+        static_cast<void*>(scene_view),
+        original_width,
+        original_height,
+        re4_temporal_probe::TEST_RENDER_WIDTH,
+        re4_temporal_probe::TEST_RENDER_HEIGHT);
 }
 
 bool RE4TemporalProbe::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* render_context) {
