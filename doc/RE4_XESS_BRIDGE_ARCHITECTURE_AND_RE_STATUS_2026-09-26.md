@@ -837,6 +837,111 @@ Current conclusion:
 
 The next diagnostic should use controlled opposite-direction camera pans to establish channel mapping and sign first, while logging the historical pixel-scale interpretation as a candidate rather than assuming it is already proven.
 
+### Capture 15 — horizontal MV channel and sign proven
+
+Capture 15 was produced from a **local working-tree build**. The log's embedded REFramework commit hash remained:
+
+~~~text
+e1cb42c9ca5f7885f8bb2282ec443749f5bce16e
+~~~
+
+but that hash is **not used as the source identity for this capture** because the runtime clearly contains later uncommitted/local probe behavior:
+
+~~~text
+Camera pan right
+Camera pan left
+samples 5-20 sparse readback
+historicalPixelCandidate={x=...,y=...}
+~~~
+
+For local diagnostic builds, the probe signature and emitted fields are therefore the authoritative compatibility check when the embedded git hash is stale.
+
+The capture contained:
+
+~~~text
+Camera pan right runs   8
+Camera pan left runs    7
+readback frames         240
+readback texels         2160 = 240 x 9
+mvSnapshotQueued        240/240
+mvReadbackBegin         240/240
+probe errors            0
+fail-closed events      0
+jitterDrawCheck         480/480
+~~~
+
+Some directional resets contained effectively no camera motion. Even with those no-motion runs included, samples after the first readback frame showed a clear horizontal polarity:
+
+~~~text
+Camera pan right:
+    120 analyzed frames
+    median frame R = +742
+    R sign: +92 / -3 / zero 25
+    median frame G = -2
+
+Camera pan left:
+    105 analyzed frames
+    median frame R = -970
+    R sign: +1 / -92 / zero 12
+    median frame G = 0
+~~~
+
+Removing the three effectively no-motion runs makes the directional evidence stronger:
+
+~~~text
+active Camera pan right:
+    6 runs / 90 frames
+    median R = +1103.5
+    R sign = positive 89/90
+    median |R| = 1103.5
+    median |G| = 7.5
+    median |R| / |G| ~= 177x
+
+active Camera pan left:
+    6 runs / 90 frames
+    median R = -1242.5
+    R sign = negative 88/90
+    median |R| = 1242.5
+    median |G| = 24.5
+    median |R| / |G| ~= 41x
+~~~
+
+Therefore current-build evidence now establishes:
+
+> **VelocityTarget R is the horizontal/X motion channel.**
+
+Observed horizontal polarity is:
+
+~~~text
+camera rotates right -> R > 0
+camera rotates left  -> R < 0
+~~~
+
+The orthogonal G channel is much smaller during broad horizontal camera motion, which strongly supports the corresponding historical model `G = vertical/Y`, but that mapping and Y polarity still require direct up/down camera motion.
+
+The historical X scale candidate:
+
+~~~text
+candidatePixelX = R_snorm * renderWidth / 2
+~~~
+
+produced plausible frame-median values that tracked operator pan speed:
+
+~~~text
+active right median candidate X ~= +43.1 px/frame
+active left  median candidate X ~= -48.5 px/frame
+~~~
+
+Individual runs varied with pan speed, including much faster runs. This is good consistency evidence for the historical `W/2` candidate, but it is **not independent scale proof** because Capture 15 did not separately measure actual image-space feature displacement.
+
+Current conclusion:
+
+- R -> X: **HIGH / PROVEN**;
+- horizontal polarity: **HIGH / PROVEN**;
+- G -> Y: **HIGH / strong hypothesis**;
+- vertical polarity: pending direct up/down evidence;
+- `W/2` and `-H/2` absolute scale: strong historical/current candidate, still pending an independent witness.
+
 ---
 
 ## 9. Current HUD/UI boundary model
@@ -903,55 +1008,63 @@ Pixel identity alone cannot prove that no unrelated earlier UI pass ever touched
 
 ## 10. Current diagnostic PR behavior
 
-Captures 12–14 now prove native zero jitter, RE4 projection/history injection, sparse VelocityTarget readback, and exclusion of projection-jitter delta from sampled static motion vectors.
+Captures 12–15 now prove:
 
-The active diagnostic advances to **directional camera-pan MV characterization**. It remains RE4-only and default-off.
+- native zero projection jitter;
+- RE4 projection/history jitter injection;
+- sparse VelocityTarget content readback;
+- exclusion of bridge projection-jitter delta from sampled static MV;
+- R as horizontal/X motion;
+- horizontal right/left polarity.
 
-### Controlled stimulus retained
+The active diagnostic now advances to **vertical camera-pan MV characterization** while preserving right/left scenarios for regression.
 
-The already-proven four-phase +/-0.5 pixel jitter and same-current-jitter history construction remain active only so the eventual production temporal path continues to be exercised exactly as validated. Capture 14 already closed jitter inclusion; this stage is not intended to re-prove it.
+The probe remains RE4-only and default-off.
 
 ### Directional scenarios
-
-The scenario list now distinguishes:
 
 ~~~text
 Static screen
 Camera pan right
 Camera pan left
+Camera pan up
+Camera pan down
 Character motion
 HUD/menu on
 HUD/menu off
 ~~~
 
-For the two camera-pan scenarios, the operator should pan continuously in the selected direction during the capture window.
+Sparse MV readback is enabled only for the four directional camera scenarios.
 
-### Sparse directional MV readback
+For each directional run:
 
-To avoid enable/reset transients:
-
-- samples 1–4 are warm-up only and are **not** read back;
+- samples 1–4 are warm-up only;
 - samples 5–20 are read back;
-- this gives 16 consecutive frames per directional run;
-- each frame still reads only the same 3x3 interior grid;
-- the original game VelocityTarget remains untouched by diagnostic D3D12 barriers;
-- snapshot/readback continues through the disposable engine Texture clone.
+- 16 consecutive readback frames;
+- same 3x3 interior grid = 9 texels/frame;
+- original game VelocityTarget receives no diagnostic D3D12 barrier;
+- disposable engine Texture clone + Present-side sparse readback are retained;
+- raw/SNORM RGBA and historical pixel-scale candidates are logged.
 
-Per texel the log retains raw and SNORM RGBA and adds the historical-scale candidate:
+Historical candidates remain:
 
 ~~~text
 candidatePixelX = R_snorm * renderWidth / 2
 candidatePixelY = G_snorm * -renderHeight / 2
 ~~~
 
-These are explicitly labeled **candidate** values. Capture 15 should use right-vs-left reversal to answer:
+### Capture 16 objective
 
-1. does R or G carry the dominant horizontal camera-pan motion?
-2. does the candidate horizontal channel reverse sign when pan direction reverses?
-3. is the orthogonal channel comparatively small for broad static-background samples?
-4. are the historical-scale pixel values coherent enough to justify a later independent scale-proof test?
+Run two separate captures:
 
-This capture may close channel mapping and sign if the opposite-direction evidence is clean. It must not close scale without an independent screen-motion/reprojection witness.
+1. select **Camera pan up**, pan continuously upward, reset capture, let the run finish;
+2. select **Camera pan down**, pan continuously downward, reset capture, let the run finish.
+
+Primary question:
+
+> Does G become the dominant vertical camera-motion channel and reverse sign cleanly between up and down while R remains comparatively small?
+
+A clean result may close G->Y and vertical polarity. It must **not** close absolute scale from plausibility alone.
 
 The probe still does **not**:
 
@@ -1079,41 +1192,41 @@ The diagnostic four-phase sequence is only a validation pattern. Production jitt
 
 ### Gate D — Motion-vector semantics
 
-**Status: JITTER EXCLUSION CLOSED; CHANNEL / SIGN / SCALE ACTIVE.**
+**Status: HORIZONTAL CHANNEL/SIGN CLOSED; VERTICAL CHANNEL/SIGN ACTIVE; ABSOLUTE SCALE PENDING.**
 
 Verified:
 
 - Velocity resource identity and render-size alignment;
-- sparse clone/readback plumbing without diagnostic barriers on the game-owned VelocityTarget;
-- injected projection-jitter delta is absent from sampled static R/G motion candidates after history settles;
+- sparse clone/readback plumbing without diagnostic barriers on game-owned VelocityTarget;
+- bridge projection-jitter delta is excluded from sampled static motion vectors;
+- **R is horizontal/X motion**;
+- horizontal observed polarity:
+  - camera right -> R positive;
+  - camera left -> R negative;
 - historical TDB > 67 pd-upscaler passed the original `R16G16B16A16_SNORM` VelocityTarget directly.
 
-Capture 14 therefore closes `jitteredMotionVectors` as **false** for the verified bridge history construction.
-
-Remaining semantics:
-
-- exact R/G -> X/Y mapping;
-- X/Y sign;
-- final normalization / scale;
-- independent confirmation of the historical candidate:
+Current strong model:
 
 ~~~text
-motionScaleX =  renderWidth / 2
-motionScaleY = -renderHeight / 2
+R = X
+G = Y
+motionScaleX candidate =  renderWidth / 2
+motionScaleY candidate = -renderHeight / 2
+jitteredMotionVectors  = false
 ~~~
+
+Only the first and last lines above are fully proven in both axes/semantics as stated; G/Y and Y polarity still need direct vertical motion, and the scale factors still need an independent witness.
 
 Next controlled diagnostic:
 
-1. discard the first four frames after reset as temporal/history warm-up;
-2. read 16 consecutive frames during an explicitly labeled **Camera pan right**;
-3. repeat after reset during **Camera pan left**;
-4. retain the same 3x3 sparse grid and deterministic jitter/history construction;
-5. log raw/SNORM R/G plus the historical-scale pixel candidate:
-   - `candidatePixelX = R * renderWidth / 2`;
-   - `candidatePixelY = G * -renderHeight / 2`;
-6. compare right-vs-left sign reversal and which channel dominates horizontal scene motion.
+1. keep the same four-frame warm-up and samples 5-20 sparse readback;
+2. run **Camera pan up** continuously;
+3. reset and run **Camera pan down** continuously;
+4. verify that G dominates broad vertical background motion and reverses sign between directions;
+5. verify R remains comparatively small for clean vertical runs;
+6. keep `candidatePixelY = G * -renderHeight / 2` explicitly labeled as a candidate.
 
-Do not call the historical scale proven merely because the resulting pixel numbers look plausible. Directional pan can close channel mapping and sign; scale should be promoted only when compared against an independent screen-motion or reprojection witness.
+If up/down evidence is clean, channel mapping and both axis polarities can be closed. Absolute scale remains a separate proof item.
 
 ### Gate E — Depth convention
 
@@ -1418,24 +1531,26 @@ display size = active DXGI swapchain/output size
 
 Color, Depth, and Velocity must continue to match the selected render size. Do not add `ImageQualityRate` control unless later runtime evidence requires it.
 
-### 18.3 Jitter and MV-jitter exclusion complete; prove direction/sign next
+### 18.3 Jitter and horizontal MV semantics complete; prove vertical semantics next
 
-Captures 12–14 establish:
+Captures 12–15 establish:
 
 - native jitter baseline;
 - deterministic RE4 jitter injection;
 - history treatment;
 - sparse MV readback;
-- exclusion of projection-jitter delta from sampled static motion.
+- exclusion of jitter delta from MV;
+- R = horizontal/X;
+- horizontal right/left polarity.
 
 Next:
 
-1. run Camera pan right after a four-frame warm-up and collect samples 5–20;
+1. run Camera pan up after a four-frame warm-up and collect samples 5-20;
 2. reset;
-3. run Camera pan left with the same capture window;
-4. use the 3x3 grid to identify the horizontal motion channel and sign reversal;
-5. log the historical `W/2, -H/2` conversion as a candidate only;
-6. after channel/sign are proven, add a separate independent witness for absolute scale if needed.
+3. run Camera pan down with the same capture window;
+4. verify G dominance and sign reversal;
+5. keep the historical `W/2, -H/2` conversion as candidate output only;
+6. after both axis mappings/signs are proven, add an independent screen-space/reprojection witness for absolute scale if still required.
 
 No full-frame dump and no direct barrier on the original VelocityTarget.
 
@@ -1551,6 +1666,6 @@ OutputTargetState
 swapchain backbuffers
 ~~~
 
-Capture 9 identifies `on_pre_overlay_layer_draw()` as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Capture 10 establishes the native-resolution baseline. Capture 11 then proves that overriding `SceneView.get_Size` to 1920x1080 moves Color, Depth, and Velocity together while the 2560x1440 DXGI output remains unchanged. Render/display size control, jitter injection, and sampled MV jitter exclusion are now closed; the next active gate is directional MV channel/sign characterization followed by independent scale proof. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
+Capture 9 identifies `on_pre_overlay_layer_draw()` as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Capture 10 establishes the native-resolution baseline. Capture 11 then proves that overriding `SceneView.get_Size` to 1920x1080 moves Color, Depth, and Velocity together while the 2560x1440 DXGI output remains unchanged. Render/display size control, jitter injection, MV jitter exclusion, and horizontal R/X polarity are now closed; the next active gate is vertical G/Y polarity followed by independent absolute scale proof. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
 
 Until the remaining gates are proven, the diagnostic stays passive and no production XeSS dispatch is enabled.
