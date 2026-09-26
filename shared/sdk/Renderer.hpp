@@ -93,10 +93,12 @@ public:
 
 private:
     // desc sits at sizeof(RenderResource) + one void* for older games, +0x18 for TDB >= 73 / SF6.
+    // RE4 1.5.9.0 (TDB 71) also uses the +0x18 layout. Keep this title-specific:
+    // other TDB 71 games must retain their existing path.
     static inline uintptr_t get_s_desc_offset() {
         const auto& gi = sdk::GameIdentity::get();
         const auto v = gi.tdb_ver();
-        if (v >= 73 || gi.is_sf6()) {
+        if (v >= 73 || gi.is_sf6() || gi.is_re4()) {
             return RenderResource::get_runtime_size() + 0x18;
         }
         return RenderResource::get_runtime_size() + sizeof(void*);
@@ -107,7 +109,9 @@ private:
         const auto v = gi.tdb_ver();
         if (v >= 73) return 0xE0;
         if (v >= 71) {
-            if (gi.is_sf6()) return 0xB8;
+            // RE4 1.5.9.0 runtime probing resolves the container at 0xB8.
+            // Keep the override RE4-only so other TDB 71 titles are unchanged.
+            if (gi.is_sf6() || gi.is_re4()) return 0xB8;
             if (gi.is_mhrise()) return 0x98; // WHAT THE HECK!!!
             return 0xA0;
         }
