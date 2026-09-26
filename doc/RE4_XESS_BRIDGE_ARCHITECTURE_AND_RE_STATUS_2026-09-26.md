@@ -1606,60 +1606,273 @@ This strengthens two conclusions:
 - translation alone is unsuitable as a reset discriminator;
 - rotation discontinuity remains a viable fallback candidate, but should remain secondary to a deterministic RE4 load/game-state signal if one exists.
 
-### Capture 22 objective — RE4 load/fade/game-state witness
+### Capture 22 — RE4 load/fade/game-state result
 
-Capture 22 is prepared as a separate `Load/fade state` scenario.
+Capture 22 was collected in `22_re2_framework_log.txt`.
 
-It does **not** invoke arbitrary game methods and does not dump object memory.
+User sequence:
 
-Instead, through REFramework's existing TDB reflection APIs, it observes integral/enum fields from six known managed singleton candidates that exist in the current RE4 runtime:
+- stable gameplay baseline;
+- **Load Save #1**;
+- ordinary gameplay;
+- **Load Save #2**;
+- ordinary gameplay;
+- ESC/menu path followed by game exit.
+
+The probe remained observe-only and recorded reflected integral/enum state from six candidate singletons.
+
+Main witness run:
 
 ~~~text
-share.FadeManager
-share.SaveDataManager
-share.MainModeManager
-chainsaw.SceneLoadZoneManager
-chainsaw.GameSituationManager
-share.SceneActivateMediator
+sample 1 -> 7043
+frame 7691 -> 14733
+managerCount = 6 throughout
+fieldCount   = 15 throughout
+frameGap     = 0
+singleton object identity changes = 0
+~~~
+
+The two Load Save operations produced the same high-value state sequence.
+
+#### Repeated SaveDataManager process sequence
+
+Load Save #1:
+
+~~~text
+sample 661+
+share.SaveDataManager.CurrentProcess
+
+1 -> 2 -> 4 -> 5 -> 0 -> 2 -> 3 -> 0 -> 1
+~~~
+
+Load Save #2:
+
+~~~text
+sample 3292+
+share.SaveDataManager.CurrentProcess
+
+1 -> 2 -> 4 -> 5 -> 0 -> 2 -> 3 -> 0 -> 1
+~~~
+
+This is a strong load-operation witness, but the production reset state machine should not depend on undocumented enum-number semantics alone.
+
+#### Repeated SceneLoadZone pause window
+
+Load Save #1:
+
+~~~text
+sample 763 / frame 8453
+SceneLoadZoneManager._Pause: 0 -> 1
+
+sample 1071 / frame 8761
+SceneLoadZoneManager._Pause: 1 -> 0
+camera:
+    translationDelta     = 2.401242018
+    rotationDeltaDegrees = 169.999954
+~~~
+
+Load Save #2:
+
+~~~text
+sample 3388 / frame 11078
+SceneLoadZoneManager._Pause: 0 -> 1
+
+sample 3664 / frame 11354
+SceneLoadZoneManager._Pause: 1 -> 0
+camera:
+    translationDelta     = 2.413129807
+    rotationDeltaDegrees = 169.999954
+~~~
+
+The rising edge occurs before the destructive camera-history transition in both loads.
+
+However, `_Pause: 1 -> 0` is **not** sufficient as the end of the invalid-history window. Additional large camera discontinuities occur after that edge.
+
+#### GameSituation inhibit window covers the full load transition
+
+Load Save #1:
+
+~~~text
+sample 686  / frame 8376
+GameSituationManager.InhibitBit: 0xB9 -> 0
+
+sample 1071 / frame 8761
+_Pause: 1 -> 0 + ~170 degree jump
+
+later:
+another ~170 degree camera jump
+
+sample 1419 / frame 9109
+GameSituationManager.InhibitBit: 0 -> 0xB9
+~~~
+
+Load Save #2:
+
+~~~text
+sample 3316 / frame 11006
+GameSituationManager.InhibitBit: 0xB9 -> 0
+
+sample 3664 / frame 11354
+_Pause: 1 -> 0 + ~170 degree jump
+
+later:
+another ~170 degree camera jump
+
+sample 3904 / frame 11594
+GameSituationManager.InhibitBit: 0 -> 0xB9
+~~~
+
+Therefore the observed RE4 load window is better modeled as:
+
+~~~text
+normal gameplay
+    |
+    | SceneLoadZoneManager._Pause becomes true
+    v
+history invalid / load transition active
+    |
+    | _Pause may become false before camera history is stable
+    | keep history invalid
+    |
+    | GameSituationManager.InhibitBit returns to the remembered
+    | pre-load normal value
+    v
+first stable gameplay frame
+    -> XeSS reset = true
+    -> resume normal temporal accumulation
+~~~
+
+The pre-load `InhibitBit` value should be remembered dynamically. Do **not** hardcode `0xB9` as a universal semantic constant from one game location/state.
+
+`SaveDataManager.CurrentProcess` can be retained as corroborating evidence or an early load-operation hint, but the production load window does not need to decode the raw enum sequence if `_Pause` + dynamic inhibit restoration are sufficient.
+
+#### Game-exit negative control
+
+The final ESC/menu/exit path is distinguishable from the two Load Save operations.
+
+Observed exit-side changes include:
+
+~~~text
+SaveDataManager._IsExcludeGameSaveInQuit: 0 -> 1 -> 0
+MainModeManager.CurrPhase: 6 -> 7 -> 5 ...
+GameSituationManager.InhibitBit: 0xB9 -> 0
+~~~
+
+and shortly afterward a separate large camera/world discontinuity:
+
+~~~text
+translationDelta ~= 212.4
+rotationDeltaDegrees ~= 15.5
+~~~
+
+But the exit path does **not** show:
+
+~~~text
+SceneLoadZoneManager._Pause: 0 -> 1
+SaveDataManager.CurrentProcess load sequence
+~~~
+
+This is a useful negative control: the selected load-state witness does not simply fire on every menu/quit transition.
+
+#### Low-value candidate rejected
+
+`SceneActivateMediator.EntryProcIntervalTimer` generated approximately 6330 of the 6409 field-change records and behaves as a near-continuous timer. It is not a useful reset signal.
+
+### Gate G decision
+
+Capture 22 provides a deterministic RE4 Load Save history-invalid window without relying on camera-angle thresholds.
+
+For current production readiness, Gate G is closed with:
+
+- unconditional reset conditions already listed below;
+- RE4 Load Save invalidation armed by the observed SceneLoadZone pause transition;
+- history kept invalid after pause release until the remembered pre-load GameSituation inhibit state is restored;
+- first valid post-load gameplay frame submitted with `reset=true`;
+- camera discontinuity retained only as optional future hardening for non-load cuts/teleports.
+
+A dedicated cutscene-only capture can be added later if a real non-load cut exposes a contradiction. It no longer blocks proceeding to D3D12 execution-order work.
+
+### Capture 23 objective — D3D12 execution ordering
+
+Gate H begins with an **observe-only** queue-ordering witness.
+
+New scenario:
+
+~~~text
+D3D12 execution ordering
 ~~~
 
 The probe:
 
-- skips diagnostic jitter and sparse MV readback;
-- records up to **8192** consecutive frames;
-- records camera translation/rotation delta every frame;
-- records singleton object identity changes;
-- enumerates reflected integral/enum fields only;
-- logs each field's schema and initial baseline once;
-- after baseline, logs **only fields whose raw value changes**.
+- performs no XeSS call;
+- performs no ResourceBarrier;
+- performs no copy;
+- submits no diagnostic command list;
+- does not mutate Color/Depth/Velocity;
+- installs an instance-local hook only on the active DIRECT command queue's `ExecuteCommandLists[10]`;
+- opens a capture window at the verified pre-Overlay callback;
+- records command-list submissions between that boundary and Present for 64 frames.
 
-Primary log records:
+At the pre-Overlay boundary it records:
 
 ~~~text
-loadStateSchema
-loadStateObject
-loadStateChange
-loadStateWitness
+executionBoundary
+    frame/sample
+    thread
+    RenderContext pointer
+    RenderContext protectFrame
+    delayEnabled
+    current TargetState/resource
+    Overlay main TargetState/resource
+    PostMain/HDR Color
+    Depth
+    Velocity
+    active queue pointer/type
 ~~~
 
-This is intentionally a discovery witness. Raw integral/enum values are logged with the reflected manager, declaring type, field name, and field type so the next analysis can identify a semantic load/fade/state transition without hardcoding guessed field offsets.
+Queue submission records:
 
-Capture 22 procedure:
+~~~text
+executionSubmit
+    submit id
+    boundary frame/sample
+    queue/type
+    num command lists
+    thread
 
-1. enter stable gameplay;
-2. select `Load/fade state`;
-3. click `Reset capture`;
-4. leave the game untouched for roughly 2-3 seconds to establish a stable baseline;
-5. perform **one Load Save**;
-6. after gameplay returns, move normally and rotate the camera for several seconds;
-7. disable the diagnostic after the post-load baseline is captured, before the 8192-frame budget if convenient.
+executionList
+    submit id
+    list index
+    ID3D12CommandList pointer
+    command-list type
+~~~
 
-Decision rule:
+Present closes each window with:
 
-- if one or more reflected singleton state changes align with the Load Save sequence and remain quiet during ordinary movement/camera rotation, prefer the narrowest stable engine/game-state signal as the XeSS history-reset trigger;
-- object identity change remains useful when it occurs but is not required;
-- `old_view_projection_matrix` is no longer a candidate reset signal;
-- if no useful explicit load/fade/game-state signal exists, use camera rotation discontinuity as the fallback path and validate its threshold against aggressive ordinary camera motion before freezing production behavior.
+~~~text
+executionPresent
+    sample
+    boundary frame
+    submitsSinceBoundary
+    totalObservedSubmits
+~~~
+
+Capture 23 procedure:
+
+1. use the controlled baseline configuration;
+2. enter stable gameplay;
+3. select `D3D12 execution ordering`;
+4. click `Reset capture`;
+5. leave the camera mostly still and let all **64 samples** complete;
+6. no Load Save, menu transition, resize, Alt+Tab, or OptiScaler/XeFG validation is needed for this capture.
+
+Decision target:
+
+- prove the pre-Overlay callback is associated with the active DIRECT queue;
+- identify which real game command-list objects are submitted after the boundary and before Present;
+- determine whether the list set/order is stable enough to justify a narrower ResourceBarrier witness in Capture 24.
+
+Do **not** hook ResourceBarrier yet. Capture 23 first establishes command-list provenance and ordering with the least invasive D3D12 observation.
 
 The probe still does **not**:
 
@@ -1864,7 +2077,7 @@ Do not hardcode the observed FOV. Derive current metadata per frame so aiming, c
 
 ### Gate G — Reset/history invalidation
 
-**Status: ACTIVE — Captures 20-21 close the renderer/history witnesses; Capture 22 prepared for explicit RE4 load-state discovery.**
+**Status: CLOSED for current RE4 XeSS producer readiness by Captures 20-22.**
 
 Unconditional production reset conditions:
 
@@ -1876,42 +2089,59 @@ Unconditional production reset conditions:
 - XeSS context recreation;
 - D3D12 device/swapchain recreation.
 
-Captures 20-21 prove these conditions are **not sufficient by themselves** for RE4 Load Save:
+Captures 20-21 prove that Load Save cannot be inferred from resource identity, frame gaps, or `old_view_projection_matrix`.
 
-- Scene/SceneInfo/Camera/Depth/Velocity/Color identities can remain unchanged;
-- render size can remain unchanged;
-- render-frame continuity can remain intact;
-- `old_view_projection_matrix` remains the exact previous-frame VP even across the Load Save discontinuity.
-
-Capture 21, with corrected user timing, shows Load Save-associated rotation discontinuities of approximately:
+Capture 22 supplies the missing explicit RE4-side load window:
 
 ~~~text
-7.25 deg
-170.00 deg
-170.00 deg
+SceneLoadZoneManager._Pause false -> true
+    => arm history-invalid load state
+
+_Pause true -> false
+    => do NOT resume history yet
+
+GameSituationManager.InhibitBit returns to the remembered
+pre-load normal value
+    => first valid gameplay frame uses reset=true
+    => resume temporal accumulation
 ~~~
 
-while later ordinary camera rotation in the same run reaches approximately 2.03 deg/frame. Ordinary movement also reaches translation ~=1.34, confirming translation-only thresholding is unsafe.
+Production rules:
 
-Do **not** freeze a camera rotation threshold yet.
+- snapshot the normal `InhibitBit` value before the load window;
+- do not hardcode the observed `0xB9` value;
+- keep history invalid across the complete pause/inhibit transition;
+- treat `SaveDataManager.CurrentProcess` only as optional corroboration unless its enum semantics are explicitly decoded later;
+- do not use translation-only reset heuristics;
+- do not freeze a camera-rotation threshold for Load Save.
 
-Capture 22 tests reflected state from RE4 Fade/Save/MainMode/SceneLoad/GameSituation/SceneActivate singletons. Prefer a deterministic engine/game-state transition if one exists. Camera rotation discontinuity remains the fallback only if this explicit-state probe yields no useful signal.
+The Capture 22 quit path changes MainMode/quit/inhibit state but does not raise `SceneLoadZoneManager._Pause`, providing a useful negative control.
+
+Non-load cutscene/teleport hardening may later use another explicit engine signal or a conservative camera-discontinuity fallback. That follow-up is not a blocker for Gate H.
 
 ### Gate H — D3D12 execution point and resource states
 
-The final producer needs a real `ID3D12GraphicsCommandList*`.
+**Status: ACTIVE — Capture 23 prepared.**
 
-Prove:
+The final producer needs a real `ID3D12GraphicsCommandList*` on the correct DIRECT queue.
 
-- command list belongs to the correct DIRECT queue;
-- exact queue ordering relative to RE4 scene work and Overlay/UI work;
-- input resource states when XeSS executes;
+Gate H must prove:
+
+- exact command-list provenance at the pre-Overlay boundary;
+- submission ordering relative to pre-Overlay and Present;
+- Color/Depth/Velocity resource states at XeSS execution;
 - output UAV state;
 - required transitions and restoration;
 - submission/fence ordering;
 - resource lifetime through execution and resize.
 
-The existing engine callbacks should be exhausted first. Add narrow command-list provenance only when necessary.
+Capture 23 deliberately starts with queue/list provenance only.
+
+It hooks the active queue instance's `ExecuteCommandLists` method and records submissions only during the pre-Overlay→Present window. It issues no GPU work and performs no ResourceBarrier.
+
+If Capture 23 identifies a stable game command-list set/order, Capture 24 will hook only the identified graphics-command-list instances long enough to observe ResourceBarrier transitions for the already-known Color/Depth/Velocity resources.
+
+Do not jump directly to a new standalone command list or queue submission path before this provenance is known.
 
 ### Gate I — XeSS output integration
 
@@ -2112,8 +2342,8 @@ Use broad D3D12 tracing only as a last resort. The old ATSBridge trace produced 
 | MV absolute scale | **HIGH / PROVEN** | Capture 18 closes W/2,-H/2 absolute scale |
 | Depth inversion | **HIGH / PROVEN** | Capture 19: SceneInfo/DepthStencilTex is inverted/reversed depth in 128/128 samples |
 | Near/far/FOV | **HIGH / PROVEN** | Capture 19: primary Camera near/far + SceneInfo-derived vertical FOV |
-| Reset/history rules | **MEDIUM / active** | Capture 20 proves same-resource Load Save discontinuity; Capture 21 tests engine oldVP reset semantics |
-| Safe XeSS command list / barriers | **LOW / pending** | No production execution yet |
+| Reset/history rules | **HIGH / PROVEN** | Capture 22: repeated _Pause + dynamic InhibitBit load window; two loads + quit negative control |
+| Safe XeSS command list / barriers | **LOW / active** | Capture 23 prepared for pre-Overlay -> Present DIRECT queue/list provenance |
 | Standard XeSS → upstream OptiScaler | **DESIGN LOCKED, runtime pending** | No custom OptiScaler ABI permitted |
 | XeFG through `FGInput=Upscaler` | **pending after SR** | Existing presentation compatibility work remains relevant |
 
@@ -2186,26 +2416,29 @@ Capture 19 closes:
 
 No GPU Depth readback is required for this gate.
 
-### 18.5 Close reset/history invalidation
+### 18.5 Reset/history invalidation — complete for current producer readiness
 
-Captures 20-21 establish:
+Captures 20-22 establish:
 
 - Load Save may preserve Scene/Camera/resource identity and render-frame continuity;
-- translation-only reset heuristics are unsafe;
-- `SceneInfo::old_view_projection_matrix` is exactly previous-frame VP and does not reset on Load Save;
-- camera rotation discontinuity remains a plausible fallback.
+- `old_view_projection_matrix` does not reset on Load Save;
+- translation-only heuristics are unsafe;
+- two Load Saves repeat the same `SceneLoadZoneManager._Pause` transition;
+- history must remain invalid after pause release until the remembered pre-load GameSituation inhibit state returns;
+- the final quit path does not raise `SceneLoadZoneManager._Pause`.
 
-Capture 22 is the next runtime test:
-
-- observe reflected integral/enum state from six RE4 load/fade/state singletons;
-- establish a short stable pre-load baseline;
-- perform one Load Save;
-- compare state changes against the camera discontinuity and post-load ordinary movement;
-- prefer the narrowest deterministic engine/game-state signal if one exists.
+Use the explicit RE4 load window rather than a camera threshold for Load Save.
 
 ### 18.6 Prove command-list/state insertion
 
-Only after Gate G is closed, add the narrow D3D12 execution machinery required for XeSS.
+Capture 23 is the next runtime test:
+
+- log the verified pre-Overlay RenderContext/resource boundary;
+- observe active DIRECT-queue `ExecuteCommandLists`;
+- identify submitted real game command lists between pre-Overlay and Present;
+- establish stable list/order provenance before any ResourceBarrier hook.
+
+Capture 24, only if Capture 23 supports it, will add narrow ResourceBarrier observation for Color/Depth/Velocity.
 
 ### 18.7 Add public XeSS producer
 
@@ -2279,7 +2512,7 @@ The RE4 bridge is ready to begin production XeSS dispatch only when all of the f
 
 The current project is **not yet at this gate**.
 
-The major resource and size-control uncertainty is now substantially closed: HDR/PostMain color, Depth, Velocity, the pre-Overlay engine boundary, SceneView-driven internal render size, Overlay working surfaces, and presentation output are mapped. MV semantics are closed through Capture 18, and Capture 19 closes inverted depth plus near/far/FOV/projection metadata. The remaining work is primarily reset/history rules, D3D12 execution ordering/resource states, output integration, and lifecycle.
+The major resource and size-control uncertainty is now substantially closed: HDR/PostMain color, Depth, Velocity, the pre-Overlay engine boundary, SceneView-driven internal render size, Overlay working surfaces, and presentation output are mapped. MV semantics are closed through Capture 18, Capture 19 closes inverted depth plus near/far/FOV/projection metadata, and Capture 22 closes the current Load Save reset/history gate. The remaining work is primarily D3D12 execution ordering/resource states, output integration, and lifecycle.
 
 ---
 
@@ -2311,6 +2544,6 @@ OutputTargetState
 swapchain backbuffers
 ~~~
 
-Capture 9 identifies on_pre_overlay_layer_draw() as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Capture 10 establishes the native-resolution baseline. Capture 11 then proves that overriding SceneView.get_Size to 1920x1080 moves Color, Depth, and Velocity together while the 2560x1440 DXGI output remains unchanged. Captures 12-16 close render/display control, jitter injection/history, MV jitter exclusion, R=X, G=Y, and both axis polarities. Capture 17 adds the independent rotation-only witness, and Capture 18 closes the absolute MV scale at W/2,-H/2 while rejecting one fixed MV/camera frame offset as the primary source of spatial residuals. Initial zero/low-motion samples immediately after Reset remain a known UI-click input-interruption artifact, not failed directional evidence. Gate D is closed. Capture 19 proves SceneInfo/DepthStencilTex inverted depth in 128/128 samples and closes the producer camera metadata path: near/far come from primary via.Camera and vertical FOV is derived from SceneInfo projection. Capture 20 then proves that a real Load Save can preserve Scene/SceneInfo/Camera/Depth/Velocity/Color identity, render size, and render-frame continuity while still producing large camera-history discontinuities. Translation alone is not a safe reset heuristic; rotation separates strongly in this run, but no threshold is frozen. Capture 21 proves SceneInfo.old_view_projection_matrix does not expose a Load Save reset signal. Capture 22 is prepared to correlate reflected Fade/Save/MainMode/SceneLoad/GameSituation/SceneActivate state changes with the Load Save sequence before accepting camera rotation as the fallback reset trigger. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
+Capture 9 identifies on_pre_overlay_layer_draw() as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Capture 10 establishes the native-resolution baseline. Capture 11 then proves that overriding SceneView.get_Size to 1920x1080 moves Color, Depth, and Velocity together while the 2560x1440 DXGI output remains unchanged. Captures 12-16 close render/display control, jitter injection/history, MV jitter exclusion, R=X, G=Y, and both axis polarities. Capture 17 adds the independent rotation-only witness, and Capture 18 closes the absolute MV scale at W/2,-H/2 while rejecting one fixed MV/camera frame offset as the primary source of spatial residuals. Initial zero/low-motion samples immediately after Reset remain a known UI-click input-interruption artifact, not failed directional evidence. Gate D is closed. Capture 19 proves SceneInfo/DepthStencilTex inverted depth in 128/128 samples and closes the producer camera metadata path: near/far come from primary via.Camera and vertical FOV is derived from SceneInfo projection. Capture 20 then proves that a real Load Save can preserve Scene/SceneInfo/Camera/Depth/Velocity/Color identity, render size, and render-frame continuity while still producing large camera-history discontinuities. Translation alone is not a safe reset heuristic; rotation separates strongly in this run, but no threshold is frozen. Capture 21 proves SceneInfo.old_view_projection_matrix does not expose a Load Save reset signal. Capture 22 then closes the current Load Save reset gate: two independent loads repeat the same SceneLoadZone pause window, history remains unstable after pause release, and GameSituation inhibit restoration marks the stable post-load return; the final quit path provides a negative control without a SceneLoadZone pause rise. Capture 23 is prepared to begin Gate H by observing the active DIRECT queue's command-list submissions between the verified pre-Overlay boundary and Present. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
 
 Until the remaining gates are proven, the diagnostic stays passive and no production XeSS dispatch is enabled.
