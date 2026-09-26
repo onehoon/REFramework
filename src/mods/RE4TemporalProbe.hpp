@@ -41,6 +41,10 @@ private:
     void log_command_list_interfaces(ID3D12CommandList* command_list);
     bool ensure_recording_function_hooks(ID3D12CommandList* command_list);
     void release_recording_function_hooks();
+    bool ensure_bridge_order_resources();
+    void release_bridge_order_resources();
+    bool submit_bridge_order_empty_list(uint32_t sample, uint32_t frame);
+    bool is_bridge_order_list(ID3D12CommandList* command_list) const;
     bool ensure_execution_queue_hook();
     void release_execution_queue_hook();
     bool ensure_resource_command_list_hook(ID3D12GraphicsCommandList* command_list);
@@ -84,6 +88,7 @@ private:
     re4_temporal_probe::FrameBudget m_resource_state_budget;
     re4_temporal_probe::FrameBudget m_interface_provenance_budget;
     re4_temporal_probe::FrameBudget m_recording_function_budget;
+    re4_temporal_probe::FrameBudget m_bridge_order_budget;
 
     bool m_reset_witness_valid{false};
     uint32_t m_reset_previous_frame{0};
@@ -193,6 +198,26 @@ private:
     std::atomic<uintptr_t> m_recording_velocity{0};
     uint32_t m_recording_last_submit_frame{0};
     uint32_t m_recording_submit_ordinal{0};
+
+    struct BridgeOrderSlot {
+        Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator{};
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> command_list{};
+        UINT64 fence_value{0};
+    };
+
+    std::mutex m_bridge_order_mutex{};
+    std::array<BridgeOrderSlot, re4_temporal_probe::BRIDGE_ORDER_SLOT_COUNT>
+        m_bridge_order_slots{};
+    Microsoft::WRL::ComPtr<ID3D12Fence> m_bridge_order_fence{};
+    UINT64 m_bridge_order_next_fence_value{0};
+    uint32_t m_bridge_order_next_slot{0};
+    std::atomic<bool> m_bridge_order_capture_open{false};
+    std::atomic<uint32_t> m_bridge_order_boundary_frame{0};
+    std::atomic<uint32_t> m_bridge_order_boundary_sample{0};
+    std::atomic<uint64_t> m_bridge_order_submitted_count{0};
+    std::atomic<uint64_t> m_bridge_order_skipped_count{0};
+    uint32_t m_bridge_order_last_submit_frame{0};
+    uint32_t m_bridge_order_submit_ordinal{0};
 
     std::atomic<uintptr_t> m_camera_ptr{0};
     std::atomic<uint32_t> m_camera_frame{0};
