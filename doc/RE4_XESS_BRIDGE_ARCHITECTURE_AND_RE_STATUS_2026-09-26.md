@@ -879,7 +879,7 @@ The 2560x1440 sample coordinates are:
 
 To avoid diagnostic barriers on game-owned temporal input:
 
-1. `on_pre_overlay_layer_draw()` obtains the current VelocityTarget engine Texture;
+1. `on_overlay_layer_draw()` obtains the current VelocityTarget engine Texture after the original Overlay draw; this mirrors the historical pd-upscaler Depth/MV snapshot callback;
 2. a **disposable diagnostic Texture clone** is created for that sample;
 3. RE Engine `RenderContext::copy_texture` copies VelocityTarget into the clone;
 4. the original game VelocityTarget is not transitioned or barriered by diagnostic D3D12 code;
