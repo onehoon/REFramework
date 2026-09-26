@@ -1,13 +1,50 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 
 namespace re4_temporal_probe {
 inline constexpr uint32_t MAX_TEMPORAL_SAMPLES = 32;
+inline constexpr uint32_t JITTER_PHASE_COUNT = 4;
+
+struct JitterOffset {
+    float x{};
+    float y{};
+};
+
+inline constexpr std::array<JitterOffset, JITTER_PHASE_COUNT> TEST_JITTER_PIXELS{{
+    {+0.5f, +0.5f},
+    {-0.5f, +0.5f},
+    {-0.5f, -0.5f},
+    {+0.5f, -0.5f},
+}};
+
+inline constexpr JitterOffset jitter_pixels_for_sample(uint32_t sample) noexcept {
+    if (sample == 0) {
+        return {};
+    }
+
+    return TEST_JITTER_PIXELS[(sample - 1) % JITTER_PHASE_COUNT];
+}
+
+inline constexpr JitterOffset projection_jitter_from_pixels(
+    JitterOffset pixel_jitter,
+    uint32_t render_width,
+    uint32_t render_height) noexcept {
+    if (render_width == 0 || render_height == 0) {
+        return {};
+    }
+
+    // Historical REFramework temporal-upscaler convention.
+    return {
+        2.0f * pixel_jitter.x / static_cast<float>(render_width),
+        -2.0f * pixel_jitter.y / static_cast<float>(render_height),
+    };
+}
 
 // Defense in depth: the diagnostic and future bridge are RE4-only.
-inline constexpr bool should_process_scene_update(
+inline constexpr bool should_process_scene(
     bool is_re4,
     bool capture_enabled,
     const void* scene) noexcept {
