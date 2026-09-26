@@ -68,6 +68,19 @@ int main() {
     CHECK(std::abs(candidate.x - 12.8f) < 0.0001f);
     CHECK(std::abs(candidate.y - 14.4f) < 0.0001f);
 
+    CHECK(!valid_clip_planes(0.0f, 1000.0f));
+    CHECK(!valid_clip_planes(1.0f, 1.0f));
+    CHECK(valid_clip_planes(0.01f, 10000.0f));
+
+    const auto normal_depth = normal_depth_terms(0.01f, 10000.0f);
+    const auto inverted_depth = inverted_depth_terms(0.01f, 10000.0f);
+    CHECK(std::abs(normal_depth.p22 + 1.000001f) < 0.000001f);
+    CHECK(std::abs(normal_depth.p32 + 0.01000001f) < 0.000001f);
+    CHECK(std::abs(inverted_depth.p22 - 0.000001f) < 0.000001f);
+    CHECK(std::abs(inverted_depth.p32 - 0.01000001f) < 0.000001f);
+    CHECK(depth_terms_error(normal_depth, normal_depth) == 0.0f);
+    CHECK(depth_terms_error(inverted_depth, normal_depth) > 1.0f);
+
     const ScreenPoint pixel{640.0f, 360.0f};
     const auto ndc = pixel_to_ndc(pixel, 2560, 1440);
     CHECK(std::abs(ndc.x + 0.5f) < 0.000001f);
