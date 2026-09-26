@@ -422,6 +422,13 @@ void RE4TemporalProbe::on_draw_ui() {
         return;
     }
 
+    if (m_mv_readback_failed) {
+        m_enabled.store(false, std::memory_order_relaxed);
+        ImGui::TextWrapped(
+            "Sparse MV readback failed closed. Restart or a D3D12 device reset is required before retrying.");
+        return;
+    }
+
     bool enabled = m_enabled.load(std::memory_order_relaxed);
     if (ImGui::Checkbox("Enable jitter + sparse MV readback test (default off)", &enabled)) {
         reset_temporal_state();
