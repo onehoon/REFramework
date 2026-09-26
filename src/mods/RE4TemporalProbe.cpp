@@ -13,7 +13,6 @@
 #include <sdk/GameIdentity.hpp>
 #include <sdk/Math.hpp>
 #include <sdk/SceneManager.hpp>
-#include <sdk/REGlobals.hpp>
 #include <sdk/RETypeDB.hpp>
 
 #include "REFramework.hpp"
@@ -318,6 +317,24 @@ IntegralFieldValue read_integral_field(
         .width = width,
         .bits = bits,
     };
+}
+
+REManagedObject* get_load_state_singleton(std::string_view type_name) {
+    using Getter = REManagedObject* (*)();
+    static std::unordered_map<std::string, Getter> getters{};
+
+    const auto key = std::string{type_name};
+    if (const auto it = getters.find(key); it != getters.end()) {
+        return it->second != nullptr ? it->second() : nullptr;
+    }
+
+    auto* type = sdk::find_type_definition(type_name);
+    auto getter = type != nullptr
+        ? reinterpret_cast<Getter>(sdk::find_native_method(type, "get_Instance"))
+        : nullptr;
+
+    getters.emplace(key, getter);
+    return getter != nullptr ? getter() : nullptr;
 }
 }
 
@@ -900,11 +917,10 @@ void RE4TemporalProbe::on_scene_layer_update(sdk::renderer::layer::Scene* layer,
         uint32_t changed_field_count = 0;
         uint32_t object_change_count = 0;
 
-        auto& globals = reframework::get_globals();
         for (const auto* manager_name : LOAD_STATE_SINGLETONS) {
             REManagedObject* object = nullptr;
             try {
-                object = globals != nullptr ? globals->get(manager_name) : nullptr;
+                object = get_load_state_singleton(manager_name);
             } catch (...) {
                 object = nullptr;
             }
