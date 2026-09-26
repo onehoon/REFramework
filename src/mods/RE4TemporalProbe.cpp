@@ -16,10 +16,12 @@
 #include "REFramework.hpp"
 
 namespace {
-constexpr std::array<const char*, 6> SCENARIOS{
+constexpr std::array<const char*, 8> SCENARIOS{
     "Static screen",
     "Camera pan right",
     "Camera pan left",
+    "Camera pan up",
+    "Camera pan down",
     "Character motion",
     "HUD/menu on",
     "HUD/menu off",
@@ -461,7 +463,7 @@ void RE4TemporalProbe::on_draw_ui() {
         m_temporal_budget.sample_count(),
         re4_temporal_probe::MAX_TEMPORAL_SAMPLES);
     ImGui::TextWrapped(
-        "RE4-only diagnostic. For Camera pan right/left, samples 1-4 are warm-up and samples 5-20 "
+        "RE4-only diagnostic. For Camera pan right/left/up/down, samples 1-4 are warm-up and samples 5-20 "
         "read a 3x3 VelocityTarget grid. Pan continuously in the selected direction during capture. "
         "Historical W/2,-H/2 motion scaling is logged as a candidate only.");
 
