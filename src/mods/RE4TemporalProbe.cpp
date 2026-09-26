@@ -2709,6 +2709,11 @@ void RE4TemporalProbe::on_draw_ui() {
             "Bridge-order samples: %u / %u",
             m_bridge_order_budget.sample_count(),
             re4_temporal_probe::BRIDGE_ORDER_MAX_SAMPLES);
+    } else if (re4_temporal_probe::is_output_copy_scenario(scenario)) {
+        ImGui::Text(
+            "Output-copy samples: %u / %u",
+            m_output_copy_budget.sample_count(),
+            re4_temporal_probe::OUTPUT_COPY_MAX_SAMPLES);
     } else {
         ImGui::Text(
             "Jitter samples: %u / %u",
@@ -2717,11 +2722,10 @@ void RE4TemporalProbe::on_draw_ui() {
     }
 
     ImGui::TextWrapped(
-        "RE4-only diagnostic. Capture 26 proves the real repeated recording path uses legacy ResourceBarrier and "
-        "closes the pre-Overlay Color/Depth/Velocity input states. For Gate H Capture 27, select D3D12 bridge "
-        "ordering. The probe submits one REFramework-owned EMPTY DIRECT command list at pre-Overlay using an "
-        "8-slot allocator/list ring and fence-completion-only reuse. It records ordering only: no resource "
-        "barrier, copy, draw, dispatch, or XeSS call is recorded in the bridge list.");
+        "RE4-only diagnostic. Capture 27 closes Gate H command-list ownership/order. For Gate I Capture 28, "
+        "select D3D12 output copy provenance. The probe remains observe-only and follows CopyTextureRegion/"
+        "CopyResource edges beginning at the verified HDR/PostMain Color resource, including whether the chain "
+        "reaches an active swapchain buffer. It records no GPU work and does not replace any target.");
 
     if (ImGui::Button("Reset capture")) {
         reset_temporal_state();
@@ -2812,7 +2816,8 @@ void RE4TemporalProbe::on_scene_layer_update(sdk::renderer::layer::Scene* layer,
         re4_temporal_probe::is_resource_state_scenario(scenario_index) ||
         re4_temporal_probe::is_interface_provenance_scenario(scenario_index) ||
         re4_temporal_probe::is_recording_function_scenario(scenario_index) ||
-        re4_temporal_probe::is_bridge_order_scenario(scenario_index)) {
+        re4_temporal_probe::is_bridge_order_scenario(scenario_index) ||
+        re4_temporal_probe::is_output_copy_scenario(scenario_index)) {
         ensure_execution_queue_hook();
         return;
     }
@@ -3385,7 +3390,8 @@ bool RE4TemporalProbe::on_pre_scene_layer_draw(sdk::renderer::layer::Scene* laye
         re4_temporal_probe::is_resource_state_scenario(scenario) ||
         re4_temporal_probe::is_interface_provenance_scenario(scenario) ||
         re4_temporal_probe::is_recording_function_scenario(scenario) ||
-        re4_temporal_probe::is_bridge_order_scenario(scenario)) {
+        re4_temporal_probe::is_bridge_order_scenario(scenario) ||
+        re4_temporal_probe::is_output_copy_scenario(scenario)) {
         return true;
     }
 
