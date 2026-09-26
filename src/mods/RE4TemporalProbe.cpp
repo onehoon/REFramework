@@ -1487,6 +1487,86 @@ void STDMETHODCALLTYPE RE4TemporalProbe::execute_command_lists_hook(
                     static_cast<void*>(list),
                     static_cast<uint32_t>(list->GetType()));
             }
+        } else if (re4_temporal_probe::is_recording_function_scenario(scenario) &&
+                   self->m_recording_capture_open.load(std::memory_order_relaxed)) {
+            auto* renderer = sdk::renderer::get_renderer();
+            const auto render_frame =
+                renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
+            const auto boundary_frame =
+                self->m_recording_boundary_frame.load(std::memory_order_relaxed);
+            const auto boundary_sample =
+                self->m_recording_boundary_sample.load(std::memory_order_relaxed);
+            const auto queue_desc =
+                queue != nullptr ? queue->GetDesc() : D3D12_COMMAND_QUEUE_DESC{};
+
+            uint32_t ordinal = 0;
+            if (render_frame.has_value()) {
+                std::scoped_lock lock{self->m_recording_mutex};
+                if (self->m_recording_last_submit_frame != *render_frame) {
+                    self->m_recording_last_submit_frame = *render_frame;
+                    self->m_recording_submit_ordinal = 0;
+                }
+                ordinal = ++self->m_recording_submit_ordinal;
+            }
+
+            const auto after_boundary =
+                render_frame.has_value() &&
+                boundary_frame != 0 &&
+                *render_frame == boundary_frame;
+
+            spdlog::info(
+                "[RE4TemporalProbe] recordingSubmit renderFrame={} ordinal={} "
+                "boundarySample={} boundaryFrame={} afterBoundary={} "
+                "queue={:p} queueType={} numLists={} thread={}",
+                render_frame.value_or(0),
+                ordinal,
+                boundary_sample,
+                boundary_frame,
+                after_boundary,
+                static_cast<void*>(queue),
+                static_cast<uint32_t>(queue_desc.Type),
+                num_command_lists,
+                GetCurrentThreadId());
+
+            for (UINT i = 0; i < num_command_lists; ++i) {
+                auto* list = command_lists != nullptr ? command_lists[i] : nullptr;
+                if (list == nullptr ||
+                    list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+                    continue;
+                }
+
+                const auto key = reinterpret_cast<uintptr_t>(list);
+                {
+                    std::scoped_lock lock{self->m_recording_mutex};
+                    self->m_recording_tracked_lists.insert(key);
+                    self->m_recording_list_states.try_emplace(key);
+                }
+
+                const auto hooks_ready =
+                    self->ensure_recording_function_hooks(list);
+
+                uint64_t generation = 0;
+                size_t tracked_lists = 0;
+                {
+                    std::scoped_lock lock{self->m_recording_mutex};
+                    if (const auto it = self->m_recording_list_states.find(key);
+                        it != self->m_recording_list_states.end()) {
+                        generation = it->second.generation;
+                    }
+                    tracked_lists = self->m_recording_tracked_lists.size();
+                }
+
+                spdlog::info(
+                    "[RE4TemporalProbe] recordingSubmitList renderFrame={} ordinal={} "
+                    "index={} list={:p} generation={} hooksReady={} trackedLists={}",
+                    render_frame.value_or(0),
+                    ordinal,
+                    i,
+                    static_cast<void*>(list),
+                    generation,
+                    hooks_ready,
+                    tracked_lists);
+            }
         } else if (re4_temporal_probe::is_resource_state_scenario(scenario)) {
             const auto sample = self->m_resource_boundary_sample.load(std::memory_order_relaxed);
             const auto boundary_frame = self->m_resource_boundary_frame.load(std::memory_order_relaxed);
@@ -2066,7 +2146,8 @@ void RE4TemporalProbe::on_scene_layer_update(sdk::renderer::layer::Scene* layer,
     const auto scenario_index = m_scenario.load(std::memory_order_relaxed);
     if (re4_temporal_probe::is_execution_order_scenario(scenario_index) ||
         re4_temporal_probe::is_resource_state_scenario(scenario_index) ||
-        re4_temporal_probe::is_interface_provenance_scenario(scenario_index)) {
+        re4_temporal_probe::is_interface_provenance_scenario(scenario_index) ||
+        re4_temporal_probe::is_recording_function_scenario(scenario_index)) {
         ensure_execution_queue_hook();
         return;
     }
@@ -2637,7 +2718,8 @@ bool RE4TemporalProbe::on_pre_scene_layer_draw(sdk::renderer::layer::Scene* laye
         re4_temporal_probe::is_load_state_scenario(scenario) ||
         re4_temporal_probe::is_execution_order_scenario(scenario) ||
         re4_temporal_probe::is_resource_state_scenario(scenario) ||
-        re4_temporal_probe::is_interface_provenance_scenario(scenario)) {
+        re4_temporal_probe::is_interface_provenance_scenario(scenario) ||
+        re4_temporal_probe::is_recording_function_scenario(scenario)) {
         return true;
     }
 
