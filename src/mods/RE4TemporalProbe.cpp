@@ -193,7 +193,7 @@ void RE4TemporalProbe::release_mv_readback_resources() {
 }
 
 void RE4TemporalProbe::perform_mv_readback() {
-    if (!m_velocity_copy_ready || m_velocity_copy == nullptr) {
+    if (!m_velocity_copy_ready || m_velocity_copy == nullptr || m_mv_readback_failed) {
         return;
     }
 
@@ -317,21 +317,34 @@ void RE4TemporalProbe::perform_mv_readback() {
     queue->ExecuteCommandLists(1, lists);
 
     const auto fence_value = ++m_mv_fence_value;
-    if (FAILED(queue->Signal(m_mv_fence.Get(), fence_value)) ||
-        FAILED(m_mv_fence->SetEventOnCompletion(fence_value, m_mv_fence_event))) {
-        spdlog::error("[RE4TemporalProbe] mvReadback failed to arm completion fence");
-        finish();
+    const auto signal_result = queue->Signal(m_mv_fence.Get(), fence_value);
+    const auto event_result = SUCCEEDED(signal_result)
+        ? m_mv_fence->SetEventOnCompletion(fence_value, m_mv_fence_event)
+        : signal_result;
+
+    if (FAILED(signal_result) || FAILED(event_result)) {
+        spdlog::error(
+            "[RE4TemporalProbe] mvReadback failed to arm completion fence signal=0x{:08x} event=0x{:08x}; "
+            "probe disabled and resources retained until device reset",
+            static_cast<uint32_t>(signal_result),
+            static_cast<uint32_t>(event_result));
+        m_mv_readback_failed = true;
+        m_enabled.store(false, std::memory_order_relaxed);
+        m_velocity_copy_ready = false;
         return;
     }
 
     const auto wait_result = WaitForSingleObject(m_mv_fence_event, 500);
     if (wait_result != WAIT_OBJECT_0) {
         spdlog::error(
-            "[RE4TemporalProbe] mvReadback sample={} frame={} fence wait failed result={}",
+            "[RE4TemporalProbe] mvReadback sample={} frame={} fence wait failed result={}; "
+            "probe disabled and resources retained until device reset",
             m_velocity_copy_sample,
             m_velocity_copy_frame,
             wait_result);
-        finish();
+        m_mv_readback_failed = true;
+        m_enabled.store(false, std::memory_order_relaxed);
+        m_velocity_copy_ready = false;
         return;
     }
 
@@ -404,7 +417,7 @@ void RE4TemporalProbe::on_draw_ui() {
     }
 
     bool enabled = m_enabled.load(std::memory_order_relaxed);
-    if (ImGui::Checkbox("Enable deterministic jitter injection test (default off)", &enabled)) {
+    if (ImGui::Checkbox("Enable jitter + sparse MV readback test (default off)", &enabled)) {
         reset_temporal_state();
         m_enabled.store(enabled, std::memory_order_relaxed);
         spdlog::info("[RE4TemporalProbe] deterministic jitter test {}", enabled ? "enabled" : "disabled");
@@ -795,8 +808,9 @@ bool RE4TemporalProbe::on_pre_overlay_layer_draw(
 
 void RE4TemporalProbe::on_present() {
     // Drain any snapshot that was already queued by the engine even if the user
-    // toggled the diagnostic off before Present.
-    if (m_velocity_copy_ready) {
+    // toggled the diagnostic off before Present. After a post-submit fence failure,
+    // fail closed and retain GPU-referenced resources until device reset.
+    if (m_velocity_copy_ready && !m_mv_readback_failed) {
         perform_mv_readback();
     }
 }
@@ -804,6 +818,7 @@ void RE4TemporalProbe::on_present() {
 void RE4TemporalProbe::on_device_reset() {
     m_velocity_copy_ready = false;
     m_velocity_copy = nullptr;
+    m_mv_readback_failed = false;
     release_mv_readback_resources();
     reset_temporal_state();
 }
