@@ -96,7 +96,7 @@ bool RE4TemporalProbe::ensure_mv_readback_resources() {
         m_mv_readback_buffer != nullptr &&
         m_mv_fence != nullptr &&
         m_mv_fence_event != nullptr) {
-        return;
+        return true;
     }
 
     if (g_framework == nullptr || !g_framework->is_dx12()) {
