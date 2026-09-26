@@ -2417,7 +2417,7 @@ queue Signal(fence, newValue)
 
 No resource is referenced by the list.
 
-A failed queue Signal permanently retains that slot for the remainder of the diagnostic session rather than risking unsafe reuse.
+A failed command-list Reset, Close, or queue Signal permanently retains that slot for the remainder of the diagnostic session rather than risking unsafe reuse.
 
 #### Capture records
 
