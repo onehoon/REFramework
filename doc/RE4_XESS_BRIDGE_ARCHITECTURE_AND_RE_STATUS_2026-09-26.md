@@ -1221,44 +1221,159 @@ motionScaleY = -renderHeight / 2            STRONGLY SUPPORTED, not closed
 MV <-> camera-matrix temporal alignment     ACTIVE
 ~~~
 
-### Capture 18 objective — MV/camera temporal alignment
+### Capture 18 — MV scale closed; fixed temporal offset rejected as the primary residual source
 
-Before adding Depth to the witness, isolate the exact matrix-pair timing used by VelocityTarget.
-
-The diagnostic now computes and logs the rotation-only reprojection for **every directional sample with valid history**, not only samples 5-20. Each point records the exact matrix pair:
+Capture 18 exercised the adjacent-frame reprojection witness across 26 repeated directional runs:
 
 ~~~text
-rotationReprojection
-    previousFrame=<P>
-    currentFrame=<C>
-    point=<0..8>
-    pixels={x=...,y=...}
+Camera pan right: 11 runs
+Camera pan left:   7 runs
+Camera pan up:     4 runs
+Camera pan down:   4 runs
+
+Total runs:        26
+jitterFrame:       814
+jitterDrawCheck:   814 / 814 allVariantsMatch=true
+MV readback:       410 frames
+MV sparse texels:  3,690
+rotation witness:  7,092 / 7,092 valid
+probe MV errors:   0
 ~~~
 
-The MV readback still captures samples 5-20 and records the same-frame pair attached at snapshot time. Because reprojection continues outside the readback window, offline analysis can compare one MV frame N against adjacent matrix-pair candidates without delaying or retaining VelocityTarget:
+One Right run was interactively reset at sample 14; the next run began immediately. This does not affect the usable sustained-motion evidence.
+
+The Capture 17 procedure clarification still applies: clicking the REFramework reset control can briefly interrupt held gameplay camera input. Initial zero/low-motion frames are therefore excluded from scale judgment rather than treated as failed directional runs.
+
+The temporal-alignment comparison tested one MV frame N against adjacent camera-matrix pairs:
 
 ~~~text
-prior pair:     currentFrame = N - 1
-same-frame pair currentFrame = N
-next pair:      previousFrame = N   (currentFrame = N + 1)
+prior pair:      currentFrame = N - 1
+same-frame pair: currentFrame = N
+next pair:       previousFrame = N  (currentFrame = N + 1)
 ~~~
 
-Capture 18 procedure:
+Result:
 
-1. hold one camera direction continuously before resetting the capture;
-2. click **Reset directional capture** once;
-3. expect a short zero/low-motion interval from the UI click;
-4. do not treat that interval as a failed direction;
-5. evaluate only the resumed sustained-motion interval;
-6. join MV and reprojection records by their explicit frame IDs;
-7. compare the prior/same/next adjacent matrix pairs on the dominant axis for both signs and both axes.
+- no single prior/same/next alignment explains all active-motion residuals;
+- extending the comparison beyond +/-1 frame likewise does not produce one global fixed lag;
+- therefore the remaining disagreement is not primarily a constant MV-vs-camera frame offset.
 
-Decision rule:
+More importantly, clean rotation-dominated regions repeatedly converge to approximately 1:1 agreement with the historical pixel conversion on both axes and both signs.
 
-- if one temporal alignment consistently brings the historical candidate and rotation-only witness into approximately 1:1 agreement across broad static-background points for both X and Y, close W/2,-H/2 and record the discovered frame relationship;
-- if no adjacent pair resolves the active-motion disagreement, then advance to a paired sparse Depth + full world-position reprojection witness to account for camera translation/parallax.
+Representative horizontal evidence:
 
-Depth readback is therefore **deferred**, not discarded. Temporal alignment is the narrower unanswered question and should be exhausted first.
+~~~text
+Right run 5  best dominant-axis ratio ~= 0.994
+Right run 9  same-frame ratio         ~= 0.945
+Left run 13 prior-pair ratio          ~= 0.951
+Left run 16 same-frame ratio          ~= 0.957
+~~~
+
+In especially clean spatial runs, the full 3x3 grid clusters near 1.0. Left run 16 produced approximately:
+
+~~~text
+0.945  0.964  0.976
+0.954  0.968  0.980
+0.945  0.954  0.964
+~~~
+
+Representative vertical samples also repeatedly converge near 1.0, including Up/Down samples around 0.96-1.03 and a Down sequence around 1.018 / 0.995 / 0.985.
+
+Conversely, some runs show large spatial variation within the same frame and same temporal alignment. A global scale error or fixed temporal offset cannot produce that screen-position-dependent pattern.
+
+The residual pattern is therefore consistent with components intentionally omitted by the rotation-only witness, such as third-person camera translation/orbit, depth-dependent parallax, foreground/player motion, and independently moving geometry. Proving those components individually is no longer necessary to determine the XeSS motion-vector scale.
+
+Capture 18 closes the historical scale:
+
+~~~text
+motionScaleX =  renderWidth / 2
+motionScaleY = -renderHeight / 2
+~~~
+
+Gate D is now CLOSED. Sparse Depth + full world-position reprojection is no longer required as an MV-scale gate.
+
+### OptiScaler DepthInverted behavior — source verification
+
+Upstream OptiScaler master was inspected at source snapshot:
+
+~~~text
+optiscaler/OptiScaler
+commit: 44cfee4d436857742a9bf71bbe81396ec9989715
+~~~
+
+For the XeSS D3D12 input path, OptiScaler/inputs/XeSS_Dx12.cpp checks the producer-provided XeSS initialization flags:
+
+~~~text
+XESS_INIT_FLAG_INVERTED_DEPTH
+    -> NVSDK_NGX_DLSS_Feature_Flags_DepthInverted
+~~~
+
+OptiScaler/upscalers/IFeature.cpp then uses that incoming feature flag unless the user explicitly overrides DepthInverted in OptiScaler config. When FGInput=Upscaler, the resulting upscaler DepthInverted state is copied into FGXeFGDepthInverted, so the producer's depth convention propagates into XeFG automatically.
+
+This means:
+
+> OptiScaler auto is not depth-texture content detection. For a standard XeSS producer, auto means the depth convention is inherited from the producer's XESS_INIT_FLAG_INVERTED_DEPTH path, with optional user override.
+
+The XeFG config also has its own default, but that does not remove the producer responsibility for standard XeSS SR. REFramework must still initialize XeSS with the correct current-build depth convention.
+
+Intel XeSS SR likewise defines normal depth as the default and requires XESS_INIT_FLAG_INVERTED_DEPTH when larger depth values represent nearer geometry.
+
+### Capture 19 objective — close Depth convention and camera projection metadata
+
+Capture 12 already observed a highly suggestive exact relationship:
+
+~~~text
+Camera projection:
+    p22 ~= -1.000000954
+    p32 ~= -0.010000009
+
+SceneInfo projection:
+    p22 ~= +0.000000954
+    p32 ~= +0.010000009
+~~~
+
+This resembles the same near/far pair encoded once as normal D3D depth and once as reversed/inverted D3D depth.
+
+Capture 19 narrows this to a direct coefficient proof rather than adding a GPU Depth readback.
+
+The probe now reads the primary via.Camera near/far clip planes through reflected engine methods and, on the same render frame, logs:
+
+~~~text
+camera near / far
+Camera projection p22 / p23 / p32 / p33
+SceneInfo projection p22 / p23 / p32 / p33 / p11
+expected normal-depth p22 / p32 from near/far
+expected inverted-depth p22 / p32 from near/far
+Camera error vs normal / inverted
+SceneInfo error vs normal / inverted
+sceneDepthInference
+verticalFovRadians = 2 * atan(1 / SceneInfo projection[1][1])
+~~~
+
+The expected right-handed D3D 0..1 depth terms are:
+
+~~~text
+normal:
+    p22 = far / (near - far)
+    p32 = far * near / (near - far)
+
+inverted:
+    p22 = near / (far - near)
+    p32 = far * near / (far - near)
+~~~
+
+Capture 19 procedure can be minimal:
+
+1. select Static screen;
+2. enable/reset the diagnostic;
+3. collect one complete 32-sample run;
+4. confirm cameraSameFrame=true and clipValid=true;
+5. confirm Camera projection matches the normal formula;
+6. confirm SceneInfo projection matches the inverted formula;
+7. confirm perspective structure p23/p33 is stable;
+8. confirm derived vertical FOV is finite/stable.
+
+If this relationship holds consistently, close Gate E and the projection portion of Gate F without a Depth texture readback. A sparse depth-content readback remains fallback-only if the projection/clip-plane evidence contradicts itself.
 
 The probe still does **not**:
 
@@ -1387,79 +1502,85 @@ The diagnostic four-phase sequence is only a validation pattern. Production jitt
 
 ### Gate D — Motion-vector semantics
 
-**Status: CHANNEL/SIGN/JITTER CLOSED; ABSOLUTE SCALE ACTIVE.**
+**Status: CLOSED by captures 14-18.**
 
-Verified:
-
-- Velocity resource identity and render-size alignment;
-- sparse clone/readback plumbing without diagnostic barriers on game-owned VelocityTarget;
-- bridge projection-jitter delta is excluded from sampled static motion vectors;
-- **R is horizontal/X motion**;
-- **G is vertical/Y motion**;
-- observed polarity:
-  - camera right -> R positive;
-  - camera left -> R negative;
-  - camera up -> G positive;
-  - camera down -> G negative;
-- historical TDB > 67 pd-upscaler passed the original R16G16B16A16_SNORM VelocityTarget directly.
-
-Current proven/candidate model:
+Verified production model:
 
 ~~~text
-R = X                                      PROVEN
-G = Y                                      PROVEN
-camera right/left polarity                 PROVEN
-camera up/down polarity                    PROVEN
-jitteredMotionVectors = false              PROVEN for tested path
+Velocity resource = Scene::VelocityTarget     PROVEN
+R = X                                         PROVEN
+G = Y                                         PROVEN
+camera right -> R positive                    PROVEN
+camera left  -> R negative                    PROVEN
+camera up    -> G positive                    PROVEN
+camera down  -> G negative                    PROVEN
+jitteredMotionVectors = false                 PROVEN for tested path
 
-motionScaleX candidate =  renderWidth / 2  PENDING absolute proof
-motionScaleY candidate = -renderHeight / 2 PENDING absolute proof
+motionScaleX =  renderWidth / 2                PROVEN
+motionScaleY = -renderHeight / 2               PROVEN
 ~~~
 
-Capture 16 closes the remaining channel/polarity question. Its active vertical frames showed G sign consistency of 42/42 for upward motion and 19/19 for downward motion while R remained much smaller.
+Evidence chain:
 
-Capture 17 validates the rotation-only witness plumbing and strongly supports the historical W/2,-H/2 scale, but it also exposes an unresolved timing variable. Initial zero/low-motion frames are explained by the REFramework Reset button temporarily interrupting held gameplay input and are not directional-test failures.
+- Capture 14 proves bridge projection-jitter delta is excluded from sampled static VelocityTarget.
+- Capture 15 closes R=X and horizontal polarity.
+- Capture 16 closes G=Y and vertical polarity.
+- Capture 17 introduces an independent rotation-only screen reprojection witness and strongly supports W/2,-H/2.
+- Capture 18 tests adjacent and wider temporal alignments, rejects one fixed MV/camera lag as the primary residual source, and shows repeated near-1:1 agreement on clean rotation-dominated pixels across both axes and both signs.
+- Spatially varying residuals within the same frame cannot be explained by a global scale error and are consistent with translation/parallax/foreground/object motion omitted by the rotation-only witness.
 
-Next controlled diagnostic:
-
-1. keep the existing 3x3 sparse MV readback for samples 5-20;
-2. compute/log the rotation-only witness for every directional sample with valid history;
-3. record exact previous/current frame IDs for each reprojection pair;
-4. ignore the short click-induced stop/restart interval;
-5. for each sustained-motion MV frame N, compare the prior/same/next adjacent camera-matrix pairs by explicit frame ID;
-6. require one consistent temporal alignment across right/left/up/down before promoting W/2,-H/2 to production values;
-7. only if adjacent-frame alignment does not explain the residuals, add sparse Depth and full translation/parallax-aware reprojection.
-
-This keeps Gate D focused on the narrowest remaining uncertainty and avoids adding depth-dependent machinery before matrix/MV frame correspondence is known.
+No further Depth-assisted reprojection work is required to determine the XeSS MV scale.
 
 ### Gate E — Depth convention
 
-Depth resource identity is strong.
+**Status: ACTIVE — Capture 19 prepared.**
 
-Still prove:
+Depth resource identity is already strong. The remaining requirement is to prove whether current RE4 SceneInfo/DepthStencilTex uses normal or reversed depth so the standard XeSS producer can set the correct initialization flag.
 
-- reversed/inverted depth or normal depth;
-- near/far mapping;
-- the correct XeSS depth flag.
+Important OptiScaler boundary:
 
-Do not inherit the historical flag without current-build evidence.
+- OptiScaler does not inspect depth content and automatically infer normal vs reversed depth for the XeSS producer path;
+- its XeSS hook reads XESS_INIT_FLAG_INVERTED_DEPTH supplied by the producer and maps that to its internal DepthInverted state;
+- user config can override it;
+- with FGInput=Upscaler, the upscaler state is propagated into XeFG automatically.
+
+Therefore REFramework remains responsible for setting the correct XeSS init flag.
+
+Capture 19 uses current-build camera near/far plus Camera/SceneInfo projection coefficients to distinguish the normal and inverted D3D formulas directly. Capture 12 already shows a strong normal-Camera / inverted-SceneInfo signature; the new witness makes the near/far relationship explicit.
+
+If Capture 19 consistently shows:
+
+~~~text
+Camera    ~= normal-depth coefficients
+SceneInfo ~= inverted-depth coefficients
+~~~
+
+then production XeSS must set:
+
+~~~text
+XESS_INIT_FLAG_INVERTED_DEPTH
+~~~
+
+A GPU Depth texture content readback is fallback-only if these coefficient relationships fail or become ambiguous.
 
 ### Gate F — Camera parameters
 
-Need current-build values for:
+**Status: ACTIVE — partially coupled to Capture 19.**
 
-- near plane;
-- far plane;
-- vertical FOV;
-- projection convention.
+Capture 19 also records:
 
-Historical formula:
+- current primary-camera near plane;
+- current primary-camera far plane;
+- stable perspective matrix structure;
+- vertical FOV derived from the unjittered SceneInfo projection:
 
 ~~~text
 verticalFov = 2 * atan(1 / projection[1][1])
 ~~~
 
-Use only after current matrix convention is verified.
+This is enough to validate the camera metadata that OptiScaler/XeFG may consume when FGInput=Upscaler.
+
+Note that native XeSS SR itself primarily needs the correct depth convention/init flag and temporal inputs; near/far/FOV are especially relevant to the downstream FG path and should still be normalized into the canonical temporal-frame contract.
 
 ### Gate G — Reset/history invalidation
 
@@ -1736,38 +1857,29 @@ display size = active DXGI swapchain/output size
 
 Color, Depth, and Velocity must continue to match the selected render size. Do not add `ImageQualityRate` control unless later runtime evidence requires it.
 
-### 18.3 Jitter and MV channel/sign semantics complete; resolve MV temporal alignment, then close scale
+### 18.3 Jitter and motion-vector semantics — complete
 
-Captures 12-17 establish:
+Captures 12-18 close:
 
 - native jitter baseline;
 - deterministic RE4 jitter injection;
 - history treatment;
 - sparse MV readback;
 - exclusion of jitter delta from MV;
-- R = X;
-- G = Y;
-- right/left polarity;
-- up/down polarity;
-- a valid independent rotation-only reprojection witness;
-- strong current-build support for W/2,-H/2.
+- R = X / G = Y;
+- both axis polarities;
+- motionScaleX = renderWidth / 2;
+- motionScaleY = -renderHeight / 2.
 
-Capture 17 also establishes a test-procedure artifact: clicking the REFramework reset button while a pan key is held briefly interrupts gameplay camera input. Initial zero/low-motion samples after Reset must therefore be ignored rather than classified as failed directional runs.
+The rotation-only witness is no longer a production dependency. It served as an independent proof tool.
 
-Next:
+### 18.4 Close depth convention + camera metadata
 
-1. log the rotation-only reprojection for every directional sample with exact previous/current frame IDs;
-2. keep MV readback on samples 5-20;
-3. use the resumed sustained-motion interval after the Reset click;
-4. compare each MV frame against prior/same/next adjacent camera-matrix pairs;
-5. close W/2,-H/2 only after one temporal relationship is consistent on both axes and both polarities;
-6. if temporal alignment is not sufficient, proceed to paired sparse Depth + full world-position reprojection.
+Capture 19 is now the next runtime test.
 
-No full-frame dump and no direct barrier on the original VelocityTarget.
+Use primary via.Camera near/far values and current SceneInfo projection coefficients to prove the D3D depth mapping and derive vertical FOV. Do not add a Depth texture readback unless coefficient evidence is ambiguous.
 
-### 18.4 Prove depth/camera/reset
-
-Close the remaining XeSS metadata contract.
+The standard XeSS producer must set XESS_INIT_FLAG_INVERTED_DEPTH itself when required. OptiScaler auto inherits the producer flag; it is not a substitute for producer-side depth-convention knowledge.
 
 ### 18.5 Prove command-list/state insertion
 
@@ -1845,7 +1957,7 @@ The RE4 bridge is ready to begin production XeSS dispatch only when all of the f
 
 The current project is **not yet at this gate**.
 
-The major resource and size-control uncertainty is now substantially closed: HDR/PostMain color, Depth, Velocity, the pre-Overlay engine boundary, SceneView-driven internal render size, Overlay working surfaces, and presentation output are mapped. MV channel mapping, both axis polarities, jitter exclusion, jitter injection mechanics, and rotation-only reprojection plumbing are also closed. Capture 17 strongly supports the historical W/2,-H/2 scale but leaves the exact VelocityTarget-to-camera-matrix frame relationship active. The remaining work is primarily MV temporal alignment/absolute scale, depth/camera semantics, execution ordering, output integration, and lifecycle.
+The major resource and size-control uncertainty is now substantially closed: HDR/PostMain color, Depth, Velocity, the pre-Overlay engine boundary, SceneView-driven internal render size, Overlay working surfaces, and presentation output are mapped. MV channel mapping, both axis polarities, jitter exclusion, jitter injection mechanics, and absolute W/2,-H/2 scale are now closed through Capture 18. The remaining work is primarily depth/camera semantics, reset/history rules, execution ordering, output integration, and lifecycle.
 
 ---
 
@@ -1877,6 +1989,6 @@ OutputTargetState
 swapchain backbuffers
 ~~~
 
-Capture 9 identifies on_pre_overlay_layer_draw() as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Capture 10 establishes the native-resolution baseline. Capture 11 then proves that overriding SceneView.get_Size to 1920x1080 moves Color, Depth, and Velocity together while the 2560x1440 DXGI output remains unchanged. Captures 12-16 close render/display control, jitter injection/history, MV jitter exclusion, R=X, G=Y, and both axis polarities. Capture 17 validates the independent rotation-only reprojection witness across 13 repeated directional runs and strongly supports W/2,-H/2, while also showing that the exact MV-to-camera-matrix temporal alignment must be resolved before absolute scale is declared closed. Initial zero/low-motion samples immediately after Reset are a known UI-click input-interruption artifact, not failed directional evidence. The next active MV gate is adjacent-frame temporal alignment by explicit frame IDs; sparse Depth/full reprojection is the fallback only if that narrower test does not resolve the residuals. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
+Capture 9 identifies on_pre_overlay_layer_draw() as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Capture 10 establishes the native-resolution baseline. Capture 11 then proves that overriding SceneView.get_Size to 1920x1080 moves Color, Depth, and Velocity together while the 2560x1440 DXGI output remains unchanged. Captures 12-16 close render/display control, jitter injection/history, MV jitter exclusion, R=X, G=Y, and both axis polarities. Capture 17 adds the independent rotation-only witness, and Capture 18 closes the absolute MV scale at W/2,-H/2 while rejecting one fixed MV/camera frame offset as the primary source of spatial residuals. Initial zero/low-motion samples immediately after Reset remain a known UI-click input-interruption artifact, not failed directional evidence. Gate D is now closed. The next active gate is Depth/camera projection semantics: Capture 19 will use reflected primary-camera near/far plus Camera/SceneInfo projection coefficients to determine the required XeSS inverted-depth flag and validate vertical FOV without adding a GPU Depth readback unless needed. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
 
 Until the remaining gates are proven, the diagnostic stays passive and no production XeSS dispatch is enabled.
