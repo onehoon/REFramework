@@ -44,6 +44,7 @@ private:
 
     std::array<Matrix4x4f, SCENE_INFO_COUNT> m_previous_projection{};
     std::array<Matrix4x4f, SCENE_INFO_COUNT> m_previous_view{};
+    std::array<uint32_t, SCENE_INFO_COUNT> m_previous_scene_frame{};
     std::array<bool, SCENE_INFO_COUNT> m_history_valid{};
 
     uint32_t m_expected_frame{0};
@@ -54,6 +55,7 @@ private:
     std::array<float, SCENE_INFO_COUNT> m_expected_p21{};
     std::array<re4_temporal_probe::MotionPixelCandidate, re4_temporal_probe::MV_SAMPLE_POINT_COUNT>
         m_expected_rotation_reprojection{};
+    uint32_t m_expected_rotation_reprojection_previous_frame{0};
     uint32_t m_expected_rotation_reprojection_frame{0};
     bool m_expected_rotation_reprojection_valid{false};
 
@@ -65,6 +67,7 @@ private:
     int m_velocity_copy_scenario{0};
     std::array<re4_temporal_probe::MotionPixelCandidate, re4_temporal_probe::MV_SAMPLE_POINT_COUNT>
         m_velocity_copy_rotation_reprojection{};
+    uint32_t m_velocity_copy_rotation_reprojection_previous_frame{0};
     bool m_velocity_copy_rotation_reprojection_valid{false};
     bool m_velocity_copy_ready{false};
     bool m_mv_readback_failed{false};
