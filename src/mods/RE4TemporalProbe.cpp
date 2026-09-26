@@ -1,5 +1,6 @@
 #include "RE4TemporalProbe.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -17,7 +18,7 @@
 #include "REFramework.hpp"
 
 namespace {
-constexpr std::array<const char*, 8> SCENARIOS{
+constexpr std::array<const char*, 9> SCENARIOS{
     "Static screen",
     "Camera pan right",
     "Camera pan left",
@@ -26,6 +27,7 @@ constexpr std::array<const char*, 8> SCENARIOS{
     "Character motion",
     "HUD/menu on",
     "HUD/menu off",
+    "Reset/history transition",
 };
 
 constexpr std::array<const char*, 6> SCENE_INFO_NAMES{
@@ -142,10 +144,65 @@ std::array<sdk::renderer::SceneInfo*, 6> scene_infos(sdk::renderer::layer::Scene
         layer->get_z_prepass_scene_info(),
     };
 }
+
+struct CameraPoseDelta {
+    bool valid{};
+    float translation{};
+    float rotation_degrees{};
+};
+
+CameraPoseDelta camera_pose_delta(
+    const Matrix4x4f& previous_view,
+    const Matrix4x4f& current_view) {
+    const auto previous_world = glm::inverse(previous_view);
+    const auto current_world = glm::inverse(current_view);
+
+    const glm::vec3 previous_position{previous_world[3]};
+    const glm::vec3 current_position{current_world[3]};
+    const auto translation = glm::length(current_position - previous_position);
+
+    auto previous_forward = glm::vec3(previous_world[2]);
+    auto current_forward = glm::vec3(current_world[2]);
+    const auto previous_length = glm::length(previous_forward);
+    const auto current_length = glm::length(current_forward);
+
+    if (!std::isfinite(translation) ||
+        previous_length < 0.000001f ||
+        current_length < 0.000001f) {
+        return {};
+    }
+
+    previous_forward /= previous_length;
+    current_forward /= current_length;
+
+    const auto dot = std::clamp(glm::dot(previous_forward, current_forward), -1.0f, 1.0f);
+    const auto rotation_radians = std::acos(dot);
+    if (!std::isfinite(rotation_radians)) {
+        return {};
+    }
+
+    return {
+        .valid = true,
+        .translation = translation,
+        .rotation_degrees = rotation_radians * 57.29577951308232f,
+    };
+}
 }
 
 void RE4TemporalProbe::reset_temporal_state() {
     m_temporal_budget.reset();
+    m_reset_watch_budget.reset();
+    m_reset_witness_valid = false;
+    m_reset_previous_frame = 0;
+    m_reset_previous_scene = 0;
+    m_reset_previous_scene_info = 0;
+    m_reset_previous_camera = 0;
+    m_reset_previous_depth = 0;
+    m_reset_previous_velocity = 0;
+    m_reset_previous_color = 0;
+    m_reset_previous_width = 0;
+    m_reset_previous_height = 0;
+    m_reset_previous_view = {};
     m_camera_ptr.store(0, std::memory_order_relaxed);
     m_camera_frame.store(0, std::memory_order_relaxed);
     m_camera_p20.store(0.0f, std::memory_order_relaxed);
@@ -567,13 +624,13 @@ void RE4TemporalProbe::on_draw_ui() {
         m_temporal_budget.sample_count(),
         re4_temporal_probe::MAX_TEMPORAL_SAMPLES);
     ImGui::TextWrapped(
-        "RE4-only diagnostic. For Camera pan right/left/up/down, samples 1-4 are warm-up and samples 5-20 "
-        "read a 3x3 VelocityTarget grid. Pan continuously in the selected direction during capture. "
-        "MV semantics are closed at W/2,-H/2. The probe now also logs primary Camera near/far and compares "
-        "Camera/SceneInfo Z-projection terms against normal and inverted D3D depth formulas. Static screen is "
-        "sufficient for the next depth-convention capture; directional MV readback remains available for regression.");
+        "RE4-only diagnostic. Gates D-F are closed. Directional scenarios retain the sparse MV regression path. "
+        "For Gate G, select Reset/history transition: this disables diagnostic jitter/readback and records up to "
+        "4096 consecutive frames of scene/camera/SceneInfo/resource identity, render-size changes, frame gaps, "
+        "and raw camera translation/rotation deltas. Trigger a checkpoint reload/load or a known camera cut while "
+        "the capture is active; no camera-cut threshold is assumed yet.");
 
-    if (ImGui::Button("Reset directional capture")) {
+    if (ImGui::Button("Reset capture")) {
         reset_temporal_state();
     }
 }
@@ -657,6 +714,94 @@ void RE4TemporalProbe::on_scene_layer_update(sdk::renderer::layer::Scene* layer,
         return;
     }
 
+    const auto scenario_index = m_scenario.load(std::memory_order_relaxed);
+    if (re4_temporal_probe::is_reset_history_scenario(scenario_index)) {
+        const auto watch_sample = m_reset_watch_budget.reserve_frame(
+            *frame,
+            re4_temporal_probe::RESET_WATCH_MAX_SAMPLES);
+        if (watch_sample == 0) {
+            return;
+        }
+
+        auto* scene_info = layer->get_scene_info();
+        auto* depth_resource = layer->get_depth_stencil_d3d12();
+        auto* velocity_resource = layer->get_motion_vectors_d3d12();
+        auto* color_resource = layer->get_post_main_target_d3d12();
+        const auto velocity = resource_shape(velocity_resource);
+
+        const auto current_scene = reinterpret_cast<uintptr_t>(layer);
+        const auto current_scene_info = reinterpret_cast<uintptr_t>(scene_info);
+        const auto current_camera = reinterpret_cast<uintptr_t>(scene_camera);
+        const auto current_depth = reinterpret_cast<uintptr_t>(depth_resource);
+        const auto current_velocity = reinterpret_cast<uintptr_t>(velocity_resource);
+        const auto current_color = reinterpret_cast<uintptr_t>(color_resource);
+        const auto current_width = static_cast<uint32_t>(velocity.width);
+        const auto current_height = velocity.height;
+
+        const auto first = !m_reset_witness_valid;
+        const auto frame_gap =
+            !first && m_reset_previous_frame != 0 && *frame != m_reset_previous_frame + 1;
+        const auto scene_changed = !first && current_scene != m_reset_previous_scene;
+        const auto scene_info_changed = !first && current_scene_info != m_reset_previous_scene_info;
+        const auto camera_changed = !first && current_camera != m_reset_previous_camera;
+        const auto depth_changed = !first && current_depth != m_reset_previous_depth;
+        const auto velocity_changed = !first && current_velocity != m_reset_previous_velocity;
+        const auto color_changed = !first && current_color != m_reset_previous_color;
+        const auto render_size_changed =
+            !first &&
+            (current_width != m_reset_previous_width || current_height != m_reset_previous_height);
+
+        CameraPoseDelta pose_delta{};
+        if (!first && scene_info != nullptr) {
+            pose_delta = camera_pose_delta(m_reset_previous_view, scene_info->view_matrix);
+        }
+
+        spdlog::info(
+            "[RE4TemporalProbe] resetWitness sample={} frame={} first={} frameGap={} "
+            "sceneChanged={} sceneInfoChanged={} cameraChanged={} depthChanged={} "
+            "velocityChanged={} colorChanged={} renderSizeChanged={} render={}x{} "
+            "poseValid={} translationDelta={:.9f} rotationDeltaDegrees={:.6f} "
+            "ptrs={{scene={:p},sceneInfo={:p},camera={:p},depth={:p},velocity={:p},color={:p}}}",
+            watch_sample,
+            *frame,
+            first,
+            frame_gap,
+            scene_changed,
+            scene_info_changed,
+            camera_changed,
+            depth_changed,
+            velocity_changed,
+            color_changed,
+            render_size_changed,
+            current_width,
+            current_height,
+            pose_delta.valid,
+            pose_delta.translation,
+            pose_delta.rotation_degrees,
+            static_cast<void*>(layer),
+            static_cast<void*>(scene_info),
+            static_cast<void*>(scene_camera),
+            static_cast<void*>(depth_resource),
+            static_cast<void*>(velocity_resource),
+            static_cast<void*>(color_resource));
+
+        m_reset_witness_valid = true;
+        m_reset_previous_frame = *frame;
+        m_reset_previous_scene = current_scene;
+        m_reset_previous_scene_info = current_scene_info;
+        m_reset_previous_camera = current_camera;
+        m_reset_previous_depth = current_depth;
+        m_reset_previous_velocity = current_velocity;
+        m_reset_previous_color = current_color;
+        m_reset_previous_width = current_width;
+        m_reset_previous_height = current_height;
+        if (scene_info != nullptr) {
+            m_reset_previous_view = scene_info->view_matrix;
+        }
+
+        return;
+    }
+
     const auto sample = m_temporal_budget.reserve_frame(*frame);
     if (sample == 0) {
         return;
@@ -683,7 +828,6 @@ void RE4TemporalProbe::on_scene_layer_update(sdk::renderer::layer::Scene* layer,
         return;
     }
 
-    const auto scenario_index = m_scenario.load(std::memory_order_relaxed);
     const auto scenario = scenario_name(scenario_index);
     const auto pixel_jitter = re4_temporal_probe::jitter_pixels_for_sample(sample);
     const auto matrix_jitter = re4_temporal_probe::projection_jitter_from_pixels(
