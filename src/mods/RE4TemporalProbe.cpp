@@ -470,6 +470,10 @@ bool RE4TemporalProbe::ensure_execution_queue_hook() {
 }
 
 void RE4TemporalProbe::release_execution_queue_hook() {
+    if (s_execution_probe_instance == this) {
+        s_execution_probe_instance = nullptr;
+    }
+
     m_execution_queue_hook.reset();
     m_execution_queue_original = nullptr;
     m_execution_boundary_frame.store(0, std::memory_order_relaxed);
@@ -2035,6 +2039,93 @@ void RE4TemporalProbe::on_overlay_layer_draw(
     }
 
     const auto scenario = m_scenario.load(std::memory_order_relaxed);
+    if (re4_temporal_probe::is_resource_state_scenario(scenario)) {
+        auto* renderer = sdk::renderer::get_renderer();
+        const auto frame = renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
+        if (!frame.has_value()) {
+            return;
+        }
+
+        const auto sample = m_resource_state_budget.reserve_frame(
+            *frame,
+            re4_temporal_probe::RESOURCE_STATE_MAX_SAMPLES);
+        if (sample == 0) {
+            m_resource_boundary_sample.store(0, std::memory_order_relaxed);
+            m_resource_boundary_frame.store(0, std::memory_order_relaxed);
+            return;
+        }
+
+        if (!ensure_execution_queue_hook()) {
+            spdlog::error(
+                "[RE4TemporalProbe] resourceBoundary sample={} frame={} queueHookUnavailable",
+                sample,
+                *frame);
+            return;
+        }
+
+        auto* scene = static_cast<sdk::renderer::layer::Scene*>(layer->get_parent());
+        auto* color = scene != nullptr ? scene->get_post_main_target_d3d12() : nullptr;
+        auto* hdr = scene != nullptr ? scene->get_hdr_target_d3d12() : nullptr;
+        auto* depth = scene != nullptr ? scene->get_depth_stencil_d3d12() : nullptr;
+        auto* velocity = scene != nullptr ? scene->get_motion_vectors_d3d12() : nullptr;
+
+        m_resource_color.store(reinterpret_cast<uintptr_t>(color), std::memory_order_relaxed);
+        m_resource_depth.store(reinterpret_cast<uintptr_t>(depth), std::memory_order_relaxed);
+        m_resource_velocity.store(reinterpret_cast<uintptr_t>(velocity), std::memory_order_relaxed);
+
+        const auto thread = GetCurrentThreadId();
+        uintptr_t active_list = 0;
+        uint64_t active_generation = 0;
+        uint64_t active_barrier_sequence = 0;
+        size_t tracked_lists = 0;
+        {
+            std::scoped_lock lock{m_resource_state_mutex};
+            const auto active = m_resource_active_by_thread.find(thread);
+            if (active != m_resource_active_by_thread.end()) {
+                active_list = active->second.first;
+                active_generation = active->second.second;
+
+                const auto tracked = m_resource_command_list_hooks.find(active_list);
+                if (tracked != m_resource_command_list_hooks.end() &&
+                    tracked->second.generation == active_generation) {
+                    active_barrier_sequence = tracked->second.target_barrier_sequence;
+                }
+            }
+            tracked_lists = m_resource_command_list_hooks.size();
+        }
+
+        auto& d3d12 = g_framework->get_d3d12_hook();
+        auto* queue = d3d12 != nullptr ? d3d12->get_command_queue() : nullptr;
+        const auto queue_desc = queue != nullptr ? queue->GetDesc() : D3D12_COMMAND_QUEUE_DESC{};
+        const auto submit_base = m_resource_submit_count.load(std::memory_order_relaxed);
+
+        m_resource_boundary_submit_base.store(submit_base, std::memory_order_relaxed);
+        m_resource_boundary_frame.store(*frame, std::memory_order_relaxed);
+        m_resource_boundary_sample.store(sample, std::memory_order_release);
+
+        spdlog::info(
+            "[RE4TemporalProbe] resourceBoundary sample={} frame={} stage=preOverlay "
+            "thread={} activeList={:p} activeGeneration={} activeBarrierSeq={} "
+            "trackedLists={} color={:p} hdr={:p} depth={:p} velocity={:p} "
+            "colorMatchesHDR={} queue={:p} queueType={} submitBase={}",
+            sample,
+            *frame,
+            thread,
+            reinterpret_cast<void*>(active_list),
+            active_generation,
+            active_barrier_sequence,
+            tracked_lists,
+            static_cast<void*>(color),
+            static_cast<void*>(hdr),
+            static_cast<void*>(depth),
+            static_cast<void*>(velocity),
+            color != nullptr && color == hdr,
+            static_cast<void*>(queue),
+            static_cast<uint32_t>(queue_desc.Type),
+            submit_base);
+        return;
+    }
+
     if (re4_temporal_probe::is_execution_order_scenario(scenario)) {
         auto* renderer = sdk::renderer::get_renderer();
         const auto frame = renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
@@ -2261,6 +2352,35 @@ void RE4TemporalProbe::on_present() {
             m_execution_boundary_frame.store(0, std::memory_order_relaxed);
         }
     }
+    if (m_enabled.load(std::memory_order_relaxed) &&
+        re4_temporal_probe::is_resource_state_scenario(
+            m_scenario.load(std::memory_order_relaxed))) {
+        const auto sample = m_resource_boundary_sample.load(std::memory_order_acquire);
+        const auto boundary_frame = m_resource_boundary_frame.load(std::memory_order_relaxed);
+        if (sample != 0 && boundary_frame != 0) {
+            const auto submit_count = m_resource_submit_count.load(std::memory_order_relaxed);
+            const auto submit_base = m_resource_boundary_submit_base.load(std::memory_order_relaxed);
+            size_t tracked_lists = 0;
+            {
+                std::scoped_lock lock{m_resource_state_mutex};
+                tracked_lists = m_resource_command_list_hooks.size();
+            }
+
+            spdlog::info(
+                "[RE4TemporalProbe] resourcePresent sample={} boundaryFrame={} "
+                "submitsSinceBoundary={} totalObservedSubmits={} trackedLists={} thread={}",
+                sample,
+                boundary_frame,
+                submit_count >= submit_base ? submit_count - submit_base : 0,
+                submit_count,
+                tracked_lists,
+                GetCurrentThreadId());
+
+            m_resource_boundary_sample.store(0, std::memory_order_release);
+            m_resource_boundary_frame.store(0, std::memory_order_relaxed);
+        }
+    }
+
 }
 
 void RE4TemporalProbe::on_device_reset() {
@@ -2268,6 +2388,7 @@ void RE4TemporalProbe::on_device_reset() {
     m_velocity_copy = nullptr;
     m_mv_readback_failed = false;
     release_mv_readback_resources();
+    release_resource_command_list_hooks();
     release_execution_queue_hook();
     reset_temporal_state();
 }
