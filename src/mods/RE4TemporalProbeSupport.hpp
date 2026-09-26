@@ -10,6 +10,7 @@ inline constexpr uint32_t MAX_NON_PRIMARY_SCENE_DIAGNOSTICS = 8;
 inline constexpr uint32_t MAX_SCENE_RTVS = 8;
 inline constexpr uint32_t MAX_POST_EFFECT_RTVS = 8;
 inline constexpr uint32_t MAX_OVERLAY_RTVS = 8;
+inline constexpr uintptr_t LAYER_PROVENANCE_SCAN_BYTES = 0x400;
 
 // Defense in depth: the diagnostic and the future bridge are RE4-only.
 // Registration is also gated in Mods.cpp, but callbacks must remain inert if
