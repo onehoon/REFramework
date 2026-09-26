@@ -37,6 +37,7 @@ private:
     bool ensure_mv_readback_resources();
     void release_mv_readback_resources();
     void perform_mv_readback();
+    void log_command_list_interfaces(ID3D12CommandList* command_list);
     bool ensure_execution_queue_hook();
     void release_execution_queue_hook();
     bool ensure_resource_command_list_hook(ID3D12GraphicsCommandList* command_list);
@@ -64,6 +65,7 @@ private:
     re4_temporal_probe::FrameBudget m_load_state_budget;
     re4_temporal_probe::FrameBudget m_execution_order_budget;
     re4_temporal_probe::FrameBudget m_resource_state_budget;
+    re4_temporal_probe::FrameBudget m_interface_provenance_budget;
 
     bool m_reset_witness_valid{false};
     uint32_t m_reset_previous_frame{0};
@@ -130,6 +132,14 @@ private:
     std::atomic<uintptr_t> m_resource_color{0};
     std::atomic<uintptr_t> m_resource_depth{0};
     std::atomic<uintptr_t> m_resource_velocity{0};
+
+    std::mutex m_interface_provenance_mutex{};
+    std::unordered_set<uintptr_t> m_interface_logged_lists{};
+    std::atomic<bool> m_interface_capture_open{false};
+    std::atomic<uint32_t> m_interface_boundary_frame{0};
+    std::atomic<uint32_t> m_interface_boundary_sample{0};
+    uint32_t m_interface_last_submit_frame{0};
+    uint32_t m_interface_submit_ordinal{0};
 
     std::atomic<uintptr_t> m_camera_ptr{0};
     std::atomic<uint32_t> m_camera_frame{0};
