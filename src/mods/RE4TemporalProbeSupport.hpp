@@ -7,6 +7,43 @@
 namespace re4_temporal_probe {
 inline constexpr uint32_t MAX_TEMPORAL_SAMPLES = 32;
 inline constexpr uint32_t JITTER_PHASE_COUNT = 4;
+inline constexpr uint32_t MAX_MV_READBACK_SAMPLES = 8;
+inline constexpr uint32_t MV_SAMPLE_GRID_SIZE = 3;
+inline constexpr uint32_t MV_SAMPLE_POINT_COUNT = MV_SAMPLE_GRID_SIZE * MV_SAMPLE_GRID_SIZE;
+inline constexpr uint64_t MV_READBACK_POINT_STRIDE = 512;
+inline constexpr uint64_t MV_READBACK_BUFFER_SIZE =
+    MV_SAMPLE_POINT_COUNT * MV_READBACK_POINT_STRIDE;
+
+struct MVSamplePoint {
+    uint32_t x{};
+    uint32_t y{};
+};
+
+inline constexpr MVSamplePoint mv_sample_point(
+    uint32_t index,
+    uint32_t width,
+    uint32_t height) noexcept {
+    if (index >= MV_SAMPLE_POINT_COUNT || width == 0 || height == 0) {
+        return {};
+    }
+
+    const auto column = index % MV_SAMPLE_GRID_SIZE;
+    const auto row = index / MV_SAMPLE_GRID_SIZE;
+
+    const auto x = ((column + 1) * width) / (MV_SAMPLE_GRID_SIZE + 1);
+    const auto y = ((row + 1) * height) / (MV_SAMPLE_GRID_SIZE + 1);
+
+    return {
+        x < width ? x : width - 1,
+        y < height ? y : height - 1,
+    };
+}
+
+inline constexpr float decode_snorm16(int16_t value) noexcept {
+    return value == INT16_MIN
+        ? -1.0f
+        : static_cast<float>(value) / 32767.0f;
+}
 
 struct JitterOffset {
     float x{};
