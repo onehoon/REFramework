@@ -884,7 +884,7 @@ To avoid diagnostic barriers on game-owned temporal input:
 3. RE Engine `RenderContext::copy_texture` copies VelocityTarget into the clone;
 4. the original game VelocityTarget is not transitioned or barriered by diagnostic D3D12 code;
 5. at Present, after the engine copy has been queued before the diagnostic command list, nine 1x1 texels are copied from the disposable clone into a small readback buffer;
-6. the diagnostic waits for its own fence, maps the readback buffer, logs the values, then releases the disposable clone.
+6. the diagnostic waits for its own fence, maps the readback buffer, logs the values, then releases the disposable clone; if command/fence completion cannot be proven, it fails closed, disables further readback, and retains GPU-referenced diagnostic resources until device reset.
 
 The initial diagnostic assumes the engine copy destination is in `COPY_DEST` when the disposable clone reaches the Present-side command list. That state assumption is confined to the disposable clone and is itself part of the readback-plumbing validation; it does not alter state tracking for the game's VelocityTarget.
 
