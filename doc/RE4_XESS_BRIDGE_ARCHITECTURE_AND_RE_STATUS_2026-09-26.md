@@ -260,7 +260,8 @@ This is the most important current reverse-engineering result.
 | Overlay main target | Native resource resolves to the same HDR/PostMain resource | **Verified** |
 | PrepareOutput output object | Current RE4 output object owns/contains the active swapchain backbuffers | **Verified presentation path** |
 | Swapchain backbuffers | Exact pointer identity found inside current OutputTargetState | **Verified** |
-| HUDless boundary | Pre-Overlay relationship is the remaining question | **Not yet fully proven** |
+| Pre-Overlay engine boundary | `on_pre_overlay_layer_draw()` sees Overlay main == `PostMainTarget` == `HDRTarget` in 50/50 paired samples across Static, Camera pan, HUD/menu off, and HUD/menu on | **Verified** |
+| Complete pixel-level HUDlessness | No independent pixel/content proof that no earlier UI pass touched HDR/PostMain | **Not independently proven; narrow provenance only if later required** |
 
 ---
 
@@ -424,6 +425,57 @@ It is no longer merely a format/dimension-based candidate.
 
 The same capture also revealed a diagnostic flaw: EndRendering samples 2–10 reused the frame-25801 anchors while the renderer advanced through later frames. Only the first correlation was fresh evidence. The EndRendering provenance sampler was therefore removed.
 
+### Capture 9 — pre-Overlay engine boundary verified
+
+The paired Overlay pre/post probe was run against PR #58 test merge commit:
+
+~~~text
+5b417fcc5740f897d9a0b649bfa6da53c11b8440
+~~~
+
+Fifty frame-local pairs were collected:
+
+~~~text
+Static screen   10/10
+Camera pan      10/10
+HUD/menu off    10/10
+HUD/menu on     20/20
+~~~
+
+Every pre-Overlay sample reported:
+
+~~~text
+mainResource == PostMainTarget == HDRTarget
+mainMatchesPostMain = true
+mainMatchesHDR      = true
+~~~
+
+The Overlay main TargetState/resource also remained stable across the original Overlay draw:
+
+~~~text
+mainTargetStable   = true   50/50
+mainResourceStable = true   50/50
+~~~
+
+This verifies the **engine-level pre-Overlay insertion boundary**: before the original `Overlay::draw()` executes, RE4 already exposes the same semantically identified HDR/PostMain scene-color resource through `Overlay::get_main_target_state()`.
+
+The RenderContext current target must **not** be used as the production anchor. It is transient and state-dependent:
+
+- `currentTargetStable=false` in 50/50 paired samples;
+- before Overlay, the native current resource was null/unresolved in 39/50 samples and equal to HDR/PostMain in only 11/50;
+- after Overlay, the current resource could resolve either to HDR/PostMain or to another menu/UI working resource depending on UI state;
+- a second HUD/menu-on session remained on a distinct post-Overlay resource for 10/10 samples while Overlay main still remained the stable HDR/PostMain resource.
+
+Therefore the production Color-selection rule should be based on the **semantic Overlay main / Scene HDR/PostMain relationship**, not on `RenderContext::get_render_target()` at Overlay time.
+
+Capture 9 also confirms that the old EndRendering stale-anchor issue is gone: all 50 pre/post observations were paired on the same sampled frame.
+
+Current conclusion:
+
+> `on_pre_overlay_layer_draw()` is the verified engine-level insertion boundary for RE4 XeSS SR, with `Overlay::get_main_target_state()` / Scene `HDRTarget` / `PostMainTarget` as the stable color anchor.
+
+This proves ordering and semantic resource identity. It does **not** independently prove pixel content (for example, whether an unrelated earlier UI pass could have touched the same resource). A content-sensitive or command-list provenance probe should be added only if later implementation behavior gives a concrete reason to doubt the engine-level boundary.
+
 ---
 
 ## 9. Current HUD/UI boundary model
@@ -472,13 +524,19 @@ on_overlay_layer_draw()
 
 Therefore the current diagnostic is deliberately bracketing the **original Overlay draw**.
 
-The key remaining question is:
+Capture 9 closes the engine-level boundary question:
 
-> Is the HDR/PostMain resource already the correct HUDless scene input in `on_pre_overlay_layer_draw()`, with the separate Overlay surface used by the game's subsequent UI composition?
+> Before the original `Overlay::draw()`, `Overlay::get_main_target_state()` already resolves to the same native resource as Scene `HDRTarget` and `PostMainTarget`.
 
-If yes, `on_pre_overlay_layer_draw()` becomes the strongest engine-level XeSS SR insertion boundary discovered so far.
+This relationship held in 50/50 paired samples across static, camera-motion, HUD-off, and HUD/menu-on scenarios. The Overlay main target remained stable across the original draw, while the RenderContext current target was transient and sometimes changed to another UI/menu working surface.
 
-Pointer identity alone cannot prove pixel-content mutation, so a narrow content/provenance check may still be necessary after this boundary capture.
+Production implication:
+
+- use the semantic Overlay main / Scene HDR/PostMain resource as the Color anchor;
+- treat `on_pre_overlay_layer_draw()` as the verified engine-level XeSS SR insertion boundary;
+- do **not** use Overlay's RenderContext current target as the production anchor.
+
+Pixel identity alone cannot prove that no unrelated earlier UI pass ever touched HDR/PostMain. That is now a secondary content-level question, not an unresolved resource/boundary-discovery question. Escalate to narrow command-list/content provenance only if later XeSS integration behavior makes it necessary.
 
 ---
 
@@ -566,17 +624,16 @@ No production XeSS dispatch should be enabled until these gates are closed.
 
 Current status:
 
-- HDR/PostMain resource: verified;
-- separate Overlay working surface: verified;
-- pre/post Overlay boundary: under direct validation;
-- exact content/composition semantics: not yet fully proven.
+- HDR/PostMain resource: **verified**;
+- separate Overlay working/current surfaces: **verified**;
+- `on_pre_overlay_layer_draw()` engine-level insertion boundary: **verified in capture 9**;
+- Overlay main == Scene `PostMainTarget` == Scene `HDRTarget`: **50/50 pre-Overlay samples**;
+- Overlay main TargetState/resource stability across original Overlay draw: **50/50**;
+- complete pixel-level proof that no unrelated earlier UI pass touched HDR/PostMain: not independently established.
 
-Required result:
+For production planning, the Color resource and engine insertion boundary are now considered closed enough to proceed to the next temporal gates. Do not spend additional captures on generic Color/Overlay target discovery.
 
-- establish the safe frame-local point where HDR/PostMain is the desired scene image before UI contamination;
-- if pointer/semantic evidence is insufficient, use the narrowest possible D3D12 provenance/content-sensitive probe.
-
-Do not return to a broad whole-frame command-list trace unless the targeted boundary probe fails.
+If later XeSS integration shows actual UI contamination or another contradiction, add the narrowest possible content-sensitive or command-list provenance probe around this exact boundary. Do not return to broad whole-frame tracing.
 
 ### Gate B — Render size vs display size
 
@@ -877,7 +934,8 @@ Use broad D3D12 tracing only as a last resort. The old ATSBridge trace produced 
 | Overlay separate current surface | **HIGH** | Stable 1920×1080 B8G8R8A8 resource |
 | Overlay main → HDR/PostMain | **HIGH** | Exact native identity |
 | PrepareOutput presentation ownership | **HIGH** | Exact swapchain buffer identity |
-| HUDless pre-Overlay boundary | **MEDIUM / active** | Engine-level target relationship strong; final content boundary still being tested |
+| Pre-Overlay engine boundary | **HIGH** | Capture 9: Overlay main == HDR/PostMain before original Overlay draw in 50/50 paired samples |
+| Complete pixel-level HUDlessness | **MEDIUM / deferred** | No contradiction observed; content-sensitive proof only if later integration requires it |
 | Render/display scaling semantics | **LOW / pending** | Not yet controlled for XeSS |
 | Jitter | **LOW / pending** | Historical method known, current-build proof pending |
 | MV scale/sign/jitter semantics | **LOW / pending** | Identity proven, semantics pending |
@@ -894,36 +952,38 @@ Use broad D3D12 tracing only as a last resort. The old ATSBridge trace produced 
 
 Work in this order.
 
-### 18.1 Finish Overlay boundary proof
+### 18.1 Lock Color as production input
 
-Use the current paired callbacks:
+Capture 9 completes the generic Color/boundary discovery phase.
+
+Production rule:
 
 ~~~text
-on_pre_overlay_layer_draw
-    -> observe HDR/PostMain + separate Overlay current target
-original Overlay::draw
-on_overlay_layer_draw
-    -> compare same-frame target/resource identities
+Color anchor
+    = Overlay::get_main_target_state() native resource
+    = Scene::PostMainTarget
+    = Scene::HDRTarget
+
+Insertion boundary
+    = on_pre_overlay_layer_draw()
 ~~~
 
-If the engine-semantic result is still ambiguous about pixel content, add the smallest possible provenance check around this exact boundary.
+Next implementation work should:
 
-### 18.2 Lock Color as production input
+- encode this semantic accessor/selection rule;
+- reject `RenderContext::get_render_target()` as the Overlay Color anchor because it is transient;
+- remove exploratory Color candidate scanning from eventual production code;
+- fail closed if the expected HDR/PostMain/Overlay-main invariant does not hold;
+- keep the existing diagnostic available only while later gates are being validated.
 
-Once the pre-UI boundary is established:
-
-- define the production accessor/selection rule;
-- remove exploratory candidate scanning from production code;
-- fail closed when expected invariants do not hold.
-
-### 18.3 Prove render-size path
+### 18.2 Prove render-size path
 
 - reproduce native-size behavior first;
 - then lower render size under bridge control;
 - verify Color/Depth/Velocity alignment;
 - keep UI/display resolution independent.
 
-### 18.4 Prove jitter and MV semantics together
+### 18.3 Prove jitter and MV semantics together
 
 Do not validate them independently if the engine couples them.
 
@@ -939,15 +999,15 @@ velocity scale x/y
 camera matrices
 ~~~
 
-### 18.5 Prove depth/camera/reset
+### 18.4 Prove depth/camera/reset
 
 Close the remaining XeSS metadata contract.
 
-### 18.6 Prove command-list/state insertion
+### 18.5 Prove command-list/state insertion
 
 Only now add the narrow D3D12 execution machinery required for XeSS.
 
-### 18.7 Add public XeSS producer
+### 18.6 Add public XeSS producer
 
 Call the official XeSS D3D12 API directly.
 
@@ -955,7 +1015,7 @@ First milestone:
 
 > Correct RE4 XeSS SR using Intel XeSS itself, with HUD/UI preserved outside the upscaled scene path.
 
-### 18.8 Validate upstream OptiScaler
+### 18.7 Validate upstream OptiScaler
 
 With the same producer code:
 
@@ -966,7 +1026,7 @@ With the same producer code:
 
 No REF-specific OptiScaler patch is allowed to become a requirement.
 
-### 18.9 Validate XeFG
+### 18.8 Validate XeFG
 
 After SR is stable:
 
@@ -1019,7 +1079,7 @@ The RE4 bridge is ready to begin production XeSS dispatch only when all of the f
 
 The current project is **not yet at this gate**.
 
-The major resource-discovery uncertainty has been reduced substantially: HDR/PostMain color, Depth, Velocity, Overlay working surface, and presentation output are now structurally mapped. The remaining work is primarily temporal semantics, boundary proof, execution ordering, and lifecycle.
+The major resource-discovery uncertainty is now substantially closed: HDR/PostMain color, Depth, Velocity, the pre-Overlay engine boundary, Overlay working surfaces, and presentation output are structurally mapped. The remaining work is primarily render/display scaling, temporal semantics, execution ordering, output integration, and lifecycle.
 
 ---
 
@@ -1051,6 +1111,6 @@ OutputTargetState
 swapchain backbuffers
 ~~~
 
-The production goal is to insert standard XeSS SR at the proven pre-UI HDR scene boundary, keep the game's own UI composition path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
+Capture 9 identifies `on_pre_overlay_layer_draw()` as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. The production goal is to insert standard XeSS SR there, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
 
 Until the remaining gates are proven, the diagnostic stays passive and no production XeSS dispatch is enabled.
