@@ -1088,6 +1088,250 @@ void STDMETHODCALLTYPE RE4TemporalProbe::recording_enhanced_barrier_hook(
 }
 
 
+
+void RE4TemporalProbe::refresh_output_copy_swapchain_buffers() {
+    std::unordered_set<uintptr_t> buffers{};
+
+    if (g_framework != nullptr && g_framework->is_dx12()) {
+        auto& d3d12 = g_framework->get_d3d12_hook();
+        auto* swapchain = d3d12 != nullptr ? d3d12->get_swap_chain() : nullptr;
+
+        if (swapchain != nullptr) {
+            DXGI_SWAP_CHAIN_DESC desc{};
+            if (SUCCEEDED(swapchain->GetDesc(&desc))) {
+                for (UINT i = 0; i < desc.BufferCount; ++i) {
+                    Microsoft::WRL::ComPtr<ID3D12Resource> buffer{};
+                    if (SUCCEEDED(swapchain->GetBuffer(i, IID_PPV_ARGS(&buffer))) &&
+                        buffer != nullptr) {
+                        buffers.insert(reinterpret_cast<uintptr_t>(buffer.Get()));
+                    }
+                }
+            }
+        }
+    }
+
+    std::scoped_lock lock{m_output_copy_mutex};
+    m_output_copy_swapchain_buffers = std::move(buffers);
+}
+
+void STDMETHODCALLTYPE RE4TemporalProbe::recording_copy_resource_hook(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12Resource* dst,
+    ID3D12Resource* src) {
+    auto* self = s_execution_probe_instance;
+    if (self == nullptr || self->m_recording_copy_resource_original == nullptr) {
+        return;
+    }
+
+    bool tracked_list = false;
+    {
+        std::scoped_lock lock{self->m_recording_mutex};
+        tracked_list = self->m_recording_tracked_lists.contains(
+            reinterpret_cast<uintptr_t>(command_list));
+    }
+
+    if (tracked_list &&
+        self->m_output_copy_capture_open.load(std::memory_order_relaxed) &&
+        self->m_enabled.load(std::memory_order_relaxed) &&
+        re4_temporal_probe::is_output_copy_scenario(
+            self->m_scenario.load(std::memory_order_relaxed)) &&
+        src != nullptr &&
+        dst != nullptr) {
+        const auto src_key = reinterpret_cast<uintptr_t>(src);
+        const auto dst_key = reinterpret_cast<uintptr_t>(dst);
+
+        bool src_tracked = false;
+        bool dst_tracked = false;
+        bool src_swapchain = false;
+        bool dst_swapchain = false;
+        size_t tracked_count = 0;
+
+        {
+            std::scoped_lock lock{self->m_output_copy_mutex};
+            src_tracked = self->m_output_copy_tracked_resources.contains(src_key);
+            dst_tracked = self->m_output_copy_tracked_resources.contains(dst_key);
+
+            if (src_tracked || dst_tracked) {
+                self->m_output_copy_tracked_resources.insert(src_key);
+                self->m_output_copy_tracked_resources.insert(dst_key);
+            }
+
+            src_swapchain = self->m_output_copy_swapchain_buffers.contains(src_key);
+            dst_swapchain = self->m_output_copy_swapchain_buffers.contains(dst_key);
+            tracked_count = self->m_output_copy_tracked_resources.size();
+        }
+
+        if (src_tracked || dst_tracked) {
+            const auto event = self->m_output_copy_event_sequence.fetch_add(
+                1,
+                std::memory_order_relaxed) + 1;
+            const auto src_shape = resource_shape(src);
+            const auto dst_shape = resource_shape(dst);
+            const auto color =
+                self->m_output_copy_color.load(std::memory_order_relaxed);
+            const auto sample =
+                self->m_output_copy_boundary_sample.load(std::memory_order_relaxed);
+            const auto frame =
+                self->m_output_copy_boundary_frame.load(std::memory_order_relaxed);
+
+            spdlog::info(
+                "[RE4TemporalProbe] outputCopy event={} sample={} frame={} type=CopyResource "
+                "list={:p} thread={} src={:p} dst={:p} "
+                "srcColor={} dstColor={} srcTracked={} dstTracked={} "
+                "srcSwapchain={} dstSwapchain={} trackedResources={} "
+                "srcDesc={{w={},h={},format={},flags=0x{:x}}} "
+                "dstDesc={{w={},h={},format={},flags=0x{:x}}}",
+                event,
+                sample,
+                frame,
+                static_cast<void*>(command_list),
+                GetCurrentThreadId(),
+                static_cast<void*>(src),
+                static_cast<void*>(dst),
+                src_key == color,
+                dst_key == color,
+                src_tracked,
+                dst_tracked,
+                src_swapchain,
+                dst_swapchain,
+                tracked_count,
+                src_shape.width,
+                src_shape.height,
+                src_shape.format,
+                src_shape.flags,
+                dst_shape.width,
+                dst_shape.height,
+                dst_shape.format,
+                dst_shape.flags);
+        }
+    }
+
+    self->m_recording_copy_resource_original(command_list, dst, src);
+}
+
+void STDMETHODCALLTYPE RE4TemporalProbe::recording_copy_texture_region_hook(
+    ID3D12GraphicsCommandList* command_list,
+    const D3D12_TEXTURE_COPY_LOCATION* dst,
+    UINT dst_x,
+    UINT dst_y,
+    UINT dst_z,
+    const D3D12_TEXTURE_COPY_LOCATION* src,
+    const D3D12_BOX* src_box) {
+    auto* self = s_execution_probe_instance;
+    if (self == nullptr || self->m_recording_copy_texture_region_original == nullptr) {
+        return;
+    }
+
+    bool tracked_list = false;
+    {
+        std::scoped_lock lock{self->m_recording_mutex};
+        tracked_list = self->m_recording_tracked_lists.contains(
+            reinterpret_cast<uintptr_t>(command_list));
+    }
+
+    auto* src_resource = src != nullptr ? src->pResource : nullptr;
+    auto* dst_resource = dst != nullptr ? dst->pResource : nullptr;
+
+    if (tracked_list &&
+        self->m_output_copy_capture_open.load(std::memory_order_relaxed) &&
+        self->m_enabled.load(std::memory_order_relaxed) &&
+        re4_temporal_probe::is_output_copy_scenario(
+            self->m_scenario.load(std::memory_order_relaxed)) &&
+        src_resource != nullptr &&
+        dst_resource != nullptr) {
+        const auto src_key = reinterpret_cast<uintptr_t>(src_resource);
+        const auto dst_key = reinterpret_cast<uintptr_t>(dst_resource);
+
+        bool src_tracked = false;
+        bool dst_tracked = false;
+        bool src_swapchain = false;
+        bool dst_swapchain = false;
+        size_t tracked_count = 0;
+
+        {
+            std::scoped_lock lock{self->m_output_copy_mutex};
+            src_tracked = self->m_output_copy_tracked_resources.contains(src_key);
+            dst_tracked = self->m_output_copy_tracked_resources.contains(dst_key);
+
+            if (src_tracked || dst_tracked) {
+                self->m_output_copy_tracked_resources.insert(src_key);
+                self->m_output_copy_tracked_resources.insert(dst_key);
+            }
+
+            src_swapchain = self->m_output_copy_swapchain_buffers.contains(src_key);
+            dst_swapchain = self->m_output_copy_swapchain_buffers.contains(dst_key);
+            tracked_count = self->m_output_copy_tracked_resources.size();
+        }
+
+        if (src_tracked || dst_tracked) {
+            const auto event = self->m_output_copy_event_sequence.fetch_add(
+                1,
+                std::memory_order_relaxed) + 1;
+            const auto src_shape = resource_shape(src_resource);
+            const auto dst_shape = resource_shape(dst_resource);
+            const auto color =
+                self->m_output_copy_color.load(std::memory_order_relaxed);
+            const auto sample =
+                self->m_output_copy_boundary_sample.load(std::memory_order_relaxed);
+            const auto frame =
+                self->m_output_copy_boundary_frame.load(std::memory_order_relaxed);
+
+            spdlog::info(
+                "[RE4TemporalProbe] outputCopy event={} sample={} frame={} type=CopyTextureRegion "
+                "list={:p} thread={} src={:p} dst={:p} "
+                "srcColor={} dstColor={} srcTracked={} dstTracked={} "
+                "srcSwapchain={} dstSwapchain={} trackedResources={} "
+                "srcType={} srcSubresource={} dstType={} dstSubresource={} "
+                "dstXYZ={}x{}x{} srcBox={} "
+                "srcDesc={{w={},h={},format={},flags=0x{:x}}} "
+                "dstDesc={{w={},h={},format={},flags=0x{:x}}}",
+                event,
+                sample,
+                frame,
+                static_cast<void*>(command_list),
+                GetCurrentThreadId(),
+                static_cast<void*>(src_resource),
+                static_cast<void*>(dst_resource),
+                src_key == color,
+                dst_key == color,
+                src_tracked,
+                dst_tracked,
+                src_swapchain,
+                dst_swapchain,
+                tracked_count,
+                src != nullptr ? static_cast<uint32_t>(src->Type) : 0,
+                src != nullptr && src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX
+                    ? src->SubresourceIndex
+                    : UINT32_MAX,
+                dst != nullptr ? static_cast<uint32_t>(dst->Type) : 0,
+                dst != nullptr && dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX
+                    ? dst->SubresourceIndex
+                    : UINT32_MAX,
+                dst_x,
+                dst_y,
+                dst_z,
+                src_box != nullptr,
+                src_shape.width,
+                src_shape.height,
+                src_shape.format,
+                src_shape.flags,
+                dst_shape.width,
+                dst_shape.height,
+                dst_shape.format,
+                dst_shape.flags);
+        }
+    }
+
+    self->m_recording_copy_texture_region_original(
+        command_list,
+        dst,
+        dst_x,
+        dst_y,
+        dst_z,
+        src,
+        src_box);
+}
+
 bool RE4TemporalProbe::ensure_bridge_order_resources() {
     std::scoped_lock lock{m_bridge_order_mutex};
 
