@@ -6,14 +6,12 @@
 #include <string>
 
 #include <d3d12.h>
-#include <dxgi1_4.h>
 #include <spdlog/spdlog.h>
 
 #include <sdk/GameIdentity.hpp>
+#include <sdk/SceneManager.hpp>
 
 namespace {
-constexpr uint32_t MAX_SAMPLES = re4_temporal_probe::MAX_SAMPLES;
-
 constexpr std::array<const char*, 5> SCENARIOS{
     "Static screen",
     "Camera pan",
@@ -51,8 +49,37 @@ ResourceShape resource_shape(ID3D12Resource* resource) {
     };
 }
 
-bool same_extent(const ResourceShape& a, const ResourceShape& b) {
-    return a.width != 0 && a.height != 0 && a.width == b.width && a.height == b.height;
+void log_scene_info_offsets(
+    uint32_t sample,
+    uint32_t frame,
+    const char* scenario,
+    sdk::renderer::SceneInfo* main,
+    sdk::renderer::SceneInfo* depth_distortion,
+    sdk::renderer::SceneInfo* filter,
+    sdk::renderer::SceneInfo* jitter_disable,
+    sdk::renderer::SceneInfo* jitter_disable_post,
+    sdk::renderer::SceneInfo* z_prepass) {
+    const auto p20 = [](sdk::renderer::SceneInfo* info) {
+        return info != nullptr ? info->projection_matrix[2][0] : 0.0f;
+    };
+    const auto p21 = [](sdk::renderer::SceneInfo* info) {
+        return info != nullptr ? info->projection_matrix[2][1] : 0.0f;
+    };
+
+    spdlog::info(
+        "[RE4TemporalProbe] temporalSample={} scenario='{}' frame={} sceneInfoOffsets "
+        "main={:p}:{:.9f},{:.9f} depthDistortion={:p}:{:.9f},{:.9f} "
+        "filter={:p}:{:.9f},{:.9f} jitterDisable={:p}:{:.9f},{:.9f} "
+        "jitterDisablePost={:p}:{:.9f},{:.9f} zPrepass={:p}:{:.9f},{:.9f}",
+        sample,
+        scenario,
+        frame,
+        static_cast<void*>(main), p20(main), p21(main),
+        static_cast<void*>(depth_distortion), p20(depth_distortion), p21(depth_distortion),
+        static_cast<void*>(filter), p20(filter), p21(filter),
+        static_cast<void*>(jitter_disable), p20(jitter_disable), p21(jitter_disable),
+        static_cast<void*>(jitter_disable_post), p20(jitter_disable_post), p21(jitter_disable_post),
+        static_cast<void*>(z_prepass), p20(z_prepass), p21(z_prepass));
 }
 }
 
@@ -62,9 +89,9 @@ void RE4TemporalProbe::on_draw_ui() {
     }
 
     bool enabled = m_enabled.load(std::memory_order_relaxed);
-    if (ImGui::Checkbox("Enable 1920x1080 render-size test (default off)", &enabled)) {
+    if (ImGui::Checkbox("Enable jitter / MV semantic capture (default off)", &enabled)) {
         m_enabled.store(enabled, std::memory_order_relaxed);
-        spdlog::info("[RE4TemporalProbe] capture {}", enabled ? "enabled" : "disabled");
+        spdlog::info("[RE4TemporalProbe] temporal capture {}", enabled ? "enabled" : "disabled");
     }
 
     int scenario = m_scenario.load(std::memory_order_relaxed);
@@ -72,242 +99,189 @@ void RE4TemporalProbe::on_draw_ui() {
         m_scenario.store(scenario, std::memory_order_relaxed);
     }
 
-    ImGui::Text("Overlay callbacks: %u", m_size_sample_budget.callback_count());
-    ImGui::Text("Size samples: %u / %u", m_size_sample_budget.sample_count(), MAX_SAMPLES);
+    ImGui::Text(
+        "Temporal samples: %u / %u",
+        m_temporal_budget.sample_count(),
+        re4_temporal_probe::MAX_TEMPORAL_SAMPLES);
     ImGui::TextWrapped(
-        "RE4-only temporary split test. When enabled, SceneView.get_Size is overridden to 1920x1080; "
-        "swapchain/output are not resized. The probe checks whether Color/Depth/Velocity follow the overridden extent.");
+        "RE4-only consecutive-frame diagnostic. No render-size override is active. "
+        "It compares the primary Camera projection with SceneInfo projection offsets and records VelocityTarget metadata.");
 
-    if (ImGui::Button("Reset capture budget")) {
-        m_size_sample_budget.reset();
-        m_latest_scene_view.store(0, std::memory_order_relaxed);
-        m_latest_view_frame.store(0, std::memory_order_relaxed);
-        m_latest_view_width.store(0, std::memory_order_relaxed);
-        m_latest_view_height.store(0, std::memory_order_relaxed);
-        m_latest_original_view_width.store(0, std::memory_order_relaxed);
-        m_latest_original_view_height.store(0, std::memory_order_relaxed);
-        m_size_pair_sample.store(0, std::memory_order_relaxed);
-        m_size_pair_frame.store(0, std::memory_order_relaxed);
+    if (ImGui::Button("Reset temporal capture")) {
+        m_temporal_budget.reset();
+        m_camera_ptr.store(0, std::memory_order_relaxed);
+        m_camera_frame.store(0, std::memory_order_relaxed);
+        m_previous_scene_projection_valid = false;
+        m_previous_scene_p20 = 0.0f;
+        m_previous_scene_p21 = 0.0f;
     }
 }
 
-void RE4TemporalProbe::on_view_get_size(REManagedObject* scene_view, float* result) {
-    if (!re4_temporal_probe::should_process_view_size(
+void RE4TemporalProbe::on_camera_get_projection_matrix(REManagedObject* camera, Matrix4x4f* result) {
+    if (!re4_temporal_probe::should_process_camera_projection(
             sdk::GameIdentity::get().is_re4(),
             m_enabled.load(std::memory_order_relaxed),
-            scene_view,
+            camera,
             result)) {
         return;
     }
 
-    if (!std::isfinite(result[0]) || !std::isfinite(result[1]) || result[0] <= 0.0f || result[1] <= 0.0f) {
+    auto* primary_camera = sdk::get_primary_camera();
+    if (primary_camera == nullptr || camera != reinterpret_cast<REManagedObject*>(primary_camera)) {
         return;
     }
 
     auto* renderer = sdk::renderer::get_renderer();
     const auto frame = renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
+    if (!frame.has_value()) {
+        return;
+    }
 
-    const auto original_width = result[0];
-    const auto original_height = result[1];
-
-    result[0] = static_cast<float>(re4_temporal_probe::TEST_RENDER_WIDTH);
-    result[1] = static_cast<float>(re4_temporal_probe::TEST_RENDER_HEIGHT);
-
-    m_latest_scene_view.store(reinterpret_cast<uintptr_t>(scene_view), std::memory_order_relaxed);
-    m_latest_view_frame.store(frame.value_or(0), std::memory_order_relaxed);
-    m_latest_view_width.store(re4_temporal_probe::TEST_RENDER_WIDTH, std::memory_order_relaxed);
-    m_latest_view_height.store(re4_temporal_probe::TEST_RENDER_HEIGHT, std::memory_order_relaxed);
-    m_latest_original_view_width.store(static_cast<uint32_t>(original_width + 0.5f), std::memory_order_relaxed);
-    m_latest_original_view_height.store(static_cast<uint32_t>(original_height + 0.5f), std::memory_order_relaxed);
+    m_camera_ptr.store(reinterpret_cast<uintptr_t>(camera), std::memory_order_relaxed);
+    m_camera_frame.store(*frame, std::memory_order_relaxed);
+    m_camera_p00.store((*result)[0][0], std::memory_order_relaxed);
+    m_camera_p11.store((*result)[1][1], std::memory_order_relaxed);
+    m_camera_p20.store((*result)[2][0], std::memory_order_relaxed);
+    m_camera_p21.store((*result)[2][1], std::memory_order_relaxed);
+    m_camera_p22.store((*result)[2][2], std::memory_order_relaxed);
+    m_camera_p23.store((*result)[2][3], std::memory_order_relaxed);
+    m_camera_p32.store((*result)[3][2], std::memory_order_relaxed);
+    m_camera_p33.store((*result)[3][3], std::memory_order_relaxed);
 }
 
-bool RE4TemporalProbe::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* render_context) {
-    if (!re4_temporal_probe::should_process_overlay(
+void RE4TemporalProbe::on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* render_context) {
+    (void)render_context;
+
+    if (!re4_temporal_probe::should_process_scene_update(
             sdk::GameIdentity::get().is_re4(),
             m_enabled.load(std::memory_order_relaxed),
-            layer,
-            render_context)) {
-        return true;
+            layer)) {
+        return;
     }
 
-    if (!m_size_sample_budget.should_sample_callback()) {
-        return true;
-    }
-
-    const auto sample = m_size_sample_budget.reserve_sample();
-    if (sample == 0) {
-        return true;
+    if (!layer->is_fully_rendered()) {
+        return;
     }
 
     auto* renderer = sdk::renderer::get_renderer();
     const auto frame = renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
-    const auto scenario = scenario_name(m_scenario.load(std::memory_order_relaxed));
-
-    auto* scene = reinterpret_cast<sdk::renderer::layer::Scene*>(layer->get_parent());
-    auto* main_target = layer->get_main_target_state().get();
-    auto* color_resource = main_target != nullptr ? main_target->get_native_resource_d3d12() : nullptr;
-    auto* post_main_resource = scene != nullptr ? scene->get_post_main_target_d3d12() : nullptr;
-    auto* hdr_resource = scene != nullptr ? scene->get_hdr_target_d3d12() : nullptr;
-    auto* depth_resource = scene != nullptr ? scene->get_depth_stencil_d3d12() : nullptr;
-    auto* velocity_resource = scene != nullptr ? scene->get_motion_vectors_d3d12() : nullptr;
-
-    const auto color = resource_shape(color_resource);
-    const auto depth = resource_shape(depth_resource);
-    const auto velocity = resource_shape(velocity_resource);
-
-    const auto color_invariant =
-        color_resource != nullptr &&
-        color_resource == post_main_resource &&
-        color_resource == hdr_resource;
-    const auto temporal_extents_aligned =
-        same_extent(color, depth) &&
-        same_extent(color, velocity);
-
-    const auto view_ptr = reinterpret_cast<REManagedObject*>(
-        m_latest_scene_view.load(std::memory_order_relaxed));
-    const auto view_frame = m_latest_view_frame.load(std::memory_order_relaxed);
-    const auto view_width = m_latest_view_width.load(std::memory_order_relaxed);
-    const auto view_height = m_latest_view_height.load(std::memory_order_relaxed);
-    const auto original_view_width = m_latest_original_view_width.load(std::memory_order_relaxed);
-    const auto original_view_height = m_latest_original_view_height.load(std::memory_order_relaxed);
-    const auto view_same_frame = frame.has_value() && view_frame != 0 && *frame == view_frame;
-
-    D3D12Hook* d3d12{};
-    IDXGISwapChain3* swapchain{};
-    DXGI_SWAP_CHAIN_DESC1 swap_desc{};
-    HRESULT swap_desc_result = E_POINTER;
-    UINT hook_display_width{};
-    UINT hook_display_height{};
-    UINT hook_render_width{};
-    UINT hook_render_height{};
-    uint32_t swapchain_source{};
-
-    if (g_framework != nullptr) {
-        const auto& hook = g_framework->get_d3d12_hook();
-        d3d12 = hook.get();
-
-        if (d3d12 != nullptr) {
-            swapchain = d3d12->get_swap_chain();
-            hook_display_width = d3d12->get_display_width();
-            hook_display_height = d3d12->get_display_height();
-            hook_render_width = d3d12->get_render_width();
-            hook_render_height = d3d12->get_render_height();
-            swapchain_source = static_cast<uint32_t>(d3d12->get_swapchain_source());
-
-            if (swapchain != nullptr) {
-                swap_desc_result = swapchain->GetDesc1(&swap_desc);
-            }
-        }
+    if (!frame.has_value()) {
+        return;
     }
 
+    const auto sample = m_temporal_budget.reserve_frame(*frame);
+    if (sample == 0) {
+        return;
+    }
+
+    auto* scene_info = layer->get_scene_info();
+    if (scene_info == nullptr) {
+        spdlog::info(
+            "[RE4TemporalProbe] temporalSample={} scenario='{}' frame={} sceneInfo=null",
+            sample,
+            scenario_name(m_scenario.load(std::memory_order_relaxed)),
+            *frame);
+        return;
+    }
+
+    const auto scenario = scenario_name(m_scenario.load(std::memory_order_relaxed));
+    auto* scene_camera = layer->get_camera();
+    auto* velocity_resource = layer->get_motion_vectors_d3d12();
+    const auto velocity = resource_shape(velocity_resource);
+
+    const auto scene_p00 = scene_info->projection_matrix[0][0];
+    const auto scene_p11 = scene_info->projection_matrix[1][1];
+    const auto scene_p20 = scene_info->projection_matrix[2][0];
+    const auto scene_p21 = scene_info->projection_matrix[2][1];
+    const auto scene_p22 = scene_info->projection_matrix[2][2];
+    const auto scene_p23 = scene_info->projection_matrix[2][3];
+    const auto scene_p32 = scene_info->projection_matrix[3][2];
+    const auto scene_p33 = scene_info->projection_matrix[3][3];
+
+    const auto previous_delta_p20 =
+        m_previous_scene_projection_valid ? scene_p20 - m_previous_scene_p20 : 0.0f;
+    const auto previous_delta_p21 =
+        m_previous_scene_projection_valid ? scene_p21 - m_previous_scene_p21 : 0.0f;
+
+    m_previous_scene_projection_valid = true;
+    m_previous_scene_p20 = scene_p20;
+    m_previous_scene_p21 = scene_p21;
+
+    const auto camera_ptr = m_camera_ptr.load(std::memory_order_relaxed);
+    const auto camera_frame = m_camera_frame.load(std::memory_order_relaxed);
+    const auto camera_same_frame = camera_frame == *frame;
+    const auto camera_matches_scene =
+        camera_ptr != 0 &&
+        camera_ptr == reinterpret_cast<uintptr_t>(scene_camera);
+
+    const auto camera_p20 = m_camera_p20.load(std::memory_order_relaxed);
+    const auto camera_p21 = m_camera_p21.load(std::memory_order_relaxed);
+
     spdlog::info(
-        "[RE4TemporalProbe] sizeSample={} scenario='{}' frame={} colorResource={:p} postMain={:p} hdr={:p} colorInvariant={} color={{width={},height={},format={},flags=0x{:x}}} depthResource={:p} depth={{width={},height={},format={},flags=0x{:x}}} velocityResource={:p} velocity={{width={},height={},format={},flags=0x{:x}}} temporalExtentsAligned={}",
+        "[RE4TemporalProbe] temporalSample={} scenario='{}' frame={} scene={:p} camera={:p} "
+        "projection={{p00={:.9f},p11={:.9f},p20={:.9f},p21={:.9f},p22={:.9f},p23={:.9f},p32={:.9f},p33={:.9f}}} "
+        "frameDelta={{p20={:.9f},p21={:.9f}}} oldVP={{m20={:.9f},m21={:.9f}}}",
         sample,
         scenario,
-        frame.has_value() ? std::to_string(*frame) : "unknown",
-        static_cast<void*>(color_resource),
-        static_cast<void*>(post_main_resource),
-        static_cast<void*>(hdr_resource),
-        color_invariant,
-        color.width,
-        color.height,
-        color.format,
-        color.flags,
-        static_cast<void*>(depth_resource),
-        depth.width,
-        depth.height,
-        depth.format,
-        depth.flags,
+        *frame,
+        static_cast<void*>(layer),
+        static_cast<void*>(scene_camera),
+        scene_p00,
+        scene_p11,
+        scene_p20,
+        scene_p21,
+        scene_p22,
+        scene_p23,
+        scene_p32,
+        scene_p33,
+        previous_delta_p20,
+        previous_delta_p21,
+        scene_info->old_view_projection_matrix[2][0],
+        scene_info->old_view_projection_matrix[2][1]);
+
+    spdlog::info(
+        "[RE4TemporalProbe] temporalSample={} scenario='{}' frame={} cameraProjection "
+        "cameraPtr={:p} cameraFrame={} sameFrame={} matchesSceneCamera={} "
+        "projection={{p00={:.9f},p11={:.9f},p20={:.9f},p21={:.9f},p22={:.9f},p23={:.9f},p32={:.9f},p33={:.9f}}} "
+        "sceneMinusCamera={{p20={:.9f},p21={:.9f}}}",
+        sample,
+        scenario,
+        *frame,
+        reinterpret_cast<void*>(camera_ptr),
+        camera_frame,
+        camera_same_frame,
+        camera_matches_scene,
+        m_camera_p00.load(std::memory_order_relaxed),
+        m_camera_p11.load(std::memory_order_relaxed),
+        camera_p20,
+        camera_p21,
+        m_camera_p22.load(std::memory_order_relaxed),
+        m_camera_p23.load(std::memory_order_relaxed),
+        m_camera_p32.load(std::memory_order_relaxed),
+        m_camera_p33.load(std::memory_order_relaxed),
+        scene_p20 - camera_p20,
+        scene_p21 - camera_p21);
+
+    spdlog::info(
+        "[RE4TemporalProbe] temporalSample={} scenario='{}' frame={} velocityResource={:p} "
+        "velocity={{width={},height={},format={},flags=0x{:x}}}",
+        sample,
+        scenario,
+        *frame,
         static_cast<void*>(velocity_resource),
         velocity.width,
         velocity.height,
         velocity.format,
-        velocity.flags,
-        temporal_extents_aligned);
+        velocity.flags);
 
-    spdlog::info(
-        "[RE4TemporalProbe] sizeSample={} scenario='{}' engineView sceneView={:p} viewFrame={} sameFrame={} originalViewSize={}x{} overriddenViewSize={}x{}",
+    log_scene_info_offsets(
         sample,
-        scenario,
-        static_cast<void*>(view_ptr),
-        view_frame,
-        view_same_frame,
-        original_view_width,
-        original_view_height,
-        view_width,
-        view_height);
-
-    spdlog::info(
-        "[RE4TemporalProbe] sizeSample={} scenario='{}' dxgi swapchain={:p} source={} descResult=0x{:08x} swapSize={}x{} swapFormat={} bufferCount={} hookDisplay={}x{} hookRenderHint={}x{}",
-        sample,
-        scenario,
-        static_cast<void*>(swapchain),
-        swapchain_source,
-        static_cast<uint32_t>(swap_desc_result),
-        SUCCEEDED(swap_desc_result) ? swap_desc.Width : 0,
-        SUCCEEDED(swap_desc_result) ? swap_desc.Height : 0,
-        SUCCEEDED(swap_desc_result) ? static_cast<uint32_t>(swap_desc.Format) : 0,
-        SUCCEEDED(swap_desc_result) ? swap_desc.BufferCount : 0,
-        hook_display_width,
-        hook_display_height,
-        hook_render_width,
-        hook_render_height);
-
-    m_size_pair_sample.store(sample, std::memory_order_relaxed);
-    m_size_pair_frame.store(frame.value_or(0), std::memory_order_relaxed);
-
-    return true;
-}
-
-void RE4TemporalProbe::on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* render_context) {
-    if (!re4_temporal_probe::should_process_overlay(
-            sdk::GameIdentity::get().is_re4(),
-            m_enabled.load(std::memory_order_relaxed),
-            layer,
-            render_context)) {
-        return;
-    }
-
-    const auto sample = m_size_pair_sample.load(std::memory_order_relaxed);
-    const auto pre_frame = m_size_pair_frame.load(std::memory_order_relaxed);
-    if (sample == 0 || pre_frame == 0) {
-        return;
-    }
-
-    auto* renderer = sdk::renderer::get_renderer();
-    const auto frame = renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
-    if (!frame.has_value() || *frame != pre_frame) {
-        return;
-    }
-
-    const auto scenario = scenario_name(m_scenario.load(std::memory_order_relaxed));
-    auto* context = static_cast<sdk::renderer::RenderContext*>(render_context);
-    auto* current_target = context->get_render_target();
-    auto* current_resource = current_target != nullptr ? current_target->get_native_resource_d3d12() : nullptr;
-    auto* main_target = layer->get_main_target_state().get();
-    auto* main_resource = main_target != nullptr ? main_target->get_native_resource_d3d12() : nullptr;
-
-    const auto current = resource_shape(current_resource);
-    const auto main = resource_shape(main_resource);
-
-    spdlog::info(
-        "[RE4TemporalProbe] sizeSamplePost={} scenario='{}' frame={} currentTarget={:p} currentResource={:p} current={{width={},height={},format={},flags=0x{:x}}} mainResource={:p} main={{width={},height={},format={},flags=0x{:x}}} currentMatchesMain={}",
-        sample,
-        scenario,
         *frame,
-        static_cast<void*>(current_target),
-        static_cast<void*>(current_resource),
-        current.width,
-        current.height,
-        current.format,
-        current.flags,
-        static_cast<void*>(main_resource),
-        main.width,
-        main.height,
-        main.format,
-        main.flags,
-        current_resource != nullptr && current_resource == main_resource);
-
-    m_size_pair_sample.store(0, std::memory_order_relaxed);
-    m_size_pair_frame.store(0, std::memory_order_relaxed);
+        scenario,
+        scene_info,
+        layer->get_depth_distortion_scene_info(),
+        layer->get_filter_scene_info(),
+        layer->get_jitter_disable_scene_info(),
+        layer->get_jitter_disable_post_scene_info(),
+        layer->get_z_prepass_scene_info());
 }
