@@ -3534,6 +3534,121 @@ void RE4TemporalProbe::on_overlay_layer_draw(
     }
 
     const auto scenario = m_scenario.load(std::memory_order_relaxed);
+    if (re4_temporal_probe::is_output_copy_scenario(scenario)) {
+        auto* renderer = sdk::renderer::get_renderer();
+        const auto frame =
+            renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
+        if (!frame.has_value()) {
+            return;
+        }
+
+        const auto sample = m_output_copy_budget.reserve_frame(
+            *frame,
+            re4_temporal_probe::OUTPUT_COPY_MAX_SAMPLES);
+        if (sample == 0) {
+            if (m_output_copy_budget.sample_count() >=
+                re4_temporal_probe::OUTPUT_COPY_MAX_SAMPLES) {
+                m_output_copy_capture_open.store(false, std::memory_order_release);
+                m_output_copy_boundary_sample.store(0, std::memory_order_relaxed);
+                m_output_copy_boundary_frame.store(0, std::memory_order_relaxed);
+            }
+            return;
+        }
+
+        if (!ensure_execution_queue_hook()) {
+            spdlog::error(
+                "[RE4TemporalProbe] outputCopyBoundary sample={} frame={} queueHookUnavailable",
+                sample,
+                *frame);
+            return;
+        }
+
+        auto* scene =
+            static_cast<sdk::renderer::layer::Scene*>(layer->get_parent());
+        auto* color =
+            scene != nullptr ? scene->get_post_main_target_d3d12() : nullptr;
+        auto* hdr =
+            scene != nullptr ? scene->get_hdr_target_d3d12() : nullptr;
+
+        auto& overlay_main_ref = layer->get_main_target_state();
+        auto* overlay_main = overlay_main_ref.get();
+        auto* overlay_main_resource =
+            overlay_main != nullptr
+                ? overlay_main->get_native_resource_d3d12()
+                : nullptr;
+
+        auto& d3d12 = g_framework->get_d3d12_hook();
+        auto* queue =
+            d3d12 != nullptr ? d3d12->get_command_queue() : nullptr;
+        const auto queue_desc =
+            queue != nullptr ? queue->GetDesc() : D3D12_COMMAND_QUEUE_DESC{};
+
+        const auto color_shape = resource_shape(color);
+        const auto main_shape = resource_shape(overlay_main_resource);
+
+        m_output_copy_capture_open.store(false, std::memory_order_release);
+        m_output_copy_boundary_frame.store(*frame, std::memory_order_relaxed);
+        m_output_copy_boundary_sample.store(sample, std::memory_order_relaxed);
+        m_output_copy_color.store(
+            reinterpret_cast<uintptr_t>(color),
+            std::memory_order_relaxed);
+
+        {
+            std::scoped_lock lock{m_output_copy_mutex};
+            m_output_copy_tracked_resources.clear();
+            if (color != nullptr) {
+                m_output_copy_tracked_resources.insert(
+                    reinterpret_cast<uintptr_t>(color));
+            }
+        }
+
+        refresh_output_copy_swapchain_buffers();
+
+        size_t swapchain_buffer_count = 0;
+        {
+            std::scoped_lock lock{m_output_copy_mutex};
+            swapchain_buffer_count = m_output_copy_swapchain_buffers.size();
+        }
+
+        const auto event_base =
+            m_output_copy_event_sequence.load(std::memory_order_relaxed);
+        m_output_copy_boundary_event_base.store(
+            event_base,
+            std::memory_order_relaxed);
+        m_output_copy_capture_open.store(true, std::memory_order_release);
+
+        spdlog::info(
+            "[RE4TemporalProbe] outputCopyBoundary sample={} frame={} stage=preOverlay "
+            "thread={} color={:p} hdr={:p} overlayMain={:p} overlayMainResource={:p} "
+            "colorMatchesHDR={} mainMatchesColor={} "
+            "colorDesc={{w={},h={},format={},flags=0x{:x}}} "
+            "mainDesc={{w={},h={},format={},flags=0x{:x}}} "
+            "queue={:p} queueType={} hooksReady={} swapchainBuffers={} eventBase={}",
+            sample,
+            *frame,
+            GetCurrentThreadId(),
+            static_cast<void*>(color),
+            static_cast<void*>(hdr),
+            static_cast<void*>(overlay_main),
+            static_cast<void*>(overlay_main_resource),
+            color != nullptr && color == hdr,
+            color != nullptr && color == overlay_main_resource,
+            color_shape.width,
+            color_shape.height,
+            color_shape.format,
+            color_shape.flags,
+            main_shape.width,
+            main_shape.height,
+            main_shape.format,
+            main_shape.flags,
+            static_cast<void*>(queue),
+            static_cast<uint32_t>(queue_desc.Type),
+            m_recording_hooks_ready.load(std::memory_order_relaxed),
+            swapchain_buffer_count,
+            event_base);
+        return;
+    }
+
     if (re4_temporal_probe::is_bridge_order_scenario(scenario)) {
         auto* renderer = sdk::renderer::get_renderer();
         const auto frame = renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
