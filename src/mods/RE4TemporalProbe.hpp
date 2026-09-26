@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 
@@ -15,8 +16,13 @@ public:
     void on_draw_ui() override;
     void on_camera_get_projection_matrix(REManagedObject* camera, Matrix4x4f* result) override;
     void on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* render_context) override;
+    bool on_pre_scene_layer_draw(sdk::renderer::layer::Scene* layer, void* render_context) override;
 
 private:
+    static constexpr size_t SCENE_INFO_COUNT = 6;
+
+    void reset_temporal_state();
+
     std::atomic<bool> m_enabled{false};
     std::atomic<int> m_scenario{0};
 
@@ -24,16 +30,17 @@ private:
 
     std::atomic<uintptr_t> m_camera_ptr{0};
     std::atomic<uint32_t> m_camera_frame{0};
-    std::atomic<float> m_camera_p00{0.0f};
-    std::atomic<float> m_camera_p11{0.0f};
     std::atomic<float> m_camera_p20{0.0f};
     std::atomic<float> m_camera_p21{0.0f};
-    std::atomic<float> m_camera_p22{0.0f};
-    std::atomic<float> m_camera_p23{0.0f};
-    std::atomic<float> m_camera_p32{0.0f};
-    std::atomic<float> m_camera_p33{0.0f};
 
-    bool m_previous_scene_projection_valid{false};
-    float m_previous_scene_p20{0.0f};
-    float m_previous_scene_p21{0.0f};
+    std::array<Matrix4x4f, SCENE_INFO_COUNT> m_previous_projection{};
+    std::array<Matrix4x4f, SCENE_INFO_COUNT> m_previous_view{};
+    std::array<bool, SCENE_INFO_COUNT> m_history_valid{};
+
+    uint32_t m_expected_frame{0};
+    uint32_t m_expected_sample{0};
+    float m_expected_matrix_jitter_x{0.0f};
+    float m_expected_matrix_jitter_y{0.0f};
+    std::array<float, SCENE_INFO_COUNT> m_expected_p20{};
+    std::array<float, SCENE_INFO_COUNT> m_expected_p21{};
 };
