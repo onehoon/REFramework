@@ -18,7 +18,7 @@
 #include "REFramework.hpp"
 
 namespace {
-constexpr std::array<const char*, 14> SCENARIOS{
+constexpr std::array<const char*, 15> SCENARIOS{
     "Static screen",
     "Camera pan right",
     "Camera pan left",
@@ -33,6 +33,7 @@ constexpr std::array<const char*, 14> SCENARIOS{
     "D3D12 resource states",
     "D3D12 interface provenance",
     "D3D12 recording functions",
+    "D3D12 bridge ordering",
 };
 
 constexpr std::array<const char*, 6> LOAD_STATE_SINGLETONS{
@@ -369,6 +370,7 @@ void RE4TemporalProbe::reset_temporal_state() {
     m_resource_state_budget.reset();
     m_interface_provenance_budget.reset();
     m_recording_function_budget.reset();
+    m_bridge_order_budget.reset();
     m_execution_boundary_frame.store(0, std::memory_order_relaxed);
     m_execution_boundary_sample.store(0, std::memory_order_relaxed);
     m_execution_submit_count.store(0, std::memory_order_relaxed);
@@ -408,6 +410,16 @@ void RE4TemporalProbe::reset_temporal_state() {
         m_recording_active_by_thread.clear();
         m_recording_last_submit_frame = 0;
         m_recording_submit_ordinal = 0;
+    }
+    m_bridge_order_capture_open.store(false, std::memory_order_relaxed);
+    m_bridge_order_boundary_frame.store(0, std::memory_order_relaxed);
+    m_bridge_order_boundary_sample.store(0, std::memory_order_relaxed);
+    m_bridge_order_submitted_count.store(0, std::memory_order_relaxed);
+    m_bridge_order_skipped_count.store(0, std::memory_order_relaxed);
+    {
+        std::scoped_lock lock{m_bridge_order_mutex};
+        m_bridge_order_last_submit_frame = 0;
+        m_bridge_order_submit_ordinal = 0;
     }
     m_reset_witness_valid = false;
     m_reset_previous_frame = 0;
