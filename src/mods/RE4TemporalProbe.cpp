@@ -96,7 +96,7 @@ bool RE4TemporalProbe::ensure_mv_readback_resources() {
         m_mv_readback_buffer != nullptr &&
         m_mv_fence != nullptr &&
         m_mv_fence_event != nullptr) {
-        return true;
+        return;
     }
 
     if (g_framework == nullptr || !g_framework->is_dx12()) {
@@ -679,7 +679,7 @@ bool RE4TemporalProbe::on_pre_scene_layer_draw(sdk::renderer::layer::Scene* laye
 }
 
 
-bool RE4TemporalProbe::on_pre_overlay_layer_draw(
+void RE4TemporalProbe::on_overlay_layer_draw(
     sdk::renderer::layer::Overlay* layer,
     void* render_context) {
     if (!re4_temporal_probe::should_process_scene(
@@ -687,7 +687,7 @@ bool RE4TemporalProbe::on_pre_overlay_layer_draw(
             m_enabled.load(std::memory_order_relaxed),
             layer) ||
         render_context == nullptr) {
-        return true;
+        return;
     }
 
     // First readback stage is intentionally Static-screen only and limited to
@@ -697,20 +697,20 @@ bool RE4TemporalProbe::on_pre_overlay_layer_draw(
         m_expected_sample == 0 ||
         m_expected_sample > re4_temporal_probe::MAX_MV_READBACK_SAMPLES ||
         m_velocity_copy_ready) {
-        return true;
+        return;
     }
 
     auto* renderer = sdk::renderer::get_renderer();
     const auto frame = renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
     if (!frame.has_value() || *frame != m_expected_frame) {
-        return true;
+        return;
     }
 
     auto* scene = static_cast<sdk::renderer::layer::Scene*>(layer->get_parent());
     if (scene == nullptr ||
         !scene->is_fully_rendered() ||
         scene->get_camera() != sdk::get_primary_camera()) {
-        return true;
+        return;
     }
 
     auto* motion_state = scene->get_motion_vectors_state();
@@ -720,7 +720,7 @@ bool RE4TemporalProbe::on_pre_overlay_layer_draw(
             "[RE4TemporalProbe] mvSnapshot sample={} frame={} VelocityTarget RTV0 is null",
             m_expected_sample,
             *frame);
-        return true;
+        return;
     }
 
     auto& source_texture_ptr = rtv->get_texture_d3d12();
@@ -730,7 +730,7 @@ bool RE4TemporalProbe::on_pre_overlay_layer_draw(
             "[RE4TemporalProbe] mvSnapshot sample={} frame={} VelocityTarget texture is null",
             m_expected_sample,
             *frame);
-        return true;
+        return;
     }
 
     auto* source_container = source_texture->get_d3d12_resource_container();
@@ -741,7 +741,7 @@ bool RE4TemporalProbe::on_pre_overlay_layer_draw(
             "[RE4TemporalProbe] mvSnapshot sample={} frame={} VelocityTarget native resource is null",
             m_expected_sample,
             *frame);
-        return true;
+        return;
     }
 
     const auto desc = source_resource->GetDesc();
@@ -757,7 +757,7 @@ bool RE4TemporalProbe::on_pre_overlay_layer_draw(
             desc.Height,
             static_cast<uint32_t>(desc.Format),
             desc.SampleDesc.Count);
-        return true;
+        return;
     }
 
     m_velocity_copy = source_texture->clone();
@@ -766,7 +766,7 @@ bool RE4TemporalProbe::on_pre_overlay_layer_draw(
             "[RE4TemporalProbe] mvSnapshot sample={} frame={} failed to clone VelocityTarget",
             m_expected_sample,
             *frame);
-        return true;
+        return;
     }
 
     auto* copy_container = m_velocity_copy->get_d3d12_resource_container();
@@ -778,7 +778,7 @@ bool RE4TemporalProbe::on_pre_overlay_layer_draw(
             m_expected_sample,
             *frame);
         m_velocity_copy = nullptr;
-        return true;
+        return;
     }
 
     auto* context = static_cast<sdk::renderer::RenderContext*>(render_context);
@@ -803,7 +803,6 @@ bool RE4TemporalProbe::on_pre_overlay_layer_draw(
         m_velocity_copy_height,
         static_cast<uint32_t>(desc.Format));
 
-    return true;
 }
 
 void RE4TemporalProbe::on_present() {
