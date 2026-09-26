@@ -31,6 +31,7 @@ int main() {
     CHECK(INTERFACE_PROVENANCE_SCENARIO == 12);
     CHECK(RECORDING_FUNCTION_SCENARIO == 13);
     CHECK(BRIDGE_ORDER_SCENARIO == 14);
+    CHECK(OUTPUT_COPY_SCENARIO == 15);
     CHECK(RESET_WATCH_MAX_SAMPLES == 4096);
     CHECK(LOAD_STATE_MAX_SAMPLES == 8192);
     CHECK(EXECUTION_ORDER_MAX_SAMPLES == 64);
@@ -38,6 +39,7 @@ int main() {
     CHECK(INTERFACE_PROVENANCE_MAX_SAMPLES == 64);
     CHECK(RECORDING_FUNCTION_MAX_SAMPLES == 64);
     CHECK(BRIDGE_ORDER_MAX_SAMPLES == 64);
+    CHECK(OUTPUT_COPY_MAX_SAMPLES == 64);
     CHECK(BRIDGE_ORDER_SLOT_COUNT == 8);
     CHECK(JITTER_PHASE_COUNT == 4);
     CHECK(MV_READBACK_FIRST_SAMPLE == 5);
@@ -70,6 +72,9 @@ int main() {
     CHECK(!is_bridge_order_scenario(13));
     CHECK(is_bridge_order_scenario(14));
     CHECK(!is_bridge_order_scenario(15));
+    CHECK(!is_output_copy_scenario(14));
+    CHECK(is_output_copy_scenario(15));
+    CHECK(!is_output_copy_scenario(16));
     CHECK(is_horizontal_mv_scenario(1));
     CHECK(is_horizontal_mv_scenario(2));
     CHECK(!is_horizontal_mv_scenario(3));
