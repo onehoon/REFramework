@@ -835,67 +835,91 @@ Pixel identity alone cannot prove that no unrelated earlier UI pass ever touched
 
 ## 10. Current diagnostic PR behavior
 
-Capture 12 proves the native zero-jitter baseline. The active diagnostic is now a **deterministic projection-jitter injection test** and remains RE4-only and default-off.
+Captures 12 and 13 close the native-jitter baseline and RE4 projection/history injection mechanics. The active diagnostic now advances to the **first narrow VelocityTarget content readback** while retaining the already-proven deterministic jitter pattern.
 
-When enabled, it:
+The probe remains RE4-only and default-off.
 
-- restricts mutation to the fully rendered primary Scene whose camera matches `sdk::get_primary_camera()`;
-- captures up to 32 consecutive frames per reset;
-- derives the render extent from the proven `VelocityTarget` resource;
-- uses this four-phase diagnostic pixel sequence:
+### Jitter path retained from Capture 13
+
+It continues to:
+
+- restrict mutation to the fully rendered primary Scene whose camera matches `sdk::get_primary_camera()`;
+- inject the proven four-phase diagnostic sequence:
+  - `(+0.5,+0.5)`
+  - `(-0.5,+0.5)`
+  - `(-0.5,-0.5)`
+  - `(+0.5,-0.5)` pixels;
+- convert with:
+  - `matrixJitterX = 2 * pixelX / renderWidth`;
+  - `matrixJitterY = -2 * pixelY / renderHeight`;
+- apply the same current jitter to all six verified SceneInfo variants;
+- rebuild previous projection history with that same current jitter;
+- keep the primary Camera projection unmodified;
+- verify the injected values again at pre-Scene draw.
+
+These mechanics are already considered proven by Capture 13; the next capture uses them only as the controlled stimulus for MV inspection.
+
+### Narrow MV readback stage
+
+The new readback is intentionally limited:
+
+- **Static screen scenario only**;
+- only the **first eight temporal samples** after reset, covering two complete four-phase jitter cycles;
+- only a **3x3 interior grid = nine texels** per sampled frame;
+- no full-frame dump;
+- all four channels of `R16G16B16A16_SNORM` are recorded both as raw signed 16-bit values and decoded SNORM floats.
+
+The 2560x1440 sample coordinates are:
 
 ~~~text
-phase 0: +0.5, +0.5 px
-phase 1: -0.5, +0.5 px
-phase 2: -0.5, -0.5 px
-phase 3: +0.5, -0.5 px
+( 640,  360)  (1280,  360)  (1920,  360)
+( 640,  720)  (1280,  720)  (1920,  720)
+( 640, 1080)  (1280, 1080)  (1920, 1080)
 ~~~
 
-- converts pixel jitter to projection offsets with the historical REFramework convention:
+To avoid diagnostic barriers on game-owned temporal input:
+
+1. `on_pre_overlay_layer_draw()` obtains the current VelocityTarget engine Texture;
+2. a **disposable diagnostic Texture clone** is created for that sample;
+3. RE Engine `RenderContext::copy_texture` copies VelocityTarget into the clone;
+4. the original game VelocityTarget is not transitioned or barriered by diagnostic D3D12 code;
+5. at Present, after the engine copy has been queued before the diagnostic command list, nine 1x1 texels are copied from the disposable clone into a small readback buffer;
+6. the diagnostic waits for its own fence, maps the readback buffer, logs the values, then releases the disposable clone.
+
+The initial diagnostic assumes the engine copy destination is in `COPY_DEST` when the disposable clone reaches the Present-side command list. That state assumption is confined to the disposable clone and is itself part of the readback-plumbing validation; it does not alter state tracking for the game's VelocityTarget.
+
+Primary new log lines:
 
 ~~~text
-matrixJitterX =  2 * pixelJitterX / renderWidth
-matrixJitterY = -2 * pixelJitterY / renderHeight
+mvSnapshotQueued
+mvReadbackBegin
+mvReadback
 ~~~
 
-- applies the same current-frame projection offset to all six verified SceneInfo variants:
-  - main;
-  - depth-distortion;
-  - filter;
-  - jitter-disable;
-  - jitter-disable-post;
-  - Z-prepass;
-- rebuilds each `old_view_projection_matrix` from the previous unjittered projection/view pair with the **same current jitter** applied to the previous projection;
-- stores the current unjittered projection/view as history for the next frame;
-- updates current projection, inverse projection, view-projection, and inverse view-projection;
-- records before/after projection offsets, history projection offsets, rebuilt old-VP values, render extent, requested pixel jitter, and normalized matrix jitter;
-- checks again at `on_pre_scene_layer_draw()` that the injected projection values survived from update to draw time.
+The immediate Capture 14 question is deliberately narrow:
 
-This mirrors the historical pd-upscaler history treatment intentionally. Applying the same current jitter to both current and previous projection is the mechanism expected to keep projection-jitter delta out of engine-generated motion vectors while still rendering the current frame at the requested jittered sample position.
+> In a static scene, while the four-phase projection jitter changes every frame, do sampled VelocityTarget texels show a matching global periodic component, or do they remain effectively independent of the injected jitter?
 
-The current probe does **not**:
+If sampled static-background motion remains near its zero/motion baseline across phases, that supports the verified history construction excluding projection-jitter delta from engine MV. If a four-phase component appears, history/MV interaction must be revisited before any production XeSS dispatch.
 
-- use XeSS-generated jitter phases yet;
+This stage does **not** yet claim:
+
+- which VelocityTarget channels are X/Y;
+- final X/Y sign;
+- final motion scale;
+- that the historical `renderWidth/2, -renderHeight/2` conversion is proven;
+- final XeSS jitter phase generation.
+
+Those require the readback path to succeed first. Camera-pan and object-motion content tests come afterward.
+
+The probe still does **not**:
+
 - dispatch XeSS;
-- read back VelocityTarget pixels;
-- claim MV sign/scale/jitter semantics yet;
 - override SceneView/render size;
 - touch `ImageQualityRate`;
-- alter TAA;
 - resize the swapchain;
 - modify OptiScaler;
 - run in non-RE4 games.
-
-The next capture should verify:
-
-1. each requested ±0.5 px phase produces the exact expected normalized matrix offset;
-2. all six SceneInfo variants receive the same phase;
-3. previous-projection history receives the same **current** matrix jitter;
-4. `jitterDrawCheck ... allVariantsMatch=true` on every sampled frame;
-5. primary Camera projection remains an unjittered reference;
-6. VelocityTarget remains present and aligned.
-
-Only after these conditions are proven should the diagnostic add a narrow MV-content measurement to determine whether the engine-generated VelocityTarget excludes the injected jitter and to establish MV sign/scale.
 
 ---
 
