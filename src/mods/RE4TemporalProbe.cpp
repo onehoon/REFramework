@@ -974,6 +974,63 @@ void STDMETHODCALLTYPE RE4TemporalProbe::execute_command_lists_hook(
                             : static_cast<uint32_t>(D3D12_COMMAND_LIST_TYPE_DIRECT));
                 }
             }
+        } else if (re4_temporal_probe::is_interface_provenance_scenario(scenario) &&
+                   self->m_interface_capture_open.load(std::memory_order_relaxed)) {
+            auto* renderer = sdk::renderer::get_renderer();
+            const auto render_frame =
+                renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
+            const auto boundary_frame =
+                self->m_interface_boundary_frame.load(std::memory_order_relaxed);
+            const auto boundary_sample =
+                self->m_interface_boundary_sample.load(std::memory_order_relaxed);
+            const auto queue_desc =
+                queue != nullptr ? queue->GetDesc() : D3D12_COMMAND_QUEUE_DESC{};
+
+            uint32_t ordinal = 0;
+            if (render_frame.has_value()) {
+                std::scoped_lock lock{self->m_interface_provenance_mutex};
+                if (self->m_interface_last_submit_frame != *render_frame) {
+                    self->m_interface_last_submit_frame = *render_frame;
+                    self->m_interface_submit_ordinal = 0;
+                }
+                ordinal = ++self->m_interface_submit_ordinal;
+            }
+
+            const auto after_boundary =
+                render_frame.has_value() &&
+                boundary_frame != 0 &&
+                *render_frame == boundary_frame;
+
+            spdlog::info(
+                "[RE4TemporalProbe] interfaceSubmit renderFrame={} ordinal={} "
+                "boundarySample={} boundaryFrame={} afterBoundary={} "
+                "queue={:p} queueType={} numLists={} thread={}",
+                render_frame.value_or(0),
+                ordinal,
+                boundary_sample,
+                boundary_frame,
+                after_boundary,
+                static_cast<void*>(queue),
+                static_cast<uint32_t>(queue_desc.Type),
+                num_command_lists,
+                GetCurrentThreadId());
+
+            for (UINT i = 0; i < num_command_lists; ++i) {
+                auto* list = command_lists != nullptr ? command_lists[i] : nullptr;
+                if (list == nullptr) {
+                    continue;
+                }
+
+                self->log_command_list_interfaces(list);
+                spdlog::info(
+                    "[RE4TemporalProbe] interfaceSubmitList renderFrame={} ordinal={} "
+                    "index={} base={:p} type={}",
+                    render_frame.value_or(0),
+                    ordinal,
+                    i,
+                    static_cast<void*>(list),
+                    static_cast<uint32_t>(list->GetType()));
+            }
         } else if (re4_temporal_probe::is_resource_state_scenario(scenario)) {
             const auto sample = self->m_resource_boundary_sample.load(std::memory_order_relaxed);
             const auto boundary_frame = self->m_resource_boundary_frame.load(std::memory_order_relaxed);
