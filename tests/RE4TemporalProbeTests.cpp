@@ -68,6 +68,20 @@ int main() {
     CHECK(std::abs(candidate.x - 12.8f) < 0.0001f);
     CHECK(std::abs(candidate.y - 14.4f) < 0.0001f);
 
+    const ScreenPoint pixel{640.0f, 360.0f};
+    const auto ndc = pixel_to_ndc(pixel, 2560, 1440);
+    CHECK(std::abs(ndc.x + 0.5f) < 0.000001f);
+    CHECK(std::abs(ndc.y - 0.5f) < 0.000001f);
+
+    const auto roundtrip = ndc_to_pixel(ndc, 2560, 1440);
+    CHECK(std::abs(roundtrip.x - pixel.x) < 0.0001f);
+    CHECK(std::abs(roundtrip.y - pixel.y) < 0.0001f);
+
+    const auto invalid_ndc = pixel_to_ndc(pixel, 0, 1440);
+    const auto invalid_pixel = ndc_to_pixel(ndc, 2560, 0);
+    CHECK(invalid_ndc.x == 0.0f && invalid_ndc.y == 0.0f);
+    CHECK(invalid_pixel.x == 0.0f && invalid_pixel.y == 0.0f);
+
     const auto j1 = jitter_pixels_for_sample(1);
     const auto j2 = jitter_pixels_for_sample(2);
     const auto j3 = jitter_pixels_for_sample(3);
