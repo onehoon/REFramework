@@ -18,7 +18,7 @@
 #include "REFramework.hpp"
 
 namespace {
-constexpr std::array<const char*, 10> SCENARIOS{
+constexpr std::array<const char*, 11> SCENARIOS{
     "Static screen",
     "Camera pan right",
     "Camera pan left",
@@ -29,6 +29,7 @@ constexpr std::array<const char*, 10> SCENARIOS{
     "HUD/menu off",
     "Reset/history transition",
     "Load/fade state",
+    "D3D12 execution ordering",
 };
 
 constexpr std::array<const char*, 6> LOAD_STATE_SINGLETONS{
@@ -342,6 +343,10 @@ void RE4TemporalProbe::reset_temporal_state() {
     m_temporal_budget.reset();
     m_reset_watch_budget.reset();
     m_load_state_budget.reset();
+    m_execution_order_budget.reset();
+    m_execution_boundary_frame.store(0, std::memory_order_relaxed);
+    m_execution_boundary_sample.store(0, std::memory_order_relaxed);
+    m_execution_submit_count.store(0, std::memory_order_relaxed);
     m_reset_witness_valid = false;
     m_reset_previous_frame = 0;
     m_reset_previous_scene = 0;
@@ -388,6 +393,129 @@ void RE4TemporalProbe::reset_temporal_state() {
     m_velocity_copy_rotation_reprojection.fill({});
     m_velocity_copy_rotation_reprojection_previous_frame = 0;
     m_velocity_copy_rotation_reprojection_valid = false;
+}
+
+bool RE4TemporalProbe::ensure_execution_queue_hook() {
+    if (m_execution_queue_hook != nullptr && m_execution_queue_original != nullptr) {
+        return true;
+    }
+
+    if (g_framework == nullptr || !g_framework->is_dx12()) {
+        return false;
+    }
+
+    auto& d3d12 = g_framework->get_d3d12_hook();
+    auto* queue = d3d12 != nullptr ? d3d12->get_command_queue() : nullptr;
+    if (queue == nullptr) {
+        spdlog::error("[RE4TemporalProbe] executionOrder missing D3D12 command queue");
+        return false;
+    }
+
+    const auto desc = queue->GetDesc();
+    if (desc.Type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        spdlog::error(
+            "[RE4TemporalProbe] executionOrder expected DIRECT queue but got type={}",
+            static_cast<uint32_t>(desc.Type));
+        return false;
+    }
+
+    try {
+        auto hook = std::make_unique<VtableHook>(Address{queue});
+        auto** vtable = *reinterpret_cast<void***>(queue);
+        if (vtable == nullptr || vtable[10] == nullptr) {
+            spdlog::error("[RE4TemporalProbe] executionOrder queue vtable/ExecuteCommandLists missing");
+            return false;
+        }
+
+        const auto original = reinterpret_cast<ExecuteCommandListsFn>(vtable[10]);
+        if (!hook->hook_method(
+                10,
+                Address{reinterpret_cast<void*>(&RE4TemporalProbe::execute_command_lists_hook)})) {
+            spdlog::error("[RE4TemporalProbe] executionOrder failed to hook ExecuteCommandLists[10]");
+            return false;
+        }
+
+        m_execution_queue_original = original;
+        m_execution_queue_hook = std::move(hook);
+        s_execution_probe_instance = this;
+
+        spdlog::info(
+            "[RE4TemporalProbe] executionOrderHook queue={:p} type={} original={:p}",
+            static_cast<void*>(queue),
+            static_cast<uint32_t>(desc.Type),
+            reinterpret_cast<void*>(original));
+        return true;
+    } catch (const std::exception& e) {
+        spdlog::error("[RE4TemporalProbe] executionOrder hook exception={}", e.what());
+    } catch (...) {
+        spdlog::error("[RE4TemporalProbe] executionOrder hook unknown exception");
+    }
+
+    return false;
+}
+
+void RE4TemporalProbe::release_execution_queue_hook() {
+    if (s_execution_probe_instance == this) {
+        s_execution_probe_instance = nullptr;
+    }
+
+    m_execution_queue_hook.reset();
+    m_execution_queue_original = nullptr;
+    m_execution_boundary_frame.store(0, std::memory_order_relaxed);
+    m_execution_boundary_sample.store(0, std::memory_order_relaxed);
+}
+
+void STDMETHODCALLTYPE RE4TemporalProbe::execute_command_lists_hook(
+    ID3D12CommandQueue* queue,
+    UINT num_command_lists,
+    ID3D12CommandList* const* command_lists) {
+    auto* self = s_execution_probe_instance;
+    auto original = self != nullptr ? self->m_execution_queue_original : nullptr;
+
+    if (self != nullptr &&
+        self->m_enabled.load(std::memory_order_relaxed) &&
+        re4_temporal_probe::is_execution_order_scenario(
+            self->m_scenario.load(std::memory_order_relaxed))) {
+        const auto sample = self->m_execution_boundary_sample.load(std::memory_order_relaxed);
+        const auto boundary_frame = self->m_execution_boundary_frame.load(std::memory_order_relaxed);
+
+        if (sample != 0 && boundary_frame != 0) {
+            const auto submit = self->m_execution_submit_count.fetch_add(
+                1,
+                std::memory_order_relaxed) + 1;
+            const auto queue_desc = queue != nullptr ? queue->GetDesc() : D3D12_COMMAND_QUEUE_DESC{};
+
+            spdlog::info(
+                "[RE4TemporalProbe] executionSubmit submit={} sample={} boundaryFrame={} "
+                "queue={:p} queueType={} numLists={} thread={}",
+                submit,
+                sample,
+                boundary_frame,
+                static_cast<void*>(queue),
+                static_cast<uint32_t>(queue_desc.Type),
+                num_command_lists,
+                GetCurrentThreadId());
+
+            for (UINT i = 0; i < num_command_lists; ++i) {
+                auto* list = command_lists != nullptr ? command_lists[i] : nullptr;
+                spdlog::info(
+                    "[RE4TemporalProbe] executionList submit={} sample={} boundaryFrame={} "
+                    "index={} list={:p} type={}",
+                    submit,
+                    sample,
+                    boundary_frame,
+                    i,
+                    static_cast<void*>(list),
+                    list != nullptr
+                        ? static_cast<uint32_t>(list->GetType())
+                        : static_cast<uint32_t>(D3D12_COMMAND_LIST_TYPE_DIRECT));
+            }
+        }
+    }
+
+    if (original != nullptr) {
+        original(queue, num_command_lists, command_lists);
+    }
 }
 
 bool RE4TemporalProbe::ensure_mv_readback_resources() {
