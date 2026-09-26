@@ -440,6 +440,116 @@ void RE4TemporalProbe::reset_temporal_state() {
     m_velocity_copy_rotation_reprojection_valid = false;
 }
 
+void RE4TemporalProbe::log_command_list_interfaces(ID3D12CommandList* command_list) {
+    if (command_list == nullptr) {
+        return;
+    }
+
+    const auto base_key = reinterpret_cast<uintptr_t>(command_list);
+    {
+        std::scoped_lock lock{m_interface_provenance_mutex};
+        if (!m_interface_logged_lists.insert(base_key).second) {
+            return;
+        }
+    }
+
+    Microsoft::WRL::ComPtr<IUnknown> identity{};
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> gcl0{};
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList1> gcl1{};
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList2> gcl2{};
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList3> gcl3{};
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> gcl4{};
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList5> gcl5{};
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList6> gcl6{};
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList7> gcl7{};
+
+    const auto qi = [command_list](REFIID iid, void** out) {
+        return command_list->QueryInterface(iid, out);
+    };
+
+    const auto hr_identity = qi(
+        IID_IUnknown,
+        reinterpret_cast<void**>(identity.ReleaseAndGetAddressOf()));
+    const auto hr0 = qi(
+        __uuidof(ID3D12GraphicsCommandList),
+        reinterpret_cast<void**>(gcl0.ReleaseAndGetAddressOf()));
+    const auto hr1 = qi(
+        __uuidof(ID3D12GraphicsCommandList1),
+        reinterpret_cast<void**>(gcl1.ReleaseAndGetAddressOf()));
+    const auto hr2 = qi(
+        __uuidof(ID3D12GraphicsCommandList2),
+        reinterpret_cast<void**>(gcl2.ReleaseAndGetAddressOf()));
+    const auto hr3 = qi(
+        __uuidof(ID3D12GraphicsCommandList3),
+        reinterpret_cast<void**>(gcl3.ReleaseAndGetAddressOf()));
+    const auto hr4 = qi(
+        __uuidof(ID3D12GraphicsCommandList4),
+        reinterpret_cast<void**>(gcl4.ReleaseAndGetAddressOf()));
+    const auto hr5 = qi(
+        __uuidof(ID3D12GraphicsCommandList5),
+        reinterpret_cast<void**>(gcl5.ReleaseAndGetAddressOf()));
+    const auto hr6 = qi(
+        __uuidof(ID3D12GraphicsCommandList6),
+        reinterpret_cast<void**>(gcl6.ReleaseAndGetAddressOf()));
+    const auto hr7 = qi(
+        __uuidof(ID3D12GraphicsCommandList7),
+        reinterpret_cast<void**>(gcl7.ReleaseAndGetAddressOf()));
+
+    int max_version = -1;
+    if (SUCCEEDED(hr0)) max_version = 0;
+    if (SUCCEEDED(hr1)) max_version = 1;
+    if (SUCCEEDED(hr2)) max_version = 2;
+    if (SUCCEEDED(hr3)) max_version = 3;
+    if (SUCCEEDED(hr4)) max_version = 4;
+    if (SUCCEEDED(hr5)) max_version = 5;
+    if (SUCCEEDED(hr6)) max_version = 6;
+    if (SUCCEEDED(hr7)) max_version = 7;
+
+    spdlog::info(
+        "[RE4TemporalProbe] interfaceTopology base={:p} baseVtable={:p} type={} "
+        "identity={{hr=0x{:08x},ptr={:p}}} maxGraphicsVersion={} "
+        "gcl0={{hr=0x{:08x},ptr={:p},vtable={:p}}} "
+        "gcl1={{hr=0x{:08x},ptr={:p}}} gcl2={{hr=0x{:08x},ptr={:p}}} "
+        "gcl3={{hr=0x{:08x},ptr={:p}}} gcl4={{hr=0x{:08x},ptr={:p}}} "
+        "gcl5={{hr=0x{:08x},ptr={:p}}} gcl6={{hr=0x{:08x},ptr={:p}}} "
+        "gcl7={{hr=0x{:08x},ptr={:p},vtable={:p}}}",
+        static_cast<void*>(command_list),
+        interface_vtable(command_list),
+        static_cast<uint32_t>(command_list->GetType()),
+        static_cast<uint32_t>(hr_identity),
+        static_cast<void*>(identity.Get()),
+        max_version,
+        static_cast<uint32_t>(hr0),
+        static_cast<void*>(gcl0.Get()),
+        interface_vtable(gcl0.Get()),
+        static_cast<uint32_t>(hr1),
+        static_cast<void*>(gcl1.Get()),
+        static_cast<uint32_t>(hr2),
+        static_cast<void*>(gcl2.Get()),
+        static_cast<uint32_t>(hr3),
+        static_cast<void*>(gcl3.Get()),
+        static_cast<uint32_t>(hr4),
+        static_cast<void*>(gcl4.Get()),
+        static_cast<uint32_t>(hr5),
+        static_cast<void*>(gcl5.Get()),
+        static_cast<uint32_t>(hr6),
+        static_cast<void*>(gcl6.Get()),
+        static_cast<uint32_t>(hr7),
+        static_cast<void*>(gcl7.Get()),
+        interface_vtable(gcl7.Get()));
+
+    spdlog::info(
+        "[RE4TemporalProbe] interfaceMethods base={:p} identity={:p} "
+        "gcl0Close={:p} gcl0Reset={:p} gcl0ResourceBarrier={:p} "
+        "gcl7Barrier={:p}",
+        static_cast<void*>(command_list),
+        static_cast<void*>(identity.Get()),
+        interface_method(gcl0.Get(), 9),
+        interface_method(gcl0.Get(), 10),
+        interface_method(gcl0.Get(), 26),
+        interface_method(gcl7.Get(), 80));
+}
+
 bool RE4TemporalProbe::ensure_execution_queue_hook() {
     if (m_execution_queue_hook != nullptr && m_execution_queue_original != nullptr) {
         return true;
