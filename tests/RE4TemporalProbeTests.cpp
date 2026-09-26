@@ -25,6 +25,8 @@ int main() {
     CHECK(should_process_view_size(true, true, &scene_view, view_size));
 
     CHECK(MAX_SAMPLES == 10);
+    CHECK(TEST_RENDER_WIDTH == 1920);
+    CHECK(TEST_RENDER_HEIGHT == 1080);
 
     SampleBudget budget;
     CHECK(budget.callback_count() == 0);
