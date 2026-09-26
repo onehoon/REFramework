@@ -2788,6 +2788,106 @@ void RE4TemporalProbe::on_overlay_layer_draw(
     }
 
     const auto scenario = m_scenario.load(std::memory_order_relaxed);
+    if (re4_temporal_probe::is_recording_function_scenario(scenario)) {
+        auto* renderer = sdk::renderer::get_renderer();
+        const auto frame = renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
+        if (!frame.has_value()) {
+            return;
+        }
+
+        const auto sample = m_recording_function_budget.reserve_frame(
+            *frame,
+            re4_temporal_probe::RECORDING_FUNCTION_MAX_SAMPLES);
+        if (sample == 0) {
+            if (m_recording_function_budget.sample_count() >=
+                re4_temporal_probe::RECORDING_FUNCTION_MAX_SAMPLES) {
+                m_recording_capture_open.store(false, std::memory_order_relaxed);
+                m_recording_boundary_sample.store(0, std::memory_order_relaxed);
+                m_recording_boundary_frame.store(0, std::memory_order_relaxed);
+            }
+            return;
+        }
+
+        if (!ensure_execution_queue_hook()) {
+            spdlog::error(
+                "[RE4TemporalProbe] recordingBoundary sample={} frame={} queueHookUnavailable",
+                sample,
+                *frame);
+            return;
+        }
+
+        auto* scene = static_cast<sdk::renderer::layer::Scene*>(layer->get_parent());
+        auto* color = scene != nullptr ? scene->get_post_main_target_d3d12() : nullptr;
+        auto* hdr = scene != nullptr ? scene->get_hdr_target_d3d12() : nullptr;
+        auto* depth = scene != nullptr ? scene->get_depth_stencil_d3d12() : nullptr;
+        auto* velocity = scene != nullptr ? scene->get_motion_vectors_d3d12() : nullptr;
+
+        m_recording_color.store(
+            reinterpret_cast<uintptr_t>(color),
+            std::memory_order_relaxed);
+        m_recording_depth.store(
+            reinterpret_cast<uintptr_t>(depth),
+            std::memory_order_relaxed);
+        m_recording_velocity.store(
+            reinterpret_cast<uintptr_t>(velocity),
+            std::memory_order_relaxed);
+
+        const auto thread = GetCurrentThreadId();
+        uintptr_t active_list = 0;
+        uint64_t active_generation = 0;
+        uint64_t active_barrier_sequence = 0;
+        size_t tracked_lists = 0;
+
+        {
+            std::scoped_lock lock{m_recording_mutex};
+            const auto active = m_recording_active_by_thread.find(thread);
+            if (active != m_recording_active_by_thread.end()) {
+                active_list = active->second.first;
+                active_generation = active->second.second;
+
+                if (const auto state = m_recording_list_states.find(active_list);
+                    state != m_recording_list_states.end() &&
+                    state->second.generation == active_generation) {
+                    active_barrier_sequence =
+                        state->second.target_barrier_sequence;
+                }
+            }
+
+            tracked_lists = m_recording_tracked_lists.size();
+        }
+
+        auto& d3d12 = g_framework->get_d3d12_hook();
+        auto* queue = d3d12 != nullptr ? d3d12->get_command_queue() : nullptr;
+        const auto queue_desc =
+            queue != nullptr ? queue->GetDesc() : D3D12_COMMAND_QUEUE_DESC{};
+
+        m_recording_boundary_frame.store(*frame, std::memory_order_relaxed);
+        m_recording_boundary_sample.store(sample, std::memory_order_relaxed);
+        m_recording_capture_open.store(true, std::memory_order_release);
+
+        spdlog::info(
+            "[RE4TemporalProbe] recordingBoundary sample={} frame={} stage=preOverlay "
+            "thread={} activeList={:p} activeGeneration={} activeBarrierSeq={} "
+            "trackedLists={} hooksReady={} color={:p} hdr={:p} depth={:p} "
+            "velocity={:p} colorMatchesHDR={} queue={:p} queueType={}",
+            sample,
+            *frame,
+            thread,
+            reinterpret_cast<void*>(active_list),
+            active_generation,
+            active_barrier_sequence,
+            tracked_lists,
+            m_recording_hooks_ready.load(std::memory_order_relaxed),
+            static_cast<void*>(color),
+            static_cast<void*>(hdr),
+            static_cast<void*>(depth),
+            static_cast<void*>(velocity),
+            color != nullptr && color == hdr,
+            static_cast<void*>(queue),
+            static_cast<uint32_t>(queue_desc.Type));
+        return;
+    }
+
     if (re4_temporal_probe::is_interface_provenance_scenario(scenario)) {
         auto* renderer = sdk::renderer::get_renderer();
         const auto frame = renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
