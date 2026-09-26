@@ -88,7 +88,6 @@ void RE4TemporalProbe::reset_temporal_state() {
     m_expected_matrix_jitter_y = 0.0f;
     m_expected_p20.fill(0.0f);
     m_expected_p21.fill(0.0f);
-    m_last_mv_readback_sample = 0;
 }
 
 bool RE4TemporalProbe::ensure_mv_readback_resources() {
@@ -325,7 +324,7 @@ void RE4TemporalProbe::perform_mv_readback() {
         return;
     }
 
-    const auto wait_result = WaitForSingleObject(m_mv_fence_event, 2000);
+    const auto wait_result = WaitForSingleObject(m_mv_fence_event, 500);
     if (wait_result != WAIT_OBJECT_0) {
         spdlog::error(
             "[RE4TemporalProbe] mvReadback sample={} frame={} fence wait failed result={}",
@@ -396,7 +395,6 @@ void RE4TemporalProbe::perform_mv_readback() {
     D3D12_RANGE written_range{0, 0};
     m_mv_readback_buffer->Unmap(0, &written_range);
 
-    m_last_mv_readback_sample = m_velocity_copy_sample;
     finish();
 }
 
@@ -685,7 +683,6 @@ bool RE4TemporalProbe::on_pre_overlay_layer_draw(
     if (scenario != 0 ||
         m_expected_sample == 0 ||
         m_expected_sample > re4_temporal_probe::MAX_MV_READBACK_SAMPLES ||
-        m_expected_sample <= m_last_mv_readback_sample ||
         m_velocity_copy_ready) {
         return true;
     }
