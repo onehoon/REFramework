@@ -470,14 +470,318 @@ bool RE4TemporalProbe::ensure_execution_queue_hook() {
 }
 
 void RE4TemporalProbe::release_execution_queue_hook() {
-    if (s_execution_probe_instance == this) {
-        s_execution_probe_instance = nullptr;
-    }
-
     m_execution_queue_hook.reset();
     m_execution_queue_original = nullptr;
     m_execution_boundary_frame.store(0, std::memory_order_relaxed);
     m_execution_boundary_sample.store(0, std::memory_order_relaxed);
+}
+
+bool RE4TemporalProbe::ensure_resource_command_list_hook(
+    ID3D12GraphicsCommandList* command_list) {
+    if (command_list == nullptr ||
+        command_list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        return false;
+    }
+
+    const auto key = reinterpret_cast<uintptr_t>(command_list);
+
+    std::scoped_lock lock{m_resource_state_mutex};
+    if (m_resource_command_list_hooks.contains(key)) {
+        return true;
+    }
+
+    try {
+        auto hook = std::make_unique<VtableHook>(Address{command_list});
+        auto close_original = hook->get_method<CommandListCloseFn>(9);
+        auto reset_original = hook->get_method<CommandListResetFn>(10);
+        auto barrier_original = hook->get_method<CommandListResourceBarrierFn>(26);
+
+        if (close_original == nullptr ||
+            reset_original == nullptr ||
+            barrier_original == nullptr) {
+            spdlog::error(
+                "[RE4TemporalProbe] resourceListHook missing method list={:p} "
+                "close={:p} reset={:p} barrier={:p}",
+                static_cast<void*>(command_list),
+                reinterpret_cast<void*>(close_original),
+                reinterpret_cast<void*>(reset_original),
+                reinterpret_cast<void*>(barrier_original));
+            return false;
+        }
+
+        if (!hook->hook_method(
+                9,
+                Address{reinterpret_cast<void*>(&RE4TemporalProbe::command_list_close_hook)}) ||
+            !hook->hook_method(
+                10,
+                Address{reinterpret_cast<void*>(&RE4TemporalProbe::command_list_reset_hook)}) ||
+            !hook->hook_method(
+                26,
+                Address{reinterpret_cast<void*>(&RE4TemporalProbe::command_list_resource_barrier_hook)})) {
+            spdlog::error(
+                "[RE4TemporalProbe] resourceListHook failed list={:p}",
+                static_cast<void*>(command_list));
+            return false;
+        }
+
+        ResourceCommandListHookState state{};
+        state.hook = std::move(hook);
+        state.close_original = close_original;
+        state.reset_original = reset_original;
+        state.barrier_original = barrier_original;
+
+        m_resource_command_list_hooks.emplace(key, std::move(state));
+
+        spdlog::info(
+            "[RE4TemporalProbe] resourceListHook list={:p} type={} trackedLists={}",
+            static_cast<void*>(command_list),
+            static_cast<uint32_t>(command_list->GetType()),
+            m_resource_command_list_hooks.size());
+        return true;
+    } catch (const std::exception& e) {
+        spdlog::error(
+            "[RE4TemporalProbe] resourceListHook exception list={:p} error={}",
+            static_cast<void*>(command_list),
+            e.what());
+    } catch (...) {
+        spdlog::error(
+            "[RE4TemporalProbe] resourceListHook unknown exception list={:p}",
+            static_cast<void*>(command_list));
+    }
+
+    return false;
+}
+
+void RE4TemporalProbe::release_resource_command_list_hooks() {
+    std::scoped_lock lock{m_resource_state_mutex};
+    m_resource_active_by_thread.clear();
+    m_resource_command_list_hooks.clear();
+}
+
+HRESULT STDMETHODCALLTYPE RE4TemporalProbe::command_list_reset_hook(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12CommandAllocator* allocator,
+    ID3D12PipelineState* initial_state) {
+    auto* self = s_execution_probe_instance;
+    if (self == nullptr) {
+        return E_FAIL;
+    }
+
+    CommandListResetFn original = nullptr;
+    {
+        std::scoped_lock lock{self->m_resource_state_mutex};
+        const auto it = self->m_resource_command_list_hooks.find(
+            reinterpret_cast<uintptr_t>(command_list));
+        if (it != self->m_resource_command_list_hooks.end()) {
+            original = it->second.reset_original;
+        }
+    }
+
+    if (original == nullptr) {
+        return E_FAIL;
+    }
+
+    const auto result = original(command_list, allocator, initial_state);
+    if (FAILED(result)) {
+        return result;
+    }
+
+    uint64_t generation = 0;
+    const auto thread = GetCurrentThreadId();
+    {
+        std::scoped_lock lock{self->m_resource_state_mutex};
+        const auto it = self->m_resource_command_list_hooks.find(
+            reinterpret_cast<uintptr_t>(command_list));
+        if (it != self->m_resource_command_list_hooks.end()) {
+            generation = ++it->second.generation;
+            it->second.target_barrier_sequence = 0;
+            self->m_resource_active_by_thread[thread] = {
+                reinterpret_cast<uintptr_t>(command_list),
+                generation,
+            };
+        }
+    }
+
+    if (self->m_enabled.load(std::memory_order_relaxed) &&
+        re4_temporal_probe::is_resource_state_scenario(
+            self->m_scenario.load(std::memory_order_relaxed))) {
+        const auto event = self->m_resource_event_sequence.fetch_add(
+            1,
+            std::memory_order_relaxed) + 1;
+        spdlog::info(
+            "[RE4TemporalProbe] resourceReset event={} list={:p} generation={} "
+            "allocator={:p} initialState={:p} thread={}",
+            event,
+            static_cast<void*>(command_list),
+            generation,
+            static_cast<void*>(allocator),
+            static_cast<void*>(initial_state),
+            thread);
+    }
+
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE RE4TemporalProbe::command_list_close_hook(
+    ID3D12GraphicsCommandList* command_list) {
+    auto* self = s_execution_probe_instance;
+    if (self == nullptr) {
+        return E_FAIL;
+    }
+
+    CommandListCloseFn original = nullptr;
+    uint64_t generation = 0;
+    const auto key = reinterpret_cast<uintptr_t>(command_list);
+    const auto thread = GetCurrentThreadId();
+
+    {
+        std::scoped_lock lock{self->m_resource_state_mutex};
+        const auto it = self->m_resource_command_list_hooks.find(key);
+        if (it != self->m_resource_command_list_hooks.end()) {
+            original = it->second.close_original;
+            generation = it->second.generation;
+        }
+    }
+
+    if (original == nullptr) {
+        return E_FAIL;
+    }
+
+    const auto result = original(command_list);
+
+    {
+        std::scoped_lock lock{self->m_resource_state_mutex};
+        const auto active = self->m_resource_active_by_thread.find(thread);
+        if (active != self->m_resource_active_by_thread.end() &&
+            active->second.first == key &&
+            active->second.second == generation) {
+            self->m_resource_active_by_thread.erase(active);
+        }
+    }
+
+    if (self->m_enabled.load(std::memory_order_relaxed) &&
+        re4_temporal_probe::is_resource_state_scenario(
+            self->m_scenario.load(std::memory_order_relaxed))) {
+        const auto event = self->m_resource_event_sequence.fetch_add(
+            1,
+            std::memory_order_relaxed) + 1;
+        spdlog::info(
+            "[RE4TemporalProbe] resourceClose event={} list={:p} generation={} "
+            "result=0x{:08x} thread={}",
+            event,
+            static_cast<void*>(command_list),
+            generation,
+            static_cast<uint32_t>(result),
+            thread);
+    }
+
+    return result;
+}
+
+void STDMETHODCALLTYPE RE4TemporalProbe::command_list_resource_barrier_hook(
+    ID3D12GraphicsCommandList* command_list,
+    UINT num_barriers,
+    const D3D12_RESOURCE_BARRIER* barriers) {
+    auto* self = s_execution_probe_instance;
+    if (self == nullptr) {
+        return;
+    }
+
+    CommandListResourceBarrierFn original = nullptr;
+    uint64_t generation = 0;
+    const auto key = reinterpret_cast<uintptr_t>(command_list);
+
+    {
+        std::scoped_lock lock{self->m_resource_state_mutex};
+        const auto it = self->m_resource_command_list_hooks.find(key);
+        if (it != self->m_resource_command_list_hooks.end()) {
+            original = it->second.barrier_original;
+            generation = it->second.generation;
+        }
+    }
+
+    if (original == nullptr) {
+        return;
+    }
+
+    const auto color = self->m_resource_color.load(std::memory_order_relaxed);
+    const auto depth = self->m_resource_depth.load(std::memory_order_relaxed);
+    const auto velocity = self->m_resource_velocity.load(std::memory_order_relaxed);
+
+    if (self->m_enabled.load(std::memory_order_relaxed) &&
+        re4_temporal_probe::is_resource_state_scenario(
+            self->m_scenario.load(std::memory_order_relaxed)) &&
+        barriers != nullptr) {
+        for (UINT i = 0; i < num_barriers; ++i) {
+            const auto& barrier = barriers[i];
+
+            ID3D12Resource* resource = nullptr;
+            if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
+                resource = barrier.Transition.pResource;
+            } else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
+                resource = barrier.UAV.pResource;
+            }
+
+            const auto resource_key = reinterpret_cast<uintptr_t>(resource);
+            const char* target = nullptr;
+            if (resource_key != 0 && resource_key == color) {
+                target = "Color";
+            } else if (resource_key != 0 && resource_key == depth) {
+                target = "Depth";
+            } else if (resource_key != 0 && resource_key == velocity) {
+                target = "Velocity";
+            }
+
+            if (target == nullptr) {
+                continue;
+            }
+
+            uint64_t barrier_sequence = 0;
+            {
+                std::scoped_lock lock{self->m_resource_state_mutex};
+                const auto it = self->m_resource_command_list_hooks.find(key);
+                if (it != self->m_resource_command_list_hooks.end()) {
+                    barrier_sequence = ++it->second.target_barrier_sequence;
+                }
+            }
+
+            const auto event = self->m_resource_event_sequence.fetch_add(
+                1,
+                std::memory_order_relaxed) + 1;
+
+            if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
+                spdlog::info(
+                    "[RE4TemporalProbe] resourceBarrier event={} list={:p} generation={} "
+                    "barrierSeq={} thread={} target={} resource={:p} type=transition "
+                    "subresource={} before={} after={} flags={}",
+                    event,
+                    static_cast<void*>(command_list),
+                    generation,
+                    barrier_sequence,
+                    GetCurrentThreadId(),
+                    target,
+                    static_cast<void*>(resource),
+                    barrier.Transition.Subresource,
+                    static_cast<uint32_t>(barrier.Transition.StateBefore),
+                    static_cast<uint32_t>(barrier.Transition.StateAfter),
+                    static_cast<uint32_t>(barrier.Flags));
+            } else {
+                spdlog::info(
+                    "[RE4TemporalProbe] resourceBarrier event={} list={:p} generation={} "
+                    "barrierSeq={} thread={} target={} resource={:p} type=uav flags={}",
+                    event,
+                    static_cast<void*>(command_list),
+                    generation,
+                    barrier_sequence,
+                    GetCurrentThreadId(),
+                    target,
+                    static_cast<void*>(resource),
+                    static_cast<uint32_t>(barrier.Flags));
+            }
+        }
+    }
+
+    original(command_list, num_barriers, barriers);
 }
 
 void STDMETHODCALLTYPE RE4TemporalProbe::execute_command_lists_hook(
@@ -487,43 +791,91 @@ void STDMETHODCALLTYPE RE4TemporalProbe::execute_command_lists_hook(
     auto* self = s_execution_probe_instance;
     auto original = self != nullptr ? self->m_execution_queue_original : nullptr;
 
-    if (self != nullptr &&
-        self->m_enabled.load(std::memory_order_relaxed) &&
-        re4_temporal_probe::is_execution_order_scenario(
-            self->m_scenario.load(std::memory_order_relaxed))) {
-        const auto sample = self->m_execution_boundary_sample.load(std::memory_order_relaxed);
-        const auto boundary_frame = self->m_execution_boundary_frame.load(std::memory_order_relaxed);
+    if (self != nullptr && self->m_enabled.load(std::memory_order_relaxed)) {
+        const auto scenario = self->m_scenario.load(std::memory_order_relaxed);
 
-        if (sample != 0 && boundary_frame != 0) {
-            const auto submit = self->m_execution_submit_count.fetch_add(
+        if (re4_temporal_probe::is_execution_order_scenario(scenario)) {
+            const auto sample = self->m_execution_boundary_sample.load(std::memory_order_relaxed);
+            const auto boundary_frame = self->m_execution_boundary_frame.load(std::memory_order_relaxed);
+
+            if (sample != 0 && boundary_frame != 0) {
+                const auto submit = self->m_execution_submit_count.fetch_add(
+                    1,
+                    std::memory_order_relaxed) + 1;
+                const auto queue_desc = queue != nullptr ? queue->GetDesc() : D3D12_COMMAND_QUEUE_DESC{};
+
+                spdlog::info(
+                    "[RE4TemporalProbe] executionSubmit submit={} sample={} boundaryFrame={} "
+                    "queue={:p} queueType={} numLists={} thread={}",
+                    submit,
+                    sample,
+                    boundary_frame,
+                    static_cast<void*>(queue),
+                    static_cast<uint32_t>(queue_desc.Type),
+                    num_command_lists,
+                    GetCurrentThreadId());
+
+                for (UINT i = 0; i < num_command_lists; ++i) {
+                    auto* list = command_lists != nullptr ? command_lists[i] : nullptr;
+                    spdlog::info(
+                        "[RE4TemporalProbe] executionList submit={} sample={} boundaryFrame={} "
+                        "index={} list={:p} type={}",
+                        submit,
+                        sample,
+                        boundary_frame,
+                        i,
+                        static_cast<void*>(list),
+                        list != nullptr
+                            ? static_cast<uint32_t>(list->GetType())
+                            : static_cast<uint32_t>(D3D12_COMMAND_LIST_TYPE_DIRECT));
+                }
+            }
+        } else if (re4_temporal_probe::is_resource_state_scenario(scenario)) {
+            const auto sample = self->m_resource_boundary_sample.load(std::memory_order_relaxed);
+            const auto boundary_frame = self->m_resource_boundary_frame.load(std::memory_order_relaxed);
+            const auto submit = self->m_resource_submit_count.fetch_add(
                 1,
                 std::memory_order_relaxed) + 1;
             const auto queue_desc = queue != nullptr ? queue->GetDesc() : D3D12_COMMAND_QUEUE_DESC{};
 
-            spdlog::info(
-                "[RE4TemporalProbe] executionSubmit submit={} sample={} boundaryFrame={} "
-                "queue={:p} queueType={} numLists={} thread={}",
-                submit,
-                sample,
-                boundary_frame,
-                static_cast<void*>(queue),
-                static_cast<uint32_t>(queue_desc.Type),
-                num_command_lists,
-                GetCurrentThreadId());
-
             for (UINT i = 0; i < num_command_lists; ++i) {
                 auto* list = command_lists != nullptr ? command_lists[i] : nullptr;
-                spdlog::info(
-                    "[RE4TemporalProbe] executionList submit={} sample={} boundaryFrame={} "
-                    "index={} list={:p} type={}",
-                    submit,
-                    sample,
-                    boundary_frame,
-                    i,
-                    static_cast<void*>(list),
-                    list != nullptr
-                        ? static_cast<uint32_t>(list->GetType())
-                        : static_cast<uint32_t>(D3D12_COMMAND_LIST_TYPE_DIRECT));
+                if (list == nullptr || list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+                    continue;
+                }
+
+                auto* graphics = static_cast<ID3D12GraphicsCommandList*>(list);
+                const auto tracked = self->ensure_resource_command_list_hook(graphics);
+
+                uint64_t generation = 0;
+                size_t tracked_lists = 0;
+                {
+                    std::scoped_lock lock{self->m_resource_state_mutex};
+                    const auto it = self->m_resource_command_list_hooks.find(
+                        reinterpret_cast<uintptr_t>(graphics));
+                    if (it != self->m_resource_command_list_hooks.end()) {
+                        generation = it->second.generation;
+                    }
+                    tracked_lists = self->m_resource_command_list_hooks.size();
+                }
+
+                if (sample != 0 && boundary_frame != 0) {
+                    spdlog::info(
+                        "[RE4TemporalProbe] resourceSubmit submit={} sample={} boundaryFrame={} "
+                        "queue={:p} queueType={} index={} list={:p} generation={} "
+                        "tracked={} trackedLists={} thread={}",
+                        submit,
+                        sample,
+                        boundary_frame,
+                        static_cast<void*>(queue),
+                        static_cast<uint32_t>(queue_desc.Type),
+                        i,
+                        static_cast<void*>(graphics),
+                        generation,
+                        tracked,
+                        tracked_lists,
+                        GetCurrentThreadId());
+                }
             }
         }
     }
