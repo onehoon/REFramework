@@ -757,7 +757,11 @@ void RE4TemporalProbe::on_draw_ui() {
 
     int scenario = m_scenario.load(std::memory_order_relaxed);
     if (ImGui::Combo("Capture scenario", &scenario, SCENARIOS.data(), (int)SCENARIOS.size())) {
+        reset_temporal_state();
         m_scenario.store(scenario, std::memory_order_relaxed);
+        spdlog::info(
+            "[RE4TemporalProbe] capture scenario changed to '{}'; capture state reset",
+            scenario_name(scenario));
     }
 
     if (re4_temporal_probe::is_reset_history_scenario(scenario)) {
@@ -1430,6 +1434,12 @@ void RE4TemporalProbe::on_scene_layer_update(sdk::renderer::layer::Scene* layer,
 
 bool RE4TemporalProbe::on_pre_scene_layer_draw(sdk::renderer::layer::Scene* layer, void* render_context) {
     (void)render_context;
+
+    const auto scenario = m_scenario.load(std::memory_order_relaxed);
+    if (re4_temporal_probe::is_reset_history_scenario(scenario) ||
+        re4_temporal_probe::is_load_state_scenario(scenario)) {
+        return true;
+    }
 
     if (!re4_temporal_probe::should_process_scene(
             sdk::GameIdentity::get().is_re4(),
