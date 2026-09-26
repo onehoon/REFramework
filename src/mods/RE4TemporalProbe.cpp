@@ -16,9 +16,10 @@
 #include "REFramework.hpp"
 
 namespace {
-constexpr std::array<const char*, 5> SCENARIOS{
+constexpr std::array<const char*, 6> SCENARIOS{
     "Static screen",
-    "Camera pan",
+    "Camera pan right",
+    "Camera pan left",
     "Character motion",
     "HUD/menu on",
     "HUD/menu off",
@@ -390,10 +391,22 @@ void RE4TemporalProbe::perform_mv_readback() {
             bytes + i * re4_temporal_probe::MV_READBACK_POINT_STRIDE,
             sizeof(raw));
 
+        const auto r_snorm = re4_temporal_probe::decode_snorm16(raw[0]);
+        const auto g_snorm = re4_temporal_probe::decode_snorm16(raw[1]);
+        const auto b_snorm = re4_temporal_probe::decode_snorm16(raw[2]);
+        const auto a_snorm = re4_temporal_probe::decode_snorm16(raw[3]);
+        const auto pixel_candidate =
+            re4_temporal_probe::historical_motion_pixel_candidate(
+                r_snorm,
+                g_snorm,
+                m_velocity_copy_width,
+                m_velocity_copy_height);
+
         spdlog::info(
             "[RE4TemporalProbe] mvReadback sample={} scenario='{}' frame={} phase={} "
             "point={} coord={}x{} raw={{r={},g={},b={},a={}}} "
-            "snorm={{r={:.9f},g={:.9f},b={:.9f},a={:.9f}}}",
+            "snorm={{r={:.9f},g={:.9f},b={:.9f},a={:.9f}}} "
+            "historicalPixelCandidate={{x={:.6f},y={:.6f}}}",
             m_velocity_copy_sample,
             scenario_name(m_velocity_copy_scenario),
             m_velocity_copy_frame,
@@ -405,10 +418,12 @@ void RE4TemporalProbe::perform_mv_readback() {
             raw[1],
             raw[2],
             raw[3],
-            re4_temporal_probe::decode_snorm16(raw[0]),
-            re4_temporal_probe::decode_snorm16(raw[1]),
-            re4_temporal_probe::decode_snorm16(raw[2]),
-            re4_temporal_probe::decode_snorm16(raw[3]));
+            r_snorm,
+            g_snorm,
+            b_snorm,
+            a_snorm,
+            pixel_candidate.x,
+            pixel_candidate.y);
     }
 
     D3D12_RANGE written_range{0, 0};
@@ -446,11 +461,11 @@ void RE4TemporalProbe::on_draw_ui() {
         m_temporal_budget.sample_count(),
         re4_temporal_probe::MAX_TEMPORAL_SAMPLES);
     ImGui::TextWrapped(
-        "RE4-only diagnostic. Injects a 4-phase +/-0.5 pixel jitter pattern. "
-        "For Static screen only, the first 8 samples snapshot VelocityTarget into a disposable clone "
-        "and read back a 3x3 interior texel grid. The game's original VelocityTarget is never barriered.");
+        "RE4-only diagnostic. For Camera pan right/left, samples 1-4 are warm-up and samples 5-20 "
+        "read a 3x3 VelocityTarget grid. Pan continuously in the selected direction during capture. "
+        "Historical W/2,-H/2 motion scaling is logged as a candidate only.");
 
-    if (ImGui::Button("Reset jitter test")) {
+    if (ImGui::Button("Reset directional capture")) {
         reset_temporal_state();
     }
 }
@@ -703,12 +718,9 @@ void RE4TemporalProbe::on_overlay_layer_draw(
         return;
     }
 
-    // First readback stage is intentionally Static-screen only and limited to
-    // eight frames (two complete diagnostic jitter cycles).
+    // Capture directional camera motion only after four warm-up frames.
     const auto scenario = m_scenario.load(std::memory_order_relaxed);
-    if (scenario != 0 ||
-        m_expected_sample == 0 ||
-        m_expected_sample > re4_temporal_probe::MAX_MV_READBACK_SAMPLES ||
+    if (!re4_temporal_probe::should_readback_mv_sample(scenario, m_expected_sample) ||
         m_velocity_copy_ready) {
         return;
     }
