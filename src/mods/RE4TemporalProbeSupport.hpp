@@ -6,6 +6,8 @@
 namespace re4_temporal_probe {
 inline constexpr uint32_t SAMPLE_INTERVAL_CALLBACKS = 60;
 inline constexpr uint32_t MAX_SAMPLES = 10;
+inline constexpr uint32_t TEST_RENDER_WIDTH = 1920;
+inline constexpr uint32_t TEST_RENDER_HEIGHT = 1080;
 
 // Defense in depth: the diagnostic and the future bridge are RE4-only.
 // Registration is also gated in Mods.cpp, but callbacks must remain inert if
