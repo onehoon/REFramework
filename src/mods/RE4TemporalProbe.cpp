@@ -711,6 +711,8 @@ HRESULT STDMETHODCALLTYPE RE4TemporalProbe::recording_reset_hook(
             auto& state = self->m_recording_list_states[key];
             generation = ++state.generation;
             state.target_barrier_sequence = 0;
+            state.legacy_barrier_calls = 0;
+            state.enhanced_barrier_calls = 0;
             self->m_recording_active_by_thread[thread] = {key, generation};
         }
     }
@@ -748,6 +750,8 @@ HRESULT STDMETHODCALLTYPE RE4TemporalProbe::recording_close_hook(
     const auto thread = GetCurrentThreadId();
     bool tracked = false;
     uint64_t generation = 0;
+    uint64_t legacy_barrier_calls = 0;
+    uint64_t enhanced_barrier_calls = 0;
 
     {
         std::scoped_lock lock{self->m_recording_mutex};
@@ -755,6 +759,8 @@ HRESULT STDMETHODCALLTYPE RE4TemporalProbe::recording_close_hook(
         if (const auto it = self->m_recording_list_states.find(key);
             it != self->m_recording_list_states.end()) {
             generation = it->second.generation;
+            legacy_barrier_calls = it->second.legacy_barrier_calls;
+            enhanced_barrier_calls = it->second.enhanced_barrier_calls;
         }
     }
 
@@ -782,10 +788,13 @@ HRESULT STDMETHODCALLTYPE RE4TemporalProbe::recording_close_hook(
             std::memory_order_relaxed) + 1;
         spdlog::info(
             "[RE4TemporalProbe] recordingClose event={} list={:p} generation={} "
+            "legacyBarrierCalls={} enhancedBarrierCalls={} "
             "result=0x{:08x} thread={}",
             event,
             static_cast<void*>(command_list),
             generation,
+            legacy_barrier_calls,
+            enhanced_barrier_calls,
             static_cast<uint32_t>(result),
             thread);
     }
@@ -812,6 +821,11 @@ void STDMETHODCALLTYPE RE4TemporalProbe::recording_resource_barrier_hook(
             it != self->m_recording_list_states.end()) {
             generation = it->second.generation;
         }
+    }
+
+    if (tracked) {
+        std::scoped_lock lock{self->m_recording_mutex};
+        ++self->m_recording_list_states[key].legacy_barrier_calls;
     }
 
     if (tracked &&
@@ -916,6 +930,11 @@ void STDMETHODCALLTYPE RE4TemporalProbe::recording_enhanced_barrier_hook(
             it != self->m_recording_list_states.end()) {
             generation = it->second.generation;
         }
+    }
+
+    if (tracked) {
+        std::scoped_lock lock{self->m_recording_mutex};
+        ++self->m_recording_list_states[key].enhanced_barrier_calls;
     }
 
     if (tracked &&
