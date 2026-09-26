@@ -7,7 +7,9 @@
 namespace re4_temporal_probe {
 inline constexpr uint32_t MAX_TEMPORAL_SAMPLES = 32;
 inline constexpr uint32_t RESET_HISTORY_SCENARIO = 8;
+inline constexpr uint32_t LOAD_STATE_SCENARIO = 9;
 inline constexpr uint32_t RESET_WATCH_MAX_SAMPLES = 4096;
+inline constexpr uint32_t LOAD_STATE_MAX_SAMPLES = 8192;
 inline constexpr uint32_t JITTER_PHASE_COUNT = 4;
 inline constexpr uint32_t MV_READBACK_FIRST_SAMPLE = 5;
 inline constexpr uint32_t MV_READBACK_SAMPLE_COUNT = 16;
@@ -25,6 +27,10 @@ inline constexpr bool is_directional_mv_scenario(int scenario) noexcept {
 
 inline constexpr bool is_reset_history_scenario(int scenario) noexcept {
     return scenario == static_cast<int>(RESET_HISTORY_SCENARIO);
+}
+
+inline constexpr bool is_load_state_scenario(int scenario) noexcept {
+    return scenario == static_cast<int>(LOAD_STATE_SCENARIO);
 }
 
 inline constexpr bool is_horizontal_mv_scenario(int scenario) noexcept {
