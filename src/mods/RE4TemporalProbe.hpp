@@ -41,6 +41,13 @@ private:
     std::atomic<uint32_t> m_camera_frame{0};
     std::atomic<float> m_camera_p20{0.0f};
     std::atomic<float> m_camera_p21{0.0f};
+    std::atomic<float> m_camera_p22{0.0f};
+    std::atomic<float> m_camera_p23{0.0f};
+    std::atomic<float> m_camera_p32{0.0f};
+    std::atomic<float> m_camera_p33{0.0f};
+    std::atomic<float> m_camera_near{0.0f};
+    std::atomic<float> m_camera_far{0.0f};
+    std::atomic<bool> m_camera_clip_valid{false};
 
     std::array<Matrix4x4f, SCENE_INFO_COUNT> m_previous_projection{};
     std::array<Matrix4x4f, SCENE_INFO_COUNT> m_previous_view{};
