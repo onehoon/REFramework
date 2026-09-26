@@ -27,6 +27,8 @@ private:
     std::atomic<uint32_t> m_latest_view_frame{0};
     std::atomic<uint32_t> m_latest_view_width{0};
     std::atomic<uint32_t> m_latest_view_height{0};
+    std::atomic<uint32_t> m_latest_original_view_width{0};
+    std::atomic<uint32_t> m_latest_original_view_height{0};
 
     std::atomic<uint32_t> m_size_pair_sample{0};
     std::atomic<uint32_t> m_size_pair_frame{0};
