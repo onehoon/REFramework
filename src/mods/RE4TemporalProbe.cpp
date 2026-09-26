@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 #include <d3d12.h>
 #include <spdlog/spdlog.h>
