@@ -52,6 +52,10 @@ private:
     float m_expected_matrix_jitter_y{0.0f};
     std::array<float, SCENE_INFO_COUNT> m_expected_p20{};
     std::array<float, SCENE_INFO_COUNT> m_expected_p21{};
+    std::array<re4_temporal_probe::MotionPixelCandidate, re4_temporal_probe::MV_SAMPLE_POINT_COUNT>
+        m_expected_rotation_reprojection{};
+    uint32_t m_expected_rotation_reprojection_frame{0};
+    bool m_expected_rotation_reprojection_valid{false};
 
     sdk::intrusive_ptr<sdk::renderer::Texture> m_velocity_copy{};
     uint32_t m_velocity_copy_sample{0};
@@ -59,6 +63,9 @@ private:
     uint32_t m_velocity_copy_width{0};
     uint32_t m_velocity_copy_height{0};
     int m_velocity_copy_scenario{0};
+    std::array<re4_temporal_probe::MotionPixelCandidate, re4_temporal_probe::MV_SAMPLE_POINT_COUNT>
+        m_velocity_copy_rotation_reprojection{};
+    bool m_velocity_copy_rotation_reprojection_valid{false};
     bool m_velocity_copy_ready{false};
     bool m_mv_readback_failed{false};
 
