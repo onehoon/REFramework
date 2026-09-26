@@ -167,6 +167,8 @@ private:
     struct RecordingListState {
         uint64_t generation{0};
         uint64_t target_barrier_sequence{0};
+        uint64_t legacy_barrier_calls{0};
+        uint64_t enhanced_barrier_calls{0};
     };
 
     std::mutex m_recording_mutex{};
