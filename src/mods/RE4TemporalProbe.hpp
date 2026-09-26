@@ -49,6 +49,8 @@ private:
     uint32_t m_reset_previous_width{0};
     uint32_t m_reset_previous_height{0};
     Matrix4x4f m_reset_previous_view{};
+    Matrix4x4f m_reset_previous_view_projection{};
+    bool m_reset_previous_view_projection_valid{false};
 
     std::atomic<uintptr_t> m_camera_ptr{0};
     std::atomic<uint32_t> m_camera_frame{0};
