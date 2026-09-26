@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -38,10 +39,22 @@ private:
     void perform_mv_readback();
     bool ensure_execution_queue_hook();
     void release_execution_queue_hook();
+    bool ensure_resource_command_list_hook(ID3D12GraphicsCommandList* command_list);
+    void release_resource_command_list_hooks();
     static void STDMETHODCALLTYPE execute_command_lists_hook(
         ID3D12CommandQueue* queue,
         UINT num_command_lists,
         ID3D12CommandList* const* command_lists);
+    static HRESULT STDMETHODCALLTYPE command_list_close_hook(
+        ID3D12GraphicsCommandList* command_list);
+    static HRESULT STDMETHODCALLTYPE command_list_reset_hook(
+        ID3D12GraphicsCommandList* command_list,
+        ID3D12CommandAllocator* allocator,
+        ID3D12PipelineState* initial_state);
+    static void STDMETHODCALLTYPE command_list_resource_barrier_hook(
+        ID3D12GraphicsCommandList* command_list,
+        UINT num_barriers,
+        const D3D12_RESOURCE_BARRIER* barriers);
 
     std::atomic<bool> m_enabled{false};
     std::atomic<int> m_scenario{0};
@@ -50,6 +63,7 @@ private:
     re4_temporal_probe::FrameBudget m_reset_watch_budget;
     re4_temporal_probe::FrameBudget m_load_state_budget;
     re4_temporal_probe::FrameBudget m_execution_order_budget;
+    re4_temporal_probe::FrameBudget m_resource_state_budget;
 
     bool m_reset_witness_valid{false};
     uint32_t m_reset_previous_frame{0};
@@ -77,6 +91,26 @@ private:
         UINT,
         ID3D12CommandList* const*);
 
+    using CommandListCloseFn = HRESULT (STDMETHODCALLTYPE*)(
+        ID3D12GraphicsCommandList*);
+    using CommandListResetFn = HRESULT (STDMETHODCALLTYPE*)(
+        ID3D12GraphicsCommandList*,
+        ID3D12CommandAllocator*,
+        ID3D12PipelineState*);
+    using CommandListResourceBarrierFn = void (STDMETHODCALLTYPE*)(
+        ID3D12GraphicsCommandList*,
+        UINT,
+        const D3D12_RESOURCE_BARRIER*);
+
+    struct ResourceCommandListHookState {
+        std::unique_ptr<VtableHook> hook{};
+        CommandListCloseFn close_original{nullptr};
+        CommandListResetFn reset_original{nullptr};
+        CommandListResourceBarrierFn barrier_original{nullptr};
+        uint64_t generation{0};
+        uint64_t target_barrier_sequence{0};
+    };
+
     static inline RE4TemporalProbe* s_execution_probe_instance{nullptr};
     std::unique_ptr<VtableHook> m_execution_queue_hook{};
     ExecuteCommandListsFn m_execution_queue_original{nullptr};
@@ -84,6 +118,18 @@ private:
     std::atomic<uint32_t> m_execution_boundary_sample{0};
     std::atomic<uint64_t> m_execution_submit_count{0};
     std::atomic<uint64_t> m_execution_boundary_submit_base{0};
+
+    std::mutex m_resource_state_mutex{};
+    std::unordered_map<uintptr_t, ResourceCommandListHookState> m_resource_command_list_hooks{};
+    std::unordered_map<uint32_t, std::pair<uintptr_t, uint64_t>> m_resource_active_by_thread{};
+    std::atomic<uint32_t> m_resource_boundary_frame{0};
+    std::atomic<uint32_t> m_resource_boundary_sample{0};
+    std::atomic<uint64_t> m_resource_submit_count{0};
+    std::atomic<uint64_t> m_resource_boundary_submit_base{0};
+    std::atomic<uint64_t> m_resource_event_sequence{0};
+    std::atomic<uintptr_t> m_resource_color{0};
+    std::atomic<uintptr_t> m_resource_depth{0};
+    std::atomic<uintptr_t> m_resource_velocity{0};
 
     std::atomic<uintptr_t> m_camera_ptr{0};
     std::atomic<uint32_t> m_camera_frame{0};
