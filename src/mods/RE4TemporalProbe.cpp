@@ -942,7 +942,7 @@ void RE4TemporalProbe::on_scene_layer_update(sdk::renderer::layer::Scene* layer,
                     previous_object != m_load_state_objects.end()
                         ? reinterpret_cast<void*>(previous_object->second)
                         : nullptr,
-                    object,
+                    static_cast<void*>(object),
                     object_changed);
                 if (object_changed) {
                     ++object_change_count;
