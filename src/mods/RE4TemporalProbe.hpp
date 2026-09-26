@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -14,6 +15,7 @@
 
 #include "Mod.hpp"
 #include "RE4TemporalProbeSupport.hpp"
+#include "utility/VtableHook.hpp"
 
 class RE4TemporalProbe final : public Mod {
 public:
@@ -34,6 +36,12 @@ private:
     bool ensure_mv_readback_resources();
     void release_mv_readback_resources();
     void perform_mv_readback();
+    bool ensure_execution_queue_hook();
+    void release_execution_queue_hook();
+    static void STDMETHODCALLTYPE execute_command_lists_hook(
+        ID3D12CommandQueue* queue,
+        UINT num_command_lists,
+        ID3D12CommandList* const* command_lists);
 
     std::atomic<bool> m_enabled{false};
     std::atomic<int> m_scenario{0};
@@ -41,6 +49,7 @@ private:
     re4_temporal_probe::FrameBudget m_temporal_budget;
     re4_temporal_probe::FrameBudget m_reset_watch_budget;
     re4_temporal_probe::FrameBudget m_load_state_budget;
+    re4_temporal_probe::FrameBudget m_execution_order_budget;
 
     bool m_reset_witness_valid{false};
     uint32_t m_reset_previous_frame{0};
@@ -62,6 +71,18 @@ private:
     std::unordered_map<std::string, uintptr_t> m_load_state_objects{};
     std::unordered_map<std::string, uint64_t> m_load_state_values{};
     std::unordered_set<std::string> m_load_state_schema_keys{};
+
+    using ExecuteCommandListsFn = void (STDMETHODCALLTYPE*)(
+        ID3D12CommandQueue*,
+        UINT,
+        ID3D12CommandList* const*);
+
+    static inline RE4TemporalProbe* s_execution_probe_instance{nullptr};
+    std::unique_ptr<VtableHook> m_execution_queue_hook{};
+    ExecuteCommandListsFn m_execution_queue_original{nullptr};
+    std::atomic<uint32_t> m_execution_boundary_frame{0};
+    std::atomic<uint32_t> m_execution_boundary_sample{0};
+    std::atomic<uint64_t> m_execution_submit_count{0};
 
     std::atomic<uintptr_t> m_camera_ptr{0};
     std::atomic<uint32_t> m_camera_frame{0};
