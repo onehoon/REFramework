@@ -769,6 +769,74 @@ That construction is intended to render the current frame at the jittered sample
 
 Gate C is therefore **closed for RE4 projection injection mechanics**. Production XeSS can later replace the diagnostic four-phase sequence with the XeSS-requested jitter sequence while retaining the verified RE4 matrix/history integration.
 
+### Capture 14 — sparse VelocityTarget readback validates jitter exclusion
+
+The first sparse MV-content readback was run from a local build whose runtime log identified commit:
+
+~~~text
+e1cb42c9ca5f7885f8bb2282ec443749f5bce16e
+~~~
+
+This happened to match the PR #58 head after the CI compile fix, but future locally built captures do not require exact remote hash identity when the probe signature and behavior match the documented diagnostic.
+
+Readback plumbing completed cleanly:
+
+~~~text
+mvSnapshotQueued   8/8
+mvReadbackBegin    8/8
+mvReadback         72/72   (8 frames x 9 texels)
+probe errors       0
+fail-closed events 0
+~~~
+
+The existing jitter path also remained intact:
+
+~~~text
+jitterDrawCheck allVariantsMatch=true   224/224
+~~~
+
+The eight static-screen frames covered two complete four-phase jitter cycles. The first cycle contained small transient R/G motion at some sample points, but the same phase pattern did **not** repeat in the second cycle.
+
+For the eight mostly-static grid points excluding the visibly moving lower-left point, the second cycle measured:
+
+~~~text
+R raw: min -1, max 0, median 0
+G raw: min  0, max 6, median 1
+~~~
+
+At 2560x1440, if frame-to-frame projection-jitter delta were present directly in normalized XY motion, the injected four-phase sequence would produce an approximately repeating raw-SNORM signature of:
+
+~~~text
+phase 0 -> 1: X ~= -0.00078125  -> raw ~= -26
+phase 1 -> 2: Y ~= +0.00138889  -> raw ~= +46
+phase 2 -> 3: X ~= +0.00078125  -> raw ~= +26
+phase 3 -> 0: Y ~= -0.00138889  -> raw ~= -46
+~~~
+
+No such globally repeated +/-26 / +/-46 pattern appeared. The second cycle instead converged to near-zero R/G on static points.
+
+One point at approximately 640x1080 showed real scene motion:
+
+~~~text
+R: -5, -112, -9, -3, -7, -4, -5, -4
+G: -107, -349, -191, 69, 23, -13, -19, -23
+~~~
+
+but those values also did not repeat with the four-phase jitter pattern, so they are scene/object motion rather than a global jitter signature.
+
+The other channels behaved differently:
+
+- B varied spatially and temporally over a much larger positive range;
+- A remained constant at raw 32658 / approximately 0.99667 for all 72 texels.
+
+Combined with the historical pd-upscaler behavior for TDB > 67, which passed the original `R16G16B16A16_SNORM` VelocityTarget directly and used `renderWidth/2, -renderHeight/2` motion scales, Capture 14 makes R/G the strong current-build XY candidates. Exact channel mapping, sign, and scale still require directional motion evidence.
+
+Current conclusion:
+
+> The verified RE4 history construction removes the injected projection-jitter delta from sampled static VelocityTarget XY candidates. Motion-vector jitter inclusion is therefore closed as **excluded** for the tested current-build path.
+
+The next diagnostic should use controlled opposite-direction camera pans to establish channel mapping and sign first, while logging the historical pixel-scale interpretation as a candidate rather than assuming it is already proven.
+
 ---
 
 ## 9. Current HUD/UI boundary model
@@ -835,82 +903,55 @@ Pixel identity alone cannot prove that no unrelated earlier UI pass ever touched
 
 ## 10. Current diagnostic PR behavior
 
-Captures 12 and 13 close the native-jitter baseline and RE4 projection/history injection mechanics. The active diagnostic now advances to the **first narrow VelocityTarget content readback** while retaining the already-proven deterministic jitter pattern.
+Captures 12–14 now prove native zero jitter, RE4 projection/history injection, sparse VelocityTarget readback, and exclusion of projection-jitter delta from sampled static motion vectors.
 
-The probe remains RE4-only and default-off.
+The active diagnostic advances to **directional camera-pan MV characterization**. It remains RE4-only and default-off.
 
-### Jitter path retained from Capture 13
+### Controlled stimulus retained
 
-It continues to:
+The already-proven four-phase +/-0.5 pixel jitter and same-current-jitter history construction remain active only so the eventual production temporal path continues to be exercised exactly as validated. Capture 14 already closed jitter inclusion; this stage is not intended to re-prove it.
 
-- restrict mutation to the fully rendered primary Scene whose camera matches `sdk::get_primary_camera()`;
-- inject the proven four-phase diagnostic sequence:
-  - `(+0.5,+0.5)`
-  - `(-0.5,+0.5)`
-  - `(-0.5,-0.5)`
-  - `(+0.5,-0.5)` pixels;
-- convert with:
-  - `matrixJitterX = 2 * pixelX / renderWidth`;
-  - `matrixJitterY = -2 * pixelY / renderHeight`;
-- apply the same current jitter to all six verified SceneInfo variants;
-- rebuild previous projection history with that same current jitter;
-- keep the primary Camera projection unmodified;
-- verify the injected values again at pre-Scene draw.
+### Directional scenarios
 
-These mechanics are already considered proven by Capture 13; the next capture uses them only as the controlled stimulus for MV inspection.
-
-### Narrow MV readback stage
-
-The new readback is intentionally limited:
-
-- **Static screen scenario only**;
-- only the **first eight temporal samples** after reset, covering two complete four-phase jitter cycles;
-- only a **3x3 interior grid = nine texels** per sampled frame;
-- no full-frame dump;
-- all four channels of `R16G16B16A16_SNORM` are recorded both as raw signed 16-bit values and decoded SNORM floats.
-
-The 2560x1440 sample coordinates are:
+The scenario list now distinguishes:
 
 ~~~text
-( 640,  360)  (1280,  360)  (1920,  360)
-( 640,  720)  (1280,  720)  (1920,  720)
-( 640, 1080)  (1280, 1080)  (1920, 1080)
+Static screen
+Camera pan right
+Camera pan left
+Character motion
+HUD/menu on
+HUD/menu off
 ~~~
 
-To avoid diagnostic barriers on game-owned temporal input:
+For the two camera-pan scenarios, the operator should pan continuously in the selected direction during the capture window.
 
-1. `on_overlay_layer_draw()` obtains the current VelocityTarget engine Texture after the original Overlay draw; this mirrors the historical pd-upscaler Depth/MV snapshot callback;
-2. a **disposable diagnostic Texture clone** is created for that sample;
-3. RE Engine `RenderContext::copy_texture` copies VelocityTarget into the clone;
-4. the original game VelocityTarget is not transitioned or barriered by diagnostic D3D12 code;
-5. at Present, after the engine copy has been queued before the diagnostic command list, nine 1x1 texels are copied from the disposable clone into a small readback buffer;
-6. the diagnostic waits for its own fence, maps the readback buffer, logs the values, then releases the disposable clone; if command/fence completion cannot be proven, it fails closed, disables further readback, and retains GPU-referenced diagnostic resources until device reset.
+### Sparse directional MV readback
 
-The initial diagnostic assumes the engine copy destination is in `COPY_DEST` when the disposable clone reaches the Present-side command list. That state assumption is confined to the disposable clone and is itself part of the readback-plumbing validation; it does not alter state tracking for the game's VelocityTarget.
+To avoid enable/reset transients:
 
-Primary new log lines:
+- samples 1–4 are warm-up only and are **not** read back;
+- samples 5–20 are read back;
+- this gives 16 consecutive frames per directional run;
+- each frame still reads only the same 3x3 interior grid;
+- the original game VelocityTarget remains untouched by diagnostic D3D12 barriers;
+- snapshot/readback continues through the disposable engine Texture clone.
+
+Per texel the log retains raw and SNORM RGBA and adds the historical-scale candidate:
 
 ~~~text
-mvSnapshotQueued
-mvReadbackBegin
-mvReadback
+candidatePixelX = R_snorm * renderWidth / 2
+candidatePixelY = G_snorm * -renderHeight / 2
 ~~~
 
-The immediate Capture 14 question is deliberately narrow:
+These are explicitly labeled **candidate** values. Capture 15 should use right-vs-left reversal to answer:
 
-> In a static scene, while the four-phase projection jitter changes every frame, do sampled VelocityTarget texels show a matching global periodic component, or do they remain effectively independent of the injected jitter?
+1. does R or G carry the dominant horizontal camera-pan motion?
+2. does the candidate horizontal channel reverse sign when pan direction reverses?
+3. is the orthogonal channel comparatively small for broad static-background samples?
+4. are the historical-scale pixel values coherent enough to justify a later independent scale-proof test?
 
-If sampled static-background motion remains near its zero/motion baseline across phases, that supports the verified history construction excluding projection-jitter delta from engine MV. If a four-phase component appears, history/MV interaction must be revisited before any production XeSS dispatch.
-
-This stage does **not** yet claim:
-
-- which VelocityTarget channels are X/Y;
-- final X/Y sign;
-- final motion scale;
-- that the historical `renderWidth/2, -renderHeight/2` conversion is proven;
-- final XeSS jitter phase generation.
-
-Those require the readback path to succeed first. Camera-pan and object-motion content tests come afterward.
+This capture may close channel mapping and sign if the opposite-direction evidence is clean. It must not close scale without an independent screen-motion/reprojection witness.
 
 The probe still does **not**:
 
@@ -919,7 +960,8 @@ The probe still does **not**:
 - touch `ImageQualityRate`;
 - resize the swapchain;
 - modify OptiScaler;
-- run in non-RE4 games.
+- run in non-RE4 games;
+- dump full-frame MV content.
 
 ---
 
@@ -1037,26 +1079,41 @@ The diagnostic four-phase sequence is only a validation pattern. Production jitt
 
 ### Gate D — Motion-vector semantics
 
-**Status: ACTIVE, coupled to Gate C.**
+**Status: JITTER EXCLUSION CLOSED; CHANNEL / SIGN / SCALE ACTIVE.**
 
-Velocity resource identity and render-size behavior are proven. Remaining semantics:
+Verified:
 
-- pixel-space vs normalized/NDC-space convention;
+- Velocity resource identity and render-size alignment;
+- sparse clone/readback plumbing without diagnostic barriers on the game-owned VelocityTarget;
+- injected projection-jitter delta is absent from sampled static R/G motion candidates after history settles;
+- historical TDB > 67 pd-upscaler passed the original `R16G16B16A16_SNORM` VelocityTarget directly.
+
+Capture 14 therefore closes `jitteredMotionVectors` as **false** for the verified bridge history construction.
+
+Remaining semantics:
+
+- exact R/G -> X/Y mapping;
 - X/Y sign;
-- scale;
-- low-resolution vs display-resolution MV;
-- whether projection jitter is already included.
-
-Historical pd-upscaler used approximately:
+- final normalization / scale;
+- independent confirmation of the historical candidate:
 
 ~~~text
-motionScaleX = renderWidth / 2
+motionScaleX =  renderWidth / 2
 motionScaleY = -renderHeight / 2
 ~~~
 
-and the current VelocityTarget is `R16G16B16A16_SNORM`, which is consistent with an NDC-like hypothesis. This is **not yet current-build proof**.
+Next controlled diagnostic:
 
-First capture the no-mutation projection baseline. If needed afterward, use a deterministic bridge-controlled jitter pattern plus the narrowest possible VelocityTarget content/provenance measurement to determine whether jitter is encoded and to validate sign/scale. Do not promote the historical scale constants to production until that evidence exists.
+1. discard the first four frames after reset as temporal/history warm-up;
+2. read 16 consecutive frames during an explicitly labeled **Camera pan right**;
+3. repeat after reset during **Camera pan left**;
+4. retain the same 3x3 sparse grid and deterministic jitter/history construction;
+5. log raw/SNORM R/G plus the historical-scale pixel candidate:
+   - `candidatePixelX = R * renderWidth / 2`;
+   - `candidatePixelY = G * -renderHeight / 2`;
+6. compare right-vs-left sign reversal and which channel dominates horizontal scene motion.
+
+Do not call the historical scale proven merely because the resulting pixel numbers look plausible. Directional pan can close channel mapping and sign; scale should be promoted only when compared against an independent screen-motion or reprojection witness.
 
 ### Gate E — Depth convention
 
@@ -1361,28 +1418,26 @@ display size = active DXGI swapchain/output size
 
 Color, Depth, and Velocity must continue to match the selected render size. Do not add `ImageQualityRate` control unless later runtime evidence requires it.
 
-### 18.3 Jitter complete; prove MV semantics next
+### 18.3 Jitter and MV-jitter exclusion complete; prove direction/sign next
 
-Jitter mechanics are complete through Capture 13.
+Captures 12–14 establish:
 
-Next MV work must be intentionally staged:
+- native jitter baseline;
+- deterministic RE4 jitter injection;
+- history treatment;
+- sparse MV readback;
+- exclusion of projection-jitter delta from sampled static motion.
 
-1. **Static readback validation**
-   - retain deterministic jitter injection;
-   - use RE Engine `RenderContext::copy_texture` to snapshot VelocityTarget into a diagnostic-only clone;
-   - never place diagnostic D3D12 barriers on the game's original VelocityTarget;
-   - read back only nine texels on a 3x3 interior grid;
-   - limit the initial probe to the first eight Static-screen frames;
-   - log all four raw R16G16B16A16_SNORM channels and decoded SNORM values;
-   - determine whether the four-phase jitter produces any global MV component in an otherwise static scene.
+Next:
 
-2. **Only after readback plumbing is proven**, use controlled Camera pan / object motion to determine:
-   - which channels encode X/Y;
-   - X/Y sign;
-   - scale;
-   - whether the historical `renderWidth/2, -renderHeight/2` conversion is correct.
+1. run Camera pan right after a four-frame warm-up and collect samples 5–20;
+2. reset;
+3. run Camera pan left with the same capture window;
+4. use the 3x3 grid to identify the horizontal motion channel and sign reversal;
+5. log the historical `W/2, -H/2` conversion as a candidate only;
+6. after channel/sign are proven, add a separate independent witness for absolute scale if needed.
 
-Do not perform a full-frame dump. Do not modify or barrier the original VelocityTarget for diagnostics.
+No full-frame dump and no direct barrier on the original VelocityTarget.
 
 ### 18.4 Prove depth/camera/reset
 
@@ -1464,7 +1519,7 @@ The RE4 bridge is ready to begin production XeSS dispatch only when all of the f
 
 The current project is **not yet at this gate**.
 
-The major resource and size-control uncertainty is now substantially closed: HDR/PostMain color, Depth, Velocity, the pre-Overlay engine boundary, SceneView-driven internal render size, Overlay working surfaces, and presentation output are mapped. The remaining work is primarily jitter/MV/depth/camera temporal semantics, execution ordering, output integration, and lifecycle.
+The major resource and size-control uncertainty is now substantially closed: HDR/PostMain color, Depth, Velocity, the pre-Overlay engine boundary, SceneView-driven internal render size, Overlay working surfaces, and presentation output are mapped. The remaining work is primarily MV channel/sign/scale, depth/camera temporal semantics, execution ordering, output integration, and lifecycle.
 
 ---
 
@@ -1496,6 +1551,6 @@ OutputTargetState
 swapchain backbuffers
 ~~~
 
-Capture 9 identifies `on_pre_overlay_layer_draw()` as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Capture 10 establishes the native-resolution baseline. Capture 11 then proves that overriding `SceneView.get_Size` to 1920x1080 moves Color, Depth, and Velocity together while the 2560x1440 DXGI output remains unchanged. Render/display size control is therefore closed; the next active gate is jitter plus motion-vector semantics. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
+Capture 9 identifies `on_pre_overlay_layer_draw()` as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Capture 10 establishes the native-resolution baseline. Capture 11 then proves that overriding `SceneView.get_Size` to 1920x1080 moves Color, Depth, and Velocity together while the 2560x1440 DXGI output remains unchanged. Render/display size control, jitter injection, and sampled MV jitter exclusion are now closed; the next active gate is directional MV channel/sign characterization followed by independent scale proof. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
 
 Until the remaining gates are proven, the diagnostic stays passive and no production XeSS dispatch is enabled.
