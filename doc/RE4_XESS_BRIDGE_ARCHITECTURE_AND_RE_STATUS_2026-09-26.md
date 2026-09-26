@@ -1541,7 +1541,7 @@ Recommended baseline when the bridge begins controlling the temporal path:
 RE4 built-in FSR2        OFF
 RE Engine TAA            disabled / NONE where required
 Dynamic Resolution       OFF
-ImageQualityRate         controlled and verified
+ImageQualityRate         untouched unless later evidence requires it
 Render size              explicitly known
 Jitter                   bridge-controlled and logged
 ~~~
