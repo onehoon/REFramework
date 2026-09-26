@@ -2029,116 +2029,283 @@ enhanced Barrier path                       UNKNOWN
 Color/Depth/Velocity states                 OPEN
 ~~~
 
-### Capture 25 objective — COM interface and barrier-path provenance
+### Capture 25 — COM interface and barrier-path provenance result
+
+Capture 25 was collected in `25_re2_framework_log.txt`.
+
+Four complete 64-frame windows were captured:
+
+~~~text
+Run 1: frame 14951 -> 15014
+Run 2: frame 15162 -> 15225
+Run 3: frame 15316 -> 15379
+Run 4: frame 15476 -> 15539
+
+interfaceBoundary = 256
+~~~
+
+#### Public GraphicsCommandList interface alias hypothesis rejected
+
+The probe emitted:
+
+~~~text
+interfaceTopology = 81
+interfaceMethods  = 81
+~~~
+
+Across all 81 topology records:
+
+- `IUnknown` QueryInterface succeeded;
+- `ID3D12GraphicsCommandList` through `ID3D12GraphicsCommandList7` all succeeded;
+- `maxGraphicsVersion = 7` in 81/81 records;
+- every GCL0..GCL7 public interface pointer exactly equaled the submitted base pointer;
+- GCL0 and GCL7 used the same public vtable;
+- canonical `IUnknown` identity was a distinct pointer.
+
+The 81 topology records reduce to:
+
+~~~text
+unique submitted/base pointers = 21
+unique canonical IUnknown      = 21
+base <-> IUnknown mapping      = 1:1
+~~~
+
+Therefore:
+
+> The Capture 24 recording blind spot cannot be explained by RE4 simply using a different public GCL1..GCL7 COM interface pointer for the same submitted object.
+
+The public GraphicsCommandList interface views all alias the same pointer/vtable in this runtime.
+
+#### Shared implementation addresses proven
+
+Every `interfaceMethods` record reported the same implementation addresses within this process for:
+
+~~~text
+Close
+Reset
+legacy ResourceBarrier
+GCL7::Barrier
+~~~
+
+This proves that all observed submitted DIRECT lists share common D3D12Core implementation functions for these methods.
+
+The absolute addresses are process-local diagnostics and must never be hardcoded.
+
+`ID3D12GraphicsCommandList7` support is also proven.
+
+That means the enhanced-barrier API is available on the active RE4 command lists, but Capture 25 does **not** prove that RE4 actually calls `GCL7::Barrier`.
+
+Support and runtime usage remain separate questions.
+
+#### Whole-frame seven-submit topology confirmed explicitly
+
+Capture 25 explicitly records queue submissions across the entire frame instead of inferring them only from boundary counters.
+
+For stable frames:
+
+~~~text
+ordinal 1 -> before pre-Overlay
+ordinal 2 -> before pre-Overlay
+
+pre-Overlay boundary
+
+ordinal 3 -> after boundary
+ordinal 4 -> after boundary
+ordinal 5 -> after boundary
+ordinal 6 -> after boundary
+ordinal 7 -> after boundary
+~~~
+
+Runs 2-4 reproduce seven submissions on all 63 post-first-frame intervals.
+
+Run 1 contains one isolated eight-submit frame during discovery/warm-up; the remaining stable frame intervals follow the seven-submit pattern.
+
+Therefore the stable whole-frame topology from Capture 24 is independently confirmed.
+
+#### Pre-boundary and post-boundary pools are distinct
+
+Within a stable run, pre-boundary submissions use a ten-list set:
+
+- one fixed list appears every frame;
+- nine additional list objects rotate through the second pre-boundary slot.
+
+The five post-boundary submissions continue to use the ten-list/two-pool system proven by Capture 23.
+
+The important conclusion is not the exact pool algorithm. It is:
+
+> Both sides of the pre-Overlay boundary contain real DIRECT command-list work and must remain in the provenance model.
+
+No capture-local pointer or ordinal cycle is a production contract.
+
+#### Capture 25 diagnostic bug
+
+The `interfacePresent` log continued after sample 64 because the sample/frame boundary fields were not cleared after Present.
+
+This produced stale repeated `interfacePresent sample=64` lines after the actual 64-frame capture was already complete.
+
+The queue submission capture itself stopped correctly, so this log-spam bug does not change the Capture 25 topology result.
+
+The bug is fixed before Capture 26 by clearing the interface boundary sample/frame after every Present.
+
+### Gate H decision after Capture 25
+
+Capture 25 closes:
+
+- public GCL0..GCL7 interface topology;
+- GCL7 capability;
+- shared implementation provenance for Close/Reset/legacy ResourceBarrier/GCL7 Barrier;
+- explicit whole-frame seven-submit ordering.
+
+Still open:
+
+- whether repeated recording actually reaches the shared Reset/Close implementation hooks;
+- whether RE4 uses legacy ResourceBarrier, enhanced Barrier, or both;
+- the exact list/generation active at pre-Overlay;
+- explicit Color/Depth/Velocity state transitions.
+
+The next probe should therefore hook the **shared implementation functions**, not clone another submitted-object vtable.
+
+### Capture 26 objective — shared recording-function witness
 
 New scenario:
 
 ~~~text
-D3D12 interface provenance
+D3D12 recording functions
 ~~~
 
-Capture 25 remains observe-only and deliberately removes the assumption that the pointer submitted to `ExecuteCommandLists` is the exact graphics interface used for recording.
+Capture 26 remains observe-only.
 
-For every unique submitted DIRECT list pointer it queries, with normal COM ownership and automatic one-reference release:
+The first submitted DIRECT list dynamically supplies the current process implementation addresses for:
 
 ~~~text
-IUnknown
-ID3D12GraphicsCommandList
-ID3D12GraphicsCommandList1
-ID3D12GraphicsCommandList2
-ID3D12GraphicsCommandList3
-ID3D12GraphicsCommandList4
-ID3D12GraphicsCommandList5
-ID3D12GraphicsCommandList6
-ID3D12GraphicsCommandList7
+ID3D12GraphicsCommandList::Close
+ID3D12GraphicsCommandList::Reset
+ID3D12GraphicsCommandList::ResourceBarrier
+ID3D12GraphicsCommandList7::Barrier
 ~~~
 
-It records:
+The diagnostic installs four shared `FunctionHook`/SafetyHook inline hooks on those implementation addresses.
+
+No process-local address from Capture 25 is hardcoded.
+
+The queue hook dynamically builds a set of DIRECT command-list pointers actually submitted by RE4. Shared-function callbacks log only when their `this` pointer belongs to that discovered set.
+
+This avoids broad D3D12 tracing while also avoiding the submitted-object vtable-clone blind spot from Capture 24.
+
+#### Recording generation
+
+For a tracked list:
 
 ~~~text
-interfaceTopology
-    submitted base pointer
-    submitted base vtable
-    canonical IUnknown identity
-    highest supported GraphicsCommandList version
-    interface pointers for GCL0..GCL7
-    GCL0/GCL7 vtable pointers
+successful shared Reset
+    -> increment per-list generation
+    -> mark list/generation active on recording thread
 
-interfaceMethods
-    GCL0 Close implementation
-    GCL0 Reset implementation
-    GCL0 ResourceBarrier implementation
-    GCL7 Barrier implementation when GCL7 is supported
+shared Close
+    -> close that generation
+    -> remove matching active-thread association
 ~~~
 
-The `GCL7 Barrier` address is read from the D3D12 ABI slot for the enhanced-barrier method; the diagnostic does not call it.
-
-Every successful `QueryInterface` reference is held in a local `ComPtr` and released exactly once when the topology record is complete.
-
-#### Capture all seven submissions, not only the five after pre-Overlay
-
-Once the first pre-Overlay sample opens the capture, the active DIRECT queue logs every submission through the remainder of the 64-frame run.
-
-For each submission:
+Primary records:
 
 ~~~text
-interfaceSubmit
-    renderFrame
-    per-frame ordinal
-    current boundary sample/frame
-    afterBoundary = true | false
-    queue/type
-    list count
-    submission thread
-
-interfaceSubmitList
-    renderFrame
-    ordinal
-    submitted base pointer
-    command-list type
+recordingFunctionHook
+recordingReset
+recordingClose
+recordingSubmit
+recordingSubmitList
+recordingBoundary
+recordingPresent
 ~~~
 
-At pre-Overlay:
+#### Legacy barrier witness
+
+For tracked lists, legacy `ResourceBarrier` is observed at the shared implementation level.
+
+Only barriers touching the current semantic resources are logged:
 
 ~~~text
-interfaceBoundary
+Color
+Depth
+Velocity
+~~~
+
+Records include:
+
+~~~text
+StateBefore
+StateAfter
+subresource
+barrier flags
+list
+generation
+recording thread
+per-generation target barrier sequence
+~~~
+
+#### Enhanced barrier witness
+
+Because Capture 25 proves GCL7 support, Capture 26 simultaneously observes the shared `ID3D12GraphicsCommandList7::Barrier` implementation.
+
+Only texture barriers whose `pResource` is Color, Depth, or Velocity are logged.
+
+Records include:
+
+~~~text
+SyncBefore / SyncAfter
+AccessBefore / AccessAfter
+LayoutBefore / LayoutAfter
+flags
+subresource range
+list
+generation
+recording thread
+per-generation target barrier sequence
+~~~
+
+This determines actual enhanced-barrier **usage**, not merely API support.
+
+#### Pre-Overlay correlation
+
+The pre-Overlay callback records:
+
+~~~text
+recordingBoundary
     sample/frame
     worker thread
+    activeList
+    activeGeneration
+    activeBarrierSeq
+    tracked-list count
+    hooksReady
     Color/HDR
     Depth
     Velocity
     queue/type
 ~~~
 
-Present records the whole-frame observed submit count.
+Whole-frame submit records preserve the proven ordinal topology and include the latest known generation for each list.
 
-The first capture frame may miss the two pre-boundary submits because the observation window opens at its pre-Overlay boundary. Frames after that are expected to expose the full stable:
+The first few frames remain discovery warm-up: a list cannot be filtered before it has first been observed on the queue. The 64-frame budget is sufficient for the repeatedly reused pools to cycle after discovery.
 
-~~~text
-ordinal 1-2   before boundary
-ordinal 3-7   after boundary
-~~~
+Capture 26 procedure:
 
-if Capture 24's inferred topology is correct.
-
-Capture 25 procedure:
-
-1. start in stable gameplay;
-2. select `D3D12 interface provenance`;
+1. enter stable gameplay;
+2. select `D3D12 recording functions`;
 3. click `Reset capture`;
 4. keep gameplay/camera mostly still;
-5. allow all **64 samples** to complete;
-6. do not Load Save, open a menu, resize, Alt+Tab, or run OptiScaler/XeFG validation.
+5. let all **64 samples** complete;
+6. do not Load Save, open menus, resize, Alt+Tab, or run OptiScaler/XeFG validation.
 
 Decision target:
 
-- determine whether submitted base pointers alias different GCL0..GCL7 interface pointers for the same canonical `IUnknown`;
-- identify the actual implementation addresses behind legacy Reset/Close/ResourceBarrier;
-- determine whether GCL7/enhanced Barrier is supported and expose its implementation address;
-- explicitly confirm the seven-submit whole-frame topology;
-- use the resulting canonical identity + implementation addresses to design the next narrow recording-function witness.
+- prove whether the shared Reset/Close implementation is the real repeated recording path;
+- determine legacy vs enhanced barrier usage;
+- reconstruct target-resource transitions by list generation;
+- determine whether the verified pre-Overlay callback occurs inside a tracked recording generation;
+- identify the explicit states that a future XeSS execution point must consume and restore.
 
-Do **not** add a new inline Reset/Barrier hook until Capture 25 tells us which implementation/interface path must be observed.
+Do not inject a transition or XeSS command yet.
 
 The probe still does **not**:
 
@@ -2387,38 +2554,35 @@ Non-load cutscene/teleport hardening may later use another explicit engine signa
 
 ### Gate H — D3D12 execution point and resource states
 
-**Status: ACTIVE — queue/list provenance closed; Capture 24 rejected the submitted-base instance-hook assumption; Capture 25 prepared.**
+**Status: ACTIVE — queue/list/whole-frame/interface provenance closed; Capture 26 prepared for shared recording-function state proof.**
 
-Capture 23 proves:
+Capture 23 proves the post-boundary DIRECT submission topology.
 
-- the relevant queue is DIRECT;
-- pre-Overlay is followed by exactly five single-list DIRECT submissions before Present in 256/256 frames;
-- the post-boundary submitted set is a deterministic ten-object/two-pool system in that captured session;
-- queue submission and Present are serialized on one thread while pre-Overlay is reached from worker render activity.
+Capture 24 proves the stable whole frame contains two DIRECT submissions before pre-Overlay and five after it, and rejects submitted-base instance-vtable hooks as sufficient recording-lifecycle observers.
 
-Capture 24 adds:
+Capture 25 then proves:
 
-- stable whole-frame topology of seven DIRECT submissions after warm-up;
-- therefore two DIRECT submissions precede pre-Overlay and five follow it;
-- 22 DIRECT list pointers were encountered by the broader diagnostic;
-- the ten post-boundary list objects were each reused 128 times;
-- instance-vtable hooks installed on the submitted base pointer observed only initial Reset events, zero Close, zero target ResourceBarrier, and no active pre-Overlay list.
+- every observed submitted list supports GCL0 through GCL7;
+- GCL0..GCL7 public interface pointers equal the submitted pointer;
+- GCL0/GCL7 use the same public vtable;
+- canonical IUnknown identity is distinct but maps 1:1 to submitted pointers;
+- all observed lists share one implementation address each for Close, Reset, legacy ResourceBarrier, and GCL7 Barrier;
+- the seven-submit whole-frame topology is explicitly reproduced.
 
-The last point is a limitation of the probe path, **not evidence that RE4 omits command-list Reset/Close/barriers**.
+Therefore the public-interface-alias explanation for Capture 24 is rejected.
 
-Do not hardcode capture-local queue/list pointers or observed pool order.
+GCL7 support proves enhanced barriers are available, but not that RE4 uses them.
 
 Gate H still must prove:
 
-- exact COM interface/implementation used for repeated recording;
-- whether legacy ResourceBarrier, enhanced Barrier, or both are used;
-- exact list/recording generation associated with the pre-Overlay boundary;
-- explicit Color/Depth/Velocity states at that point;
-- required transitions/restoration;
-- output UAV state;
-- future XeSS submission/fence ordering and resize lifetime.
+- the actual repeated Reset/Close recording path;
+- legacy ResourceBarrier vs enhanced Barrier runtime usage;
+- exact Color/Depth/Velocity transitions;
+- whether pre-Overlay occurs inside a tracked recording generation;
+- required XeSS input/output transitions and restoration;
+- future submission/fence ordering and resize lifetime.
 
-Capture 25 now records canonical `IUnknown` identity, GCL0..GCL7 interface pointers/vtables, legacy method implementation addresses, the GCL7 enhanced Barrier implementation when supported, and all seven whole-frame DIRECT submissions.
+Capture 26 installs implementation-level FunctionHook/SafetyHook observers dynamically from the live command-list vtable and filters callbacks to DIRECT list pointers actually discovered on the active RE4 queue.
 
 The probe remains observe-only and performs no GPU command mutation.
 
@@ -2624,7 +2788,9 @@ Use broad D3D12 tracing only as a last resort. The old ATSBridge trace produced 
 | Reset/history rules | **HIGH / PROVEN** | Capture 22: repeated _Pause + dynamic InhibitBit load window; two loads + quit negative control |
 | DIRECT queue/list provenance | **HIGH / PROVEN** | Capture 23: 256/256 frames, five DIRECT single-list submits, deterministic ten-list pool |
 | Whole-frame DIRECT submit topology | **HIGH / PROVEN** | Capture 24: stable 7/frame after warm-up = 2 before pre-Overlay + 5 after |
-| Safe XeSS input states / barriers | **MEDIUM / active** | Capture 24 rejected submitted-base instance hook; Capture 25 tests COM interface + enhanced-barrier provenance |
+| Public GCL0-GCL7 topology | **HIGH / PROVEN** | Capture 25: all public GraphicsCommandList interfaces alias submitted pointer; GCL7 supported |
+| Shared D3D12 method provenance | **HIGH / PROVEN** | Capture 25: common Close/Reset/legacy ResourceBarrier/GCL7 Barrier implementations |
+| Safe XeSS input states / barriers | **MEDIUM / active** | Capture 26 prepared for shared implementation-level legacy/enhanced barrier witness |
 | Standard XeSS → upstream OptiScaler | **DESIGN LOCKED, runtime pending** | No custom OptiScaler ABI permitted |
 | XeFG through `FGInput=Upscaler` | **pending after SR** | Existing presentation compatibility work remains relevant |
 
@@ -2712,32 +2878,36 @@ Use the explicit RE4 load window rather than a camera threshold for Load Save.
 
 ### 18.6 Prove command-list/state insertion
 
-Capture 23 closes queue/list provenance:
+Capture 23 closes post-boundary queue/list provenance.
 
-- active queue is DIRECT;
-- 256/256 pre-Overlay frames are followed by exactly five single-list DIRECT submissions before Present;
-- ten command-list objects form two deterministic five-list pools in the captured run;
-- all capture-local pointers/order patterns remain diagnostics only and must not be hardcoded.
+Capture 24 proves:
 
-Capture 24 establishes a necessary correction:
+- stable whole-frame topology = two DIRECT submits before pre-Overlay plus five after;
+- tracing only the ten post-boundary list objects is insufficient;
+- submitted-base instance-vtable hooks do not expose the real repeated recording lifecycle.
 
-- the stable whole frame contains seven DIRECT submissions: two before pre-Overlay and five after;
-- broader discovery encounters 22 DIRECT list pointers;
-- the ten post-boundary list objects are repeatedly reused;
-- instance-vtable hooks on the submitted base pointer do not observe the repeated Reset/Close/barrier recording path;
-- zero observed ResourceBarrier must not be interpreted as zero real barriers.
+Capture 25 closes the next provenance layer:
 
-Capture 25 is the next runtime test:
+- GCL0..GCL7 QueryInterface succeeds on all observed list topology records;
+- every public GCL0..GCL7 interface aliases the submitted pointer/vtable;
+- canonical IUnknown remains a distinct 1:1 identity;
+- GCL7 capability is present;
+- one shared implementation address is observed for each of Close, Reset, legacy ResourceBarrier, and GCL7 Barrier;
+- seven-submit whole-frame ordering is explicitly confirmed.
 
-- map each submitted pointer to canonical IUnknown identity;
-- query GraphicsCommandList interface versions 0 through 7;
-- log interface/vtable relationships;
-- log implementation addresses for legacy Close/Reset/ResourceBarrier and GCL7 enhanced Barrier;
-- explicitly record all whole-frame submits with before/after-pre-Overlay classification.
+The interface-alias hypothesis is no longer a blocker.
 
-Only after this interface/implementation provenance is known should the next narrow recording-function hook be added.
+Capture 26 is the next runtime test:
 
-Do not add production barriers or XeSS execution until explicit Color/Depth/Velocity states are reconstructed.
+- dynamically inline-hook the four shared implementation functions from the live vtable;
+- filter callbacks to list pointers actually observed on the RE4 DIRECT queue;
+- track successful Reset generations and Close;
+- observe both legacy ResourceBarrier and enhanced Barrier;
+- filter barrier detail to Color/Depth/Velocity;
+- correlate the current pre-Overlay worker thread with any active list/generation;
+- join recording events to actual seven-submit Execute order.
+
+Do not add production barriers or XeSS execution until explicit target resource states are reconstructed.
 
 ### 18.7 Add public XeSS producer
 
@@ -2811,7 +2981,7 @@ The RE4 bridge is ready to begin production XeSS dispatch only when all of the f
 
 The current project is **not yet at this gate**.
 
-The major resource and size-control uncertainty is now substantially closed: HDR/PostMain color, Depth, Velocity, the pre-Overlay engine boundary, SceneView-driven internal render size, Overlay working surfaces, and presentation output are mapped. MV semantics are closed through Capture 18, Capture 19 closes inverted depth plus near/far/FOV/projection metadata, Capture 22 closes the current Load Save reset/history gate, Capture 23 closes post-boundary DIRECT queue/list provenance, and Capture 24 extends that to a stable seven-submit whole-frame topology while rejecting the submitted-base instance-vtable assumption. The remaining work is primarily exact recording-interface/barrier provenance, target resource states at the insertion point, output integration, and lifecycle.
+The major resource and size-control uncertainty is now substantially closed: HDR/PostMain color, Depth, Velocity, the pre-Overlay engine boundary, SceneView-driven internal render size, Overlay working surfaces, and presentation output are mapped. MV semantics are closed through Capture 18, Capture 19 closes inverted depth plus near/far/FOV/projection metadata, Capture 22 closes the current Load Save reset/history gate, Capture 23 closes post-boundary DIRECT queue/list provenance, Capture 24 extends that to a stable seven-submit whole-frame topology while rejecting the submitted-base instance-vtable assumption, and Capture 25 closes public GCL0-GCL7 interface/shared-method provenance. The remaining work is primarily actual shared recording/barrier usage, target resource states at the insertion point, output integration, and lifecycle.
 
 ---
 
@@ -2843,6 +3013,6 @@ OutputTargetState
 swapchain backbuffers
 ~~~
 
-Capture 9 identifies on_pre_overlay_layer_draw() as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Capture 10 establishes the native-resolution baseline. Capture 11 then proves that overriding SceneView.get_Size to 1920x1080 moves Color, Depth, and Velocity together while the 2560x1440 DXGI output remains unchanged. Captures 12-16 close render/display control, jitter injection/history, MV jitter exclusion, R=X, G=Y, and both axis polarities. Capture 17 adds the independent rotation-only witness, and Capture 18 closes the absolute MV scale at W/2,-H/2 while rejecting one fixed MV/camera frame offset as the primary source of spatial residuals. Initial zero/low-motion samples immediately after Reset remain a known UI-click input-interruption artifact, not failed directional evidence. Gate D is closed. Capture 19 proves SceneInfo/DepthStencilTex inverted depth in 128/128 samples and closes the producer camera metadata path: near/far come from primary via.Camera and vertical FOV is derived from SceneInfo projection. Capture 20 then proves that a real Load Save can preserve Scene/SceneInfo/Camera/Depth/Velocity/Color identity, render size, and render-frame continuity while still producing large camera-history discontinuities. Translation alone is not a safe reset heuristic; rotation separates strongly in this run, but no threshold is frozen. Capture 21 proves SceneInfo.old_view_projection_matrix does not expose a Load Save reset signal. Capture 22 then closes the current Load Save reset gate: two independent loads repeat the same SceneLoadZone pause window, history remains unstable after pause release, and GameSituation inhibit restoration marks the stable post-load return; the final quit path provides a negative control without a SceneLoadZone pause rise. Capture 23 closes the first Gate H provenance step: four complete 64-frame runs show one active DIRECT queue, exactly five single-list DIRECT submissions between pre-Overlay and Present in all 256 frames, and a deterministic ten-command-list/two-pool reuse pattern. Capture 24 then shows that the stable whole frame actually contains seven DIRECT submits (two before pre-Overlay plus five after), while the submitted-base instance-vtable hook fails to observe the real repeated Reset/Close/barrier recording lifecycle. Capture 25 is prepared to map canonical COM identity, GraphicsCommandList 0-7 interface aliases/vtables, legacy method implementations, enhanced Barrier support, and all seven submit ordinals before attempting another recording-function hook. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
+Capture 9 identifies on_pre_overlay_layer_draw() as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Capture 10 establishes the native-resolution baseline. Capture 11 then proves that overriding SceneView.get_Size to 1920x1080 moves Color, Depth, and Velocity together while the 2560x1440 DXGI output remains unchanged. Captures 12-16 close render/display control, jitter injection/history, MV jitter exclusion, R=X, G=Y, and both axis polarities. Capture 17 adds the independent rotation-only witness, and Capture 18 closes the absolute MV scale at W/2,-H/2 while rejecting one fixed MV/camera frame offset as the primary source of spatial residuals. Initial zero/low-motion samples immediately after Reset remain a known UI-click input-interruption artifact, not failed directional evidence. Gate D is closed. Capture 19 proves SceneInfo/DepthStencilTex inverted depth in 128/128 samples and closes the producer camera metadata path: near/far come from primary via.Camera and vertical FOV is derived from SceneInfo projection. Capture 20 then proves that a real Load Save can preserve Scene/SceneInfo/Camera/Depth/Velocity/Color identity, render size, and render-frame continuity while still producing large camera-history discontinuities. Translation alone is not a safe reset heuristic; rotation separates strongly in this run, but no threshold is frozen. Capture 21 proves SceneInfo.old_view_projection_matrix does not expose a Load Save reset signal. Capture 22 then closes the current Load Save reset gate: two independent loads repeat the same SceneLoadZone pause window, history remains unstable after pause release, and GameSituation inhibit restoration marks the stable post-load return; the final quit path provides a negative control without a SceneLoadZone pause rise. Capture 23 closes the first Gate H provenance step: four complete 64-frame runs show one active DIRECT queue, exactly five single-list DIRECT submissions between pre-Overlay and Present in all 256 frames, and a deterministic ten-command-list/two-pool reuse pattern. Capture 24 then shows that the stable whole frame actually contains seven DIRECT submits (two before pre-Overlay plus five after), while the submitted-base instance-vtable hook fails to observe the real repeated Reset/Close/barrier recording lifecycle. Capture 25 rejects the public-interface-alias explanation: GCL0 through GCL7 all alias the submitted pointer/vtable, GCL7 is supported, canonical IUnknown maps 1:1, and all observed lists share the same implementation functions for Close/Reset/legacy ResourceBarrier/GCL7 Barrier. Capture 26 is prepared to observe those shared implementation functions directly, filtered to actual RE4 submitted lists, and to distinguish real legacy versus enhanced barrier usage before any production XeSS transition is added. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
 
 Until the remaining gates are proven, the diagnostic stays passive and no production XeSS dispatch is enabled.
