@@ -627,7 +627,7 @@ Pixel identity alone cannot prove that no unrelated earlier UI pass ever touched
 
 ## 10. Current diagnostic PR behavior
 
-Capture 9 ends generic Color/Overlay resource discovery. The active diagnostic is now a **render/display-size correlation probe** and remains passive and default-off.
+Capture 9 ends generic Color/Overlay resource discovery. Capture 10 establishes the native-size baseline. The active diagnostic is now a **temporary render/display split test** and remains default-off.
 
 It currently:
 
@@ -638,7 +638,8 @@ It currently:
 - reads Velocity directly from `VelocityTarget`;
 - records Color/Depth/Velocity native-resource extents and formats in one frame-local sample;
 - records whether those temporal input extents are aligned;
-- passively records the latest existing `via.SceneView.get_Size` callback result and render-frame ID;
+- temporarily overrides `via.SceneView.get_Size` to a fixed **1920x1080** only while the diagnostic is enabled;
+- records both the original SceneView size and the overridden size with render-frame correlation;
 - records the active D3D12 swapchain `DXGI_SWAP_CHAIN_DESC1` width/height/format/buffer count;
 - records the existing D3D12Hook display-size and render-size hints for comparison, without treating them as authoritative engine render size;
 - pairs a post-Overlay observation on the same frame and records the current working-target extent when available;
@@ -649,8 +650,7 @@ The old primary-Scene MRT candidate scan, PostEffect candidate scan, and repeate
 
 It does **not**:
 
-- change `SceneView.get_Size`;
-- change render resolution;
+- expose production XeSS quality presets or a production upscaling UI;
 - change `ImageQualityRate`;
 - change TAA or dynamic-resolution settings;
 - submit D3D12 work;
@@ -669,13 +669,13 @@ color={width=...,height=...}
 depth={width=...,height=...}
 velocity={width=...,height=...}
 temporalExtentsAligned=
-engineView ... viewFrame=... sameFrame=... viewSize=...x...
+engineView ... sameFrame=... originalViewSize=...x... overriddenViewSize=1920x1080
 dxgi ... swapSize=...x... hookDisplay=...x... hookRenderHint=...x...
 sizeSamplePost=...
 current={width=...,height=...}
 ~~~
 
-The goal is to determine which existing engine/DXGI size signals correspond to scene render resolution, display/output resolution, and transient Overlay/UI working-target resolution before any render-size mutation is attempted.
+The decisive question is whether the fixed SceneView override alone causes Color/Depth/Velocity to move together to 1920x1080 while the DXGI output remains 2560x1440. This is a diagnostic-only causal test, not the final XeSS quality-selection implementation.
 
 ---
 
@@ -758,9 +758,10 @@ This proves the native-resolution baseline and validates `SceneView.get_Size` as
 
 Next required controlled test:
 
-- keep swapchain/display at 2560x1440;
-- lower RE4 internal render resolution through a controlled game configuration, not through probe mutation;
-- verify whether `SceneView.get_Size`, Color, Depth, and Velocity move to the same lower extent;
+- enable the diagnostic-only fixed `SceneView.get_Size = 1920x1080` override;
+- do not resize the swapchain explicitly;
+- do not alter `ImageQualityRate`, TAA, jitter, or XeSS state;
+- verify whether Color, Depth, and Velocity move together to 1920x1080;
 - verify that swapchain/display remains 2560x1440;
 - continue observing Overlay/UI working-target extent separately.
 
@@ -775,7 +776,7 @@ Color/Depth/Velocity extent relationship
 Overlay/UI working-size relationship
 ~~~
 
-and can reproduce that relationship in at least one render/display split configuration before any bridge-controlled render-size override is introduced.
+and can reproduce that relationship in this fixed 1920x1080 diagnostic split before any production XeSS preset logic is introduced.
 
 ### Gate C — Jitter
 
@@ -1119,12 +1120,12 @@ native swapchain/display
 
 Next:
 
-- keep swapchain/display fixed at 2560x1440;
-- lower internal RE4 render resolution through a controlled game-side configuration first;
-- do **not** use the diagnostic itself to force render size yet;
-- verify whether `SceneView.get_Size` tracks the lower Color/Depth/Velocity extent on the same render frame;
+- use the diagnostic-only fixed 1920x1080 `SceneView.get_Size` override;
+- leave swapchain/display untouched;
+- leave `ImageQualityRate`, TAA, jitter, and XeSS untouched;
+- verify whether Color/Depth/Velocity follow the override together on the same render frame;
 - keep Overlay/UI working-target extent as an independent signal;
-- only after the split relationship is proven should the bridge begin implementing its own render-size override;
+- only after the split relationship is proven should production code map XeSS quality settings to input resolution;
 - fail closed if Color/Depth/Velocity extents do not remain mutually aligned.
 
 ### 18.3 Prove jitter and MV semantics together
