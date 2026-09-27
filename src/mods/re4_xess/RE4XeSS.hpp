@@ -10,9 +10,8 @@
 
 #include "Mod.hpp"
 #include "RE4XeSSFrame.hpp"
-#include "RE4XeSSD3D12.hpp"
 #include "RE4XeSSOutputHandoff.hpp"
-#include "RE4XeSSRuntime.hpp"
+#include "RE4XeSSWorker.hpp"
 
 class RE4XeSS final : public Mod {
 public:
@@ -85,25 +84,22 @@ private:
         RE4XeSSRuntime::InputResolutionQuery input{};
         uintptr_t device_identity{};
         uintptr_t queue_identity{};
+        bool bridge_idle{ true };
+        bool bridge_quarantined{};
+        bool bridge_device_removed{};
+        uint64_t control_generation{};
+        uint64_t device_reset_generation{};
         std::string failure_reason{};
     };
 
-    struct OwnerConfiguration {
-        ID3D12Device* device{};
-        ID3D12CommandQueue* queue{};
-        UpscalingMode mode{ UpscalingMode::Off };
-        xess_quality_settings_t quality{ XESS_QUALITY_SETTING_AA };
-        xess_2d_t display{};
-        RE4XeSSRuntime::InputResolutionQuery input{};
-        bool valid{};
-    };
-
     void request_mode(UpscalingMode mode);
-    bool service_owner_thread();
     void publish_producer_snapshot(ProducerSnapshot snapshot);
+    void publish_worker_snapshot(const RE4XeSSWorker::Snapshot& snapshot);
     ProducerSnapshot get_producer_snapshot() const;
     void set_owner_unavailable(std::string reason, bool draining = false, bool faulted = false);
     void mark_execution_fault(std::string reason);
+    std::string pending_worker_fault(uint64_t control_generation, uint64_t device_reset_generation);
+    void acknowledge_worker_fault(uint64_t control_generation, uint64_t device_reset_generation);
     void update_temporal_configuration();
     void update_load_state();
     void invalidate_history(std::string_view reason, bool reset_jitter = true);
@@ -114,28 +110,26 @@ private:
     bool is_temporal_active() const;
 
     std::atomic<UpscalingMode> m_requested_mode{ UpscalingMode::Off };
-    std::atomic<bool> m_bootstrap_requested{};
     std::atomic<uint64_t> m_control_generation{};
     std::atomic<uint64_t> m_device_reset_generation{};
     std::atomic<uint64_t> m_last_frame_device_reset_generation{};
-    std::atomic<bool> m_owner_thread_violation{};
-    std::atomic_flag m_owner_thread_logged = ATOMIC_FLAG_INIT;
-    uint64_t m_owner_device_reset_generation{};
     UpscalingMode m_last_frame_mode{ UpscalingMode::Off };
     std::string m_last_invalid_config_token{};
-    RE4XeSSRuntime m_runtime{};
-    RE4XeSSD3D12 m_bridge{};
+    RE4XeSSWorker m_worker{};
     RE4XeSSOutputHandoff m_output_handoff{};
     mutable std::mutex m_producer_snapshot_mutex{};
     ProducerSnapshot m_producer_snapshot{};
-    OwnerConfiguration m_owner_configuration{};
-    std::atomic<DWORD> m_execution_owner_thread_id{};
-    bool m_owner_execution_faulted{};
-    uint64_t m_owner_fault_control_generation{};
-    uint64_t m_owner_fault_device_reset_generation{};
-    bool m_owner_waiting_for_new_device{};
-    ID3D12Device* m_removed_device_identity{};
-    std::string m_owner_failure_reason{};
+    mutable std::mutex m_pending_worker_fault_mutex{};
+    std::string m_pending_worker_fault_reason{};
+    uint64_t m_pending_worker_fault_generation{};
+    uint64_t m_pending_worker_fault_reset_generation{};
+
+    std::atomic_flag m_pre_overlay_in_progress = ATOMIC_FLAG_INIT;
+    std::atomic<uint64_t> m_pre_overlay_overlap_epoch{};
+    std::atomic<uint64_t> m_pre_overlay_overlap_count{};
+    std::atomic<DWORD> m_last_pre_overlay_thread_id{};
+    std::atomic<uint32_t> m_pre_overlay_migration_log_count{};
+    std::atomic<uint32_t> m_pre_overlay_coordinator_log_count{};
 
     bool m_temporal_ready{};
     bool m_temporal_signature_valid{};
@@ -172,6 +166,7 @@ private:
     uintptr_t m_last_velocity_identity{};
     std::optional<FrameSnapshot> m_latest_frame_snapshot{};
     uint64_t m_output_handoff_control_generation{};
+    uint64_t m_output_handoff_device_reset_generation{};
 
     bool m_pause_previous_valid{};
     bool m_pause_previous{};

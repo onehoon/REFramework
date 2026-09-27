@@ -1520,6 +1520,8 @@ if(REF_BUILD_FRAMEWORK AND CMAKE_SIZEOF_VOID_P EQUAL 8) # build-framework
 		"src/mods/re4_xess/RE4XeSSOutputHandoff.hpp"
 		"src/mods/re4_xess/RE4XeSSRuntime.cpp"
 		"src/mods/re4_xess/RE4XeSSRuntime.hpp"
+		"src/mods/re4_xess/RE4XeSSWorker.cpp"
+		"src/mods/re4_xess/RE4XeSSWorker.hpp"
 		"src/mods/spritefonts/Roboto.spritefont.h"
 		"src/mods/tools/ChainViewer.cpp"
 		"src/mods/tools/ChainViewer.hpp"

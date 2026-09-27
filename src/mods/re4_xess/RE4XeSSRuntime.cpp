@@ -26,6 +26,11 @@ std::string result_message(const char* operation, xess_result_t result) {
     return std::string{ operation } + " returned XeSS result " + std::to_string(static_cast<int32_t>(result));
 }
 
+std::string path_for_log(const std::filesystem::path& path) {
+    const auto utf8 = path.u8string();
+    return { reinterpret_cast<const char*>(utf8.data()), utf8.size() };
+}
+
 }
 
 RE4XeSSRuntime::~RE4XeSSRuntime() {
@@ -63,19 +68,32 @@ bool RE4XeSSRuntime::initialize(ID3D12Device* device, const std::filesystem::pat
         reframework_directory / L"OptiScaler" / L"libxess.dll",
     };
 
-    std::error_code path_error;
-    for (const auto& candidate : m_candidates) {
-        path_error.clear();
-        const auto is_file = std::filesystem::is_regular_file(candidate, path_error);
-        if (path_error) {
-            fail("Could not inspect runtime candidate: " + path_error.message());
+    for (size_t index = 0; index < m_candidates.size(); ++index) {
+        const auto& candidate = m_candidates[index];
+        const auto attributes = GetFileAttributesW(candidate.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES) {
+            const auto error = GetLastError();
+            if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+                spdlog::info("[RE4XeSS][Runtime] candidate {} missing; continuing: {}",
+                    index + 1, path_for_log(candidate));
+                continue;
+            }
+
+            fail("Could not inspect runtime candidate '" + path_for_log(candidate) +
+                "', Win32 error " + std::to_string(error));
             return false;
         }
 
-        if (is_file) {
-            m_selected_path = candidate;
-            break;
+        if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            spdlog::info("[RE4XeSS][Runtime] candidate {} is a directory; continuing: {}",
+                index + 1, path_for_log(candidate));
+            continue;
         }
+
+        m_selected_path = candidate;
+        spdlog::info("[RE4XeSS][Runtime] candidate {} selected: {}",
+            index + 1, path_for_log(candidate));
+        break;
     }
 
     if (m_selected_path.empty()) {
@@ -90,9 +108,15 @@ bool RE4XeSSRuntime::initialize(ID3D12Device* device, const std::filesystem::pat
 
     if (m_module == nullptr) {
         const auto error = GetLastError();
-        fail("LoadLibraryExW failed with Win32 error " + std::to_string(error));
+        spdlog::error("[RE4XeSS][Runtime] LoadLibraryExW failed for '{}' with Win32 error {}",
+            path_for_log(m_selected_path), error);
+        fail("LoadLibraryExW failed for '" + path_for_log(m_selected_path) +
+            "' with Win32 error " + std::to_string(error));
         return false;
     }
+
+    spdlog::info("[RE4XeSS][Runtime] LoadLibraryExW succeeded for exact path '{}'",
+        path_for_log(m_selected_path));
 
     m_state = State::ModuleReady;
 

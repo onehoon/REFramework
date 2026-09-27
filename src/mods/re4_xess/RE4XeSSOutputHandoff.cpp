@@ -61,20 +61,14 @@ RE4XeSSOutputHandoff::~RE4XeSSOutputHandoff() {
 
 bool RE4XeSSOutputHandoff::restore(
     sdk::renderer::layer::Overlay* layer,
-    DWORD current_thread,
     std::string& error) {
     error.clear();
     if (!m_installed) {
         return true;
     }
-    if (current_thread != m_owner_thread_id) {
-        error = "Overlay handoff restoration was requested from a non-owner thread";
-        quarantine(error);
-        return false;
-    }
 
     if (layer == nullptr) {
-        error = "Overlay layer is unavailable; the installed handoff remains retained for a later owner-thread restore";
+        error = "Overlay layer is unavailable; the installed handoff remains retained for a later pre-Overlay restore";
         return false;
     }
     if (layer != m_installed_overlay) {
@@ -403,7 +397,6 @@ bool RE4XeSSOutputHandoff::prepare(
 
     m_signature = requested_signature;
     m_expected_state = D3D12_RESOURCE_STATE_COMMON;
-    m_owner_thread_id = GetCurrentThreadId();
     m_next_retirement_value = 1;
     m_last_signaled_retirement_value = 0;
     m_last_completed_retirement_value = 0;
@@ -769,7 +762,6 @@ void RE4XeSSOutputHandoff::release_generation() noexcept {
     }
     m_signature = {};
     m_expected_state = D3D12_RESOURCE_STATE_COMMON;
-    m_owner_thread_id = 0;
     m_next_retirement_value = 1;
     m_last_signaled_retirement_value = 0;
     m_last_completed_retirement_value = 0;
