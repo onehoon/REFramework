@@ -1794,6 +1794,9 @@ A dedicated cutscene-only capture can be added later if a real non-load cut expo
 
 ### Capture 23 — D3D12 execution ordering result
 
+> **Timing correction:** Captures 23-27 were recorded from `on_overlay_layer_draw()` after the original Overlay draw, despite their historical `pre-Overlay` log labels. The queue/interface/barrier/lifetime evidence below remains valid, but any statement that depends specifically on the true pre-Overlay callback is superseded by the timing-audit correction after Capture 27 and must be revalidated by Capture 29.
+
+
 Capture 23 was collected in `23_re2_framework_log.txt`.
 
 The diagnostic was reset/re-run four times, producing four complete 64-frame windows:
