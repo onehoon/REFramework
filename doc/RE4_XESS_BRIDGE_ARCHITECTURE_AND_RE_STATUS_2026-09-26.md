@@ -2697,7 +2697,7 @@ The reason is now source-confirmed: `D3D12 resource states` still relies on the 
 
 Therefore Capture 29 does not invalidate the previously observed post-Overlay `0xC0 / 0xE0 / 0x04` tuple; it simply leaves the true pre-Overlay tuple unmeasured.
 
-### Capture 29b objective — true pre-Overlay state tuple via shared recording hooks
+### Capture 29b objective and result — true pre-Overlay state tuple proven
 
 Reuse the already-proven `D3D12 recording functions` scenario rather than adding another hook family.
 
@@ -2743,7 +2743,32 @@ No bridge-order rerun is required.
 
 If Capture 29b reproduces that tuple consistently, Gate H is fully closed again. The already-prepared final HDR composite diagnostic then proceeds as Capture 30.
 
-### Capture 30 objective — final HDR composite/output witness
+Capture 29b has now completed two full 64-sample runs:
+
+~~~text
+Run 1: frame 8214 -> 8277
+Run 2: frame 8450 -> 8513
+
+recordingBoundary = 128
+recordingPresent  = 128
+~~~
+
+All 128 boundaries are `stage=preOverlay`. After shared-hook warm-up, sample 3-64 in both runs gives **124/124 stable frames** with:
+
+~~~text
+Color               = 0xC0
+Depth subresource 0 = 0xE0
+Depth subresource 1 = 0xE0
+Velocity            = 0x04
+~~~
+
+The complete observed Color/Depth/Velocity transition cycle is stable across those frames and restores the same tuple at the actual true pre-Overlay boundary.
+
+Therefore Gate H is now **CLOSED**. For production XeSS insertion, Color is already shader-readable at `0xC0`, Depth is depth-read + shader-readable at `0xE0`, while Velocity arrives as `0x04` (`RENDER_TARGET`) and must be transitioned for XeSS consumption and restored to `0x04` before returning control to RE4.
+
+No further Gate H rerun is required.
+
+### Capture 30 objective — final HDR composite/output witness (initial configuration)
 
 New scenario:
 
@@ -2856,6 +2881,94 @@ Decision target:
 - use that stage to decide how a future display-resolution XeSS result should enter RE4's own presentation/UI pipeline.
 
 Do not replace an engine target, modify a descriptor, or dispatch XeSS in Capture 30.
+
+### Capture 30 result — final engine list and state window narrowed
+
+Two complete 64-sample runs were collected:
+
+~~~text
+Run 1: frame 6741 -> 6804
+Run 2: frame 7020 -> 7083
+
+finalCompositeBoundary = 128
+finalCompositeCopy     = 124
+finalCompositePresent  = 128
+~~~
+
+Samples 3-64 in both runs give **124/124 stable frames**. The same event pattern repeats:
+
+~~~text
+earlier engine list:
+    Color 0xC0 -> 0x04
+
+final engine DIRECT list:
+    Color 0x04 -> 0xC0
+    Color 0xC0 -> 0x04
+    Color 0x04 -> 0x08
+    Color 0x08 -> 0x04
+    Color 0x04 -> 0x800
+    CopyResource: Color -> stable same-format HDR copy destination
+    Color 0x800 -> 0xC0
+    Color 0xC0 -> 0x04
+    Color 0x04 -> 0xC0
+    Color 0xC0 -> 0x04
+    Swapchain 0x00 -> 0x04
+    Color     0x04 -> 0xC0
+    [narrow final-output draw window]
+    Swapchain 0x04 -> 0x00
+~~~
+
+The Capture 28 copy edge is therefore reproduced in all 124 stable frames. However, after discovering that destination in the current frame, the probe records no explicit legacy transition that establishes it as shader-readable before Present:
+
+~~~text
+intermediateState at Present = 0x0
+candidateDraws using the intermediate criterion = 0
+~~~
+
+This does **not** prove that the copy destination is unused. It means only that Capture 30 does not support the earlier assumption that this destination itself is the directly observed shader-readable final screen-output source.
+
+The late Color/swapchain events are on the last engine DIRECT submission before Present:
+
+~~~text
+ordinal 7 = 122/124 stable frames
+ordinal 8 =   2/124 stable frames
+~~~
+
+The two ordinal-8 cases are the rare eight-submit topology; the semantic position is still the final engine DIRECT submission before Present.
+
+Most importantly, Capture 30 proves a repeatable narrow state-overlap window:
+
+~~~text
+active swapchain buffer = 0x04  (RENDER_TARGET)
+Color                   = 0xC0  (shader-readable)
+~~~
+
+followed by `Swapchain 0x04 -> 0x00` and Present.
+
+### Capture 30b objective — exact Color -> swapchain draw witness
+
+The initial Capture 30 draw filter required the discovered copy destination to be shader-readable, which is why it emitted zero candidate draws. Reuse the same `D3D12 final output composite` scenario, but key the narrow candidate on:
+
+~~~text
+Color is shader-readable
+AND
+an active swapchain buffer is RENDER_TARGET
+~~~
+
+The detailed record keeps the draw API/arguments, command-list identity, sample/frame/thread, Color identity/state, copy-destination identity/state for context, and active swapchain identity/state.
+
+Capture 30b procedure:
+
+1. enter stable gameplay;
+2. select `D3D12 final output composite`;
+3. click `Reset capture`;
+4. keep gameplay/camera mostly still;
+5. allow all **64 samples** to complete;
+6. exit and upload the log.
+
+One clean 64-sample run is sufficient initially.
+
+If one stable unique fullscreen-style draw pattern repeats between the Color/swapchain overlap and `Swapchain 0x04 -> 0x00`, use that stage as the Gate I final-output handoff. A state-overlap candidate still does not by itself prove descriptor binding; add narrow descriptor/SRV provenance only if multiple candidates remain ambiguous.
 
 The probe still does **not**:
 
@@ -3032,7 +3145,11 @@ However, its matrix layout, handedness, frame-history convention, and jitter-seq
 - do not copy the specific jitter sample `-0.87500, +0.77778`;
 - keep this project's independently verified RE4 projection-jitter conversion and MV/camera semantics as the production contract.
 
-The screenshot is best treated as **independent convergence on the same broad RE4 temporal/post-processing pipeline**, with its strongest practical value being the external hint that the unresolved Capture 28 HDR intermediate is consumed through a tone-map/final-screen-output path rather than a simple copy-to-swapchain chain.
+The screenshot is best treated as **independent convergence on the same broad RE4 temporal/post-processing pipeline**.
+
+Capture 30 adds an important correction to the earlier screenshot interpretation: the Capture 28 copy destination is reproduced, but no current-frame legacy transition proves it shader-readable before Present. Therefore do **not** identify that destination directly with huutaiii's `ToneMapOut`, `FSRSharpenedColor`, or `ScreenOutPassInput`.
+
+The stronger native correspondence now is the proven final-list window where the active swapchain is `RENDER_TARGET` and Color becomes shader-readable. That is structurally compatible with a final `ScreenOutPass`-style stage, but the huutaiii naming remains an external analogy until Capture 30b identifies the exact RE4 draw.
 
 ---
 
@@ -3300,7 +3417,7 @@ No engine-owned command list should be modified.
 
 ### Gate I — XeSS output integration
 
-**Status: ACTIVE — Capture 28 closes the copy edge; Capture 30 is prepared for the final non-copy composite boundary after Capture 29b closes Gate H state timing.**
+**Status: ACTIVE — Gate H is closed by Capture 29b; Capture 30 proves the final engine output list and narrows the non-copy composite to a Color-shader-readable + swapchain-RT window; Capture 30b targets the exact draw.**
 
 Capture 28 proves:
 
@@ -3315,13 +3432,13 @@ Therefore direct copy replacement at the swapchain is not an evidence-backed int
 
 Still decide and prove:
 
-- the non-copy consumption stage for the HDR intermediate;
-- the swapchain render-target transition and final composite draw window;
+- the exact draw stage inside the proven Color `0xC0` + swapchain `0x04` overlap window;
+- whether that draw uniquely identifies the final screen-output/composite handoff;
 - how a display-resolution XeSS output feeds that path without bypassing RE4 Overlay/UI composition;
 - bridge output resource state transitions;
 - resource lifetime and resize behavior.
 
-Capture 30 observes only Color/intermediate/swapchain legacy barriers and graphics draws occurring while the intermediate is shader-readable and a swapchain buffer is in `RENDER_TARGET`.
+Capture 30b keeps the same narrow Color/copy-destination/swapchain legacy-barrier tracing, but emits detailed graphics draws while **Color** is shader-readable and an active swapchain buffer is in `RENDER_TARGET`. The copy destination remains logged only as context until its role is independently proven.
 
 Historical pd-upscaler remains a concept oracle only. Current RE4 1.5.9 runtime evidence determines the actual integration point.
 
@@ -3526,13 +3643,13 @@ Use broad D3D12 tracing only as a last resort. The old ATSBridge trace produced 
 | Public GCL0-GCL7 topology | **HIGH / PROVEN** | Capture 25: all public GraphicsCommandList interfaces alias submitted pointer; GCL7 supported |
 | Shared D3D12 method provenance | **HIGH / PROVEN** | Capture 25: common Close/Reset/legacy ResourceBarrier/GCL7 Barrier implementations |
 | Actual barrier API usage | **HIGH / PROVEN** | Capture 26: repeated legacy ResourceBarrier use; zero enhanced Barrier calls |
-| True pre-Overlay input states | **ACTIVE / Capture 29b** | Capture 29 reached the true pre callback but the legacy per-object state probe observed zero target barriers; Capture 29b reuses the shared recording-function hooks |
-| RE4 input-state restoration | **HIGH at post-Overlay / pre pending** | Capture 26 proves recurring post-Overlay restoration behavior; Capture 29b checks the true pre boundary with the shared recording hook |
+| True pre-Overlay input states | **HIGH / PROVEN** | Capture 29b: 124/124 stable true-pre frames reproduce Color=0xC0, Depth=0xE0, Velocity=0x04 |
+| RE4 input-state restoration | **HIGH / PROVEN** | Capture 29b reproduces the stable transition cycle and restores the true-pre tuple in 124/124 stable frames |
 | Bridge-owned command-list ordering | **HIGH / true pre proven** | Capture 29 proves 126/126 stable true-pre frames with engine 1-2 -> REF ordinal 3 -> engine 4-8 -> Present, plus fence-safe reuse |
 | Bridge allocator/list fence lifetime | **HIGH / PROVEN** | Capture 27: all 120 slot reuses occur only after prior fence completion; 128/128 Present fences complete |
 | Output Color→HDR intermediate copy | **HIGH / PROVEN** | Capture 28: 124/124 post-warm-up samples use one same-format CopyResource edge |
 | Copy-chain reachability to swapchain | **HIGH / REJECTED** | Capture 28: reachedSwapchain=false in 128/128 Present summaries; no second tracked copy edge |
-| Final HDR composite/output stage | **MEDIUM / active** | Capture 30 is prepared for the intermediate/swapchain barrier + candidate draw witness after Capture 29b |
+| Final HDR composite/output stage | **HIGH / narrowed, exact draw active** | Capture 30 proves the final engine list and Color=0xC0 + swapchain=0x04 overlap; Capture 30b targets the exact draw |
 | Standard XeSS → upstream OptiScaler | **DESIGN LOCKED, runtime pending** | No custom OptiScaler ABI permitted |
 | XeFG through `FGInput=Upscaler` | **pending after SR** | Existing presentation compatibility work remains relevant |
 
