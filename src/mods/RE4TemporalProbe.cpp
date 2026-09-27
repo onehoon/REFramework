@@ -4206,7 +4206,7 @@ void RE4TemporalProbe::on_overlay_layer_draw(
         const auto color_shape = resource_shape(color);
 
         spdlog::info(
-            "[RE4TemporalProbe] finalCompositeBoundary sample={} frame={} stage=preOverlay "
+            "[RE4TemporalProbe] finalCompositeBoundary sample={} frame={} stage=postOverlay "
             "thread={} color={:p} hdr={:p} overlayMainResource={:p} "
             "colorMatchesHDR={} mainMatchesColor={} "
             "colorDesc={{w={},h={},format={},flags=0x{:x}}} "
@@ -4315,7 +4315,7 @@ void RE4TemporalProbe::on_overlay_layer_draw(
         m_output_copy_capture_open.store(true, std::memory_order_release);
 
         spdlog::info(
-            "[RE4TemporalProbe] outputCopyBoundary sample={} frame={} stage=preOverlay "
+            "[RE4TemporalProbe] outputCopyBoundary sample={} frame={} stage=postOverlay "
             "thread={} color={:p} hdr={:p} overlayMain={:p} overlayMainResource={:p} "
             "colorMatchesHDR={} mainMatchesColor={} "
             "colorDesc={{w={},h={},format={},flags=0x{:x}}} "
@@ -4395,7 +4395,7 @@ void RE4TemporalProbe::on_overlay_layer_draw(
         m_bridge_order_capture_open.store(true, std::memory_order_release);
 
         spdlog::info(
-            "[RE4TemporalProbe] bridgeOrderBoundary sample={} frame={} stage=preOverlay "
+            "[RE4TemporalProbe] bridgeOrderBoundary sample={} frame={} stage=postOverlay "
             "thread={} color={:p} hdr={:p} depth={:p} velocity={:p} "
             "colorMatchesHDR={} queue={:p} queueType={} fenceCompleted={}",
             sample,
@@ -4501,7 +4501,7 @@ void RE4TemporalProbe::on_overlay_layer_draw(
         m_recording_capture_open.store(true, std::memory_order_release);
 
         spdlog::info(
-            "[RE4TemporalProbe] recordingBoundary sample={} frame={} stage=preOverlay "
+            "[RE4TemporalProbe] recordingBoundary sample={} frame={} stage=postOverlay "
             "thread={} activeList={:p} activeGeneration={} activeBarrierSeq={} "
             "trackedLists={} hooksReady={} color={:p} hdr={:p} depth={:p} "
             "velocity={:p} colorMatchesHDR={} queue={:p} queueType={}",
@@ -4564,7 +4564,7 @@ void RE4TemporalProbe::on_overlay_layer_draw(
         m_interface_capture_open.store(true, std::memory_order_release);
 
         spdlog::info(
-            "[RE4TemporalProbe] interfaceBoundary sample={} frame={} stage=preOverlay "
+            "[RE4TemporalProbe] interfaceBoundary sample={} frame={} stage=postOverlay "
             "thread={} color={:p} hdr={:p} depth={:p} velocity={:p} "
             "colorMatchesHDR={} queue={:p} queueType={}",
             sample,
@@ -4645,7 +4645,7 @@ void RE4TemporalProbe::on_overlay_layer_draw(
         m_resource_boundary_sample.store(sample, std::memory_order_release);
 
         spdlog::info(
-            "[RE4TemporalProbe] resourceBoundary sample={} frame={} stage=preOverlay "
+            "[RE4TemporalProbe] resourceBoundary sample={} frame={} stage=postOverlay "
             "thread={} activeList={:p} activeGeneration={} activeBarrierSeq={} "
             "trackedLists={} color={:p} hdr={:p} depth={:p} velocity={:p} "
             "colorMatchesHDR={} queue={:p} queueType={} submitBase={}",
@@ -4717,7 +4717,7 @@ void RE4TemporalProbe::on_overlay_layer_draw(
         m_execution_boundary_sample.store(sample, std::memory_order_release);
 
         spdlog::info(
-            "[RE4TemporalProbe] executionBoundary sample={} frame={} stage=preOverlay "
+            "[RE4TemporalProbe] executionBoundary sample={} frame={} stage=postOverlay "
             "thread={} renderContext={:p} protectFrame={} delayEnabled={} "
             "currentTarget={:p} currentResource={:p} overlayMain={:p} overlayMainResource={:p} "
             "color={:p} hdr={:p} depth={:p} velocity={:p} "
