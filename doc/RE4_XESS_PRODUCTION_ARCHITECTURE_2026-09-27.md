@@ -1225,6 +1225,12 @@ protected XeFG compatibility code:
 
 ### PR 2 — production temporal frame builder
 
+Implementation work order:
+
+~~~text
+doc/RE4_XESS_PR2_WORK_ORDER_2026-09-27.md
+~~~
+
 Scope:
 
 - semantic Color / Depth / Velocity accessors;
