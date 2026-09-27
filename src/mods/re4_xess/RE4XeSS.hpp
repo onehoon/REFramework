@@ -11,6 +11,7 @@
 #include "Mod.hpp"
 #include "RE4XeSSFrame.hpp"
 #include "RE4XeSSD3D12.hpp"
+#include "RE4XeSSOutputHandoff.hpp"
 #include "RE4XeSSRuntime.hpp"
 
 class RE4XeSS final : public Mod {
@@ -36,6 +37,7 @@ public:
     std::optional<std::string> on_initialize_d3d_thread() override;
     void on_frame() override;
     void on_draw_ui() override;
+    void on_post_present() override;
     void on_device_reset() override;
     void on_config_load(const utility::Config& cfg) override;
     void on_config_save(utility::Config& cfg) override;
@@ -43,6 +45,7 @@ public:
     void on_camera_get_projection_matrix(REManagedObject* camera, Matrix4x4f* result) override;
     void on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* render_context) override;
     bool on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* render_context) override;
+    void on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* render_context) override;
 
 private:
     struct SceneInfoHistory {
@@ -122,6 +125,7 @@ private:
     std::string m_last_invalid_config_token{};
     RE4XeSSRuntime m_runtime{};
     RE4XeSSD3D12 m_bridge{};
+    RE4XeSSOutputHandoff m_output_handoff{};
     mutable std::mutex m_producer_snapshot_mutex{};
     ProducerSnapshot m_producer_snapshot{};
     OwnerConfiguration m_owner_configuration{};
@@ -167,6 +171,7 @@ private:
     uintptr_t m_last_depth_identity{};
     uintptr_t m_last_velocity_identity{};
     std::optional<FrameSnapshot> m_latest_frame_snapshot{};
+    uint64_t m_output_handoff_control_generation{};
 
     bool m_pause_previous_valid{};
     bool m_pause_previous{};

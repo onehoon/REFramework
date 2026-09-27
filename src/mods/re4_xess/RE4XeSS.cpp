@@ -17,6 +17,7 @@
 #include <utility/Module.hpp>
 
 #include "mods/REFrameworkConfig.hpp"
+#include "REFramework.hpp"
 
 namespace {
 
@@ -326,6 +327,7 @@ void RE4XeSS::on_draw_ui() {
     ImGui::TextUnformatted("RE4 XeSS");
 
     const auto producer = get_producer_snapshot();
+    const auto handoff = m_output_handoff.snapshot();
     const auto requested_mode = m_requested_mode.load(std::memory_order_acquire);
     auto selected_mode = static_cast<int32_t>(requested_mode);
     if (ImGui::Combo("Upscaling Mode", &selected_mode, UPSCALING_MODE_LABELS.data(), static_cast<int32_t>(UPSCALING_MODE_LABELS.size()))) {
@@ -337,6 +339,12 @@ void RE4XeSS::on_draw_ui() {
 
     if (requested_mode == UpscalingMode::Off) {
         ImGui::TextUnformatted("Off - native RE4 rendering");
+        if (handoff.retirement == RE4XeSSOutputHandoff::RetirementStatus::MissingMarker ||
+            handoff.retirement == RE4XeSSOutputHandoff::RetirementStatus::Draining ||
+            handoff.retirement == RE4XeSSOutputHandoff::RetirementStatus::Quarantined) {
+            ImGui::TextWrapped("Previous XeSS output handoff: %s",
+                handoff.failure_reason.empty() ? "draining or quarantined" : handoff.failure_reason.c_str());
+        }
         return;
     }
 
@@ -349,7 +357,21 @@ void RE4XeSS::on_draw_ui() {
         return;
     }
     if (producer.execution_ready) {
-        ImGui::TextUnformatted("XeSS execute active - detached output only; not presented yet");
+        if (handoff.installed) {
+            ImGui::TextUnformatted("XeSS output handoff active - RE4 presentation path");
+        } else if (handoff.retirement == RE4XeSSOutputHandoff::RetirementStatus::MissingMarker ||
+            handoff.retirement == RE4XeSSOutputHandoff::RetirementStatus::Draining ||
+            handoff.retirement == RE4XeSSOutputHandoff::RetirementStatus::WriterPending) {
+            ImGui::TextUnformatted("XeSS output handoff draining");
+            if (!handoff.failure_reason.empty()) {
+                ImGui::TextWrapped("%s", handoff.failure_reason.c_str());
+            }
+        } else if (handoff.retirement == RE4XeSSOutputHandoff::RetirementStatus::Quarantined) {
+            ImGui::TextWrapped("XeSS output handoff unavailable: %s",
+                handoff.failure_reason.empty() ? "generation quarantined" : handoff.failure_reason.c_str());
+        } else {
+            ImGui::TextUnformatted("XeSS execute active - waiting for output handoff");
+        }
         ImGui::Text("Display: %ux%u  Input: %ux%u  Generation: %llu",
             producer.display.x,
             producer.display.y,
@@ -381,6 +403,18 @@ void RE4XeSS::on_draw_ui() {
     } else {
         ImGui::TextUnformatted("Waiting for the RE4 pre-Overlay D3D12 owner thread");
     }
+}
+
+void RE4XeSS::on_post_present() {
+    if (!sdk::GameIdentity::get().is_re4() || g_framework == nullptr ||
+        g_framework->get_renderer_type() != REFramework::RendererType::D3D12) {
+        return;
+    }
+    const auto& hook = g_framework->get_d3d12_hook();
+    if (hook == nullptr) {
+        return;
+    }
+    m_output_handoff.on_post_present(hook->get_device(), hook->get_command_queue());
 }
 
 void RE4XeSS::on_device_reset() {
@@ -1424,7 +1458,34 @@ void RE4XeSS::on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* re
 
 bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* render_context) {
     (void)render_context;
-    if (!service_owner_thread()) {
+    std::string restore_error;
+    if (!m_output_handoff.restore(layer, GetCurrentThreadId(), restore_error)) {
+        const auto handoff = m_output_handoff.snapshot();
+        set_owner_unavailable(restore_error, true,
+            handoff.retirement == RE4XeSSOutputHandoff::RetirementStatus::Quarantined);
+        clear_frame_state();
+        return true;
+    }
+
+    const auto control_generation = m_control_generation.load(std::memory_order_acquire);
+    const auto reset_generation = m_device_reset_generation.load(std::memory_order_acquire);
+    const auto handoff_before_service = m_output_handoff.snapshot();
+    if (handoff_before_service.has_generation &&
+        (control_generation != m_output_handoff_control_generation ||
+            reset_generation != m_owner_device_reset_generation)) {
+        m_output_handoff.request_retirement(
+            control_generation != m_output_handoff_control_generation
+                ? "upscaling mode/quality generation changed"
+                : "D3D12 device-reset generation changed");
+    }
+
+    const bool owner_ready = service_owner_thread();
+    m_output_handoff.poll_retirement(m_bridge.idle(), false);
+    if (!owner_ready) {
+        if (m_output_handoff.snapshot().has_generation) {
+            m_output_handoff.request_retirement("XeSS owner configuration is unavailable");
+            m_output_handoff.poll_retirement(m_bridge.idle(), false);
+        }
         const auto execution_owner_thread_id = m_execution_owner_thread_id.load(std::memory_order_acquire);
         if (execution_owner_thread_id == 0 || execution_owner_thread_id == GetCurrentThreadId()) {
             clear_frame_state();
@@ -1432,6 +1493,8 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         return true;
     }
     if (!is_temporal_active()) {
+        m_output_handoff.request_retirement("temporal upscaling mode is inactive");
+        m_output_handoff.poll_retirement(m_bridge.idle(), false);
         clear_frame_state();
         return true;
     }
@@ -1564,9 +1627,52 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         }
     }
 
+    RE4XeSSD3D12::OutputBinding output{};
+    std::string handoff_error;
+    if (!m_output_handoff.prepare(
+            layer,
+            m_owner_configuration.device,
+            m_owner_configuration.queue,
+            color,
+            render_width,
+            render_height,
+            packet.display_width,
+            packet.display_height,
+            control_generation,
+            m_bridge.idle(),
+            false,
+            output,
+            handoff_error)) {
+        const auto handoff_state = m_output_handoff.snapshot();
+        const bool retirement_pending = handoff_state.retirement == RE4XeSSOutputHandoff::RetirementStatus::WriterPending ||
+            handoff_state.retirement == RE4XeSSOutputHandoff::RetirementStatus::MissingMarker ||
+            handoff_state.retirement == RE4XeSSOutputHandoff::RetirementStatus::Draining ||
+            handoff_state.retirement == RE4XeSSOutputHandoff::RetirementStatus::Quarantined;
+        if (retirement_pending) {
+            set_owner_unavailable(handoff_error, true,
+                handoff_state.retirement == RE4XeSSOutputHandoff::RetirementStatus::Quarantined);
+        } else {
+            mark_execution_fault(handoff_error);
+            set_owner_unavailable(m_owner_failure_reason, false, true);
+        }
+        invalidate_history("output-handoff-unavailable");
+        clear_frame_state();
+        return true;
+    }
+    m_output_handoff_control_generation = control_generation;
+
     std::string submit_error;
-    const auto submit_result = m_bridge.submit(packet, m_runtime, submit_error);
+    const auto submit_result = m_bridge.submit(packet, m_runtime, output, submit_error);
     if (submit_result == RE4XeSSD3D12::SubmitResult::Submitted) {
+        m_output_handoff.note_submission_succeeded();
+        std::string install_error;
+        if (!m_output_handoff.install(layer, packet.frame_id, install_error)) {
+            m_output_handoff.request_retirement("XeSS output was submitted but Overlay installation failed");
+            set_owner_unavailable(install_error, true, true);
+            invalidate_history("output-handoff-install-failed");
+            clear_frame_state();
+            return true;
+        }
         m_last_color_identity = color_identity;
         m_last_depth_identity = depth_identity;
         m_last_velocity_identity = velocity_identity;
@@ -1610,6 +1716,13 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
             }
         }
     } else {
+        if (m_bridge.quarantined()) {
+            m_output_handoff.quarantine(
+                submit_error.empty()
+                    ? "XeSS bridge quarantined after output submission; output state is uncertain"
+                    : submit_error,
+                true);
+        }
         mark_execution_fault(submit_error.empty() ? m_bridge.failure_reason() : submit_error);
         set_owner_unavailable(m_owner_failure_reason, m_bridge.quarantined(), true);
         invalidate_history("xess-execute-fault");
@@ -1617,4 +1730,9 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
 
     clear_frame_state();
     return true;
+}
+
+void RE4XeSS::on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* render_context) {
+    (void)render_context;
+    m_output_handoff.observe_overlay(layer);
 }

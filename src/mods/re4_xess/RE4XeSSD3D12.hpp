@@ -25,6 +25,15 @@ public:
         bool operator==(const Signature&) const = default;
     };
 
+    struct OutputBinding {
+        ID3D12Resource* resource{};
+        D3D12_RESOURCE_STATES before_state{ D3D12_RESOURCE_STATE_COMMON };
+        D3D12_RESOURCE_STATES after_state{
+            static_cast<D3D12_RESOURCE_STATES>(
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+        };
+    };
+
     enum class SubmitResult : uint8_t {
         Submitted,
         Busy,
@@ -55,6 +64,7 @@ public:
     SubmitResult submit(
         const RE4XeSSFrame& frame,
         RE4XeSSRuntime& runtime,
+        const OutputBinding& output,
         std::string& error);
 
     PollResult poll();
@@ -80,6 +90,7 @@ private:
         Microsoft::WRL::ComPtr<ID3D12Resource> color_pin;
         Microsoft::WRL::ComPtr<ID3D12Resource> depth_pin;
         Microsoft::WRL::ComPtr<ID3D12Resource> original_velocity_pin;
+        Microsoft::WRL::ComPtr<ID3D12Resource> output_pin;
         uint64_t last_fence_value{};
     };
 
@@ -89,11 +100,13 @@ private:
     bool create_conversion_pipeline(std::string& error);
     bool validate_format_support(DXGI_FORMAT format, std::string& error) const;
     bool validate_frame(const RE4XeSSFrame& frame, std::string& error) const;
+    bool validate_output(const OutputBinding& output, std::string& error) const;
     void write_slot_descriptors(CommandSlot& slot, ID3D12Resource* velocity);
     bool record_and_submit(
         CommandSlot& slot,
         const RE4XeSSFrame& frame,
         RE4XeSSRuntime& runtime,
+        const OutputBinding& output,
         uint32_t slot_index,
         std::string& error);
     void set_name(ID3D12Object* object, const wchar_t* name) const noexcept;
@@ -103,7 +116,6 @@ private:
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_queue;
     Microsoft::WRL::ComPtr<ID3D12Fence> m_fence;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_converted_velocity;
-    Microsoft::WRL::ComPtr<ID3D12Resource> m_detached_output;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_velocity_root_signature;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_velocity_pipeline;
     std::array<CommandSlot, SLOT_COUNT> m_slots{};
