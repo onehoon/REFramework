@@ -1,7 +1,8 @@
 # RE4 XeSS Production — PR 3 Work Order
 
 Base branch: `feature/re4-xess`  
-Expected base HEAD at authoring time: `1b59aa05a63586ec62137a5ab48f03ebbb7bf730`  
+Production code baseline before PR 3 documentation: `1b59aa05a63586ec62137a5ab48f03ebbb7bf730`  
+Implementation must branch from the latest `feature/re4-xess` so this work order and architecture corrections are included.  
 PR target: `feature/re4-xess`  
 Suggested implementation branch: `feature/re4-xess-pr3-detached-execute`  
 Date: 2026-09-27  
