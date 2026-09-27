@@ -1191,6 +1191,25 @@ The RE4 producer does not detect whether libxess.dll is Intel's runtime or OptiS
 
 That is intentional.
 
+### Load-state accessor runtime gate
+
+The PR4-Log capture after PR65 proves the producer path reaches stock OptiScaler through public XeSS calls, but no frame reaches `xessD3D12Execute`.
+
+Observed:
+
+~~~text
+OptiScaler GetVersion/CreateContext/Init/SetVelocityScale > 0
+RE4XeSS Worker submit                              = 0
+OptiScaler xessD3D12Execute                        = 0
+PR4 OutputHandoff                                  = 0
+~~~
+
+At the same time production logged `load-state-observation-unavailable` continuously.
+
+The Capture 22 Load Save state-machine semantics remain frozen. The current task is only to prove why the production accessor cannot obtain a valid `SceneLoadZoneManager._Pause` + `GameSituationManager.InhibitBit` snapshot.
+
+Do not bypass this gate, hardcode `InhibitBit`, or replace the proven semantic load window with camera heuristics.
+
 The public call stream remains the same and is serialized on the single dedicated RE4XeSS worker thread:
 
 ~~~text
@@ -1497,6 +1516,12 @@ First-runtime corrective work order:
 
 ~~~text
 doc/RE4_XESS_PR4_RUNTIME_BLOCKER_FIX_WORK_ORDER_2026-09-27.md
+~~~
+
+Next runtime blocker work order after PR65 worker/runtime success:
+
+~~~text
+doc/RE4_XESS_LOAD_STATE_ACCESSOR_DIAGNOSTIC_WORK_ORDER_2026-09-27.md
 ~~~
 
 Scope:
