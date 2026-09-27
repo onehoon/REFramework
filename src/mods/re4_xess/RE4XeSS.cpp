@@ -7,7 +7,9 @@
 #include <filesystem>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include <sdk/GameIdentity.hpp>
@@ -116,6 +118,87 @@ struct GameLoadSnapshot {
     uint64_t inhibit{};
 };
 
+enum class LoadSnapshotFailure : uint8_t {
+    None,
+    PauseTypeUnavailable,
+    PauseGetterUnavailable,
+    PauseGetterInvalidSignature,
+    PauseFieldUnavailable,
+    SituationTypeUnavailable,
+    SituationGetterUnavailable,
+    SituationGetterInvalidSignature,
+    InhibitFieldUnavailable,
+    ThreadContextUnavailable,
+    PauseInstanceUnavailable,
+    SituationInstanceUnavailable,
+    PauseFieldTypeUnavailable,
+    PauseFieldTypeMismatch,
+    PauseFieldAddressUnavailable,
+    PauseFieldValueInvalid,
+    InhibitFieldTypeUnavailable,
+    InhibitStorageTypeUnavailable,
+    InhibitStorageTypeMismatch,
+    InhibitStorageWidthInvalid,
+    InhibitFieldAddressUnavailable,
+};
+
+std::string_view load_snapshot_failure_name(LoadSnapshotFailure failure) {
+    switch (failure) {
+    case LoadSnapshotFailure::None: return "Valid";
+    case LoadSnapshotFailure::PauseTypeUnavailable: return "PauseTypeUnavailable";
+    case LoadSnapshotFailure::PauseGetterUnavailable: return "PauseGetterUnavailable";
+    case LoadSnapshotFailure::PauseGetterInvalidSignature: return "PauseGetterInvalidSignature";
+    case LoadSnapshotFailure::PauseFieldUnavailable: return "PauseFieldUnavailable";
+    case LoadSnapshotFailure::SituationTypeUnavailable: return "SituationTypeUnavailable";
+    case LoadSnapshotFailure::SituationGetterUnavailable: return "SituationGetterUnavailable";
+    case LoadSnapshotFailure::SituationGetterInvalidSignature: return "SituationGetterInvalidSignature";
+    case LoadSnapshotFailure::InhibitFieldUnavailable: return "InhibitFieldUnavailable";
+    case LoadSnapshotFailure::ThreadContextUnavailable: return "ThreadContextUnavailable";
+    case LoadSnapshotFailure::PauseInstanceUnavailable: return "PauseInstanceUnavailable";
+    case LoadSnapshotFailure::SituationInstanceUnavailable: return "SituationInstanceUnavailable";
+    case LoadSnapshotFailure::PauseFieldTypeUnavailable: return "PauseFieldTypeUnavailable";
+    case LoadSnapshotFailure::PauseFieldTypeMismatch: return "PauseFieldTypeMismatch";
+    case LoadSnapshotFailure::PauseFieldAddressUnavailable: return "PauseFieldAddressUnavailable";
+    case LoadSnapshotFailure::PauseFieldValueInvalid: return "PauseFieldValueInvalid";
+    case LoadSnapshotFailure::InhibitFieldTypeUnavailable: return "InhibitFieldTypeUnavailable";
+    case LoadSnapshotFailure::InhibitStorageTypeUnavailable: return "InhibitStorageTypeUnavailable";
+    case LoadSnapshotFailure::InhibitStorageTypeMismatch: return "InhibitStorageTypeMismatch";
+    case LoadSnapshotFailure::InhibitStorageWidthInvalid: return "InhibitStorageWidthInvalid";
+    case LoadSnapshotFailure::InhibitFieldAddressUnavailable: return "InhibitFieldAddressUnavailable";
+    }
+    return "Unknown";
+}
+
+struct LoadFieldObservation {
+    sdk::REField* field{};
+    sdk::RETypeDefinition* declaring_type{};
+    sdk::RETypeDefinition* field_type{};
+    sdk::RETypeDefinition* storage_type{};
+    const void* address{};
+    uint32_t field_size{};
+    uint32_t storage_width{};
+    bool is_static{};
+    std::optional<uint64_t> raw_value{};
+};
+
+struct LoadAccessorObservation {
+    sdk::RETypeDefinition* pause_type{};
+    sdk::REMethodDefinition* pause_getter{};
+    LoadFieldObservation pause_field{};
+    sdk::RETypeDefinition* situation_type{};
+    sdk::REMethodDefinition* situation_getter{};
+    LoadFieldObservation inhibit_field{};
+    void* thread_context{};
+    REManagedObject* pause_instance{};
+    REManagedObject* situation_instance{};
+};
+
+struct GameLoadSnapshotResult {
+    std::optional<GameLoadSnapshot> snapshot{};
+    LoadSnapshotFailure failure{ LoadSnapshotFailure::None };
+    LoadAccessorObservation observation{};
+};
+
 struct LoadStateAccessors {
     sdk::RETypeDefinition* pause_type{};
     sdk::REMethodDefinition* pause_instance_getter{};
@@ -143,6 +226,26 @@ struct LoadStateAccessors {
     }
 };
 
+void observe_field_metadata(LoadFieldObservation& observation, sdk::REField* field) {
+    observation.field = field;
+    if (field == nullptr) {
+        return;
+    }
+
+    observation.declaring_type = field->get_declaring_type();
+    observation.field_type = field->get_type();
+    observation.is_static = field->is_static();
+    if (observation.field_type != nullptr) {
+        observation.field_size = observation.field_type->get_size();
+        observation.storage_type = observation.field_type->is_enum()
+            ? observation.field_type->get_underlying_type()
+            : observation.field_type;
+        if (observation.storage_type != nullptr) {
+            observation.storage_width = observation.storage_type->get_size();
+        }
+    }
+}
+
 bool is_integral_type(const sdk::RETypeDefinition* type) {
     if (type == nullptr) {
         return false;
@@ -155,82 +258,304 @@ bool is_integral_type(const sdk::RETypeDefinition* type) {
         name == "System.UInt64" || name == "System.Int64";
 }
 
-std::optional<uint64_t> read_integral_field(sdk::REField* field, REManagedObject* instance) {
-    if (field == nullptr || instance == nullptr) {
-        return std::nullopt;
+struct BoolFieldReadResult {
+    std::optional<bool> value{};
+    LoadSnapshotFailure failure{ LoadSnapshotFailure::None };
+};
+
+struct IntegralFieldReadResult {
+    std::optional<uint64_t> value{};
+    LoadSnapshotFailure failure{ LoadSnapshotFailure::None };
+};
+
+BoolFieldReadResult read_bool_field(LoadFieldObservation& observation, REManagedObject* instance) {
+    const auto* type = observation.field_type;
+    if (type == nullptr) {
+        return { std::nullopt, LoadSnapshotFailure::PauseFieldTypeUnavailable };
+    }
+    if (type->get_full_name() != "System.Boolean" || type->get_size() != sizeof(uint8_t)) {
+        return { std::nullopt, LoadSnapshotFailure::PauseFieldTypeMismatch };
     }
 
-    auto* field_type = field->get_type();
-    if (field_type == nullptr) {
-        return std::nullopt;
-    }
-
-    auto* storage_type = field_type->is_enum() ? field_type->get_underlying_type() : field_type;
-    if (!is_integral_type(storage_type)) {
-        return std::nullopt;
-    }
-
-    const auto width = storage_type->get_size();
-    if (width != 1 && width != 2 && width != 4 && width != 8) {
-        return std::nullopt;
-    }
-
-    const auto* address = field->get_data_raw(instance);
-    if (address == nullptr) {
-        return std::nullopt;
-    }
-
-    uint64_t value{};
-    std::memcpy(&value, address, width);
-    return value;
-}
-
-std::optional<bool> read_bool_field(sdk::REField* field, REManagedObject* instance) {
-    if (field == nullptr || instance == nullptr) {
-        return std::nullopt;
-    }
-
-    auto* type = field->get_type();
-    if (type == nullptr || type->get_full_name() != "System.Boolean" || type->get_size() != sizeof(uint8_t)) {
-        return std::nullopt;
-    }
-
-    const auto* address = field->get_data_raw(instance);
-    if (address == nullptr) {
-        return std::nullopt;
+    observation.address = observation.field->get_data_raw(instance);
+    if (observation.address == nullptr) {
+        return { std::nullopt, LoadSnapshotFailure::PauseFieldAddressUnavailable };
     }
 
     uint8_t value{};
-    std::memcpy(&value, address, sizeof(value));
+    std::memcpy(&value, observation.address, sizeof(value));
+    observation.raw_value = value;
     if (value > 1) {
-        return std::nullopt;
+        return { std::nullopt, LoadSnapshotFailure::PauseFieldValueInvalid };
     }
 
-    return value != 0;
+    return { value != 0, LoadSnapshotFailure::None };
 }
 
-std::optional<GameLoadSnapshot> read_game_load_snapshot() {
+IntegralFieldReadResult read_integral_field(LoadFieldObservation& observation, REManagedObject* instance) {
+    const auto* field_type = observation.field_type;
+    if (field_type == nullptr) {
+        return { std::nullopt, LoadSnapshotFailure::InhibitFieldTypeUnavailable };
+    }
+    if (field_type->is_enum() && observation.storage_type == nullptr) {
+        return { std::nullopt, LoadSnapshotFailure::InhibitStorageTypeUnavailable };
+    }
+    if (!is_integral_type(observation.storage_type)) {
+        return { std::nullopt, LoadSnapshotFailure::InhibitStorageTypeMismatch };
+    }
+
+    const auto width = observation.storage_width;
+    if (width != 1 && width != 2 && width != 4 && width != 8) {
+        return { std::nullopt, LoadSnapshotFailure::InhibitStorageWidthInvalid };
+    }
+
+    observation.address = observation.field->get_data_raw(instance);
+    if (observation.address == nullptr) {
+        return { std::nullopt, LoadSnapshotFailure::InhibitFieldAddressUnavailable };
+    }
+
+    uint64_t value{};
+    std::memcpy(&value, observation.address, width);
+    observation.raw_value = value;
+    return { value, LoadSnapshotFailure::None };
+}
+
+void append_pointer(std::ostringstream& stream, const void* pointer) {
+    if (pointer == nullptr) {
+        stream << "null";
+        return;
+    }
+    stream << "0x" << std::hex << reinterpret_cast<uintptr_t>(pointer) << std::dec;
+}
+
+void append_type(std::ostringstream& stream, const sdk::RETypeDefinition* type) {
+    append_pointer(stream, type);
+    stream << "(" << (type != nullptr ? type->get_full_name() : "null");
+    if (type != nullptr) {
+        stream << ",size=" << type->get_size() << ",enum=" << (type->is_enum() ? "true" : "false");
+    }
+    stream << ")";
+}
+
+void append_method(std::ostringstream& stream, std::string_view label, sdk::REMethodDefinition* method) {
+    stream << " " << label << "=";
+    append_pointer(stream, method);
+    if (method == nullptr) {
+        return;
+    }
+
+    const auto* declaring_type = method->get_declaring_type();
+    const auto* return_type = method->get_return_type();
+    const auto* method_name = method->get_name();
+    stream << "(declaring=" << (declaring_type != nullptr ? declaring_type->get_full_name() : "null")
+           << ",name=" << (method_name != nullptr ? method_name : "null")
+           << ",static=" << (method->is_static() ? "true" : "false")
+           << ",params=" << method->get_num_params()
+           << ",function=";
+    append_pointer(stream, method->get_function());
+    stream << ",return=";
+    append_type(stream, return_type);
+    stream << ")";
+}
+
+void append_field(std::ostringstream& stream, std::string_view label, const LoadFieldObservation& field) {
+    stream << " " << label << "=";
+    append_pointer(stream, field.field);
+    if (field.field == nullptr) {
+        return;
+    }
+
+    const auto* name = field.field->get_name();
+    stream << "(declaring=";
+    append_type(stream, field.declaring_type);
+    stream << ",name=" << (name != nullptr ? name : "null") << ",type=";
+    append_type(stream, field.field_type);
+    stream << ",fieldSize=" << field.field_size << ",static=" << (field.is_static ? "true" : "false")
+           << ",storage=";
+    append_type(stream, field.storage_type);
+    stream << ",storageWidth=" << field.storage_width << ",address=";
+    append_pointer(stream, field.address);
+    if (field.raw_value) {
+        stream << ",rawValue=0x" << std::hex << *field.raw_value << std::dec;
+    }
+    stream << ")";
+}
+
+std::string format_load_accessor_observation(const GameLoadSnapshotResult& result) {
+    const auto& observation = result.observation;
+    std::ostringstream stream;
+    stream << "stage=" << load_snapshot_failure_name(result.failure);
+    stream << " threadContext=";
+    append_pointer(stream, observation.thread_context);
+    stream << " pauseType=";
+    append_type(stream, observation.pause_type);
+    append_method(stream, "pauseGetter", observation.pause_getter);
+    append_field(stream, "pauseField", observation.pause_field);
+    stream << " pauseManager=";
+    append_pointer(stream, observation.pause_instance);
+    stream << " situationType=";
+    append_type(stream, observation.situation_type);
+    append_method(stream, "situationGetter", observation.situation_getter);
+    append_field(stream, "inhibitField", observation.inhibit_field);
+    stream << " situationManager=";
+    append_pointer(stream, observation.situation_instance);
+    if (result.snapshot) {
+        stream << " pause=" << (result.snapshot->pause ? 1 : 0)
+               << " inhibit=0x" << std::hex << result.snapshot->inhibit << std::dec;
+    }
+    return stream.str();
+}
+
+struct LoadAccessorLogState {
+    GameLoadSnapshotResult last_result{};
+    uint32_t valid_samples{};
+    uint32_t transition_logs{};
+    bool initialized{};
+    bool suppression_logged{};
+};
+
+bool same_load_field_observation(const LoadFieldObservation& lhs, const LoadFieldObservation& rhs) {
+    return lhs.field == rhs.field && lhs.declaring_type == rhs.declaring_type &&
+        lhs.field_type == rhs.field_type && lhs.storage_type == rhs.storage_type &&
+        lhs.address == rhs.address && lhs.field_size == rhs.field_size &&
+        lhs.storage_width == rhs.storage_width && lhs.is_static == rhs.is_static &&
+        lhs.raw_value == rhs.raw_value;
+}
+
+bool same_load_accessor_observation(const GameLoadSnapshotResult& lhs, const GameLoadSnapshotResult& rhs) {
+    const auto& lhs_observation = lhs.observation;
+    const auto& rhs_observation = rhs.observation;
+    const bool same_snapshot = lhs.snapshot.has_value() == rhs.snapshot.has_value() &&
+        (!lhs.snapshot || (lhs.snapshot->pause == rhs.snapshot->pause &&
+            lhs.snapshot->inhibit == rhs.snapshot->inhibit));
+
+    return lhs.failure == rhs.failure && same_snapshot &&
+        lhs_observation.pause_type == rhs_observation.pause_type &&
+        lhs_observation.pause_getter == rhs_observation.pause_getter &&
+        same_load_field_observation(lhs_observation.pause_field, rhs_observation.pause_field) &&
+        lhs_observation.situation_type == rhs_observation.situation_type &&
+        lhs_observation.situation_getter == rhs_observation.situation_getter &&
+        same_load_field_observation(lhs_observation.inhibit_field, rhs_observation.inhibit_field) &&
+        lhs_observation.thread_context == rhs_observation.thread_context &&
+        lhs_observation.pause_instance == rhs_observation.pause_instance &&
+        lhs_observation.situation_instance == rhs_observation.situation_instance;
+}
+
+void log_load_accessor_observation(const GameLoadSnapshotResult& result) {
+    const auto config = REFrameworkConfig::get();
+    if (config == nullptr || !config->is_debug_log_enabled()) {
+        return;
+    }
+
+    static LoadAccessorLogState state{};
+    const bool changed = !state.initialized || !same_load_accessor_observation(state.last_result, result);
+    const bool valid_sample = result.snapshot.has_value() && state.valid_samples < 32;
+    if (!changed && !valid_sample) {
+        return;
+    }
+
+    const bool transition_limit_reached = changed && state.initialized && state.transition_logs >= 128;
+    if (transition_limit_reached && !valid_sample) {
+        if (!state.suppression_logged) {
+            state.suppression_logged = true;
+            spdlog::warn("[RE4XeSS][LoadAccessor] further state-transition diagnostics suppressed after 128 changes");
+        }
+        state.last_result = result;
+        return;
+    }
+
+    spdlog::info("[RE4XeSS][LoadAccessor] {}", format_load_accessor_observation(result));
+    if (changed && state.initialized && state.transition_logs < 128) {
+        ++state.transition_logs;
+    }
+    if (valid_sample) {
+        ++state.valid_samples;
+    }
+    state.last_result = result;
+    state.initialized = true;
+}
+
+bool valid_zero_parameter_static_getter(sdk::REMethodDefinition* method) {
+    return method != nullptr && method->get_function() != nullptr &&
+        method->is_static() && method->get_num_params() == 0;
+}
+
+GameLoadSnapshotResult read_game_load_snapshot() {
     static LoadStateAccessors accessors{};
     accessors.resolve();
 
-    if (accessors.pause_instance_getter == nullptr || accessors.pause_field == nullptr ||
-        accessors.situation_instance_getter == nullptr || accessors.inhibit_field == nullptr) {
-        return std::nullopt;
+    GameLoadSnapshotResult result{};
+    auto& observation = result.observation;
+    observation.pause_type = accessors.pause_type;
+    observation.pause_getter = accessors.pause_instance_getter;
+    observation.situation_type = accessors.situation_type;
+    observation.situation_getter = accessors.situation_instance_getter;
+    observe_field_metadata(observation.pause_field, accessors.pause_field);
+    observe_field_metadata(observation.inhibit_field, accessors.inhibit_field);
+    observation.thread_context = sdk::get_thread_context();
+
+    if (observation.pause_type == nullptr) {
+        result.failure = LoadSnapshotFailure::PauseTypeUnavailable;
+        return result;
+    }
+    if (observation.pause_getter == nullptr) {
+        result.failure = LoadSnapshotFailure::PauseGetterUnavailable;
+        return result;
+    }
+    if (observation.pause_field.field == nullptr) {
+        result.failure = LoadSnapshotFailure::PauseFieldUnavailable;
+        return result;
+    }
+    if (observation.situation_type == nullptr) {
+        result.failure = LoadSnapshotFailure::SituationTypeUnavailable;
+        return result;
+    }
+    if (observation.situation_getter == nullptr) {
+        result.failure = LoadSnapshotFailure::SituationGetterUnavailable;
+        return result;
+    }
+    if (observation.inhibit_field.field == nullptr) {
+        result.failure = LoadSnapshotFailure::InhibitFieldUnavailable;
+        return result;
+    }
+    if (!valid_zero_parameter_static_getter(observation.pause_getter)) {
+        result.failure = LoadSnapshotFailure::PauseGetterInvalidSignature;
+        return result;
+    }
+    if (!valid_zero_parameter_static_getter(observation.situation_getter)) {
+        result.failure = LoadSnapshotFailure::SituationGetterInvalidSignature;
+        return result;
     }
 
-    auto* pause_manager = accessors.pause_instance_getter->call_safe<REManagedObject*>(sdk::get_thread_context());
-    auto* situation_manager = accessors.situation_instance_getter->call_safe<REManagedObject*>(sdk::get_thread_context());
-    if (pause_manager == nullptr || situation_manager == nullptr) {
-        return std::nullopt;
+    if (observation.thread_context == nullptr) {
+        result.failure = LoadSnapshotFailure::ThreadContextUnavailable;
+        return result;
     }
 
-    const auto pause = read_bool_field(accessors.pause_field, pause_manager);
-    const auto inhibit = read_integral_field(accessors.inhibit_field, situation_manager);
-    if (!pause || !inhibit) {
-        return std::nullopt;
+    observation.pause_instance = observation.pause_getter->call_safe<REManagedObject*>(observation.thread_context);
+    observation.situation_instance = observation.situation_getter->call_safe<REManagedObject*>(observation.thread_context);
+    if (observation.pause_instance == nullptr) {
+        result.failure = LoadSnapshotFailure::PauseInstanceUnavailable;
+        return result;
+    }
+    if (observation.situation_instance == nullptr) {
+        result.failure = LoadSnapshotFailure::SituationInstanceUnavailable;
+        return result;
     }
 
-    return GameLoadSnapshot{ *pause, *inhibit };
+    const auto pause = read_bool_field(observation.pause_field, observation.pause_instance);
+    const auto inhibit = read_integral_field(observation.inhibit_field, observation.situation_instance);
+    if (pause.failure != LoadSnapshotFailure::None) {
+        result.failure = pause.failure;
+        return result;
+    }
+    if (inhibit.failure != LoadSnapshotFailure::None) {
+        result.failure = inhibit.failure;
+        return result;
+    }
+
+    result.snapshot = GameLoadSnapshot{ *pause.value, *inhibit.value };
+    return result;
 }
 
 std::array<sdk::renderer::SceneInfo*, 6> scene_infos(sdk::renderer::layer::Scene* layer) {
@@ -839,12 +1164,14 @@ void RE4XeSS::update_temporal_configuration() {
 }
 
 void RE4XeSS::update_load_state() {
-    const auto snapshot = read_game_load_snapshot();
-    if (!snapshot) {
+    const auto observation = read_game_load_snapshot();
+    log_load_accessor_observation(observation);
+    if (!observation.snapshot) {
         m_load_observation_valid = false;
         invalidate_history("load-state-observation-unavailable");
         return;
     }
+    const auto& snapshot = *observation.snapshot;
 
     const auto log_load_event = [](std::string_view message) {
         if (REFrameworkConfig::get()->is_debug_log_enabled()) {
@@ -856,8 +1183,8 @@ void RE4XeSS::update_load_state() {
 
     if (!m_pause_previous_valid) {
         m_pause_previous_valid = true;
-        m_pause_previous = snapshot->pause;
-        if (snapshot->pause) {
+        m_pause_previous = snapshot.pause;
+        if (snapshot.pause) {
             m_startup_mid_load = true;
             m_load_transition_active = true;
             m_remembered_normal_inhibit_valid = false;
@@ -867,18 +1194,18 @@ void RE4XeSS::update_load_state() {
             invalidate_history("startup-observed-mid-load");
             log_load_event("load pause observed at startup; no pre-load baseline assumed");
         } else if (!m_remembered_normal_inhibit_valid) {
-            m_remembered_normal_inhibit = snapshot->inhibit;
+            m_remembered_normal_inhibit = snapshot.inhibit;
             m_remembered_normal_inhibit_valid = true;
         }
         return;
     }
 
-    if (snapshot->pause) {
+    if (snapshot.pause) {
         if (!m_pause_previous) {
             const bool witnessed_pre_pause_departure =
                 m_inhibit_departure_pending && m_remembered_normal_inhibit_valid;
-            if (m_remembered_normal_inhibit_valid && snapshot->inhibit != m_remembered_normal_inhibit) {
-                m_departure_inhibit = snapshot->inhibit;
+            if (m_remembered_normal_inhibit_valid && snapshot.inhibit != m_remembered_normal_inhibit) {
+                m_departure_inhibit = snapshot.inhibit;
             }
 
             m_load_transition_active = true;
@@ -908,7 +1235,7 @@ void RE4XeSS::update_load_state() {
 
     if (m_startup_mid_load) {
         if (pause_just_released) {
-            m_post_pause_rebaseline_candidate = snapshot->inhibit;
+            m_post_pause_rebaseline_candidate = snapshot.inhibit;
             m_post_pause_rebaseline_candidate_valid = true;
             m_post_pause_rebaseline_transition_seen = false;
             m_post_pause_rebaseline_stable_count = 0;
@@ -917,7 +1244,7 @@ void RE4XeSS::update_load_state() {
         }
 
         if (!m_post_pause_rebaseline_candidate_valid) {
-            m_post_pause_rebaseline_candidate = snapshot->inhibit;
+            m_post_pause_rebaseline_candidate = snapshot.inhibit;
             m_post_pause_rebaseline_candidate_valid = true;
             m_post_pause_rebaseline_transition_seen = false;
             m_post_pause_rebaseline_stable_count = 0;
@@ -925,12 +1252,12 @@ void RE4XeSS::update_load_state() {
         }
 
         if (!m_post_pause_rebaseline_transition_seen) {
-            if (snapshot->inhibit == m_post_pause_rebaseline_candidate) {
+            if (snapshot.inhibit == m_post_pause_rebaseline_candidate) {
                 return;
             }
 
             const auto previous_candidate = m_post_pause_rebaseline_candidate;
-            m_post_pause_rebaseline_candidate = snapshot->inhibit;
+            m_post_pause_rebaseline_candidate = snapshot.inhibit;
             m_post_pause_rebaseline_transition_seen = true;
             m_post_pause_rebaseline_stable_count = 1;
             if (REFrameworkConfig::get()->is_debug_log_enabled()) {
@@ -941,8 +1268,8 @@ void RE4XeSS::update_load_state() {
             return;
         }
 
-        if (snapshot->inhibit != m_post_pause_rebaseline_candidate) {
-            m_post_pause_rebaseline_candidate = snapshot->inhibit;
+        if (snapshot.inhibit != m_post_pause_rebaseline_candidate) {
+            m_post_pause_rebaseline_candidate = snapshot.inhibit;
             m_post_pause_rebaseline_stable_count = 1;
             return;
         }
@@ -977,8 +1304,8 @@ void RE4XeSS::update_load_state() {
             return;
         }
 
-        if (snapshot->inhibit != m_remembered_normal_inhibit) {
-            m_departure_inhibit = snapshot->inhibit;
+        if (snapshot.inhibit != m_remembered_normal_inhibit) {
+            m_departure_inhibit = snapshot.inhibit;
             return;
         }
 
@@ -994,15 +1321,15 @@ void RE4XeSS::update_load_state() {
     }
 
     if (!m_remembered_normal_inhibit_valid) {
-        m_remembered_normal_inhibit = snapshot->inhibit;
+        m_remembered_normal_inhibit = snapshot.inhibit;
         m_remembered_normal_inhibit_valid = true;
         return;
     }
 
-    if (snapshot->inhibit != m_remembered_normal_inhibit) {
+    if (snapshot.inhibit != m_remembered_normal_inhibit) {
         if (!m_inhibit_departure_pending) {
             m_inhibit_departure_pending = true;
-            m_departure_inhibit = snapshot->inhibit;
+            m_departure_inhibit = snapshot.inhibit;
             invalidate_history("pre-pause-inhibit-departure");
             if (REFrameworkConfig::get()->is_debug_log_enabled()) {
                 spdlog::info("[RE4XeSS][Reset] frozen normal InhibitBit={:#x} departed to {:#x}; keeping history blocked until Pause or return",
@@ -1023,7 +1350,7 @@ void RE4XeSS::update_load_state() {
 
 void RE4XeSS::on_view_get_size(REManagedObject* scene_view, float* result) {
     (void)scene_view;
-    if (!is_temporal_active() || result == nullptr ||
+    if (!is_temporal_active() || !m_load_observation_valid || result == nullptr ||
         m_input_resolution.optimal.x == 0 || m_input_resolution.optimal.y == 0) {
         return;
     }
@@ -1087,7 +1414,11 @@ void RE4XeSS::on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* re
         return;
     }
 
-    if (m_inhibit_departure_pending || m_load_transition_active || m_startup_mid_load || !m_load_observation_valid) {
+    if (!m_load_observation_valid) {
+        invalidate_history("load-state-observation-unavailable");
+        return;
+    }
+    if (m_inhibit_departure_pending || m_load_transition_active || m_startup_mid_load) {
         invalidate_history("load-history-invalid");
         return;
     }
@@ -1393,7 +1724,12 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         clear_frame_state();
         return true;
     }
-    if (m_inhibit_departure_pending || m_load_transition_active || m_startup_mid_load || !m_load_observation_valid) {
+    if (!m_load_observation_valid) {
+        invalidate_history("load-state-observation-unavailable");
+        clear_frame_state();
+        return true;
+    }
+    if (m_inhibit_departure_pending || m_load_transition_active || m_startup_mid_load) {
         invalidate_history("load-history-invalid");
         clear_frame_state();
         return true;
