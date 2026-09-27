@@ -81,9 +81,21 @@ std::optional<xess_quality_settings_t> mode_to_quality_setting(UpscalingMode mod
     return std::nullopt;
 }
 
-std::string path_for_log(const std::filesystem::path& path) {
-    return path.empty() ? std::string{ "<unavailable>" } : utility::narrow(path.c_str());
-}
+struct PreOverlayGateGuard {
+    std::atomic_flag& gate;
+    bool log_exit{};
+    DWORD thread_id{};
+    uint64_t overlap_epoch{};
+
+    ~PreOverlayGateGuard() {
+        gate.clear(std::memory_order_release);
+        if (log_exit) {
+            spdlog::info("[RE4XeSS][Coordinator] exit thread={} overlapEpoch={}",
+                thread_id,
+                static_cast<unsigned long long>(overlap_epoch));
+        }
+    }
+};
 
 float halton(uint32_t sample_index, uint32_t base) {
     float result{};
@@ -247,43 +259,38 @@ bool is_valid_texture_extent(ID3D12Resource* resource, uint32_t width, uint32_t 
         description.SampleDesc.Count == 1;
 }
 
+std::filesystem::path reframework_module_directory() {
+    const auto module = REFramework::get_reframework_module();
+    if (module == nullptr) {
+        return {};
+    }
+    const auto module_path = utility::get_module_path(module);
+    return module_path ? std::filesystem::path{ *module_path }.parent_path() : std::filesystem::path{};
+}
+
 }
 
 RE4XeSS::~RE4XeSS() {
-    const auto execution_owner_thread_id = m_execution_owner_thread_id.load(std::memory_order_acquire);
-    const auto owner_thread = execution_owner_thread_id == 0 || m_runtime.is_owner_thread();
-    if (!owner_thread || m_owner_thread_violation.load(std::memory_order_acquire)) {
-        m_bridge.quarantine();
-        m_runtime.quarantine();
-        return;
-    }
-
-    if (m_bridge.has_generation()) {
-        const auto result = m_bridge.poll();
-        if (result == RE4XeSSD3D12::PollResult::DeviceRemoved) {
-            m_bridge.shutdown_after_device_removed();
-        } else if (result == RE4XeSSD3D12::PollResult::Idle) {
-            m_bridge.shutdown();
-        } else {
-            m_bridge.quarantine();
-            m_runtime.quarantine();
-            return;
-        }
-    }
-    m_runtime.shutdown();
+    m_worker.stop();
 }
 
 std::optional<std::string> RE4XeSS::on_initialize() {
+    if (!sdk::GameIdentity::get().is_re4()) {
+        return std::nullopt;
+    }
+
+    std::string error;
+    if (!m_worker.start(error)) {
+        const std::string reason = error.empty() ? "The RE4XeSS worker could not be started" : error;
+        set_owner_unavailable(reason, false, true);
+        spdlog::error("[RE4XeSS][Failure] {}", reason);
+    }
     return std::nullopt;
 }
 
 std::optional<std::string> RE4XeSS::on_initialize_d3d_thread() {
     if (!sdk::GameIdentity::get().is_re4()) {
         return std::nullopt;
-    }
-
-    if (m_requested_mode.load(std::memory_order_acquire) != UpscalingMode::Off) {
-        m_bootstrap_requested.store(true, std::memory_order_release);
     }
 
     return std::nullopt;
@@ -293,7 +300,6 @@ void RE4XeSS::on_frame() {
     clear_frame_state();
 
     if (!sdk::GameIdentity::get().is_re4()) {
-        m_bootstrap_requested.store(false, std::memory_order_release);
         reset_temporal_state("non-re4", true);
         return;
     }
@@ -401,7 +407,7 @@ void RE4XeSS::on_draw_ui() {
     } else if (producer.context_ready) {
         ImGui::TextUnformatted("XeSS producer initialized; waiting for temporal inputs");
     } else {
-        ImGui::TextUnformatted("Waiting for the RE4 pre-Overlay D3D12 owner thread");
+        ImGui::TextUnformatted("Waiting for the RE4 XeSS worker and pre-Overlay request");
     }
 }
 
@@ -464,8 +470,6 @@ void RE4XeSS::request_mode(UpscalingMode mode) {
 
     m_requested_mode.store(mode, std::memory_order_release);
     m_control_generation.fetch_add(1, std::memory_order_acq_rel);
-    m_bootstrap_requested.store(mode != UpscalingMode::Off, std::memory_order_release);
-
     spdlog::info("[RE4XeSS][Config] mode changed: {} -> {}",
         mode_to_display_label(old_mode), mode_to_display_label(mode));
 
@@ -482,352 +486,71 @@ void RE4XeSS::publish_producer_snapshot(ProducerSnapshot snapshot) {
     m_producer_snapshot = std::move(snapshot);
 }
 
+void RE4XeSS::publish_worker_snapshot(const RE4XeSSWorker::Snapshot& snapshot) {
+    ProducerSnapshot producer{};
+    producer.context_ready = snapshot.context_ready;
+    producer.execution_ready = snapshot.execution_ready;
+    producer.draining = snapshot.draining;
+    producer.faulted = snapshot.faulted;
+    producer.mode = static_cast<UpscalingMode>(snapshot.mode_token);
+    producer.quality = snapshot.quality;
+    producer.display = snapshot.display;
+    producer.input = snapshot.input;
+    producer.device_identity = snapshot.device_identity;
+    producer.queue_identity = snapshot.queue_identity;
+    producer.bridge_idle = snapshot.bridge_idle;
+    producer.bridge_quarantined = snapshot.bridge_quarantined;
+    producer.bridge_device_removed = snapshot.bridge_device_removed;
+    producer.control_generation = snapshot.control_generation;
+    producer.device_reset_generation = snapshot.device_reset_generation;
+    producer.failure_reason = snapshot.failure_reason;
+    publish_producer_snapshot(std::move(producer));
+}
+
 RE4XeSS::ProducerSnapshot RE4XeSS::get_producer_snapshot() const {
     std::lock_guard lock{ m_producer_snapshot_mutex };
     return m_producer_snapshot;
 }
 
 void RE4XeSS::set_owner_unavailable(std::string reason, bool draining, bool faulted) {
-    ProducerSnapshot snapshot{};
+    auto snapshot = get_producer_snapshot();
     snapshot.mode = m_requested_mode.load(std::memory_order_acquire);
+    snapshot.context_ready = false;
+    snapshot.execution_ready = false;
     snapshot.draining = draining;
     snapshot.faulted = faulted;
     snapshot.failure_reason = std::move(reason);
-    if (m_owner_configuration.valid) {
-        snapshot.context_ready = true;
-        snapshot.mode = m_owner_configuration.mode;
-        snapshot.quality = m_owner_configuration.quality;
-        snapshot.display = m_owner_configuration.display;
-        snapshot.input = m_owner_configuration.input;
-        snapshot.device_identity = reinterpret_cast<uintptr_t>(m_owner_configuration.device);
-        snapshot.queue_identity = reinterpret_cast<uintptr_t>(m_owner_configuration.queue);
-    }
     publish_producer_snapshot(std::move(snapshot));
 }
 
 void RE4XeSS::mark_execution_fault(std::string reason) {
-    m_owner_execution_faulted = true;
-    m_owner_fault_control_generation = m_control_generation.load(std::memory_order_acquire);
-    m_owner_fault_device_reset_generation = m_device_reset_generation.load(std::memory_order_acquire);
-    m_owner_failure_reason = std::move(reason);
-    spdlog::error("[RE4XeSS][Failure] {}", m_owner_failure_reason);
+    {
+        std::lock_guard lock{ m_pending_worker_fault_mutex };
+        m_pending_worker_fault_reason = reason;
+        m_pending_worker_fault_generation = m_control_generation.load(std::memory_order_acquire);
+        m_pending_worker_fault_reset_generation = m_device_reset_generation.load(std::memory_order_acquire);
+    }
+    spdlog::error("[RE4XeSS][Failure] {}", reason);
+    set_owner_unavailable(std::move(reason), false, true);
 }
 
-bool RE4XeSS::service_owner_thread() {
-    static std::atomic_flag owner_thread_violation_logged = ATOMIC_FLAG_INIT;
-    const auto requested_mode = m_requested_mode.load(std::memory_order_acquire);
-    const bool active = sdk::GameIdentity::get().is_re4() && requested_mode != UpscalingMode::Off;
-
-    if (m_owner_thread_violation.load(std::memory_order_acquire)) {
-        ProducerSnapshot snapshot{};
-        snapshot.mode = requested_mode;
-        snapshot.faulted = true;
-        snapshot.failure_reason = "The true pre-Overlay callback changed threads; XeSS is quarantined";
-        publish_producer_snapshot(std::move(snapshot));
-        return false;
+std::string RE4XeSS::pending_worker_fault(uint64_t control_generation, uint64_t device_reset_generation) {
+    std::lock_guard lock{ m_pending_worker_fault_mutex };
+    if (m_pending_worker_fault_generation != control_generation ||
+        m_pending_worker_fault_reset_generation != device_reset_generation) {
+        m_pending_worker_fault_reason.clear();
+        return {};
     }
-
-    auto execution_owner_thread_id = m_execution_owner_thread_id.load(std::memory_order_acquire);
-    if (execution_owner_thread_id == 0) {
-        if (!active) {
-            return false;
-        }
-        const auto current_thread_id = GetCurrentThreadId();
-        DWORD expected_thread_id{};
-        if (m_execution_owner_thread_id.compare_exchange_strong(
-                expected_thread_id,
-                current_thread_id,
-                std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
-            execution_owner_thread_id = current_thread_id;
-        } else {
-            execution_owner_thread_id = expected_thread_id;
-        }
-    }
-    if (execution_owner_thread_id != GetCurrentThreadId()) {
-        if (!owner_thread_violation_logged.test_and_set(std::memory_order_relaxed)) {
-            spdlog::error("[RE4XeSS][Failure] pre-Overlay callback moved from XeSS owner thread {} to {}; all XeSS work is blocked",
-                execution_owner_thread_id,
-                GetCurrentThreadId());
-        }
-        m_owner_thread_violation.store(true, std::memory_order_release);
-        ProducerSnapshot snapshot{};
-        snapshot.mode = requested_mode;
-        snapshot.faulted = true;
-        snapshot.failure_reason = "The true pre-Overlay callback changed threads; XeSS is quarantined";
-        publish_producer_snapshot(std::move(snapshot));
-        return false;
-    }
-    std::string owner_error;
-    if (!m_runtime.bind_owner_thread(owner_error)) {
-        mark_execution_fault(owner_error);
-        set_owner_unavailable(m_owner_failure_reason, false, true);
-        return false;
-    }
-    if (!m_owner_thread_logged.test_and_set(std::memory_order_relaxed)) {
-        spdlog::info("[RE4XeSS][Init] pre-Overlay callback owner verified: ownerThread={} callbackThread={}",
-            execution_owner_thread_id,
-            GetCurrentThreadId());
-    }
-
-    ID3D12Device* device{};
-    ID3D12CommandQueue* queue{};
-    if (g_framework != nullptr && g_framework->get_renderer_type() == REFramework::RendererType::D3D12) {
-        const auto& hook = g_framework->get_d3d12_hook();
-        if (hook != nullptr) {
-            device = hook->get_device();
-            queue = hook->get_command_queue();
-        }
-    }
-    xess_2d_t display{};
-    const bool has_display = active && get_display_resolution(display);
-    const auto quality = mode_to_quality_setting(requested_mode);
-    const bool queue_is_direct = queue != nullptr &&
-        queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT;
-    const bool has_d3d_state = active && quality && device != nullptr && queue_is_direct && has_display;
-    const std::string unavailable_reason = queue != nullptr && !queue_is_direct
-        ? "The active RE4 D3D12 command queue is not DIRECT"
-        : "Waiting for a valid RE4 D3D12 device, DIRECT queue, and display extent";
-    const auto reset_generation = m_device_reset_generation.load(std::memory_order_acquire);
-    const bool reset_pending = reset_generation != m_owner_device_reset_generation;
-    const auto control_generation = m_control_generation.load(std::memory_order_acquire);
-
-    auto poll_result = m_bridge.has_generation()
-        ? m_bridge.poll()
-        : RE4XeSSD3D12::PollResult::Idle;
-    if (poll_result == RE4XeSSD3D12::PollResult::DeviceRemoved) {
-        const auto removed_device = m_owner_configuration.device;
-        m_bridge.shutdown_after_device_removed();
-        m_runtime.shutdown();
-        m_owner_configuration = {};
-        m_owner_waiting_for_new_device = true;
-        m_removed_device_identity = removed_device;
-        m_owner_device_reset_generation = reset_generation;
-        spdlog::error("[RE4XeSS][Failure] old D3D12 generation is terminal after confirmed device removal; XeSS context destroyed on owner thread");
-        if (!reset_pending && device == removed_device) {
-            set_owner_unavailable("Waiting for a replacement D3D12 device after confirmed device removal", true);
-            return false;
-        }
-        poll_result = RE4XeSSD3D12::PollResult::Idle;
-    }
-
-    if (m_owner_waiting_for_new_device) {
-        if (!reset_pending && device == m_removed_device_identity) {
-            set_owner_unavailable("Waiting for a replacement D3D12 device after confirmed device removal", true);
-            return false;
-        }
-        m_owner_waiting_for_new_device = false;
-        m_removed_device_identity = nullptr;
-    }
-
-    const bool old_configuration_differs = m_owner_configuration.valid &&
-        (!has_d3d_state ||
-            m_owner_configuration.device != device ||
-            m_owner_configuration.queue != queue ||
-            m_owner_configuration.mode != requested_mode ||
-            m_owner_configuration.quality != *quality ||
-            m_owner_configuration.display.x != display.x ||
-            m_owner_configuration.display.y != display.y);
-    const bool transition_pending = !active || reset_pending || old_configuration_differs ||
-        (active && !has_d3d_state) || m_owner_execution_faulted;
-
-    if (transition_pending) {
-        if (m_bridge.has_generation()) {
-            if (poll_result == RE4XeSSD3D12::PollResult::InFlight) {
-                set_owner_unavailable("XeSS bridge work is draining before reconfiguration", true);
-                return false;
-            }
-            if (poll_result == RE4XeSSD3D12::PollResult::Quarantined) {
-                set_owner_unavailable(m_bridge.failure_reason(), true, true);
-                return false;
-            }
-            if (poll_result != RE4XeSSD3D12::PollResult::Idle) {
-                mark_execution_fault(m_bridge.failure_reason());
-                set_owner_unavailable(m_owner_failure_reason, true, true);
-                return false;
-            }
-            m_bridge.shutdown();
-        }
-
-        if (reset_pending || !active || !has_d3d_state || old_configuration_differs ||
-            m_owner_execution_faulted) {
-            m_runtime.shutdown();
-        }
-        m_owner_configuration = {};
-
-        if (reset_pending) {
-            m_owner_device_reset_generation = reset_generation;
-        }
-
-        if (m_owner_execution_faulted) {
-            m_runtime.shutdown();
-            const bool explicit_retry =
-                control_generation != m_owner_fault_control_generation ||
-                reset_generation != m_owner_fault_device_reset_generation;
-            if (!explicit_retry) {
-                set_owner_unavailable(m_owner_failure_reason, false, true);
-                return false;
-            }
-            m_owner_execution_faulted = false;
-            m_owner_failure_reason.clear();
-        }
-
-        if (!active) {
-            m_runtime.shutdown();
-            m_bootstrap_requested.store(false, std::memory_order_release);
-            set_owner_unavailable("Off - native RE4 rendering");
-            return false;
-        }
-
-        if (!has_d3d_state) {
-            m_runtime.shutdown();
-            set_owner_unavailable(unavailable_reason, true);
-            return false;
-        }
-    }
-
-    if (!has_d3d_state) {
-        set_owner_unavailable(unavailable_reason);
-        return false;
-    }
-
-    if (m_owner_configuration.valid) {
-        const RE4XeSSD3D12::Signature bridge_signature{
-            m_owner_configuration.input.optimal.x,
-            m_owner_configuration.input.optimal.y,
-            m_owner_configuration.display.x,
-            m_owner_configuration.display.y,
-            DXGI_FORMAT_R11G11B10_FLOAT,
-        };
-        if (m_bridge.has_generation() && !m_bridge.matches(bridge_signature, device, queue)) {
-            if (poll_result == RE4XeSSD3D12::PollResult::InFlight ||
-                poll_result == RE4XeSSD3D12::PollResult::Quarantined) {
-                set_owner_unavailable("XeSS bridge generation is draining before resource recreation", true,
-                    poll_result == RE4XeSSD3D12::PollResult::Quarantined);
-                return false;
-            }
-            if (poll_result == RE4XeSSD3D12::PollResult::DeviceRemoved) {
-                set_owner_unavailable(m_bridge.failure_reason(), true, true);
-                return false;
-            }
-            m_bridge.shutdown();
-            m_runtime.shutdown();
-            m_owner_configuration = {};
-            invalidate_history("bridge-generation-signature-change");
-            set_owner_unavailable("XeSS bridge signature changed; recreating the producer context", true);
-            return false;
-        }
-
-        ProducerSnapshot snapshot{};
-        snapshot.context_ready = true;
-        snapshot.execution_ready = m_bridge.ready();
-        snapshot.mode = m_owner_configuration.mode;
-        snapshot.quality = m_owner_configuration.quality;
-        snapshot.display = m_owner_configuration.display;
-        snapshot.input = m_owner_configuration.input;
-        snapshot.device_identity = reinterpret_cast<uintptr_t>(m_owner_configuration.device);
-        snapshot.queue_identity = reinterpret_cast<uintptr_t>(m_owner_configuration.queue);
-        publish_producer_snapshot(std::move(snapshot));
-        return true;
-    }
-
-    if (m_runtime.state() != RE4XeSSRuntime::State::ContextReady) {
-        std::filesystem::path reframework_directory;
-        const auto reframework_module = REFramework::get_reframework_module();
-        if (reframework_module != nullptr) {
-            if (const auto module_path = utility::get_module_pathw(reframework_module)) {
-                reframework_directory = std::filesystem::path{ *module_path }.parent_path();
-            }
-        }
-
-        const auto initialized = m_runtime.initialize(device, reframework_directory);
-        if (REFrameworkConfig::get()->is_debug_log_enabled()) {
-            const auto& candidates = m_runtime.candidates();
-            spdlog::info("[RE4XeSS][Runtime] REFramework directory='{}'; candidate 1='{}'; candidate 2='{}'; selected='{}'; load result={}",
-                path_for_log(reframework_directory),
-                path_for_log(candidates[0]),
-                path_for_log(candidates[1]),
-                path_for_log(m_runtime.selected_path()),
-                initialized ? "success" : "failure");
-        }
-        if (!initialized) {
-            mark_execution_fault(m_runtime.failure_reason());
-            set_owner_unavailable(m_owner_failure_reason, false, true);
-            return false;
-        }
-    }
-
-    std::string query_error;
-    const auto input = m_runtime.query_optimal_input_resolution(display, *quality, query_error);
-    if (!input) {
-        mark_execution_fault(query_error);
-        m_runtime.shutdown();
-        set_owner_unavailable(m_owner_failure_reason, false, true);
-        return false;
-    }
-
-    const auto render = input->optimal;
-    const auto cross_a = static_cast<uint64_t>(render.x) * display.y;
-    const auto cross_b = static_cast<uint64_t>(render.y) * display.x;
-    const auto cross_error = cross_a > cross_b ? cross_a - cross_b : cross_b - cross_a;
-    const auto relative_aspect_error = render.y != 0 && display.x != 0
-        ? static_cast<double>(cross_error) / (static_cast<double>(render.y) * display.x)
-        : std::numeric_limits<double>::infinity();
-    if (render.x == 0 || render.y == 0 || render.x > display.x || render.y > display.y ||
-        !std::isfinite(relative_aspect_error) || relative_aspect_error > 0.01) {
-        mark_execution_fault("XeSS producer returned an invalid or aspect-incompatible optimal input extent");
-        m_runtime.shutdown();
-        set_owner_unavailable(m_owner_failure_reason, false, true);
-        return false;
-    }
-
-    RE4XeSSRuntime::InitSignature init_signature{
-        display,
-        *quality,
-        XESS_INIT_FLAG_INVERTED_DEPTH,
-        static_cast<float>(render.x) / 2.0f,
-        -static_cast<float>(render.y) / 2.0f,
-    };
-    std::string init_error;
-    if (!m_runtime.initialize_sr(init_signature, init_error)) {
-        mark_execution_fault(init_error);
-        m_runtime.shutdown();
-        set_owner_unavailable(m_owner_failure_reason, false, true);
-        return false;
-    }
-
-    m_owner_configuration = { device, queue, requested_mode, *quality, display, *input, true };
-    m_bootstrap_requested.store(false, std::memory_order_release);
-    ProducerSnapshot snapshot{};
-    snapshot.context_ready = true;
-    snapshot.mode = requested_mode;
-    snapshot.quality = *quality;
-    snapshot.display = display;
-    snapshot.input = *input;
-    snapshot.device_identity = reinterpret_cast<uintptr_t>(device);
-    snapshot.queue_identity = reinterpret_cast<uintptr_t>(queue);
-    publish_producer_snapshot(std::move(snapshot));
-    spdlog::info(
-        "[RE4XeSS][Init] ownerThread={} device=0x{:x} queue=0x{:x} queueType={} display={}x{} render={}x{} mode={} quality={} initFlags={} velocityScale=({:.1f},{:.1f}) convertedMV={} output={} ring={}",
-        m_runtime.owner_thread_id(),
-        reinterpret_cast<uintptr_t>(device),
-        reinterpret_cast<uintptr_t>(queue),
-        static_cast<uint32_t>(queue->GetDesc().Type),
-        display.x,
-        display.y,
-        render.x,
-        render.y,
-        mode_to_display_label(requested_mode),
-        static_cast<int32_t>(*quality),
-        XESS_INIT_FLAG_INVERTED_DEPTH,
-        init_signature.velocity_scale_x,
-        init_signature.velocity_scale_y,
-        static_cast<uint32_t>(DXGI_FORMAT_R16G16_FLOAT),
-        static_cast<uint32_t>(DXGI_FORMAT_R11G11B10_FLOAT),
-        RE4XeSSD3D12::SLOT_COUNT);
-    return false; // The first active owner callback only creates/queries/initializes.
+    return m_pending_worker_fault_reason;
 }
 
+void RE4XeSS::acknowledge_worker_fault(uint64_t control_generation, uint64_t device_reset_generation) {
+    std::lock_guard lock{ m_pending_worker_fault_mutex };
+    if (m_pending_worker_fault_generation == control_generation &&
+        m_pending_worker_fault_reset_generation == device_reset_generation) {
+        m_pending_worker_fault_reason.clear();
+    }
+}
 bool RE4XeSS::get_display_resolution(xess_2d_t& resolution) const {
     resolution = {};
 
@@ -864,6 +587,8 @@ bool RE4XeSS::is_temporal_active() const {
         !producer.draining &&
         !producer.faulted &&
         producer.mode == requested_mode &&
+        producer.control_generation == m_control_generation.load(std::memory_order_acquire) &&
+        producer.device_reset_generation == m_device_reset_generation.load(std::memory_order_acquire) &&
         producer.display.x == m_display_resolution.x &&
         producer.display.y == m_display_resolution.y &&
         m_last_frame_device_reset_generation.load(std::memory_order_acquire) ==
@@ -965,6 +690,15 @@ void RE4XeSS::update_temporal_configuration() {
 
     if (!sdk::GameIdentity::get().is_re4() || requested_mode == UpscalingMode::Off) {
         set_unavailable("Off - native RE4 rendering", "mode-off");
+        return;
+    }
+
+    if (producer.control_generation != m_control_generation.load(std::memory_order_acquire) ||
+        producer.device_reset_generation != m_device_reset_generation.load(std::memory_order_acquire)) {
+        set_unavailable("Waiting for the worker to accept the current control/device generation",
+            "producer-generation-stale");
+        m_temporal_signature_valid = false;
+        m_input_resolution_valid = false;
         return;
     }
 
@@ -1458,43 +1192,204 @@ void RE4XeSS::on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* re
 
 bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* render_context) {
     (void)render_context;
+    const auto callback_thread_id = GetCurrentThreadId();
+    const auto debug_log = REFrameworkConfig::get()->is_debug_log_enabled();
+    const auto overlap_epoch = m_pre_overlay_overlap_epoch.load(std::memory_order_acquire);
+    if (m_pre_overlay_in_progress.test_and_set(std::memory_order_acquire)) {
+        m_pre_overlay_overlap_epoch.fetch_add(1, std::memory_order_acq_rel);
+        const auto overlap_count = m_pre_overlay_overlap_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (debug_log && overlap_count <= 8) {
+            spdlog::warn("[RE4XeSS][Coordinator] overlapping pre-Overlay callback rejected thread={} count={}",
+                callback_thread_id, static_cast<unsigned long long>(overlap_count));
+        }
+        return true;
+    }
+
+    const auto coordinator_log_index = m_pre_overlay_coordinator_log_count.fetch_add(1, std::memory_order_relaxed);
+    const auto previous_thread_id = m_last_pre_overlay_thread_id.exchange(callback_thread_id, std::memory_order_acq_rel);
+    const bool log_coordinator = debug_log && coordinator_log_index < 32;
+    const bool thread_migrated = previous_thread_id != 0 && previous_thread_id != callback_thread_id;
+    const auto migration_log_index = thread_migrated
+        ? m_pre_overlay_migration_log_count.fetch_add(1, std::memory_order_relaxed)
+        : 32;
+    const bool log_migration = debug_log && thread_migrated && migration_log_index < 32;
+    PreOverlayGateGuard gate_guard{
+        m_pre_overlay_in_progress,
+        log_coordinator,
+        callback_thread_id,
+        overlap_epoch,
+    };
+    if (log_coordinator) {
+        spdlog::info("[RE4XeSS][Coordinator] callbackThread={} workerThread={} overlapEpoch={}",
+            callback_thread_id,
+            m_worker.thread_id(),
+            static_cast<unsigned long long>(overlap_epoch));
+    }
+    if (log_migration) {
+        spdlog::info("[RE4XeSS][Coordinator] callback thread migration {} -> {}; workerThread={} (informational)",
+            previous_thread_id, callback_thread_id, m_worker.thread_id());
+    }
+
+    const auto requested_mode = m_requested_mode.load(std::memory_order_acquire);
+    const auto control_generation = m_control_generation.load(std::memory_order_acquire);
+    const auto reset_generation = m_device_reset_generation.load(std::memory_order_acquire);
+
     std::string restore_error;
-    if (!m_output_handoff.restore(layer, GetCurrentThreadId(), restore_error)) {
+    if (!m_output_handoff.restore(layer, restore_error)) {
         const auto handoff = m_output_handoff.snapshot();
         set_owner_unavailable(restore_error, true,
             handoff.retirement == RE4XeSSOutputHandoff::RetirementStatus::Quarantined);
+        invalidate_history("output-handoff-restore-failed");
         clear_frame_state();
         return true;
     }
 
-    const auto control_generation = m_control_generation.load(std::memory_order_acquire);
-    const auto reset_generation = m_device_reset_generation.load(std::memory_order_acquire);
     const auto handoff_before_service = m_output_handoff.snapshot();
     if (handoff_before_service.has_generation &&
         (control_generation != m_output_handoff_control_generation ||
-            reset_generation != m_owner_device_reset_generation)) {
+            reset_generation != m_output_handoff_device_reset_generation)) {
         m_output_handoff.request_retirement(
             control_generation != m_output_handoff_control_generation
                 ? "upscaling mode/quality generation changed"
                 : "D3D12 device-reset generation changed");
     }
 
-    const bool owner_ready = service_owner_thread();
-    m_output_handoff.poll_retirement(m_bridge.idle(), false);
-    if (!owner_ready) {
+    RE4XeSSWorker::ControlRequest control_request{};
+    control_request.active = sdk::GameIdentity::get().is_re4() && requested_mode != UpscalingMode::Off;
+    control_request.mode_token = static_cast<int32_t>(requested_mode);
+    control_request.quality = mode_to_quality_setting(requested_mode);
+    control_request.control_generation = control_generation;
+    control_request.device_reset_generation = reset_generation;
+    control_request.caller_thread_id = callback_thread_id;
+    control_request.external_fault = pending_worker_fault(control_generation, reset_generation);
+    control_request.reframework_directory = reframework_module_directory();
+    if (control_request.active) {
+        (void)get_display_resolution(control_request.display);
+    }
+    if (g_framework != nullptr && g_framework->get_renderer_type() == REFramework::RendererType::D3D12) {
+        const auto& hook = g_framework->get_d3d12_hook();
+        if (hook != nullptr) {
+            control_request.device = hook->get_device();
+            control_request.queue = hook->get_command_queue();
+        }
+    }
+
+    RE4XeSSWorker::ControlResult control_result{};
+    const auto producer_before_service = get_producer_snapshot();
+    const bool worker_already_idle_for_off =
+        requested_mode == UpscalingMode::Off &&
+        producer_before_service.mode == UpscalingMode::Off &&
+        producer_before_service.control_generation == control_generation &&
+        producer_before_service.device_reset_generation == reset_generation &&
+        !producer_before_service.context_ready &&
+        !producer_before_service.execution_ready &&
+        !producer_before_service.draining &&
+        !producer_before_service.faulted &&
+        producer_before_service.bridge_idle &&
+        !producer_before_service.bridge_quarantined;
+    if (worker_already_idle_for_off) {
+        control_result.status = RE4XeSSWorker::ServiceStatus::Waiting;
+        control_result.control_generation = control_generation;
+        control_result.device_reset_generation = reset_generation;
+        auto& snapshot = control_result.snapshot;
+        snapshot.mode_token = static_cast<int32_t>(UpscalingMode::Off);
+        snapshot.control_generation = producer_before_service.control_generation;
+        snapshot.device_reset_generation = producer_before_service.device_reset_generation;
+        snapshot.bridge_idle = producer_before_service.bridge_idle;
+        snapshot.bridge_quarantined = producer_before_service.bridge_quarantined;
+        snapshot.bridge_device_removed = producer_before_service.bridge_device_removed;
+        snapshot.device_identity = producer_before_service.device_identity;
+        snapshot.queue_identity = producer_before_service.queue_identity;
+        snapshot.failure_reason = producer_before_service.failure_reason;
+    } else {
+        control_result = m_worker.service_sync(control_request);
+        publish_worker_snapshot(control_result.snapshot);
+        if (control_result.status != RE4XeSSWorker::ServiceStatus::DispatchFailed &&
+            control_result.status != RE4XeSSWorker::ServiceStatus::Stale &&
+            control_result.control_generation == control_generation &&
+            control_result.device_reset_generation == reset_generation) {
+            acknowledge_worker_fault(control_generation, reset_generation);
+        }
+    }
+
+    const auto control_still_current =
+        control_result.control_generation == control_generation &&
+        control_result.device_reset_generation == reset_generation &&
+        m_control_generation.load(std::memory_order_acquire) == control_generation &&
+        m_device_reset_generation.load(std::memory_order_acquire) == reset_generation &&
+        m_requested_mode.load(std::memory_order_acquire) == requested_mode &&
+        m_pre_overlay_overlap_epoch.load(std::memory_order_acquire) == overlap_epoch;
+    const auto writer_status = m_output_handoff.poll_retirement(
+        control_result.snapshot.bridge_idle,
+        control_result.snapshot.bridge_device_removed);
+    (void)writer_status;
+
+    if (!control_still_current) {
         if (m_output_handoff.snapshot().has_generation) {
-            m_output_handoff.request_retirement("XeSS owner configuration is unavailable");
-            m_output_handoff.poll_retirement(m_bridge.idle(), false);
+            m_output_handoff.request_retirement("pre-Overlay control result became stale");
+            m_output_handoff.poll_retirement(
+                control_result.snapshot.bridge_idle,
+                control_result.snapshot.bridge_device_removed);
         }
-        const auto execution_owner_thread_id = m_execution_owner_thread_id.load(std::memory_order_acquire);
-        if (execution_owner_thread_id == 0 || execution_owner_thread_id == GetCurrentThreadId()) {
-            clear_frame_state();
-        }
+        invalidate_history("pre-overlay-control-stale");
+        clear_frame_state();
         return true;
     }
+
+    if (control_result.status == RE4XeSSWorker::ServiceStatus::DispatchFailed ||
+        control_result.status == RE4XeSSWorker::ServiceStatus::Faulted) {
+        const auto reason = !control_result.snapshot.failure_reason.empty()
+            ? control_result.snapshot.failure_reason
+            : "The RE4XeSS worker could not service the current control request";
+        if (m_output_handoff.snapshot().has_generation) {
+            m_output_handoff.request_retirement("RE4XeSS worker control dispatch/fault");
+            m_output_handoff.poll_retirement(
+                control_result.snapshot.bridge_idle,
+                control_result.snapshot.bridge_device_removed);
+        }
+        set_owner_unavailable(reason, control_result.snapshot.draining, true);
+        invalidate_history("worker-control-fault");
+        clear_frame_state();
+        return true;
+    }
+
+    const bool worker_ready = control_result.status == RE4XeSSWorker::ServiceStatus::Ready &&
+        control_result.ready_for_frame &&
+        control_result.snapshot.context_ready &&
+        !control_result.snapshot.draining &&
+        !control_result.snapshot.faulted;
+    const bool worker_configuration_matches = !control_result.ready_for_frame ||
+        (control_result.snapshot.mode_token == control_request.mode_token &&
+            control_request.quality.has_value() &&
+            control_result.snapshot.quality == *control_request.quality &&
+            control_result.snapshot.display.x == control_request.display.x &&
+            control_result.snapshot.display.y == control_request.display.y &&
+            control_result.snapshot.device_identity == reinterpret_cast<uintptr_t>(control_request.device.Get()) &&
+            control_result.snapshot.queue_identity == reinterpret_cast<uintptr_t>(control_request.queue.Get()));
+    if (worker_ready && !worker_configuration_matches) {
+        const std::string reason{ "RE4XeSS worker reported readiness for a different mode/device/queue/display configuration" };
+        mark_execution_fault(reason);
+        set_owner_unavailable(reason, false, true);
+        invalidate_history("worker-configuration-mismatch");
+        clear_frame_state();
+        return true;
+    }
+    if (!worker_ready) {
+        if (m_output_handoff.snapshot().has_generation) {
+            m_output_handoff.request_retirement("XeSS worker configuration is not ready for this frame");
+            m_output_handoff.poll_retirement(
+                control_result.snapshot.bridge_idle,
+                control_result.snapshot.bridge_device_removed);
+        }
+        clear_frame_state();
+        return true;
+    }
+
     if (!is_temporal_active()) {
-        m_output_handoff.request_retirement("temporal upscaling mode is inactive");
-        m_output_handoff.poll_retirement(m_bridge.idle(), false);
+        m_output_handoff.request_retirement("temporal upscaling mode is inactive or stale");
+        m_output_handoff.poll_retirement(
+            control_result.snapshot.bridge_idle,
+            control_result.snapshot.bridge_device_removed);
         clear_frame_state();
         return true;
     }
@@ -1546,8 +1441,9 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         return true;
     }
     if (color->GetDesc().Format != DXGI_FORMAT_R11G11B10_FLOAT) {
-        mark_execution_fault("The current RE4 Color resource is not R11G11B10_FLOAT; PR3 output contract cannot be met");
-        set_owner_unavailable(m_owner_failure_reason, false, true);
+        const std::string reason{ "The current RE4 Color resource is not R11G11B10_FLOAT; PR3 output contract cannot be met" };
+        mark_execution_fault(reason);
+        set_owner_unavailable(reason, false, true);
         invalidate_history("unsupported-color-format");
         clear_frame_state();
         return true;
@@ -1582,7 +1478,7 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
     packet.reset_history = m_first_valid_frame_reset_pending || m_history_invalid;
     packet.frame_id = *m_cached_scene_frame;
 
-    if (packet.reset_history && REFrameworkConfig::get()->is_debug_log_enabled()) {
+    if (packet.reset_history && debug_log) {
         spdlog::info("[RE4XeSS][Frame] first valid resetHistory packet: frame={} input={}x{} display={}x{}",
             static_cast<unsigned long long>(packet.frame_id),
             packet.render_width,
@@ -1598,53 +1494,25 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         packet.display_height,
         color->GetDesc().Format,
     };
-    if (m_bridge.has_generation() && !m_bridge.matches(
-            bridge_signature,
-            m_owner_configuration.device,
-            m_owner_configuration.queue)) {
-        if (!m_bridge.idle()) {
-            set_owner_unavailable("XeSS bridge generation is draining before resource recreation", true,
-                m_bridge.quarantined());
-            invalidate_history("bridge-generation-draining");
-            clear_frame_state();
-            return true;
-        }
-        m_bridge.shutdown();
-    }
-
-    if (!m_bridge.ready()) {
-        std::string bridge_error;
-        if (!m_bridge.initialize(
-                m_owner_configuration.device,
-                m_owner_configuration.queue,
-                bridge_signature,
-                bridge_error)) {
-            mark_execution_fault(bridge_error);
-            set_owner_unavailable(m_owner_failure_reason, false, true);
-            invalidate_history("bridge-initialization-failed");
-            clear_frame_state();
-            return true;
-        }
-    }
-
     RE4XeSSD3D12::OutputBinding output{};
     std::string handoff_error;
     if (!m_output_handoff.prepare(
             layer,
-            m_owner_configuration.device,
-            m_owner_configuration.queue,
+            control_request.device.Get(),
+            control_request.queue.Get(),
             color,
             render_width,
             render_height,
             packet.display_width,
             packet.display_height,
             control_generation,
-            m_bridge.idle(),
-            false,
+            control_result.snapshot.bridge_idle,
+            control_result.snapshot.bridge_device_removed,
             output,
             handoff_error)) {
         const auto handoff_state = m_output_handoff.snapshot();
-        const bool retirement_pending = handoff_state.retirement == RE4XeSSOutputHandoff::RetirementStatus::WriterPending ||
+        const bool retirement_pending =
+            handoff_state.retirement == RE4XeSSOutputHandoff::RetirementStatus::WriterPending ||
             handoff_state.retirement == RE4XeSSOutputHandoff::RetirementStatus::MissingMarker ||
             handoff_state.retirement == RE4XeSSOutputHandoff::RetirementStatus::Draining ||
             handoff_state.retirement == RE4XeSSOutputHandoff::RetirementStatus::Quarantined;
@@ -1653,18 +1521,50 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
                 handoff_state.retirement == RE4XeSSOutputHandoff::RetirementStatus::Quarantined);
         } else {
             mark_execution_fault(handoff_error);
-            set_owner_unavailable(m_owner_failure_reason, false, true);
+            set_owner_unavailable(handoff_error, false, true);
         }
         invalidate_history("output-handoff-unavailable");
         clear_frame_state();
         return true;
     }
     m_output_handoff_control_generation = control_generation;
+    m_output_handoff_device_reset_generation = reset_generation;
 
-    std::string submit_error;
-    const auto submit_result = m_bridge.submit(packet, m_runtime, output, submit_error);
-    if (submit_result == RE4XeSSD3D12::SubmitResult::Submitted) {
+    RE4XeSSWorker::SubmitRequest submit_request{};
+    submit_request.frame = packet;
+    submit_request.color_pin = color;
+    submit_request.depth_pin = depth;
+    submit_request.velocity_pin = velocity;
+    submit_request.output = output;
+    submit_request.output_pin = output.resource;
+    submit_request.bridge_signature = bridge_signature;
+    submit_request.mode_token = static_cast<int32_t>(requested_mode);
+    submit_request.control_generation = control_generation;
+    submit_request.device_reset_generation = reset_generation;
+    submit_request.caller_thread_id = callback_thread_id;
+
+    const auto submit_result = m_worker.submit_sync(std::move(submit_request));
+    publish_worker_snapshot(submit_result.snapshot);
+    if (submit_result.status == RE4XeSSWorker::SubmitResult::Status::Submitted) {
         m_output_handoff.note_submission_succeeded();
+
+        const auto submit_still_current =
+            submit_result.control_generation == control_generation &&
+            submit_result.device_reset_generation == reset_generation &&
+            m_control_generation.load(std::memory_order_acquire) == control_generation &&
+            m_device_reset_generation.load(std::memory_order_acquire) == reset_generation &&
+            m_requested_mode.load(std::memory_order_acquire) == requested_mode &&
+            m_pre_overlay_overlap_epoch.load(std::memory_order_acquire) == overlap_epoch;
+        if (!submit_still_current) {
+            m_output_handoff.request_retirement("submitted XeSS output belongs to a stale control/device/overlap generation");
+            m_output_handoff.poll_retirement(
+                submit_result.bridge_idle,
+                submit_result.bridge_device_removed);
+            invalidate_history("xess-submit-stale-after-submit");
+            clear_frame_state();
+            return true;
+        }
+
         std::string install_error;
         if (!m_output_handoff.install(layer, packet.frame_id, install_error)) {
             m_output_handoff.request_retirement("XeSS output was submitted but Overlay installation failed");
@@ -1673,6 +1573,7 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
             clear_frame_state();
             return true;
         }
+
         m_last_color_identity = color_identity;
         m_last_depth_identity = depth_identity;
         m_last_velocity_identity = velocity_identity;
@@ -1698,39 +1599,49 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         m_first_valid_frame_reset_pending = false;
         m_history_invalid = false;
         m_last_reset_reason.clear();
-
-        auto producer = get_producer_snapshot();
-        producer.context_ready = true;
-        producer.execution_ready = true;
-        producer.draining = false;
-        producer.faulted = false;
-        producer.failure_reason.clear();
-        publish_producer_snapshot(std::move(producer));
-    } else if (submit_result == RE4XeSSD3D12::SubmitResult::Busy) {
-        invalidate_history("xess-command-ring-busy");
-        if (REFrameworkConfig::get()->is_debug_log_enabled()) {
+    } else if (submit_result.status == RE4XeSSWorker::SubmitResult::Status::Busy ||
+        submit_result.status == RE4XeSSWorker::SubmitResult::Status::Stale ||
+        submit_result.status == RE4XeSSWorker::SubmitResult::Status::NotReady) {
+        invalidate_history(submit_result.status == RE4XeSSWorker::SubmitResult::Status::Busy
+                ? "xess-command-ring-busy"
+                : "xess-submit-stale");
+        if (submit_result.status == RE4XeSSWorker::SubmitResult::Status::Busy && debug_log) {
             static uint32_t busy_warning_count{};
             if (busy_warning_count < 8) {
                 ++busy_warning_count;
                 spdlog::warn("[RE4XeSS][Failure] all bridge slots are busy; skipping frame and resetting XeSS history");
             }
         }
-    } else {
-        if (m_bridge.quarantined()) {
-            m_output_handoff.quarantine(
-                submit_error.empty()
-                    ? "XeSS bridge quarantined after output submission; output state is uncertain"
-                    : submit_error,
-                true);
+        if (submit_result.status == RE4XeSSWorker::SubmitResult::Status::Stale) {
+            m_output_handoff.request_retirement("worker rejected a stale submit generation");
+            m_output_handoff.poll_retirement(
+                submit_result.bridge_idle,
+                submit_result.bridge_device_removed);
         }
-        mark_execution_fault(submit_error.empty() ? m_bridge.failure_reason() : submit_error);
-        set_owner_unavailable(m_owner_failure_reason, m_bridge.quarantined(), true);
+    } else {
+        const auto reason = !submit_result.failure_reason.empty()
+            ? submit_result.failure_reason
+            : "The RE4XeSS worker failed to submit the current frame";
+        if (submit_result.status == RE4XeSSWorker::SubmitResult::Status::DispatchFailed ||
+            submit_result.bridge_quarantined ||
+            !submit_result.bridge_idle) {
+            m_output_handoff.quarantine(reason, true);
+        } else {
+            m_output_handoff.request_retirement("XeSS submit failed before GPU work became active");
+            m_output_handoff.poll_retirement(
+                submit_result.bridge_idle,
+                submit_result.bridge_device_removed);
+        }
+        mark_execution_fault(reason);
+        set_owner_unavailable(reason, submit_result.snapshot.draining, true);
         invalidate_history("xess-execute-fault");
     }
 
     clear_frame_state();
     return true;
 }
+
+
 
 void RE4XeSS::on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* render_context) {
     (void)render_context;

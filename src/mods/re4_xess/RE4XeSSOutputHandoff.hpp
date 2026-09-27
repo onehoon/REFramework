@@ -38,7 +38,7 @@ public:
     RE4XeSSOutputHandoff(const RE4XeSSOutputHandoff&) = delete;
     RE4XeSSOutputHandoff& operator=(const RE4XeSSOutputHandoff&) = delete;
 
-    bool restore(sdk::renderer::layer::Overlay* layer, DWORD current_thread, std::string& error);
+    bool restore(sdk::renderer::layer::Overlay* layer, std::string& error);
     void request_retirement(std::string_view reason);
     RetirementStatus poll_retirement(bool bridge_writer_idle, bool bridge_device_removed);
     bool prepare(
@@ -99,7 +99,6 @@ private:
     sdk::renderer::layer::Overlay* m_installed_overlay{};
     Signature m_signature{};
     D3D12_RESOURCE_STATES m_expected_state{ D3D12_RESOURCE_STATE_COMMON };
-    uint64_t m_owner_thread_id{};
     uint64_t m_next_retirement_value{ 1 };
     uint64_t m_last_signaled_retirement_value{};
     uint64_t m_last_completed_retirement_value{};
