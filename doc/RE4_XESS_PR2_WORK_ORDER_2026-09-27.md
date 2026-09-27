@@ -390,8 +390,26 @@ Requirements:
 - call the already resolved xessGetOptimalInputResolution;
 - return optimal/min/max;
 - reject zero output or zero returned optimal dimensions;
-- validate optimal lies within returned min/max when the runtime returns a meaningful range;
 - preserve the exact public frontend result;
+- apply the following exact min/max policy:
+
+~~~text
+all min/max dimensions are zero:
+    range metadata is treated as unavailable;
+    do not range-check optimal
+
+all min/max dimensions are nonzero:
+    range is meaningful;
+    require min.x <= max.x and min.y <= max.y;
+    require optimal.x in [min.x, max.x];
+    require optimal.y in [min.y, max.y]
+
+mixed zero/nonzero min/max dimensions:
+    malformed response;
+    fail temporal configuration
+~~~
+
+Do not silently repair or synthesize min/max values.
 - do not replace it with hardcoded XeSS ratios;
 - do not call xessD3D12Init;
 - do not call xessD3D12Execute.
@@ -468,8 +486,26 @@ valid D3D12 swapchain/display extent
 valid xessGetOptimalInputResolution result
 nonzero render extent
 render extent <= display extent
-matching aspect ratio within integer-rounding tolerance
+matching aspect ratio within the explicit tolerance below
 ~~~
+
+Aspect validation must use a deterministic cross-product test, not floating-point equality:
+
+~~~text
+crossError =
+    abs(renderWidth * displayHeight - renderHeight * displayWidth)
+
+relativeAspectError =
+    crossError / (renderHeight * displayWidth)
+
+require relativeAspectError <= 0.01
+~~~
+
+Use 64-bit arithmetic for the products.
+
+The 1% tolerance intentionally allows ordinary integer/multiple rounding from a public XeSS/OptiScaler frontend while rejecting a clearly incompatible aspect ratio.
+
+If the returned optimal extent exceeds 1% relative aspect error, fail temporal configuration and log the exact returned display/render extents and error. Do not silently rewrite the runtime-returned size.
 
 When not temporal-ready:
 
@@ -762,9 +798,15 @@ Track at least:
 ~~~text
 history_invalid
 load_transition_active
+inhibit_departure_pending
 pause_previous
 remembered_normal_inhibit_valid
 remembered_normal_inhibit
+departure_inhibit
+startup_mid_load
+post_pause_rebaseline_candidate_valid
+post_pause_rebaseline_candidate
+post_pause_rebaseline_stable_count
 first_valid_frame_reset_pending
 ~~~
 
@@ -812,39 +854,121 @@ Do not enumerate every field every frame.
 
 ### 12.3 Load transition algorithm
 
-Normal gameplay:
+Capture 22 proves that InhibitBit can leave its normal value **before** _Pause rises:
 
-- observe current InhibitBit;
-- remember it as the current normal value while no load transition is active.
+~~~text
+normal InhibitBit
+    -> different value
 
-On _Pause false -> true:
+~77 frames later in the captured load:
+    _Pause false -> true
+~~~
 
-- mark load_transition_active=true;
-- invalidate all projection history;
-- invalidate frame-packet history;
-- remember the last pre-load normal InhibitBit;
-- reset jitter sequence.
+Therefore the normal inhibit baseline must not be overwritten every frame while load_transition_active is still false.
 
-While load_transition_active:
+Use this state machine.
 
-- do not treat _Pause false as immediate recovery;
-- keep reset/history invalid.
+#### Establishing the normal baseline
 
-Recovery requires:
+On the first valid observation with:
 
 ~~~text
 _Pause == false
-AND remembered normal inhibit is valid
-AND current InhibitBit == remembered pre-load normal value
+AND no load/departure state is active
 ~~~
 
-Then:
+capture current InhibitBit as remembered_normal_inhibit.
+
+Once remembered_normal_inhibit is valid, do **not** replace it merely because a later frame reports another InhibitBit value.
+
+#### Early inhibit departure
+
+If:
+
+~~~text
+_Pause == false
+AND remembered_normal_inhibit is valid
+AND current InhibitBit != remembered_normal_inhibit
+~~~
+
+then:
+
+- set inhibit_departure_pending=true;
+- record departure_inhibit=current value for diagnostics;
+- freeze remembered_normal_inhibit at the old normal value;
+- invalidate projection/frame history immediately;
+- reset the jitter sequence;
+- keep waiting for _Pause confirmation or a return to the frozen baseline.
+
+If current InhibitBit returns to remembered_normal_inhibit before _Pause ever rises:
+
+- clear inhibit_departure_pending;
+- keep history invalid until the next fully valid frame;
+- that next valid frame gets reset_history=true.
+
+Do not promote departure_inhibit to the new normal value merely because _Pause has not risen yet.
+
+#### Pause confirmation
+
+If _Pause becomes true at any point:
+
+- enter load_transition_active=true;
+- clear inhibit_departure_pending;
+- keep the previously remembered normal inhibit value unchanged;
+- invalidate all temporal history;
+- reset jitter;
+- do not publish an accumulating-history frame.
+
+This also applies when _Pause is already true on the first observation. In that case:
+
+~~~text
+startup_mid_load=true
+load_transition_active=true
+history invalid
+~~~
+
+and no pre-load normal inhibit value is invented.
+
+#### Normal recovery when a pre-load baseline exists
+
+After _Pause becomes false, do not resume immediately.
+
+When remembered_normal_inhibit is valid, recovery requires:
+
+~~~text
+_Pause == false
+AND current InhibitBit == remembered_normal_inhibit
+~~~
+
+Only then:
 
 - end load_transition_active;
-- next fully valid temporal frame gets reset_history=true;
-- after that frame, normal accumulation resumes.
+- clear departure/startup fallback state;
+- keep first_valid_frame_reset_pending=true;
+- the next fully valid temporal frame gets reset_history=true;
+- after that frame, normal temporal accumulation resumes.
 
-If singleton data is temporarily unavailable, stay conservative and keep history invalid.
+#### Startup-mid-load fallback when no pre-load baseline exists
+
+If RE4XeSS first observes the game with _Pause already true, there is no evidence-backed pre-load normal InhibitBit to compare against.
+
+Do not hardcode 0xB9 and do not adopt the value seen immediately after _Pause falls.
+
+For this fallback only:
+
+1. wait until _Pause is false;
+2. remember the first post-pause InhibitBit as a temporary candidate, but do not recover;
+3. require a **subsequent InhibitBit transition** after _Pause is false;
+4. treat the new value as a rebaseline candidate;
+5. require that candidate to remain unchanged for at least **3 consecutive valid observations**;
+6. adopt it as remembered_normal_inhibit;
+7. set first_valid_frame_reset_pending=true and recover on the next fully valid temporal frame.
+
+If no post-pause InhibitBit transition occurs, remain history-invalid rather than guessing.
+
+This startup-mid-load fallback is a conservative implementation policy for a case not directly covered by Capture 22; the normal evidence-backed path remains frozen-baseline departure -> _Pause -> return to frozen baseline.
+
+If either singleton/field observation is temporarily unavailable, stay conservative and keep history invalid.
 
 ---
 
@@ -936,11 +1060,30 @@ resetHistory
 frame id
 ~~~
 
-Publish/store only one packet per render frame.
+Construct at most one pointer-bearing RE4XeSSFrame per render frame.
 
-PR 2 does not pass it to xessD3D12Execute yet.
+The Color/Depth/Velocity pointers are **borrowed only for the current true pre-Overlay callback**.
 
-Expose a read-only/debug view suitable for PR 3 integration.
+Lifetime contract:
+
+~~~text
+on_pre_overlay_layer_draw begins
+    -> resolve engine resources
+    -> validate and construct RE4XeSSFrame
+    -> future PR 3 may consume the packet synchronously here
+on_pre_overlay_layer_draw returns
+    -> resource pointers in that packet are no longer valid for dereference/use
+~~~
+
+PR 3 must execute/record its resource use synchronously before the same pre-Overlay callback returns.
+
+Do not queue the pointer-bearing packet for another thread or a later callback.
+
+Do not AddRef/Release the engine resources to extend packet lifetime.
+
+For PR 2 debugging, persist only a metadata snapshot after the callback. If resource identity is useful in that snapshot, store addresses as uintptr_t/opaque identity values; do not expose them as reusable ID3D12Resource* handles.
+
+PR 2 does not pass the transient packet to xessD3D12Execute yet.
 
 ---
 
@@ -966,7 +1109,7 @@ next valid frame resetHistory=true
 
 Do not AddRef/Release engine-owned resources merely for identity tracking.
 
-Store borrowed pointer values only.
+Store borrowed pointer values only inside the active callback and, for cross-frame identity comparison, store their raw address values as opaque identities. Do not treat those saved identities as dereferenceable resource handles.
 
 Clear them on:
 
@@ -1236,21 +1379,29 @@ Expected:
 
 With an active mode and Debug Log:
 
-Expected sequence:
+Expected sequence for the Capture 22 ordering:
 
 ~~~text
+InhibitBit leaves remembered normal value
+    freeze old baseline
+    history invalid
+
+later:
 _Pause false -> true
-    reset/history invalid
+    confirm load transition
+    keep frozen baseline
 
 _Pause true -> false
     still invalid
 
-InhibitBit returns to remembered pre-load value
-    recovery completes
+InhibitBit returns to frozen pre-load baseline
+    recovery armed
 
 first valid gameplay frame
     resetHistory=true
 ~~~
+
+Also test/inspect the startup-mid-load guard if practical: first observation with _Pause=true must enter history-invalid state without inventing a pre-load baseline.
 
 Do not accept _Pause false alone as recovery.
 
@@ -1294,7 +1445,7 @@ PR 2 is complete only when:
 - Color/Depth/Velocity semantic identities match the research contract.
 - Temporal resource extents are validated at true pre-Overlay.
 - Motion scales are W/2 and -H/2.
-- Load Save reset waits for dynamic InhibitBit restoration after _Pause.
+- Load Save reset preserves the pre-departure InhibitBit baseline even when InhibitBit changes before _Pause, then waits for restoration after _Pause.
 - Resource identity/size/context/mode discontinuities invalidate history.
 - First valid frame of a new temporal generation has resetHistory=true.
 - Off/fault paths stop render-size and jitter mutation.
