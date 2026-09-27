@@ -151,7 +151,7 @@ bridge command allocator/list state
 bridge writer fence state
 ~~~
 
-The caller thread continues to own:
+The callback side continues to own:
 
 ~~~text
 SceneView/jitter integration
@@ -161,6 +161,10 @@ post-Present downstream retirement marker
 UI/config
 load-state observation
 ~~~
+
+Callback-side ownership does **not** mean one fixed Windows thread.
+
+The first PR4 capture proved that consecutive true pre-Overlay callbacks may execute on different engine threads. OutputHandoff therefore follows the semantic pre-Overlay coordinator, not a callback thread ID.
 
 ---
 
@@ -282,6 +286,52 @@ The mailbox must be bounded.
 
 Do not let old frame requests accumulate.
 
+### 4.3 The callback coordinator is also single-entry
+
+The worker mailbox alone does not serialize callback-side temporal state or OutputHandoff mutation.
+
+Add an explicit non-reentrant gate around the full true pre-Overlay coordinator.
+
+Suggested state:
+
+~~~cpp
+std::atomic_flag m_pre_overlay_in_progress = ATOMIC_FLAG_INIT;
+std::atomic<uint64_t> m_pre_overlay_overlap_epoch{};
+~~~
+
+At callback entry:
+
+~~~cpp
+if (m_pre_overlay_in_progress.test_and_set(std::memory_order_acquire)) {
+    m_pre_overlay_overlap_epoch.fetch_add(1, std::memory_order_acq_rel);
+
+    // Fail closed. Do not restore/install handoff, do not dispatch XeSS,
+    // and do not mutate temporal history from the overlapping callback.
+    return true;
+}
+
+const auto gate = gsl::finally([&] {
+    m_pre_overlay_in_progress.clear(std::memory_order_release);
+});
+~~~
+
+Use any equivalent RAII cleanup available in the repository; do not add a dependency only for this helper.
+
+The callback that owns the gate snapshots `m_pre_overlay_overlap_epoch` before worker dispatch and verifies that it is unchanged before post-submit handoff installation/history commit.
+
+If an overlapping callback was observed while the owner callback waited on the worker, the current frame is considered stale even if the worker submitted GPU work:
+
+~~~text
+no Overlay handoff install
+no temporal-history commit
+invalidate history for next valid submission
+retire submitted output after writer completion
+~~~
+
+Do not block/spin waiting for the other callback.
+
+This is a fail-closed guard until runtime evidence proves pre-Overlay callbacks are never concurrent.
+
 ---
 
 ## 5. Worker ownership of RE4XeSSRuntime
@@ -362,8 +412,8 @@ queue identity
 bridge idle
 bridge quarantined
 failure reason
-control generation
-device-reset generation
+accepted control generation
+accepted device-reset generation
 ~~~
 
 The callback-side `RE4XeSSOutputHandoff::poll_retirement()` uses the returned `bridge_idle` bit instead of calling `m_bridge.idle()` directly.
@@ -405,6 +455,10 @@ The existing control behavior remains:
 - mode/quality/display/device change;
 - device removal;
 - explicit retry generation.
+
+The worker must echo the exact accepted `control_generation` and `device_reset_generation` in `ControlResult`.
+
+A result from a different generation is stale and cannot make callback-side temporal state ready.
 
 Do not change XeSS quality mapping.
 
@@ -454,6 +508,91 @@ Do not remove the existing slot pins.
 
 They protect a different lifetime interval.
 
+### 8.1 Submit generation contract
+
+`SubmitResult` must echo:
+
+~~~text
+control_generation
+device_reset_generation
+submitted / busy / faulted
+bridge_idle
+bridge_quarantined
+~~~
+
+Before recording a submit, the worker must reject the request if its generation does not match the worker's currently accepted control configuration.
+
+Suggested worker-side check:
+
+~~~cpp
+if (request.control_generation != m_configuration.control_generation ||
+    request.device_reset_generation != m_configuration.device_reset_generation) {
+    return SubmitResult{
+        .status = SubmitStatus::Stale,
+        .control_generation = request.control_generation,
+        .device_reset_generation = request.device_reset_generation,
+    };
+}
+~~~
+
+This prevents requests that were already stale before worker execution.
+
+### 8.2 Generation can still change while synchronous submit is running
+
+Mode Off, quality change, or device reset may be requested by another callback/thread after the request passed the worker-side check.
+
+Therefore, after `submit_sync()` returns and **before** OutputHandoff install/history commit, reload:
+
+~~~cpp
+const auto current_control =
+    m_control_generation.load(std::memory_order_acquire);
+const auto current_reset =
+    m_device_reset_generation.load(std::memory_order_acquire);
+const auto current_overlap =
+    m_pre_overlay_overlap_epoch.load(std::memory_order_acquire);
+~~~
+
+Require all of:
+
+~~~text
+result.control_generation == request.control_generation == current_control
+result.device_reset_generation == request.device_reset_generation == current_reset
+current_overlap == overlap_epoch_captured_before_dispatch
+requested mode is still the request mode
+~~~
+
+If any check fails, the result is stale.
+
+#### Stale before GPU submission
+
+If worker returns `Stale` without submitting:
+
+~~~text
+do not install OutputHandoff
+do not commit history
+invalidate history
+service the newer control generation on the next coordinator pass
+~~~
+
+#### Stale after GPU submission
+
+If the worker already returned `Submitted` but the callback-side post-return check finds a newer generation:
+
+~~~text
+call OutputHandoff::note_submission_succeeded()
+DO NOT install Overlay main TargetState
+DO NOT clear resetHistory/history-invalid state
+request retirement of that output generation
+keep bridge/output lifetime until writer fence proves the submitted work complete
+no downstream-retirement marker is required because the handoff was never installed/read by RE4
+~~~
+
+The next coordinator pass services the new control/device generation.
+
+Do not treat stale-after-submit as a device fault.
+
+This rule prevents an old Quality/device generation from becoming visible after Mode Off or reset was requested.
+
 ---
 
 ## 9. Pre-Overlay callback flow after this fix
@@ -465,7 +604,11 @@ Target order:
 ~~~text
 on_pre_overlay_layer_draw(current engine thread may vary)
     |
-    | restore previous PR4 handoff
+    | acquire non-reentrant coordinator gate
+    | snapshot control/reset/overlap generations
+    v
+restore previous PR4 handoff
+    |
     v
 build ControlRequest
     |
@@ -473,11 +616,12 @@ build ControlRequest
     v
 worker.service_sync()
     |
+    | verify echoed generations are still current
     | returns producer state + bridge_idle
     v
 callback polls OutputHandoff retirement
     |
-    +-- worker not ready
+    +-- worker not ready/stale
     |      fail closed for this frame
     |
     v
@@ -491,12 +635,21 @@ pin request resources
     v
 worker.submit_sync()
     |
-    +-- Submitted
+    | reload control/reset/overlap generations
+    v
+    +-- Submitted + still current
     |      OutputHandoff note_submission_succeeded
-    |      install TargetState on current callback thread
+    |      install TargetState on this callback thread
     |      commit temporal history
     |
-    +-- Busy
+    +-- Submitted + stale after return
+    |      note submission for state tracking
+    |      NO install
+    |      NO history commit
+    |      retire output after writer completion
+    |      reset history next valid submit
+    |
+    +-- Stale / Busy
     |      no install
     |      reset history next valid submit
     |
@@ -575,7 +728,7 @@ Do not special-case or detect OptiScaler.
 
 ---
 
-## 11. Callback-side OutputHandoff remains unchanged in ownership
+## 11. Callback-side OutputHandoff stays outside the worker, but its thread-affinity behavior must change
 
 Keep `RE4XeSSOutputHandoff` outside the worker.
 
@@ -586,7 +739,58 @@ Reasons:
 - `on_post_present()` owns downstream retirement marker logic;
 - it performs no XeSS API call.
 
-The worker returns `bridge_idle` and failure/quarantine state for its retirement decisions.
+However, the current implementation has an obsolete fixed-callback-thread restriction:
+
+~~~text
+prepare:
+    m_owner_thread_id = GetCurrentThreadId()
+
+restore:
+    if current_thread != m_owner_thread_id:
+        quarantine
+~~~
+
+This must be removed.
+
+The runtime evidence proves the next valid semantic pre-Overlay callback can run on another engine thread.
+
+### 11.1 New OutputHandoff CPU ownership rule
+
+OutputHandoff install/restore/prepare operations are owned by the **single-entry pre-Overlay coordinator**, not by a Windows thread ID.
+
+Therefore:
+
+- remove `m_owner_thread_id` from OutputHandoff generation state;
+- remove the `current_thread` ownership argument/check from `restore()`, or make it diagnostic-only with no failure behavior;
+- do not set a callback owner thread in `prepare()`;
+- allow frame N install on thread A and frame N+1 restore on thread B;
+- retain all existing Overlay identity, TargetState identity, marker, fence, and generation checks.
+
+The coordinator gate in section 4.3 is what serializes callback-side mutation.
+
+`on_post_present()` remains independently synchronized by the existing retirement mutex and does not mutate Overlay/TargetState.
+
+### 11.2 Thread migration acceptance
+
+Required runtime sequence:
+
+~~~text
+frame N pre-Overlay callback thread = A
+    install handoff
+
+frame N post-Present
+    retirement marker queued
+
+frame N+1 pre-Overlay callback thread = B
+    restore succeeds
+    no quarantine due only to A != B
+~~~
+
+Log the first 32 migrations under Debug Log.
+
+Thread migration itself is informational, not an error.
+
+The worker returns `bridge_idle` and failure/quarantine state for retirement decisions.
 
 Do not weaken the PR4 dual-fence lifetime contract.
 
@@ -752,13 +956,16 @@ src/mods/re4_xess/RE4XeSS.cpp
 
 src/mods/re4_xess/RE4XeSSRuntime.cpp
 src/mods/re4_xess/RE4XeSSRuntime.hpp   # only if small ownership/log helpers are needed
+
+src/mods/re4_xess/RE4XeSSOutputHandoff.hpp
+src/mods/re4_xess/RE4XeSSOutputHandoff.cpp
 ~~~
 
 `RE4XeSSD3D12.*` should not need algorithmic changes.
 
 Its ownership changes to the worker, but PR3 bridge semantics remain intact.
 
-`RE4XeSSOutputHandoff.*` should not need behavioral changes.
+`RE4XeSSOutputHandoff.*` **does require the targeted behavioral correction described in section 11**: remove fixed callback-thread affinity while preserving all semantic/generation/retirement invariants.
 
 No changes expected in:
 
@@ -782,9 +989,31 @@ Search the final code for concepts equivalent to:
 pre-Overlay callback moved from XeSS owner thread
 m_execution_owner_thread_id
 m_owner_thread_violation
+OutputHandoff m_owner_thread_id
+"restoration was requested from a non-owner thread"
 ~~~
 
-They should be removed from production control flow.
+They should be removed from production failure/control flow.
+
+### Callback coordinator non-reentrancy
+
+Static review must show that the complete pre-Overlay coordinator is guarded by a nonblocking single-entry gate.
+
+An overlapping callback must not:
+
+~~~text
+restore/install Overlay handoff
+dispatch another XeSS request
+mutate temporal history
+~~~
+
+It marks the current owner pass stale and returns fail-closed.
+
+### Generation post-check
+
+After worker `service_sync()` and especially after `submit_sync()`, code must compare returned/request generations with the latest control/reset generation.
+
+A stale `Submitted` result must not install Overlay state or commit history.
 
 ### One XeSS API CPU owner
 
@@ -878,14 +1107,18 @@ xessD3D12CreateContext success
 
 OptiScaler should observe the public XeSS producer calls.
 
-### 19.2 Thread acceptance
+### 19.2 Thread and handoff acceptance
 
 Expected even if RE4 callback IDs alternate:
 
 ~~~text
-preOverlay callbackThread=1304
-preOverlay callbackThread=28692
-preOverlay callbackThread=<other possible id>
+frame N:
+    preOverlay callbackThread=1304
+    handoff install succeeds
+
+frame N+1:
+    preOverlay callbackThread=28692
+    previous handoff restore succeeds
 
 RE4XeSS workerThread=<one constant id>
 runtime ownerThread=<same worker id>
@@ -893,7 +1126,63 @@ runtime ownerThread=<same worker id>
 
 No quarantine from callback migration.
 
-### 19.3 Producer progression
+OutputHandoff must not report a non-owner-thread restoration failure.
+
+### 19.3 Coordinator overlap test
+
+Runtime evidence does not prove callbacks are non-overlapping.
+
+Add bounded logging for coordinator entry/exit and overlap detection.
+
+Normal expected result:
+
+~~~text
+overlapCount = 0
+~~~
+
+If overlap occurs:
+
+~~~text
+second callback fails closed immediately
+owner callback becomes stale before install/history commit
+no second worker submit is queued
+next valid frame resets history
+~~~
+
+A detected overlap is not permission to add a blocking callback mutex.
+
+Use the nonblocking guard defined in section 4.3.
+
+### 19.4 Generation-change test
+
+Exercise at least:
+
+~~~text
+Quality -> Off
+Quality -> Balanced
+device/swapchain reset if practical
+~~~
+
+around active worker dispatch.
+
+Required invariant:
+
+~~~text
+old-generation worker result may finish
+but if current control/reset generation changed:
+    no old handoff install
+    no old history commit
+~~~
+
+If an old-generation command list was already submitted, logs must show:
+
+~~~text
+stale-after-submit
+writer retirement/drain
+no downstream marker required unless that output had actually been installed
+~~~
+
+### 19.5 Producer progression
 
 The retest must reach beyond the old stop point:
 
@@ -906,7 +1195,7 @@ xessD3D12Execute
 
 Only after these succeed should PR3/PR4 GPU/output validation continue.
 
-### 19.4 OptiScaler evidence
+### 19.6 OptiScaler evidence
 
 OptiScaler.log should contain intercepted XeSS producer activity.
 
@@ -941,6 +1230,11 @@ This corrective PR is complete when:
 - a dedicated RE4XeSS worker thread exists;
 - every public XeSS API call runs on that one worker thread;
 - RE4 pre-Overlay callback thread migration is tolerated;
+- OutputHandoff restore/install is serialized by the semantic coordinator and does not require a fixed callback thread;
+- pre-Overlay callback re-entry is nonblocking fail-closed;
+- worker control/submit results are generation-tagged;
+- stale worker results cannot install handoff or commit history;
+- stale-after-submit output remains alive through writer retirement;
 - RE4XeSSD3D12 is owned/serialized by the same worker;
 - callback-to-worker resource lifetime is protected by request ComPtr pins;
 - existing bridge slot GPU pins remain intact;
@@ -993,6 +1287,8 @@ Stop and report if:
 - RE4 requires the bridge command list to be recorded on the callback thread;
 - moving bridge ownership to the worker would require changes in D3D12Hook or XeFG compatibility;
 - OutputHandoff TargetState mutation would need to move to the worker;
+- callback overlap cannot be handled fail-closed without blocking/re-entering RE Engine;
+- a stale-after-submit generation cannot be retained safely until writer completion;
 - candidate 2 exact-path loading fails even though the file is present, with a dependency/load error that requires global DLL search mutation.
 
 These are new architecture contradictions and must be reviewed before widening the patch.
