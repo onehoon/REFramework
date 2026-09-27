@@ -408,6 +408,8 @@ The preferred first implementation is an engine-visible display-resolution targe
 - keep the handoff installed across the original Overlay draw and later output/composite recording;
 - restore the saved original Overlay main TargetState at the **next** true pre-Overlay callback, before resolving the next frame's semantic Color;
 - perform install/restore through sdk::intrusive_ptr assignment so refcount changes remain balanced;
+- do **not** bind OutputHandoff restore/install to a fixed Windows callback thread ID;
+- serialize OutputHandoff mutation through the single-entry semantic pre-Overlay coordinator instead;
 - preserve the original engine state/pointers and restore or safely retire them on disable, failure, resize, or device-generation change.
 
 This architecture keeps RE4 responsible for its own UI and final presentation instead of replacing the final backbuffer.
@@ -955,7 +957,9 @@ If the retirement Signal fails or the callback observes a different active devic
 
 The post-Present callback is not assumed to run on the dedicated XeSS worker or on any stable pre-Overlay callback thread. It pins and synchronizes access to its generation's queue/fence, then only Signals and publishes marker evidence. It performs no XeSS API call, Overlay/TargetState access, TargetState release, or fence wait.
 
-OutputHandoff TargetState install/restore/retirement decisions remain on the semantic RE4 callback side. Bridge writer-idle/quarantine information comes from the worker result/snapshot; the callback side does not mutate RE4XeSSD3D12 directly.
+OutputHandoff TargetState install/restore/retirement decisions remain on the semantic RE4 callback side. This callback side is serialized by a non-reentrant pre-Overlay coordinator gate, not by a fixed callback thread ID. A handoff installed on one valid pre-Overlay callback thread may be restored on a different valid pre-Overlay callback thread.
+
+Bridge writer-idle/quarantine information comes from the worker result/snapshot; the callback side does not mutate RE4XeSSD3D12 directly.
 
 No public XeSS API is called from on_post_present().
 
@@ -992,7 +996,7 @@ Disabled
 WaitingForD3D12
     |
     v
-WaitingForOwnerThread
+WaitingForWorker
     |
     v
 WaitingForValidScene
@@ -1124,6 +1128,20 @@ otherwise
 A Signal failure after `ExecuteCommandLists` is special: the list may have been accepted while writer completion proof was lost. That execution generation must keep its slot pins, command objects, bridge-owned resources, and XeSS context quarantined until either normal completion becomes provable or an explicit device-removal/reset terminal condition disposes the old device generation.
 
 A downstream-retirement Signal failure is independently terminal for handoff lifetime: keep the handoff TargetState/resource generation quarantined until a valid same-generation retirement proof or confirmed device removal exists.
+
+Control/device generations are independently monotonic. Every worker control/submit result is tagged with the exact `control_generation` and `device_reset_generation` it accepted. Before callback-side handoff installation or temporal-history commit, the coordinator reloads the current generations and rejects stale results.
+
+If a stale result is detected **after** the worker already submitted GPU work:
+
+~~~text
+do not install Overlay handoff
+do not commit temporal history
+retain output through bridge writer completion
+request output generation retirement
+resume only from the newer generation
+~~~
+
+No downstream retirement marker is required for that stale output unless it was actually installed into RE4 and therefore acquired downstream readers.
 
 If neither writer nor downstream-consumer completion can be proven as required, keep that generation quarantined for the rest of the process rather than guessing completion.
 
@@ -1687,6 +1705,9 @@ Production code should implement the minimum stable contract, not carry broad ho
 | AD-27 | PR4 first runtime evidence showed the true pre-Overlay callback move from thread 1304 to 28692; callback-thread migration is normal and must not quarantine XeSS. |
 | AD-28 | XeSS runtime discovery tries <REF>\libxess.dll then <REF>\OptiScaler\libxess.dll; expected absence of the first candidate continues to the second instead of faulting. |
 | AD-29 | RE4XeSSRuntime and RE4XeSSD3D12 share the dedicated worker CPU owner. OutputHandoff remains callback-side; synchronous worker dispatch preserves pre-Overlay ordering without a per-frame GPU wait. |
+| AD-30 | RE4XeSSOutputHandoff is owned by the semantic pre-Overlay coordinator, not a fixed callback thread ID. Install on callback thread A and restore on callback thread B is valid when coordinator serialization and Overlay/generation invariants hold. |
+| AD-31 | The true pre-Overlay coordinator is non-reentrant. Concurrent callback overlap fails closed without a second worker dispatch or callback-side temporal/handoff mutation, and marks the active pass stale before install/history commit. |
+| AD-32 | Worker control/submit results are tagged with control/device-reset generations. Callback-side install/history commit requires a post-return generation recheck; stale-after-submit work is retired by writer lifetime rules without becoming visible. |
 
 ---
 
