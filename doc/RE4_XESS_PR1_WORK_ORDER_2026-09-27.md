@@ -23,7 +23,8 @@ Implement the smallest production RE4 XeSS shell that proves these boundaries in
 RE4 only
     -> RE4XeSS Mod exists
     -> RE4-only Upscaling Mode UI/config exists
-    -> public libxess.dll is loaded through normal Windows DLL resolution
+    -> libxess.dll is discovered in one of the two supported REFramework-relative locations
+    -> the selected DLL is loaded from its exact path
     -> required public XeSS exports are resolved dynamically
     -> a D3D12 XeSS context can be created/destroyed against RE4's existing D3D12 device
 
@@ -140,39 +141,133 @@ Do not port RE4TemporalProbe or any diagnostic tracing code.
 
 cmake.toml uses globs, but the checked-in generated CMakeLists.txt explicitly enumerates sources.
 
-Update cmake.toml, then run normal CMake configure so the existing cmkr bootstrap regenerates CMakeLists.txt. Commit both changes.
+PR 1 does not need an XeSS-specific cmake.toml dependency/include-path change. Add the new source files, then refresh the generated CMakeLists.txt source enumeration through cmkr. Commit CMakeLists.txt only if generation changes it.
 
 ---
 
-## 3. XeSS SDK dependency for PR 1
+## 3. XeSS ABI and runtime discovery for PR 1
 
-Use official Intel XeSS public headers pinned to:
+REFramework does not own or distribute the Intel XeSS SDK/runtime package for this feature.
+
+For the target deployment, OptiScaler installation provides the runtime DLL set.
+
+Do not add:
 
 ~~~text
-Intel XeSS SDK v3.0.2
-repository: https://github.com/intel/xess
-tag commit: 8fe81bdbbaf00b3c1b733fd0d830c333dc84e6f0
+dependencies/xess
+XeSS git submodule
+Intel XeSS SDK package
+Intel XeSS include directory
+libxess.lib
+Intel XeSS runtime DLL copies
+XeFG SDK files
 ~~~
 
-At work-order review time, v3.0.2 is the latest stable SDK release.
+### 3.1 Compile-time ABI surface
 
-Preferred integration:
-- add git submodule dependencies/xess
-- pin the gitlink to the exact commit above
-- add dependencies/xess/inc to the REFramework include path
-- include xess/xess.h and xess/xess_d3d12.h
+Add one small internal ABI declaration header:
 
-Do not link libxess.lib.
+~~~text
+src/mods/re4_xess/RE4XeSSApi.hpp
+~~~
 
-Do not copy Intel runtime binaries into REFramework output:
-- libxess.dll
-- libxess.lib
-- libxess_fg.dll
-- libxess_fg.lib
+Keep only the public XeSS ABI declarations required by the RE4 producer.
 
-PR 1 must use LoadLibraryW and GetProcAddress so normal game-directory DLL resolution remains compatible with stock OptiScaler interception.
+PR 1 needs at least the declarations required for:
 
-Do not add any XeFG SDK dependency.
+~~~text
+xess_context_handle_t
+xess_result_t
+xess_version_t
+xess_2d_t
+xess_quality_settings_t
+
+xessGetVersion
+xessGetOptimalInputResolution
+xessDestroyContext
+xessSetVelocityScale
+xessD3D12CreateContext
+xessD3D12Init
+xessD3D12Execute
+~~~
+
+Preserve the public ABI exactly: calling convention, enum values, field widths, and packing.
+
+Public quality values used by the RE4 UI contract:
+
+~~~text
+ULTRA_PERFORMANCE = 100
+PERFORMANCE       = 101
+BALANCED          = 102
+QUALITY           = 103
+ULTRA_QUALITY     = 104
+ULTRA_QUALITY_PLUS= 105
+AA                = 106
+~~~
+
+Do not copy unrelated SDK samples or implementation code.
+
+### 3.2 Supported runtime locations
+
+Search exactly these locations, relative to the directory containing the loaded REFramework DLL:
+
+~~~text
+1. <REFramework directory>\libxess.dll
+2. <REFramework directory>\OptiScaler\libxess.dll
+~~~
+
+Priority is top-level first.
+
+If both exist, use the top-level DLL.
+
+If neither exists, fail closed and keep native RE4 rendering.
+
+Do not fall back to arbitrary PATH/current-working-directory discovery.
+
+### 3.3 Resolve the REFramework directory from the loaded module
+
+Base the search on:
+
+~~~cpp
+REFramework::get_reframework_module()
+~~~
+
+Use the repository's existing module-path helper where practical.
+
+Do not derive the base directory from REFramework::get_persistent_dir(), the current working directory, or the game executable path by assumption.
+
+### 3.4 Exact-path loading and adjacent dependencies
+
+After selecting a candidate, load that exact full path.
+
+Preferred behavior:
+
+~~~text
+LoadLibraryExW(
+    selected_full_path,
+    nullptr,
+    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)
+~~~
+
+This allows DLL dependencies located next to the selected libxess.dll to resolve when the OptiScaler DLL set is inside the OptiScaler subfolder.
+
+Do not use SetDllDirectory as a process-wide shortcut.
+
+Do not mutate global DLL search state.
+
+### 3.5 OptiScaler transparency
+
+RE4XeSS does not identify whether the selected libxess.dll is an Intel runtime-facing DLL or an OptiScaler-provided XeSS frontend/proxy.
+
+The module only finds the DLL, loads it, resolves public XeSS exports, and calls the public XeSS ABI.
+
+No OptiScaler detection or private API is added.
+
+### 3.6 No XeSS packaging
+
+PR 1 must not copy or package XeSS DLLs.
+
+Runtime-file deployment is outside REFramework's responsibility for this target architecture.
 
 ---
 
@@ -183,6 +278,7 @@ Create only:
 ~~~text
 src/mods/re4_xess/RE4XeSS.hpp
 src/mods/re4_xess/RE4XeSS.cpp
+src/mods/re4_xess/RE4XeSSApi.hpp
 src/mods/re4_xess/RE4XeSSRuntime.hpp
 src/mods/re4_xess/RE4XeSSRuntime.cpp
 ~~~
@@ -334,25 +430,33 @@ Faulted
 
 Make the class non-copyable and RAII-safe.
 
-### 6.1 Normal DLL loading
+### 6.1 Runtime discovery and DLL loading
 
-Use:
+Resolve the directory containing the loaded REFramework DLL, then probe:
 
-~~~cpp
-LoadLibraryW(L"libxess.dll")
+~~~text
+<REF directory>\libxess.dll
+<REF directory>\OptiScaler\libxess.dll
 ~~~
 
-Do not:
-- force an absolute Intel runtime path
-- load dependencies/xess/bin/libxess.dll
-- copy a DLL from code
-- call into OptiScaler private APIs
+Load the first existing candidate by exact full path.
 
-Debug Log may report the actual loaded path through GetModuleFileNameW.
+Prefer LoadLibraryExW with DLL-load-directory semantics so dependencies adjacent to the selected DLL can resolve without changing process-wide search state.
+
+Do not:
+
+- use bare LoadLibraryW(L"libxess.dll") as the only lookup mechanism;
+- search arbitrary PATH entries after the two supported locations fail;
+- use an Intel SDK/dependencies directory;
+- use SetDllDirectory globally;
+- copy a DLL from code;
+- call OptiScaler private APIs.
+
+When Debug Log is enabled, log the REFramework directory, both candidates, the selected path, and the load result.
 
 ### 6.2 Required public exports
 
-Use official XeSS header types, preferably decltype, rather than handwritten ABI definitions.
+Use RE4XeSSApi.hpp as the minimal public ABI declaration surface. Keep its declarations ABI-compatible with the public XeSS interface and use those types for function pointers.
 
 Resolve at least:
 
@@ -440,7 +544,7 @@ Keep one useful failure reason for UI/logging.
 Default is Off.
 
 With Off:
-- do not LoadLibraryW(libxess.dll)
+- do not search for or load libxess.dll
 - do not create context
 - do not mutate rendering
 
@@ -548,11 +652,7 @@ If any appears necessary, stop and report instead of widening PR 1.
 Expected approximately:
 
 ~~~text
-.gitmodules
-dependencies/xess                         # gitlink
-
-cmake.toml
-CMakeLists.txt                            # cmkr-generated
+CMakeLists.txt                            # cmkr-generated source-list refresh, if needed
 
 shared/sdk/Renderer.hpp
 
@@ -561,9 +661,16 @@ src/mods/REFrameworkConfig.hpp
 
 src/mods/re4_xess/RE4XeSS.hpp
 src/mods/re4_xess/RE4XeSS.cpp
+src/mods/re4_xess/RE4XeSSApi.hpp
 src/mods/re4_xess/RE4XeSSRuntime.hpp
 src/mods/re4_xess/RE4XeSSRuntime.cpp
 ~~~
+
+No XeSS SDK/submodule/dependency package should be added.
+
+cmake.toml does not need an XeSS-specific include path or link dependency.
+
+Because checked-in CMakeLists.txt is generated and enumerates files explicitly, refresh its source list through cmkr if needed after adding the new source files.
 
 REFrameworkConfig.cpp should not need restructuring.
 
@@ -579,19 +686,25 @@ Do not port:
 
 ## 11. Build-system work
 
-Add submodule:
+Do not add a XeSS package, submodule, include directory, import library, or runtime-copy step.
+
+The existing cmake.toml source glob already covers src/** files.
+
+After creating the new source files, refresh the generated CMakeLists.txt source enumeration through cmkr.
+
+Preferred:
 
 ~~~text
-dependencies/xess
-url = https://github.com/intel/xess.git
-gitlink = 8fe81bdbbaf00b3c1b733fd0d830c333dc84e6f0
+cmkr gen
 ~~~
 
-Add dependencies/xess/inc to the REFramework target include directories in cmake.toml.
+or use the repository's existing cmkr/CMake regeneration flow.
 
-Do not add an XeSS link library.
+If configure does not regenerate because cmake.toml itself did not change, force a local cmkr regeneration rather than adding a fake semantic dependency.
 
-Run normal CMake configure so cmkr regenerates CMakeLists.txt and picks up the new src/mods/re4_xess sources.
+Commit CMakeLists.txt only if it actually changes.
+
+There must be no XeSS library in target_link_libraries.
 
 ---
 
@@ -600,8 +713,6 @@ Run normal CMake configure so cmkr regenerates CMakeLists.txt and picks up the n
 Use the repository PR-build shape:
 
 ~~~powershell
-git submodule update --init --recursive
-
 cmake -S . -B build ^
   -G "Visual Studio 18 2026" ^
   -A x64 ^
@@ -617,7 +728,7 @@ Required:
 
 There must be no unresolved direct xess import.
 
-If practical, inspect dinput8.dll imports and verify libxess.dll is not a static import dependency.
+If practical, inspect dinput8.dll imports and verify libxess.dll is not a static import dependency. The only XeSS runtime load must come from the explicit two-location RE4XeSS loader.
 
 ---
 
@@ -738,9 +849,11 @@ PR 1 is complete only when:
 - The full RE4 Upscaling Mode selector exists and defaults to Off.
 - Off causes zero XeSS bootstrap.
 - Active modes bootstrap runtime/context without changing rendering.
-- Official XeSS public headers are pinned to fixed v3.0.2 revision.
+- No XeSS SDK/submodule/runtime package is added to REFramework.
+- RE4XeSSApi.hpp contains only the minimal public XeSS ABI needed by the producer.
 - No XeSS import library is linked.
-- libxess.dll uses normal Windows DLL search.
+- libxess.dll discovery is limited to <REF>\libxess.dll, then <REF>\OptiScaler\libxess.dll.
+- The selected DLL is loaded by exact path without process-wide DLL search mutation.
 - Required public exports are dynamic.
 - Existing RE4 D3D12 device is used for context creation.
 - Context/module teardown is RAII-safe.
@@ -764,7 +877,7 @@ PR description must state:
 3. there is no XeSS execute/render modification yet;
 4. dynamic public XeSS loading preserves stock OptiScaler interception;
 5. existing XeFG compatibility code is unchanged;
-6. exact Intel XeSS SDK revision;
+6. the two supported libxess.dll runtime locations;
 7. runtime tests actually performed;
 8. runtime tests remaining for the user.
 
@@ -777,9 +890,10 @@ Do not merge automatically.
 Stop and report instead of widening scope if:
 
 - context creation seems to require changes inside existing XeFG compatibility;
-- normal LoadLibraryW(libxess.dll) cannot preserve intended OptiScaler interception;
+- neither supported REFramework-relative libxess.dll location can provide a usable public XeSS frontend;
+- exact-path loading from the OptiScaler subdirectory cannot resolve required adjacent DLL dependencies without unsafe global search-path mutation;
 - current RE4 D3D12 device is unsuitable for XeSS context creation;
-- official v3.0.2 public headers conflict with the stock OptiScaler XeSS frontend contract;
+- the minimal public XeSS ABI declarations required by the producer conflict with the runtime-exported ABI;
 - another game would require a shared Renderer behavior change;
 - implementation requires SceneView/jitter/output mutation before PR 2;
 - build integration would require bundling an Intel runtime DLL.
