@@ -18,7 +18,7 @@
 #include "REFramework.hpp"
 
 namespace {
-constexpr std::array<const char*, 16> SCENARIOS{
+constexpr std::array<const char*, 17> SCENARIOS{
     "Static screen",
     "Camera pan right",
     "Camera pan left",
@@ -35,6 +35,7 @@ constexpr std::array<const char*, 16> SCENARIOS{
     "D3D12 recording functions",
     "D3D12 bridge ordering",
     "D3D12 output copy provenance",
+    "D3D12 final output composite",
 };
 
 constexpr std::array<const char*, 6> LOAD_STATE_SINGLETONS{
@@ -373,6 +374,7 @@ void RE4TemporalProbe::reset_temporal_state() {
     m_recording_function_budget.reset();
     m_bridge_order_budget.reset();
     m_output_copy_budget.reset();
+    m_final_composite_budget.reset();
     m_execution_boundary_frame.store(0, std::memory_order_relaxed);
     m_execution_boundary_sample.store(0, std::memory_order_relaxed);
     m_execution_submit_count.store(0, std::memory_order_relaxed);
@@ -435,6 +437,23 @@ void RE4TemporalProbe::reset_temporal_state() {
         m_output_copy_swapchain_buffers.clear();
         m_output_copy_last_submit_frame = 0;
         m_output_copy_submit_ordinal = 0;
+    }
+    m_final_composite_capture_open.store(false, std::memory_order_relaxed);
+    m_final_composite_boundary_frame.store(0, std::memory_order_relaxed);
+    m_final_composite_boundary_sample.store(0, std::memory_order_relaxed);
+    m_final_composite_event_sequence.store(0, std::memory_order_relaxed);
+    m_final_composite_boundary_event_base.store(0, std::memory_order_relaxed);
+    m_final_composite_color.store(0, std::memory_order_relaxed);
+    m_final_composite_intermediate.store(0, std::memory_order_relaxed);
+    m_final_composite_candidate_draws.store(0, std::memory_order_relaxed);
+    m_final_composite_total_draws.store(0, std::memory_order_relaxed);
+    {
+        std::scoped_lock lock{m_final_composite_mutex};
+        m_final_composite_tracked_resources.clear();
+        m_final_composite_swapchain_buffers.clear();
+        m_final_composite_resource_states.clear();
+        m_final_composite_last_submit_frame = 0;
+        m_final_composite_submit_ordinal = 0;
     }
     m_reset_witness_valid = false;
     m_reset_previous_frame = 0;
@@ -2788,6 +2807,11 @@ void RE4TemporalProbe::on_draw_ui() {
             "Output-copy samples: %u / %u",
             m_output_copy_budget.sample_count(),
             re4_temporal_probe::OUTPUT_COPY_MAX_SAMPLES);
+    } else if (re4_temporal_probe::is_final_composite_scenario(scenario)) {
+        ImGui::Text(
+            "Final-composite samples: %u / %u",
+            m_final_composite_budget.sample_count(),
+            re4_temporal_probe::FINAL_COMPOSITE_MAX_SAMPLES);
     } else {
         ImGui::Text(
             "Jitter samples: %u / %u",
@@ -2796,10 +2820,11 @@ void RE4TemporalProbe::on_draw_ui() {
     }
 
     ImGui::TextWrapped(
-        "RE4-only diagnostic. Capture 27 closes Gate H command-list ownership/order. For Gate I Capture 28, "
-        "select D3D12 output copy provenance. The probe remains observe-only and follows CopyTextureRegion/"
-        "CopyResource edges beginning at the verified HDR/PostMain Color resource, including whether the chain "
-        "reaches an active swapchain buffer. It records no GPU work and does not replace any target.");
+        "RE4-only diagnostic. Gate H is closed. Capture 28 proves HDR/PostMain is copied once per stable frame "
+        "to a same-format HDR intermediate, but the copy graph never reaches the swapchain. For Gate I Capture 29, "
+        "select D3D12 final output composite. The probe remains observe-only and follows only Color/intermediate/"
+        "swapchain legacy barriers plus DrawInstanced/DrawIndexedInstanced calls that occur while the discovered "
+        "HDR intermediate is shader-readable and a swapchain buffer is in RENDER_TARGET. No GPU work is added.");
 
     if (ImGui::Button("Reset capture")) {
         reset_temporal_state();
