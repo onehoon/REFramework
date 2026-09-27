@@ -1238,7 +1238,7 @@ This corrective PR is complete when:
 - RE4XeSSD3D12 is owned/serialized by the same worker;
 - callback-to-worker resource lifetime is protected by request ComPtr pins;
 - existing bridge slot GPU pins remain intact;
-- OutputHandoff remains callback-side and unchanged in semantics;
+- OutputHandoff remains callback-side; its semantic TargetState/retirement model is preserved, while the obsolete fixed callback-thread affinity is removed;
 - post-Present retirement remains callback-side and calls no XeSS API;
 - mode/reset/destructor teardown calls XeSS only on worker;
 - no per-frame GPU fence wait is introduced;
