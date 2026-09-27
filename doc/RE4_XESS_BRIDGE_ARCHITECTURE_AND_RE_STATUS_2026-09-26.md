@@ -4,7 +4,8 @@
 **Target:** Resident Evil 4 (2023), Direct3D 12  
 **Game build under investigation:** RE4 `1.5.9.0`, Steam AppID `2050650`, BuildID `22377325`  
 **Date:** 2026-09-26  
-**Status:** Active source of truth for the RE4 XeSS integration in this fork
+**Last research update:** 2026-09-27  
+**Status:** Reverse-engineering phase complete through Capture 30b; production implementation moves to `feature/re4-xess`
 
 ---
 
@@ -23,6 +24,34 @@ The earlier ATSBridge repository was useful for architecture exploration, D3D12 
 - historical `pd-upscaler` / PDPerf code is an optional reverse-engineering oracle only, not a runtime dependency.
 
 From this point forward, production code and current documentation live in this REFramework fork. ATSBridge should be treated as historical evidence/prototype material.
+
+### 1.1 Research-to-production branch handoff
+
+The reverse-engineering campaign is complete enough to begin the first production XeSS implementation.
+
+Branch roles are now:
+
+~~~text
+master
+    = current custom REFramework baseline
+      including the existing XeFG / swapchain compatibility work
+
+refactor/re4-temporal-diagnostic
+    = research/archive branch
+      Capture 1-30b diagnostics and evidence
+      do not use as the production code base
+
+feature/re4-xess
+    = production implementation branch
+      created from current master
+      implement the RE4-only XeSS producer here
+~~~
+
+At the 2026-09-27 handoff, `feature/re4-xess` and `master` both point to `56eac9066489e61c5caf4198f868a1d8a05f50f8`.
+
+Do **not** merge the diagnostic probe wholesale into the production branch. Port only the minimal engine/SDK facts and reusable callback/accessor support required by the production subsystem.
+
+Historical upstream `pd-upscaler` remains a source of implementation ideas and reverse-engineering context only. Do not merge or cherry-pick the branch as the production base, and do not introduce `PDPerfPlugin.dll` as a runtime dependency.
 
 ---
 
@@ -2970,6 +2999,69 @@ One clean 64-sample run is sufficient initially.
 
 If one stable unique fullscreen-style draw pattern repeats between the Color/swapchain overlap and `Swapchain 0x04 -> 0x00`, use that stage as the Gate I final-output handoff. A state-overlap candidate still does not by itself prove descriptor binding; add narrow descriptor/SRV provenance only if multiple candidates remain ambiguous.
 
+### Capture 30b result — exact final screen-output draw proven
+
+Capture 30b completed two 64-sample runs:
+
+~~~text
+Run 1: frame 10775 -> 10838
+Run 2: frame 11033 -> 11096
+~~~
+
+The first two samples of each run are hook/discovery warm-up. Samples 3-64 in both runs give **124/124 stable frames**.
+
+Every stable frame contains exactly one candidate draw in the proven Color/swapchain overlap window:
+
+~~~text
+type          = DrawInstanced
+vertices      = 3
+instances     = 1
+startVertex   = 0
+startInstance = 0
+
+Color state        = 0xC0
+Swapchain state    = 0x04
+Copy-destination state = 0x0
+~~~
+
+This is a stable fullscreen-triangle style draw.
+
+The complete late-frame ordering is:
+
+~~~text
+Swapchain 0x00 -> 0x04
+Color     0x04 -> 0xC0
+
+DrawInstanced(3, 1, 0, 0)
+
+Swapchain 0x04 -> 0x00
+Present
+~~~
+
+Per-frame summaries report:
+
+~~~text
+eventsSinceBoundary        = 15
+candidateDrawsSinceBoundary= 1
+~~~
+
+for all 124 stable frames.
+
+The candidate command list is always the final engine DIRECT submission before Present:
+
+~~~text
+ordinal 7 = 122/124 stable frames
+ordinal 8 =   2/124 stable frames
+~~~
+
+The two ordinal-8 cases are the previously observed rare eight-submit topology. The production contract is the semantic position — **last engine DIRECT submission before Present** — not the absolute ordinal.
+
+The candidate also follows the active swapchain buffer rather than one fixed address, so the result is consistent with normal multi-buffer presentation.
+
+This closes the native final-output discovery question. Descriptor-level provenance is not required before implementation because the state-based window produces one unique fullscreen-style candidate per stable frame. Add descriptor/SRV tracing later only if production integration contradicts this result.
+
+The Capture 28/30 copy destination remains a real repeated same-format copy target, but its post-copy role is still intentionally unspecified. It must not be treated as the proven final screen-output SRV.
+
 The probe still does **not**:
 
 - dispatch XeSS;
@@ -3149,7 +3241,7 @@ The screenshot is best treated as **independent convergence on the same broad RE
 
 Capture 30 adds an important correction to the earlier screenshot interpretation: the Capture 28 copy destination is reproduced, but no current-frame legacy transition proves it shader-readable before Present. Therefore do **not** identify that destination directly with huutaiii's `ToneMapOut`, `FSRSharpenedColor`, or `ScreenOutPassInput`.
 
-The stronger native correspondence now is the proven final-list window where the active swapchain is `RENDER_TARGET` and Color becomes shader-readable. That is structurally compatible with a final `ScreenOutPass`-style stage, but the huutaiii naming remains an external analogy until Capture 30b identifies the exact RE4 draw.
+Capture 30b now identifies the exact native draw in that window: one `DrawInstanced(3,1,0,0)` fullscreen-triangle style pass per stable frame while Color is shader-readable and the active swapchain is `RENDER_TARGET`. This is structurally compatible with a final `ScreenOutPass`-style stage. The huutaiii resource names remain external analogies and are not adopted as native RE4 identities.
 
 ---
 
@@ -3197,9 +3289,11 @@ No OptiScaler-internal type belongs in this contract.
 
 ---
 
-## 12. Remaining production gates
+## 12. Research gates and production validation gates
 
-No production XeSS dispatch should be enabled until these gates are closed.
+The reverse-engineering gates needed to start implementation are now closed through the native final-output discovery stage.
+
+The remaining work is no longer broad RE4 pipeline discovery. It is production implementation plus runtime validation of the actual XeSS/OptiScaler/XeFG path.
 
 ### Gate A — HUDless Color boundary
 
@@ -3387,7 +3481,7 @@ Non-load cutscene/teleport hardening may later use another explicit engine signa
 
 ### Gate H — D3D12 execution point and resource states
 
-**Status: ACTIVE — true pre-Overlay ordering CLOSED by Capture 29; only the input-state tuple remains for Capture 29b.**
+**Status: CLOSED by Captures 29 and 29b.**
 
 The source-level timing audit still changes the interpretation of Captures 23-27:
 
@@ -3421,7 +3515,7 @@ No engine-owned command list should be modified.
 
 ### Gate I — XeSS output integration
 
-**Status: ACTIVE — Gate H is closed by Capture 29b; Capture 30 proves the final engine output list and narrows the non-copy composite to a Color-shader-readable + swapchain-RT window; Capture 30b targets the exact draw.**
+**Status: NATIVE DISCOVERY CLOSED by Capture 30b; production XeSS output handoff still requires implementation-time validation.**
 
 Capture 28 proves:
 
@@ -3434,15 +3528,23 @@ Capture 28 proves:
 
 Therefore direct copy replacement at the swapchain is not an evidence-backed integration strategy.
 
-Still decide and prove:
+Capture 30b closes the remaining native draw-discovery questions:
 
-- the exact draw stage inside the proven Color `0xC0` + swapchain `0x04` overlap window;
-- whether that draw uniquely identifies the final screen-output/composite handoff;
-- how a display-resolution XeSS output feeds that path without bypassing RE4 Overlay/UI composition;
-- bridge output resource state transitions;
-- resource lifetime and resize behavior.
+- exactly one fullscreen-triangle style `DrawInstanced(3,1,0,0)` occurs per stable frame in the Color `0xC0` + swapchain `0x04` overlap;
+- the pattern repeats in 124/124 stable frames across two runs;
+- the candidate is always on the last engine DIRECT submission before Present;
+- the candidate follows the active swapchain buffer;
+- the Capture 28/30 copy destination remains at observed state `0x0` in this window and is not the proven final screen-output source.
 
-Capture 30b keeps the same narrow Color/copy-destination/swapchain legacy-barrier tracing, but emits detailed graphics draws while **Color** is shader-readable and an active swapchain buffer is in `RENDER_TARGET`. The copy destination remains logged only as context until its role is independently proven.
+What remains under Gate I is implementation-time validation:
+
+- create and own the XeSS output resource;
+- establish the exact state transitions for the chosen production handoff;
+- feed display-resolution XeSS output into RE4's own post/UI/presentation path without bypassing UI composition;
+- validate resize, fullscreen/Alt+Tab, swapchain recreation, and device reset;
+- verify no new HUD/UI contamination or presentation artifact appears.
+
+Do not add descriptor-heap tracing preemptively. Reopen descriptor/SRV provenance only if the production implementation produces an ambiguity or contradiction.
 
 Historical pd-upscaler remains a concept oracle only. Current RE4 1.5.9 runtime evidence determines the actual integration point.
 
@@ -3653,13 +3755,26 @@ Use broad D3D12 tracing only as a last resort. The old ATSBridge trace produced 
 | Bridge allocator/list fence lifetime | **HIGH / PROVEN** | Capture 27: all 120 slot reuses occur only after prior fence completion; 128/128 Present fences complete |
 | Output Color→HDR intermediate copy | **HIGH / PROVEN** | Capture 28: 124/124 post-warm-up samples use one same-format CopyResource edge |
 | Copy-chain reachability to swapchain | **HIGH / REJECTED** | Capture 28: reachedSwapchain=false in 128/128 Present summaries; no second tracked copy edge |
-| Final HDR composite/output stage | **HIGH / narrowed, exact draw active** | Capture 30 proves the final engine list and Color=0xC0 + swapchain=0x04 overlap; Capture 30b targets the exact draw |
+| Final HDR composite/output stage | **HIGH / PROVEN** | Capture 30b: 124/124 stable frames contain exactly one DrawInstanced(3,1,0,0) in the Color=0xC0 + swapchain=0x04 window on the final engine DIRECT list |
 | Standard XeSS → upstream OptiScaler | **DESIGN LOCKED, runtime pending** | No custom OptiScaler ABI permitted |
 | XeFG through `FGInput=Upscaler` | **pending after SR** | Existing presentation compatibility work remains relevant |
 
 ---
 
 ## 18. Near-term work order
+
+Research tracing is complete. Production work now runs on `feature/re4-xess`.
+
+Implementation rules:
+
+- base on the current XeFG-compatible `master`, not `pd-upscaler`;
+- keep RE4 logic isolated under a dedicated production subsystem such as `src/mods/re4_xess/`;
+- port proven semantic accessors/state rules, not the diagnostic capture machinery;
+- use the official public XeSS D3D12 API directly;
+- first validate Intel XeSS itself with OptiScaler absent;
+- then validate stock upstream OptiScaler interception;
+- then validate `FGInput=Upscaler` and XeFG lifecycle;
+- keep PR #58 / `refactor/re4-temporal-diagnostic` as research history rather than the production base.
 
 Work in this order.
 
@@ -3798,16 +3913,18 @@ Capture 30 has completed and narrows the final output path:
 - the swapchain then transitions `0x04 -> 0x00`;
 - this late sequence is on the final engine DIRECT submission before Present.
 
-Capture 30b is now the next Gate I runtime test:
+Capture 30b has completed the native output-discovery phase:
 
-- keep `D3D12 final output composite`;
-- emit detailed DrawInstanced/DrawIndexedInstanced records only while **Color** is shader-readable and an active swapchain buffer is in `RENDER_TARGET`;
-- retain the copy-destination state only as context;
-- correlate candidate draw lists with the final engine queue ordinal.
+- 124/124 stable frames contain exactly one candidate;
+- candidate = `DrawInstanced(3,1,0,0)`;
+- Color = `0xC0`;
+- active swapchain = `0x04`;
+- copy destination state = `0x0`;
+- candidate list = final engine DIRECT submission before Present.
 
-Do not hook descriptor heaps or trace all graphics commands yet.
+Do not add more broad D3D12 tracing at this point.
 
-If Capture 30b identifies one stable unique draw pattern, use it to choose the Gate I output handoff. Add descriptor-level SRV provenance only if multiple candidate draws remain ambiguous.
+The next work belongs on `feature/re4-xess`: implement the first RE4-only public XeSS D3D12 producer using the proven temporal inputs, command-list ordering, state contract, reset logic, and output-stage evidence. Add another diagnostic only in response to a concrete production contradiction.
 
 ### 18.7 Add public XeSS producer
 
@@ -3879,9 +3996,13 @@ The RE4 bridge is ready to begin production XeSS dispatch only when all of the f
 - required resource states/barriers;
 - resize/device lifecycle.
 
-The current project is **not yet at this gate**.
+The reverse-engineering project is now **at the implementation-start gate**.
 
-The major resource, timing, and state uncertainty is now substantially closed: HDR/PostMain color, Depth, Velocity, the true pre-Overlay boundary, SceneView-driven internal render size, Overlay working surfaces, and presentation output are mapped. MV semantics are closed through Capture 18, Capture 19 closes inverted depth plus near/far/FOV/projection metadata, and Capture 22 closes the current Load Save reset/history gate. Captures 23-27 prove the DIRECT queue/list population, public GCL topology, shared recording implementations, actual legacy ResourceBarrier path, post-Overlay state behavior, and safe REF-owned allocator/list/fence lifetime. Capture 29 proves true-pre ordinal-3 insertion, and Capture 29b closes the timing correction with Color=0xC0, Depth=0xE0, Velocity=0x04 in 124/124 stable frames. Capture 28 proves the first Color -> same-format copy edge and rejects a copy-only path to swapchain. Capture 30 proves the final engine output list and narrows the non-copy presentation stage to a Color-shader-readable + swapchain-RT overlap immediately before Present, while showing that the discovered copy destination is not yet proven shader-readable in that current-frame window. Capture 30b now targets the exact draw before standard XeSS producer validation and upstream OptiScaler/XeFG validation.
+This does not mean production validation is finished. It means the remaining unknowns are best resolved by the real XeSS implementation rather than by broader passive tracing.
+
+The major resource, timing, state, and native output-stage uncertainty is now closed strongly enough to start production. HDR/PostMain Color, Depth, Velocity, the true pre-Overlay boundary, SceneView-driven internal render size, Overlay working surfaces, presentation ownership, jitter, MV semantics, inverted depth, camera metadata, reset/history invalidation, DIRECT queue/list topology, resource states, and bridge-owned list/fence lifetime are all mapped. Capture 29/29b close the true-pre execution/state contract. Capture 28 rejects a copy-only swapchain path. Capture 30 narrows the final output window, and Capture 30b closes the native final-draw discovery with one stable fullscreen-triangle style draw in 124/124 stable frames on the last engine DIRECT submission before Present.
+
+The next evidence milestone is not another generic capture. It is a real standard XeSS D3D12 dispatch on `feature/re4-xess`, followed by controlled validation of the actual output handoff, lifecycle, upstream OptiScaler interception, and XeFG.
 
 ---
 
@@ -3916,12 +4037,15 @@ R11G11B10_FLOAT
              ├─ final list: Color -> 0xC0
              │   while active swapchain -> 0x04
              │
-             ├─ exact final draw (Capture 30b active)
+             ├─ final fullscreen draw (Capture 30b PROVEN)
+             │   DrawInstanced(3,1,0,0)
              ▼
 swapchain backbuffers
              └─ 0x04 -> 0x00 -> Present
 ~~~
 
-Capture 9 identifies on_pre_overlay_layer_draw() as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Captures 10-18 close render/display control, jitter injection/history, and MV semantics. Capture 19 closes inverted depth plus near/far/FOV/projection metadata, and Capture 22 closes the current Load Save reset/history gate. Captures 23-27 prove the DIRECT queue/list population, public GCL topology, shared recording implementations, actual legacy ResourceBarrier usage, post-Overlay state behavior, and safe REF-owned allocator/list/fence lifetime. The source-level timing audit corrected their original pre/post interpretation. Capture 29 proves the true-pre REF ordinal-3 insertion, and Capture 29b closes Gate H completely by reproducing Color=0xC0, Depth=0xE0, Velocity=0x04 at the actual pre-Overlay boundary in 124/124 stable frames. Capture 28 proves a repeated HDR/PostMain -> same-format CopyResource edge and rejects a copy-connected route to the swapchain. Capture 30 reproduces that edge but does not observe a current-frame shader-readable state for the copy destination; instead it proves the final engine DIRECT list contains a stable swapchain 0x00->0x04 transition followed by Color 0x04->0xC0, then swapchain 0x04->0x00 immediately before Present. Gate I is now narrowed to the draw window where Color is shader-readable and the active swapchain buffer is RENDER_TARGET. Capture 30b targets that exact draw. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
+Capture 9 identifies `on_pre_overlay_layer_draw()` as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Captures 10-18 close render/display control, jitter injection/history, and MV semantics. Capture 19 closes inverted depth plus near/far/FOV/projection metadata, and Capture 22 closes the current Load Save reset/history gate. Captures 23-27 prove the DIRECT queue/list population, public GCL topology, shared recording implementations, actual legacy ResourceBarrier usage, post-Overlay state behavior, and safe REF-owned allocator/list/fence lifetime. The source-level timing audit corrected their original pre/post interpretation. Capture 29 proves the true-pre REF-owned ordinal-3 insertion, and Capture 29b closes Gate H completely with Color=0xC0, Depth=0xE0, Velocity=0x04 at the actual pre-Overlay boundary in 124/124 stable frames. Capture 28 proves a repeated HDR/PostMain -> same-format CopyResource edge and rejects a copy-connected route to the swapchain. Capture 30 proves the final engine list and the Color-readable + swapchain-RT window. Capture 30b then closes the native final-output discovery: 124/124 stable frames contain exactly one `DrawInstanced(3,1,0,0)` fullscreen-triangle style pass in that window, always on the last engine DIRECT submission before Present.
 
-Until the remaining gates are proven, the diagnostic stays passive and no production XeSS dispatch is enabled.
+The reverse-engineering phase is therefore complete for the first production milestone. Implementation now moves to `feature/re4-xess`, based on the existing XeFG-compatible `master`. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, preserve RE4's own Overlay/UI path, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
+
+The diagnostic branch remains passive and should now be treated as an evidence/archive branch. New production XeSS dispatch belongs only on `feature/re4-xess`.
