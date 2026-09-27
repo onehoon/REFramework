@@ -2557,6 +2557,78 @@ void STDMETHODCALLTYPE RE4TemporalProbe::execute_command_lists_hook(
                         : static_cast<uint32_t>(D3D12_COMMAND_LIST_TYPE_DIRECT),
                     self->is_bridge_order_list(list));
             }
+        } else if (re4_temporal_probe::is_final_composite_scenario(scenario)) {
+            auto* renderer = sdk::renderer::get_renderer();
+            const auto render_frame =
+                renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
+            const auto boundary_frame =
+                self->m_final_composite_boundary_frame.load(std::memory_order_relaxed);
+            const auto boundary_sample =
+                self->m_final_composite_boundary_sample.load(std::memory_order_relaxed);
+            const auto capture_open =
+                self->m_final_composite_capture_open.load(std::memory_order_relaxed);
+            const auto queue_desc =
+                queue != nullptr ? queue->GetDesc() : D3D12_COMMAND_QUEUE_DESC{};
+
+            uint32_t ordinal = 0;
+            if (render_frame.has_value()) {
+                std::scoped_lock lock{self->m_final_composite_mutex};
+                if (self->m_final_composite_last_submit_frame != *render_frame) {
+                    self->m_final_composite_last_submit_frame = *render_frame;
+                    self->m_final_composite_submit_ordinal = 0;
+                }
+                ordinal = ++self->m_final_composite_submit_ordinal;
+            }
+
+            const auto after_boundary =
+                render_frame.has_value() &&
+                boundary_frame != 0 &&
+                *render_frame == boundary_frame;
+
+            if (capture_open) {
+                spdlog::info(
+                    "[RE4TemporalProbe] finalCompositeSubmit renderFrame={} ordinal={} "
+                    "boundarySample={} boundaryFrame={} afterBoundary={} "
+                    "queue={:p} queueType={} numLists={} thread={}",
+                    render_frame.value_or(0),
+                    ordinal,
+                    boundary_sample,
+                    boundary_frame,
+                    after_boundary,
+                    static_cast<void*>(queue),
+                    static_cast<uint32_t>(queue_desc.Type),
+                    num_command_lists,
+                    GetCurrentThreadId());
+            }
+
+            for (UINT i = 0; i < num_command_lists; ++i) {
+                auto* list = command_lists != nullptr ? command_lists[i] : nullptr;
+                if (list == nullptr ||
+                    list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+                    continue;
+                }
+
+                const auto key = reinterpret_cast<uintptr_t>(list);
+                {
+                    std::scoped_lock lock{self->m_recording_mutex};
+                    self->m_recording_tracked_lists.insert(key);
+                    self->m_recording_list_states.try_emplace(key);
+                }
+
+                const auto hooks_ready =
+                    self->ensure_recording_function_hooks(list);
+
+                if (capture_open) {
+                    spdlog::info(
+                        "[RE4TemporalProbe] finalCompositeSubmitList renderFrame={} "
+                        "ordinal={} index={} list={:p} hooksReady={}",
+                        render_frame.value_or(0),
+                        ordinal,
+                        i,
+                        static_cast<void*>(list),
+                        hooks_ready);
+                }
+            }
         } else if (re4_temporal_probe::is_output_copy_scenario(scenario)) {
             auto* renderer = sdk::renderer::get_renderer();
             const auto render_frame =
@@ -3363,7 +3435,8 @@ void RE4TemporalProbe::on_scene_layer_update(sdk::renderer::layer::Scene* layer,
         re4_temporal_probe::is_interface_provenance_scenario(scenario_index) ||
         re4_temporal_probe::is_recording_function_scenario(scenario_index) ||
         re4_temporal_probe::is_bridge_order_scenario(scenario_index) ||
-        re4_temporal_probe::is_output_copy_scenario(scenario_index)) {
+        re4_temporal_probe::is_output_copy_scenario(scenario_index) ||
+        re4_temporal_probe::is_final_composite_scenario(scenario_index)) {
         ensure_execution_queue_hook();
         return;
     }
@@ -3937,7 +4010,8 @@ bool RE4TemporalProbe::on_pre_scene_layer_draw(sdk::renderer::layer::Scene* laye
         re4_temporal_probe::is_interface_provenance_scenario(scenario) ||
         re4_temporal_probe::is_recording_function_scenario(scenario) ||
         re4_temporal_probe::is_bridge_order_scenario(scenario) ||
-        re4_temporal_probe::is_output_copy_scenario(scenario)) {
+        re4_temporal_probe::is_output_copy_scenario(scenario) ||
+        re4_temporal_probe::is_final_composite_scenario(scenario)) {
         return true;
     }
 
