@@ -350,11 +350,19 @@ Responsibilities:
 - API result logging;
 - runtime capability/version reporting under Debug Log.
 
-REFramework does not distribute the XeSS runtime. Resolve the directory containing the loaded REFramework DLL, prefer <REF>\libxess.dll, then <REF>\OptiScaler\libxess.dll, and load the selected DLL by exact path. Do not search arbitrary PATH/current-working-directory locations or mutate process-wide DLL search state.
+REFramework does not distribute the XeSS runtime. Resolve the directory containing the loaded REFramework DLL, prefer <REF>\libxess.dll, then <REF>\OptiScaler\libxess.dll, and load the selected DLL by exact path. A missing first candidate is expected and must continue to the second candidate; only unexpected inspection errors or both candidates being absent are failures. Do not search arbitrary PATH/current-working-directory locations or mutate process-wide DLL search state.
 
-XeSS-SR is not thread-safe. The production owner thread is the stable thread executing the true RE4 `on_pre_overlay_layer_draw()` callback. Context creation, version query, optimal-input query, initialization, velocity-scale setup, execute, and context destruction all run only on that recorded owner thread.
+XeSS-SR is not thread-safe.
 
-Non-owner callbacks may request state transitions but must not call public XeSS functions. If an owner-thread callback is not available for an otherwise necessary teardown, fail closed and quarantine the old XeSS context/module rather than making a cross-thread XeSS call.
+The first PR4 runtime capture disproved the earlier assumption that the true RE4 pre-Overlay callback has a stable CPU thread identity: the callback moved from Windows thread 1304 to 28692 within the same active session.
+
+Therefore the production XeSS owner is a dedicated RE4XeSS worker thread, not an RE Engine callback thread.
+
+Context creation, version query, optimal-input query, initialization, velocity-scale setup, execute, and context destruction all run only on that dedicated worker thread.
+
+RE4 callbacks may move between engine threads and only provide control state or synchronous work requests. They must not call public XeSS functions directly.
+
+The semantic true pre-Overlay boundary remains the ordering point: the callback synchronously asks the worker to service/record/submit XeSS CPU work, receives the result, then installs the engine OutputHandoff on the callback thread. The synchronous dispatch waits for CPU recording/submission only; it does not wait for GPU fence completion.
 
 No libxess_fg.dll API is loaded here.
 
@@ -371,9 +379,11 @@ Responsibilities:
 - reset/recreate resources when display size or device identity changes;
 - never modify or append to an engine-owned command list.
 
-The research campaign proves that an REFramework-owned DIRECT list can be submitted from the true pre-Overlay callback safely.
+RE4XeSSD3D12 is serialized by the same dedicated RE4XeSS worker that owns RE4XeSSRuntime. Alternating RE4 callback threads must not mutate bridge allocator/list/fence state directly.
 
-The implementation must rely on the semantic callback boundary, not on a hardcoded queue ordinal.
+The research campaign proves that an REFramework-owned DIRECT list can be ordered at the true pre-Overlay semantic boundary. The corrective worker design preserves that ordering by synchronously recording/submitting the bridge list before the callback installs the handoff and lets RE4 downstream work continue.
+
+The implementation must rely on the semantic callback boundary, not on a hardcoded queue ordinal or callback thread ID.
 
 ### 5.5 RE4XeSSOutputHandoff — engine re-entry boundary
 
@@ -943,7 +953,9 @@ If the post-Present callback is suppressed or no retirement marker exists, do no
 
 If the retirement Signal fails or the callback observes a different active device/queue, hard-quarantine the old handoff generation. Do not signal a replacement queue or assume it covers the previous consumers. Confirmed device removal is the terminal exception.
 
-The post-Present callback is not assumed to run on the true pre-Overlay owner thread. It pins and synchronizes access to its generation's queue/fence, then only Signals and publishes marker evidence. It performs no XeSS API call, Overlay/TargetState access, TargetState release, or fence wait. The true pre-Overlay owner thread alone polls retirement and releases/recreates the engine TargetState after both writer and downstream proofs are safe.
+The post-Present callback is not assumed to run on the dedicated XeSS worker or on any stable pre-Overlay callback thread. It pins and synchronizes access to its generation's queue/fence, then only Signals and publishes marker evidence. It performs no XeSS API call, Overlay/TargetState access, TargetState release, or fence wait.
+
+OutputHandoff TargetState install/restore/retirement decisions remain on the semantic RE4 callback side. Bridge writer-idle/quarantine information comes from the worker result/snapshot; the callback side does not mutate RE4XeSSD3D12 directly.
 
 No public XeSS API is called from on_post_present().
 
@@ -1161,7 +1173,7 @@ The RE4 producer does not detect whether libxess.dll is Intel's runtime or OptiS
 
 That is intentional.
 
-The public call stream remains the same and is serialized on the single pre-Overlay XeSS owner thread:
+The public call stream remains the same and is serialized on the single dedicated RE4XeSS worker thread:
 
 ~~~text
 CreateContext
@@ -1463,6 +1475,12 @@ Implementation work order:
 doc/RE4_XESS_PR4_WORK_ORDER_2026-09-27.md
 ~~~
 
+First-runtime corrective work order:
+
+~~~text
+doc/RE4_XESS_PR4_RUNTIME_BLOCKER_FIX_WORK_ORDER_2026-09-27.md
+~~~
+
 Scope:
 
 - engine-visible display-resolution handoff target;
@@ -1660,12 +1678,15 @@ Production code should implement the minimum stable contract, not carry broad ho
 | AD-18 | RE4 UI exposes one Upscaling Mode selector: Off plus the public XeSS Native AA / UQ+ / UQ / Quality / Balanced / Performance / Ultra Performance presets. |
 | AD-19 | Preset-to-render-size mapping is obtained through the public XeSS frontend query; REFramework does not hardcode backend-specific SR ratios. |
 | AD-20 | Broad reverse-engineering tracing is finished; add new probes only for concrete implementation contradictions. |
-| AD-21 | Every public XeSS API call is serialized on the stable true pre-Overlay owner thread; non-owner callbacks only request state transitions. |
+| AD-21 | Every public XeSS API call is serialized on one dedicated RE4XeSS worker thread. The true pre-Overlay callback remains the semantic ordering boundary but its CPU thread identity is explicitly not assumed stable. |
 | AD-22 | The RE4XeSSFrame remains callback-scoped CPU data, while submitted Color/Depth/original-Velocity resources are retained by slot-local COM pins until fence completion is proven. |
 | AD-23 | `GetCompletedValue()==UINT64_MAX` is device removal, never completion; unprovable post-submit generations are quarantined rather than reused or freed speculatively. |
 | AD-24 | The PR3 bridge fence proves only REF/XeSS writer completion. Engine-visible handoff TargetState release/recreation additionally requires a same-DIRECT-queue downstream-retirement fence signaled after Present, unless confirmed device removal terminally ends the old generation. |
 | AD-25 | Normal handoff texture reuse relies on same-queue GPU ordering and does not CPU-wait every frame; teardown/recreation uses the downstream retirement proof. |
 | AD-26 | Fresh cloned handoff state COMMON -> UAV -> 0xC0 and steady 0xC0 -> UAV -> 0xC0 are runtime validation gates that require D3D12 debug-layer evidence or a narrow handoff-resource state-provenance capture. |
+| AD-27 | PR4 first runtime evidence showed the true pre-Overlay callback move from thread 1304 to 28692; callback-thread migration is normal and must not quarantine XeSS. |
+| AD-28 | XeSS runtime discovery tries <REF>\libxess.dll then <REF>\OptiScaler\libxess.dll; expected absence of the first candidate continues to the second instead of faulting. |
+| AD-29 | RE4XeSSRuntime and RE4XeSSD3D12 share the dedicated worker CPU owner. OutputHandoff remains callback-side; synchronous worker dispatch preserves pre-Overlay ordering without a per-frame GPU wait. |
 
 ---
 
