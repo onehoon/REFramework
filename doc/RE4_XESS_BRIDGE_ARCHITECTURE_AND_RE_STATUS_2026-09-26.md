@@ -2445,34 +2445,21 @@ At Present, the bridge fence has reached the just-issued signal value in **128/1
 
 The eight-slot design therefore has substantial observed headroom in this stable RE4 path and does not require a CPU/GPU wait.
 
-#### Gate H decision
+#### Gate H decision at the time of Capture 27 — superseded by timing audit
 
-Capture 27 closes the final Gate H ordering/lifetime question.
+Capture 27 originally appeared to close Gate H because its runtime label reported `stage=preOverlay`.
 
-Production planning can now use:
+The later source-level audit proves that this scenario was actually executing from `on_overlay_layer_draw()`, after the original Overlay draw. Therefore the following Capture 27 facts remain valid:
 
-~~~text
-RE4 engine submits 1-2
-        ↓
-verified pre-Overlay HDR/PostMain boundary
-        ↓
-REFramework-owned DIRECT command list
-        ↓
-RE4 engine submits 3-7
-        ↓
-Present
-~~~
-
-Combined with Capture 26:
-
-- REFramework owns the XeSS command allocator/list;
-- the bridge uses the same active RE4 DIRECT queue;
-- Color/Depth/Velocity states at the insertion boundary are known;
-- required input restoration is known;
-- allocator/list reuse is fence-gated and nonblocking;
+- REFramework owns the allocator/list ring;
+- the same active RE4 DIRECT queue accepts the bridge-owned list;
+- eight-slot reuse is fence-gated and nonblocking;
+- surrounding engine work remains stable around the **post-Overlay** insertion;
 - no engine-owned recording list needs to be adopted or extended.
 
-**Gate H is CLOSED.**
+What is superseded is the timing-specific claim that this ordinal and the Capture 26 state tuple were already proven at `on_pre_overlay_layer_draw()`.
+
+Gate H is reopened only for that narrow true pre-Overlay state/order revalidation in Capture 29.
 
 ### Capture 28 — post-Overlay output copy provenance result
 
@@ -2491,7 +2478,7 @@ outputCopy events  = 124
 
 The first two samples of each run are shared-hook/list discovery warm-up.
 
-Capture 28 was opened from `on_overlay_layer_draw()`, i.e. **after** the original RE4 Overlay draw. The runtime record still printed `stage=preOverlay` because that diagnostic string was inherited from the earlier insertion-boundary probes. That label is stale only; it does not change the recorded callback timing. Capture 29 corrects the label to `stage=postOverlay`.
+Capture 28 was opened from `on_overlay_layer_draw()`, i.e. **after** the original RE4 Overlay draw. The runtime record still printed `stage=preOverlay` because that diagnostic string was inherited from the earlier insertion-boundary probes. That label is stale only; it does not change the recorded callback timing. The probe now prints `stage=postOverlay` for post-Overlay output scenarios, while Capture 29's restored true pre-Overlay scenarios print `stage=preOverlay`.
 
 From sample 3 through sample 64 in both runs — **124/124 stable samples** — exactly one tracked copy occurs per frame.
 
