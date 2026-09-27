@@ -1022,6 +1022,28 @@ void STDMETHODCALLTYPE RE4TemporalProbe::recording_resource_barrier_hook(
 
 
     if (tracked &&
+        self->m_enabled.load(std::memory_order_relaxed) &&
+        re4_temporal_probe::is_final_composite_scenario(
+            self->m_scenario.load(std::memory_order_relaxed)) &&
+        barriers != nullptr) {
+        for (UINT i = 0; i < num_barriers; ++i) {
+            const auto& barrier = barriers[i];
+            if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ||
+                barrier.Transition.pResource == nullptr) {
+                continue;
+            }
+
+            const auto resource_key =
+                reinterpret_cast<uintptr_t>(barrier.Transition.pResource);
+            std::scoped_lock lock{self->m_final_composite_mutex};
+            if (self->m_final_composite_swapchain_buffers.contains(resource_key)) {
+                self->m_final_composite_resource_states[resource_key] =
+                    static_cast<uint32_t>(barrier.Transition.StateAfter);
+            }
+        }
+    }
+
+    if (tracked &&
         self->m_final_composite_capture_open.load(std::memory_order_relaxed) &&
         self->m_enabled.load(std::memory_order_relaxed) &&
         re4_temporal_probe::is_final_composite_scenario(
@@ -1573,6 +1595,7 @@ void STDMETHODCALLTYPE RE4TemporalProbe::recording_copy_resource_hook(
                 if (src_key == color && dst_key != color) {
                     self->m_final_composite_intermediate.store(
                         dst_key, std::memory_order_relaxed);
+                    self->m_final_composite_resource_states.erase(dst_key);
                 }
             }
 
@@ -1765,6 +1788,7 @@ void STDMETHODCALLTYPE RE4TemporalProbe::recording_copy_texture_region_hook(
                 if (src_key == color && dst_key != color) {
                     self->m_final_composite_intermediate.store(
                         dst_key, std::memory_order_relaxed);
+                    self->m_final_composite_resource_states.erase(dst_key);
                 }
             }
         }
@@ -4149,8 +4173,16 @@ void RE4TemporalProbe::on_overlay_layer_draw(
 
             std::scoped_lock lock{m_final_composite_mutex};
             m_final_composite_tracked_resources.clear();
-            m_final_composite_resource_states.clear();
             m_final_composite_swapchain_buffers = std::move(swapchain_buffers);
+
+            for (auto it = m_final_composite_resource_states.begin();
+                 it != m_final_composite_resource_states.end();) {
+                if (!m_final_composite_swapchain_buffers.contains(it->first)) {
+                    it = m_final_composite_resource_states.erase(it);
+                } else {
+                    ++it;
+                }
+            }
 
             if (color != nullptr) {
                 m_final_composite_tracked_resources.insert(
