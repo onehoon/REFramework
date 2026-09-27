@@ -112,9 +112,16 @@ frame id
 
 Keep this semantic boundary.
 
-PR 3 must consume the pointer-bearing `RE4XeSSFrame` **synchronously inside the same callback**.
+The `RE4XeSSFrame` itself remains a callback-scoped CPU packet and must not be queued to another thread. However, once PR 3 records asynchronous D3D12 work, the GPU-visible resources referenced by that packet must remain alive until the submitted bridge fence completes.
 
-Do not retain or queue engine resource pointers after the callback returns.
+Therefore the submission transaction must:
+
+1. consume the frame packet synchronously in `on_pre_overlay_layer_draw()`;
+2. acquire balanced COM strong references to Color, Depth, and the original RE4 VelocityTarget in the selected command slot **before** recording XeSS work;
+3. keep those slot-local references until that slot's fence value has completed;
+4. release them only when fence completion is proven and the slot is about to be safely reused, or when a pre-submit failure proves that no GPU work was submitted.
+
+Do not retain raw engine pointers as reusable cross-frame ownership. The only cross-callback lifetime extension is the bounded per-slot COM pin required for submitted GPU work.
 
 ### 2.2 PR 2 currently commits temporal history before any XeSS execute exists
 
@@ -252,6 +259,123 @@ If the device cannot create/use a typed UAV for the current Color format, fail t
 
 Any later post-XeSS format conversion belongs to PR 4's output handoff.
 
+### 2.7 GPU input lifetime is fence-scoped, not callback-scoped
+
+Intel XeSS v3.0.2 states that D3D12 Execute records commands into the application command list and that the application is responsible for keeping all input/output resources alive until the actual GPU execution.
+
+Source:
+
+~~~text
+Intel XeSS SDK v3.0.2
+doc/xess_sr_developer_guide_english.md
+Execution section, lines corresponding to:
+"xess*Execute records commands" and
+"input and output resources are alive at the time of the actual GPU execution"
+~~~
+
+PR 3 therefore uses **slot-local COM pinning** for engine inputs.
+
+This is not ownership transfer and must not be implemented as any kind of "Release until refcount reaches X" logic.
+
+Allowed:
+
+~~~text
+ComPtr assignment / AddRef when the slot accepts a frame
+balanced ComPtr reset after that slot's fence completion is proven
+~~~
+
+Forbidden:
+
+~~~text
+raw pointer retained without a lifetime guarantee
+aggressive/refcount-draining Release loops
+releasing a slot pin merely because the CPU callback returned
+~~~
+
+Bridge-owned converted MV/output resources are generation-owned and must also remain alive until all submitted slots from that generation are complete.
+
+### 2.8 All public XeSS API calls have one owner thread
+
+Intel XeSS v3.0.2 explicitly says XeSS-SR is not thread-safe and, in general, all XeSS-SR API calls must be made from the same thread where XeSS-SR was initialized.
+
+PR 1/2 currently allow XeSS calls from more than one callback path:
+
+~~~text
+on_initialize_d3d_thread()
+    -> try_bootstrap()
+    -> Load/resolve + xessGetVersion + xessD3D12CreateContext
+
+on_frame()
+    -> update_temporal_configuration()
+    -> xessGetOptimalInputResolution
+~~~
+
+PR 3 must refactor this.
+
+The production owner thread is the stable thread executing the true:
+
+~~~text
+RE4XeSS::on_pre_overlay_layer_draw()
+~~~
+
+callback.
+
+On the first valid active RE4 pre-Overlay callback:
+
+~~~text
+ownerThreadId = GetCurrentThreadId()
+~~~
+
+All public XeSS calls for that runtime generation must run only on this thread:
+
+~~~text
+xessGetVersion
+xessD3D12CreateContext
+xessGetOptimalInputResolution
+xessD3D12Init
+xessSetVelocityScale
+xessD3D12Execute
+xessDestroyContext
+~~~
+
+The runtime wrapper must guard this invariant. A public XeSS call attempted from another thread is a fail-closed programming error: do not call the XeSS function.
+
+Non-owner callbacks may only update/request plain control state such as:
+
+~~~text
+requested mode
+device/reset generation
+display-size change
+bootstrap/reconfigure/shutdown requested
+load-state observations
+~~~
+
+If those fields can be touched from different callback threads, protect the control-plane handoff with atomics or a small mutex. Do not use a mutex to permit concurrent XeSS calls.
+
+#### Bootstrap consequence
+
+Because `xessGetOptimalInputResolution` is now owner-thread-only, the first active pre-Overlay callback may initialize/query the producer **after that frame has already rendered at native size**.
+
+That frame must not execute XeSS.
+
+The queried render size becomes eligible for SceneView/jitter on the next frame:
+
+~~~text
+frame N pre-Overlay:
+    establish owner thread
+    create/query/init
+    no XeSS execute
+
+frame N+1:
+    SceneView uses cached XeSS input size
+    jitter/history is active
+    pre-Overlay records first XeSS execute with resetHistory = 1
+~~~
+
+The same one-frame-or-more fail-closed transition applies after resize/reconfiguration.
+
+Do not try to regain same-frame execution by moving XeSS calls back to `on_frame()` or another unproven thread.
+
 ---
 
 ## 3. New production component
@@ -275,7 +399,7 @@ This component owns:
 - nonblocking slot acquisition;
 - queue submission/fence values.
 
-It does not own:
+It does not semantically own:
 
 - RE4 Color;
 - RE4 Depth;
@@ -284,7 +408,9 @@ It does not own:
 - engine TargetStates;
 - swapchain buffers.
 
-Do not AddRef/Release engine resources for lifetime extension.
+However, each submitted command slot must hold temporary balanced `ComPtr<ID3D12Resource>` pins for the engine Color, Depth, and original Velocity resource until that slot's fence completion is proven.
+
+These references extend COM lifetime only; they do not transfer engine ownership and must never be drained aggressively.
 
 Normal COM references held by bridge-owned device resources and objects are expected.
 
@@ -351,6 +477,40 @@ Do not include private OptiScaler types.
 ---
 
 ## 5. RE4 XeSS init contract
+
+### 5.0 Owner-thread refactor required before new API calls
+
+Before adding real Init/Execute, remove public XeSS API calls from non-owner callback paths.
+
+Required behavioral changes:
+
+~~~text
+on_initialize_d3d_thread()
+    must NOT call RE4XeSSRuntime::initialize()
+    only marks bootstrap/request state
+
+on_frame()
+    must NOT call:
+        xessGetOptimalInputResolution
+        xessDestroyContext
+        xessD3D12CreateContext
+        xessD3D12Init
+        xessSetVelocityScale
+        xessD3D12Execute
+
+on_device_reset()
+    must NOT directly destroy the XeSS context
+    only marks reset/device generation invalid and requests owner-thread teardown
+
+RE4XeSS destructor
+    must NOT blindly call xessDestroyContext from an arbitrary destructor thread
+~~~
+
+The owner-thread service runs at the beginning of `on_pre_overlay_layer_draw()` **before** the current `is_temporal_active()` early return, because that service is what creates/queries/reconfigures the runtime that makes temporal mode ready for the next frame.
+
+`RE4XeSSRuntime` must record its owner thread ID and reject public API entry points on any other thread.
+
+Normal teardown calls `xessDestroyContext` on the owner thread after the bridge generation is safely drained. If process/module teardown occurs on a different thread before owner-thread cleanup is possible, prefer intentionally quarantining the raw XeSS context/module handle until process teardown over making a cross-thread XeSS call.
 
 Extend `RE4XeSSRuntime` with a small public-producer initialization wrapper.
 
@@ -495,7 +655,9 @@ xessSetVelocityScale successful
 
 ### 6.2 Signature changes
 
-Mode changes already recreate the PR 1 runtime context.
+Mode changes must no longer recreate the PR 1 runtime context directly from `on_frame()`.
+
+They enqueue an owner-thread transition request.
 
 For display/render size or other execution-signature changes:
 
@@ -519,7 +681,9 @@ Do not call `xessD3D12Init` while earlier XeSS command lists are still pending.
 
 Do not block every frame while draining.
 
-Polling `GetCompletedValue()` from the normal coordinator path is preferred.
+Fence polling is owner-thread service work. Read `GetCompletedValue()` once per service pass as needed.
+
+**Important:** `ID3D12Fence::GetCompletedValue() == UINT64_MAX` means the D3D12 device has been removed. It is not a completed-fence value. Detect this sentinel before any `completed >= target` comparison and move the generation into the device-removed path.
 
 ---
 
@@ -534,6 +698,12 @@ struct CommandSlot {
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> velocity_descriptors;
+
+    // Fence-scoped GPU lifetime pins for borrowed RE4 inputs.
+    Microsoft::WRL::ComPtr<ID3D12Resource> color_pin;
+    Microsoft::WRL::ComPtr<ID3D12Resource> depth_pin;
+    Microsoft::WRL::ComPtr<ID3D12Resource> original_velocity_pin;
+
     uint64_t last_fence_value{};
 };
 ~~~
@@ -552,13 +722,28 @@ last submitted fence value
 
 ### 7.1 Slot acquisition
 
-Before resetting a slot:
+Before resetting a slot, first obtain the fence completed value.
+
+Decision:
 
 ~~~text
+completed == UINT64_MAX
+    -> device removed
+    -> slot is NOT reusable through the normal completion path
+
 slot.lastFence == 0
-OR
-bridgeFence.GetCompletedValue() >= slot.lastFence
+    -> reusable
+
+completed >= slot.lastFence
+    -> reusable
+    -> release old engine resource pins
+    -> rewrite descriptors/reset allocator/list
+
+otherwise
+    -> busy
 ~~~
+
+Never use the `UINT64_MAX` device-removal sentinel as proof of completion.
 
 If the preferred slot is busy, scan the other seven slots.
 
@@ -569,6 +754,12 @@ If all eight are busy:
 - do not execute XeSS for that frame;
 - leave engine resources untouched;
 - invalidate XeSS temporal history so the next submitted frame uses `resetHistory=true`.
+
+When a free slot accepts a frame, acquire the slot-local Color/Depth/original-Velocity `ComPtr` pins before recording the conversion/XeSS commands.
+
+If any failure occurs before `ExecuteCommandLists`, discard the list and release those newly acquired pins immediately.
+
+After `ExecuteCommandLists`, keep the pins until normal fence completion is proven. A later Signal failure does not make the pins releasable.
 
 ### 7.2 Command-list creation
 
@@ -960,14 +1151,31 @@ If `xessD3D12Execute` returns an error, do not submit the partially recorded lis
 
 `ExecuteCommandLists` is void but queue `Signal` returns an HRESULT.
 
-If Signal fails after ExecuteCommandLists:
+If Signal fails after `ExecuteCommandLists`, the GPU list may already have been accepted while the normal completion proof has been lost.
+
+Required behavior:
 
 - treat the execution generation as terminally faulted;
-- do not reuse allocators/resources whose completion can no longer be proven;
-- log the HRESULT and `GetDeviceRemovedReason()`;
-- wait for device/reset lifecycle to establish a new safe generation.
+- keep every slot pin, command allocator/list, descriptor heap, converted MV, detached output, fence, and XeSS context for that generation quarantined;
+- never reuse a quarantined slot;
+- log the Signal HRESULT and `device->GetDeviceRemovedReason()`;
+- stop all new XeSS calls except owner-thread teardown after a later safe terminal condition.
 
-Do not immediately Release resources that may still be referenced by the submitted GPU work.
+Safe terminal conditions are:
+
+~~~text
+A. normal fence completion later becomes provable
+   -> owner thread may drain and teardown normally
+
+B. D3D12 device removal/reset is explicitly confirmed
+   -> old-device GPU execution is no longer a reusable generation
+   -> owner thread may perform the old XeSS context teardown
+      and release the old D3D12 generation as part of device replacement
+~~~
+
+If neither condition is established, keep the generation quarantined for the rest of the process rather than risking use-after-free.
+
+Do not infer completion from timeout, frame count, callback return, or `UINT64_MAX`.
 
 ---
 
@@ -1006,16 +1214,38 @@ If bridge work remains in flight:
 - drain asynchronously;
 - once idle, destroy runtime context and bridge resources.
 
-### 13.3 Device reset
+### 13.3 Device reset / device removal
 
-On device reset:
+`on_device_reset()` is a control-plane callback only. It must not directly call any public XeSS function unless it is proven to be the current XeSS owner thread; the normal implementation should simply enqueue owner-thread teardown/recreate work.
 
-- stop submissions;
+On reset/device identity change:
+
+- stop new submissions immediately;
 - mark execution/temporal state invalid;
-- do not submit against the old queue/device after the callback;
-- release runtime/bridge GPU resources only when safe completion is established.
+- do not submit against the old queue/device;
+- keep old slot pins and bridge-owned GPU resources until their disposition is safe.
 
-If the device is removed, record `GetDeviceRemovedReason()` and move to a recreate/wait state rather than attempting more XeSS work.
+Fence handling:
+
+~~~text
+completed = fence->GetCompletedValue()
+
+if completed == UINT64_MAX:
+    classify old generation as DeviceRemoved
+    never reuse any slot from it
+    never run normal completed>=target logic
+
+else:
+    normal drain logic may compare completed against target values
+~~~
+
+Also record `device->GetDeviceRemovedReason()`.
+
+For a healthy device/reset transition, normal fence completion is required before releasing the old generation.
+
+For confirmed device removal, the old generation is terminal and must never be reused. Perform `xessDestroyContext` only on the recorded XeSS owner thread. If that thread cannot be re-entered, quarantine the XeSS context/module until process teardown rather than violating XeSS thread ownership.
+
+Only after the old generation is terminally disposed may a new device generation establish a new owner/runtime/bridge state.
 
 Do not call any XeFG lifecycle API.
 
@@ -1059,6 +1289,8 @@ Add event-driven logs:
 Useful initialization evidence:
 
 ~~~text
+XeSS owner thread id
+current callback thread id at first owner establishment
 device
 queue
 queue type
@@ -1071,6 +1303,8 @@ converted MV format
 output format
 ring size
 ~~~
+
+Also log once if any callback attempts a public XeSS API call from a non-owner thread; this is a fail-closed error and the XeSS function must not be invoked.
 
 Bounded execute evidence under Debug Log, e.g. first 32 successful submissions per execution generation:
 
@@ -1251,6 +1485,31 @@ final-screen descriptor patch
 
 The built REFramework DLL must still have no static `libxess.dll` import.
 
+### 20.6 XeSS single-thread ownership
+
+Static/code review must confirm:
+
+~~~text
+on_initialize_d3d_thread -> no public XeSS call
+on_frame                 -> no public XeSS call
+on_device_reset          -> no public XeSS call in the normal path
+on_pre_overlay_layer_draw owner service -> all public XeSS calls
+~~~
+
+The runtime wrapper must contain an owner-thread guard.
+
+### 20.7 Fence-scoped input pins
+
+Code review must confirm each submitted slot retains balanced strong references to:
+
+~~~text
+Color
+Depth
+original RE4 VelocityTarget
+~~~
+
+until normal fence completion is proven, and that `UINT64_MAX` is handled as device removal before comparison.
+
 ---
 
 ## 21. Local build validation
@@ -1310,6 +1569,8 @@ Use Quality first.
 Expected initialization:
 
 ~~~text
+pre-Overlay thread establishes XeSS ownerThreadId
+all public XeSS calls are logged on that same thread
 public input resolution query succeeds
 DIRECT queue validated
 8-slot ring created
@@ -1339,8 +1600,10 @@ No visible upscaled presentation is expected.
 Run stable gameplay long enough to establish:
 
 - many successful execute calls;
+- all XeSS API calls remain on the recorded owner thread;
 - fence values continue advancing;
 - allocator/list slots are reused only after completion;
+- engine Color/Depth/original-Velocity pins remain held until each slot completes and are released on safe reuse;
 - no frame-by-frame CPU wait;
 - no ring corruption;
 - no device removed error;
@@ -1439,6 +1702,8 @@ Do not enable XeFG validation yet as an acceptance requirement for PR 3.
 PR 3 is complete only when:
 
 - complete minimal XeSS init/execute ABI declarations are correct and statically checked;
+- every public XeSS API call is serialized on one pre-Overlay owner thread;
+- PR1/PR2 bootstrap/query/teardown paths no longer call XeSS from arbitrary callbacks;
 - current runtime context can be initialized with inverted-depth / low-res / non-jittered-MV semantics;
 - velocity scale is set to `W/2, -H/2`;
 - RE4 `R16G16B16A16_SNORM` MV is converted to bridge-owned `R16G16_FLOAT`;
@@ -1447,14 +1712,17 @@ PR 3 is complete only when:
 - detached output matches Color format and display extent;
 - output stays outside RE4 presentation;
 - eight-slot allocator/list ring is nonblocking;
-- slot reuse is fence-proven;
+- submitted engine Color/Depth/original-Velocity resources are COM-pinned per slot through proven GPU completion;
+- slot reuse is fence-proven and never treats `UINT64_MAX` as completion;
 - no engine-owned command list is modified;
 - queue submission uses the active RE4 DIRECT queue;
 - repeated output UAV writes are synchronized;
 - resetHistory is consumed only after successful submission;
 - skipped/failed submissions force reset on the next valid execute;
 - runtime/context teardown never races known in-flight bridge work;
+- Signal-failure generations quarantine resources until a safe terminal condition instead of guessing completion;
 - mode/display/render/device changes enter a safe drain/reconfigure path;
+- confirmed device removal is terminal for the old ring generation and cannot be mistaken for fence completion;
 - no OptiScaler private API exists;
 - no XeFG compatibility behavior changes;
 - no static libxess import exists;
@@ -1475,14 +1743,17 @@ PR description must state:
 1. this is PR 3 of the RE4 XeSS production sequence;
 2. PR 2 base/merge commit `1b59aa05a63586ec62137a5ab48f03ebbb7bf730`;
 3. real XeSS Init/SetVelocityScale/Execute is now active;
-4. RE4 SNORM Velocity is converted to public-XeSS-compatible RG16F;
-5. detached XeSS output is not presented;
-6. original Velocity is restored before RE4 downstream work;
-7. ring/fence ownership and no-per-frame-wait behavior;
-8. existing XeFG compatibility remains untouched;
-9. exact local build result;
-10. runtime tests actually performed;
-11. runtime tests left for the user.
+4. all public XeSS API calls are serialized on the pre-Overlay owner thread;
+5. submitted Color/Depth/original-Velocity resources are pinned until fence completion;
+6. RE4 SNORM Velocity is converted to public-XeSS-compatible RG16F;
+7. detached XeSS output is not presented;
+8. original Velocity is restored before RE4 downstream work;
+9. ring/fence ownership, device-removal sentinel handling, and no-per-frame-wait behavior;
+10. Signal-failure quarantine behavior;
+11. existing XeFG compatibility remains untouched;
+12. exact local build result;
+13. runtime tests actually performed;
+14. runtime tests left for the user.
 
 Do not merge automatically.
 
@@ -1503,6 +1774,9 @@ Stop and report instead of widening PR 3 if:
 - original Velocity cannot be restored to `0x04` safely;
 - repeated XeSS submission requires modifying an engine command list;
 - implementation appears to require an output TargetState/swapchain change before PR 4;
-- implementation appears to require changes in existing XeFG compatibility.
+- implementation appears to require changes in existing XeFG compatibility;
+- public XeSS calls cannot be kept on one stable pre-Overlay owner thread;
+- submitted engine inputs cannot be kept alive through GPU completion with bounded slot-local COM pins;
+- fence completion becomes unprovable without a confirmed device-reset/removal terminal condition.
 
 These are architecture/evidence contradictions and require review before scope expands.
