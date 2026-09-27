@@ -4049,3 +4049,18 @@ Capture 9 identifies `on_pre_overlay_layer_draw()` as the verified engine-level 
 The reverse-engineering phase is therefore complete for the first production milestone. Implementation now moves to `feature/re4-xess`, based on the existing XeFG-compatible `master`. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, preserve RE4's own Overlay/UI path, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
 
 The diagnostic branch remains passive and should now be treated as an evidence/archive branch. New production XeSS dispatch belongs only on `feature/re4-xess`.
+
+
+---
+
+## 21. Production architecture handoff
+
+The reverse-engineering record above remains the source of truth for what was proven.
+
+The final production target architecture for implementation on feature/re4-xess is defined in:
+
+~~~text
+doc/RE4_XESS_PRODUCTION_ARCHITECTURE_2026-09-27.md
+~~~
+
+That document is the source of truth for what should now be built. If implementation contradicts a proven runtime fact, update the evidence record first instead of silently changing a frozen production assumption.
