@@ -30,6 +30,14 @@ jobs:
       - name: Configure CMake
         run: cmake -S ${{github.workspace}} -B ${{github.workspace}}/build -G "Visual Studio 18 2026" -A x64 -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DDEVELOPER_MODE=ON -DREFRAMEWORK_BUILD_NUMBER=${{ github.event.pull_request.number }} -DREFRAMEWORK_BUILD_SHA=${{ github.event.pull_request.head.sha }} "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
 
+      - name: Configure temporal probe tests
+        run: cmake -S ${{github.workspace}}/tests -B ${{github.workspace}}/build-re4-temporal-tests -G "Visual Studio 18 2026" -A x64
+
+      - name: Build and test temporal probe
+        run: |
+          cmake --build ${{github.workspace}}/build-re4-temporal-tests --config ${{env.BUILD_TYPE}}
+          ctest --test-dir ${{github.workspace}}/build-re4-temporal-tests -C ${{env.BUILD_TYPE}} --output-on-failure
+
       - name: Build REFramework
         run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target REFramework
 

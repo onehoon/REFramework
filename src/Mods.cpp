@@ -13,6 +13,7 @@
 #include "mods/ManualFlashlight.hpp"
 #include "mods/PluginLoader.hpp"
 #include "mods/REFrameworkConfig.hpp"
+#include "mods/RE4TemporalProbe.hpp"
 #include "mods/MethodDatabase.hpp"
 #include "mods/Scene.hpp"
 #include "mods/ScriptRunner.hpp"
@@ -57,6 +58,10 @@ Mods::Mods() {
     // All games!!!!
     m_mods.emplace_back(std::make_unique<Camera>());
     m_mods.emplace_back(Graphics::get());
+
+    if (sdk::GameIdentity::get().is_re4()) {
+        m_mods.emplace_back(std::make_unique<RE4TemporalProbe>());
+    }
 
     {
         const auto& gi = sdk::GameIdentity::get();
