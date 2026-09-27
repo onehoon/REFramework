@@ -299,7 +299,32 @@ The 0xC0 downstream state is the verified current RE4 semantic Color contract.
 
 The fresh-clone COMMON assumption must be validated during PR 4 runtime testing.
 
-If D3D12 validation, engine behavior, or a narrow state trace contradicts either:
+A visual result with no obvious corruption is **not** sufficient evidence.
+
+Required validation evidence:
+
+1. run a dedicated validation session with the D3D12 debug layer enabled **before the RE4 D3D12 device is created**;
+2. give the cloned native resource a stable debug name such as `RE4XeSS Handoff Output`;
+3. observe the first handoff using exactly:
+
+~~~text
+COMMON -> UNORDERED_ACCESS -> 0xC0
+~~~
+
+4. observe at least 64 consecutive stable handoff frames using:
+
+~~~text
+0xC0 -> UNORDERED_ACCESS -> 0xC0
+~~~
+
+5. cover at least one mode transition/recreation cycle;
+6. verify there are no D3D12 debug-layer messages attributable to the named handoff resource or bridge command lists for invalid StateBefore, resource-state mismatch, invalid barrier use, or lifetime/use-after-free behavior.
+
+Do not add permanent production debug-layer enablement just to satisfy this test.
+
+If no safe pre-device debug-layer activation path is available in the local validation setup, do **not** mark the COMMON/0xC0 gate PASS from visual behavior alone. Use the narrow handoff-resource state-provenance fallback instead and keep PR 4 unready until the state contract is evidenced.
+
+If D3D12 validation, engine behavior, or the narrow state trace contradicts either:
 
 ~~~text
 fresh cloned target is usable from COMMON
@@ -350,7 +375,7 @@ ALLOW_RENDER_TARGET
 typed UAV capability
 ~~~
 
-### 6.3 Per-slot output lifetime pin
+### 6.3 Per-slot output writer lifetime pin
 
 Add to each submitted slot:
 
@@ -360,11 +385,65 @@ Microsoft::WRL::ComPtr<ID3D12Resource> output_pin;
 
 Acquire before recording.
 
-Keep until that slot's fence completion is proven.
+Keep until that slot's **PR 3 bridge fence** completion is proven.
+
+This pin protects the XeSS/bridge command list that writes the output. It does **not** prove that later RE4 Overlay/final-output GPU command lists have finished reading the handoff resource.
 
 Use the same Signal-failure quarantine rules as Color, Depth, and original Velocity.
 
-### 6.4 Remove detached output from normal path
+### 6.4 Downstream-consumer lifetime is a separate fence domain
+
+Current source review does not establish that RE Engine `RenderResource::release()` defers D3D12 resource destruction until GPU completion.
+
+Therefore PR 4 must not release a handoff TargetState merely because the PR 3 bridge fence is idle.
+
+Use a separate **downstream retirement fence** owned by `RE4XeSSOutputHandoff`.
+
+The existing callback sequence provides the required semantic point:
+
+~~~text
+RE4 final engine command lists submitted
+    |
+Present / Present1 original call
+    |
+Mod::on_post_present()
+~~~
+
+For every frame in which an XeSS handoff was installed and reached the presentation path, `RE4XeSS::on_post_present()` must enqueue:
+
+~~~cpp
+activeDirectQueue->Signal(outputRetirementFence, retirementValue);
+~~~
+
+The queue/device must match the handoff generation.
+
+Because the Signal is enqueued on the same active DIRECT queue **after** the frame's RE4 downstream command submissions, completion of that retirement value proves that prior GPU consumers of the handoff resource have retired.
+
+No XeSS API may be called from `on_post_present()`.
+
+If the existing presentation compatibility path suppresses mod post-present callbacks for a frame, no retirement evidence exists for that frame. Do not synthesize completion. Keep the affected generation alive/quarantined until a later valid marker for that generation or a confirmed device-removal terminal condition exists.
+
+If the retirement `Signal` itself fails, quarantine the output generation.
+
+### 6.5 Same-generation frame reuse does not require a CPU wait
+
+Normal frame-to-frame reuse of the same handoff texture is ordered by the same DIRECT queue:
+
+~~~text
+frame N XeSS write
+    ->
+frame N RE4 downstream reads/final output
+    ->
+frame N+1 XeSS write
+~~~
+
+The frame N+1 bridge list is submitted later to the same queue, so queue ordering serializes the prior downstream reads before the next write.
+
+Do not CPU-wait on the downstream retirement fence every frame.
+
+The retirement fence exists for **lifetime/destruction/recreation proof**, not normal steady-state reuse.
+
+### 6.6 Remove detached output from normal path
 
 Generation resources still create the converted MV target.
 
@@ -565,11 +644,17 @@ Suggested state:
 sdk::intrusive_ptr<TargetState> handoff_state;
 sdk::intrusive_ptr<TargetState> saved_original_state;
 
+Microsoft::WRL::ComPtr<ID3D12Fence> downstream_retirement_fence;
+uint64_t next_retirement_value{1};
+uint64_t last_signaled_retirement_value{};
+uint64_t last_completed_retirement_value{};
+
 Overlay* installed_overlay{};
 
 uintptr_t template_state_identity{};
 uintptr_t template_resource_identity{};
 ID3D12Device* device_identity{};
+ID3D12CommandQueue* queue_identity{};
 
 uint32_t display_width{};
 uint32_t display_height{};
@@ -578,7 +663,8 @@ DXGI_FORMAT format{};
 D3D12_RESOURCE_STATES expected_pre_xess_state{ COMMON };
 
 bool installed{};
-bool has_completed_present_generation{};
+bool presented_since_install{};
+bool retirement_marker_required{};
 bool quarantined{};
 ~~~
 
@@ -598,9 +684,12 @@ At next pre-Overlay owner callback:
 
 1. restore installed handoff;
 2. stop new temporal/XeSS submissions;
-3. drain bridge work;
-4. after bridge idle, retire bridge execution resources;
-5. release handoff TargetState generation on owner thread.
+3. drain PR 3 bridge work;
+4. require the latest downstream retirement marker for the last presented handoff frame;
+5. release the old handoff TargetState generation **only after both**:
+   - bridge writer fences are safe; and
+   - downstream retirement fence completion is proven;
+6. if downstream completion cannot be proven, keep the handoff generation quarantined instead of releasing it.
 
 ### Quality or display-size change
 
@@ -609,10 +698,12 @@ At next pre-Overlay:
 1. restore old handoff;
 2. stop old generation;
 3. drain bridge slots;
-4. release old handoff only after output pins are fence-safe;
-5. recreate runtime/bridge generation as existing PR 3 policy requires;
-6. create new display-resolution handoff;
-7. first later successful frame uses resetHistory=1.
+4. require completion of the last downstream retirement marker for the old handoff generation;
+5. release/recreate the old handoff only after both writer-side and downstream-consumer completion are proven;
+6. if either proof is unavailable, quarantine the old handoff generation;
+7. recreate runtime/bridge generation as existing PR 3 policy requires;
+8. create new display-resolution handoff;
+9. first later successful frame uses resetHistory=1.
 
 ### Device reset/removal
 
@@ -620,12 +711,19 @@ on_device_reset remains control-plane only.
 
 It must not directly write Overlay main or destroy XeSS from an arbitrary thread.
 
+For handoff lifetime:
+
+- a bridge fence alone is insufficient;
+- if a valid downstream retirement marker for the old generation completed, normal release is allowed after writer fences are also safe;
+- if no such marker exists, do not infer downstream completion from Present count, callback return, timeout, or bridge idleness;
+- confirmed device removal is a terminal condition for the old D3D12 generation;
+- otherwise keep the old handoff TargetState/resource generation quarantined until downstream retirement can be proven.
+
 On next valid owner callback/new renderer generation:
 
 - never write through old Overlay pointer;
-- retire/quarantine old bridge/handoff generation using PR 3 rules;
-- release old TargetState ownership only when safe;
-- rebuild from new device and new Overlay template.
+- retire/quarantine old bridge/handoff generation using the combined writer + downstream-consumer rules;
+- rebuild from the new device and new Overlay template only without reusing old-generation resources.
 
 ### Signal-failure quarantine
 
@@ -638,7 +736,7 @@ If Signal fails after ExecuteCommandLists:
 
 ---
 
-## 12. Optional post-Overlay observation
+## 12. Post-Overlay and post-Present callbacks
 
 It is acceptable to add on_overlay_layer_draw for observation only.
 
@@ -652,6 +750,10 @@ display extent
 ~~~
 
 Do not restore or mutate from this callback.
+
+`on_post_present()` has a different mandatory role: when the current frame presented an installed handoff and the active queue/device still match the handoff generation, enqueue the downstream retirement fence Signal described in section 6.4.
+
+This callback must not call any public XeSS API and must not release the TargetState immediately. It only records retirement evidence for later owner-thread teardown/recreation.
 
 ---
 
@@ -852,7 +954,23 @@ No refcount-draining loops.
 
 ### Slot output pin
 
-Every submitted slot pins supplied output until fence completion.
+Every submitted slot pins supplied output until the bridge writer fence completes.
+
+### Downstream retirement proof
+
+Static review must confirm:
+
+~~~text
+PR 3 bridge fence
+    = XeSS/bridge writer completion only
+
+PR 4 downstream retirement fence
+    = RE4 post-handoff consumer completion
+~~~
+
+Handoff TargetState destruction/recreation requires both domains to be safe, unless confirmed device removal terminates the old generation.
+
+`on_post_present()` must Signal the retirement fence on the same handoff-generation DIRECT queue and must not call XeSS APIs.
 
 ### Native final path unhooked
 
@@ -925,12 +1043,17 @@ Debug evidence:
 frame N:
     handoff installed
 
+frame N post-Present:
+    downstream retirement Signal queued
+
 frame N+1 pre-Overlay:
     handoff restored to original
     original again matches PostMain/HDR
     new packet collected
     handoff reused after successful submit
 ~~~
+
+Steady-state reuse must not wait for the retirement fence on CPU; same-queue ordering provides read-before-next-write ordering.
 
 ### Post-Overlay persistence
 
@@ -962,7 +1085,17 @@ Expected scene = XeSS output, UI downstream/native, no stale scene, no size mism
 
 Test Quality -> Balanced -> Native AA -> Off -> Quality.
 
-Expected previous handoff restoration, safe drain, target recreation where needed, history reset, and native output on Off.
+For at least one transition, log and verify:
+
+~~~text
+last bridge writer fence completes
+last downstream retirement fence completes
+only then old handoff TargetState generation is released/recreated
+~~~
+
+Expected previous handoff restoration, safe dual-domain drain, target recreation where needed, history reset, and native output on Off.
+
+If the downstream marker is missing or Signal fails, the old generation must remain quarantined rather than being released.
 
 ### Resize/fullscreen/Alt+Tab
 
@@ -972,9 +1105,30 @@ Expected no old TargetState reuse across new device/display generation and corre
 
 First valid post-load XeSS submission remains resetHistory=1 and visible handoff resumes only after temporal load gate recovery.
 
+### D3D12 debug-layer state validation
+
+Run the dedicated debug-layer session defined in section 5.2.
+
+PASS requires:
+
+~~~text
+fresh handoff:
+    COMMON -> UAV -> 0xC0
+
+64+ stable repeated frames:
+    0xC0 -> UAV -> 0xC0
+
+one recreation/mode transition:
+    no handoff-related invalid StateBefore/state-mismatch/lifetime warning
+~~~
+
+The handoff native resource should carry the debug name `RE4XeSS Handoff Output` so relevant messages can be identified.
+
+Unrelated existing game/debug-layer messages do not automatically fail the test; any message involving the named handoff resource, bridge command lists, or the documented transitions must be resolved.
+
 ### Long session
 
-Check no refcount growth pattern, no per-frame TargetState churn, no ring starvation, no stale restoration, and no device removal.
+Check no refcount growth pattern, no per-frame TargetState churn, no ring starvation, no stale restoration, no downstream retirement backlog during normal operation, and no device removal.
 
 ---
 
@@ -1002,7 +1156,9 @@ PR 4 is complete only when:
 - handoff TargetState is cloned from semantic Overlay HDR/PostMain state;
 - handoff state is display-resolution R11G11B10_FLOAT;
 - XeSS writes directly into the handoff TargetState native resource;
-- supplied output is slot-pinned through fence completion;
+- supplied output is slot-pinned through the bridge writer fence;
+- a separate same-queue downstream retirement fence proves completion of RE4 post-handoff consumers before handoff-generation release/recreation;
+- steady-state reuse relies on same-DIRECT-queue ordering and does not CPU-wait every frame;
 - XeSS output transitions to 0xC0 for RE4 downstream use;
 - Overlay main is replaced only after successful submission/Signal;
 - original Overlay main is restored at next pre-Overlay before new Color collection;
@@ -1012,7 +1168,9 @@ PR 4 is complete only when:
 - native final RE4 screen-out remains active;
 - UI/Overlay remains downstream of scene upscaling;
 - mode/resize/device/load transitions restore or safely retire handoff generations;
-- Signal-failure/device-removal quarantine includes output TargetState/resource lifetime;
+- bridge-Signal and downstream-retirement-Signal failures quarantine the affected output generation;
+- device removal is never confused with retirement completion;
+- COMMON -> UAV -> 0xC0 and repeated 0xC0 -> UAV -> 0xC0 are validated with the D3D12 debug layer or the documented narrow provenance fallback;
 - no foreign refcount-draining logic exists;
 - existing XeFG compatibility is untouched;
 - x64 Release build succeeds;
@@ -1032,13 +1190,14 @@ PR description must state:
 4. XeSS writes directly into that cloned display-resolution resource;
 5. original Overlay main restores at next pre-Overlay, not post-Overlay;
 6. PrepareOutput/swapchain remain untouched;
-7. output resource is fence-pinned;
-8. fresh-clone COMMON / steady 0xC0 assumption and actual runtime result;
-9. native final screen-out remains active;
-10. UI/menu runtime results;
-11. resize/Alt+Tab results actually performed;
-12. stock OptiScaler results actually performed;
-13. tests remaining for the user.
+7. output resource is bridge-fence pinned for writer lifetime;
+8. separate post-Present downstream retirement fence and teardown criteria;
+9. fresh-clone COMMON / steady 0xC0 debug-layer validation result;
+10. native final screen-out remains active;
+11. UI/menu runtime results;
+12. resize/Alt+Tab results actually performed;
+13. stock OptiScaler results actually performed;
+14. tests remaining for the user.
 
 Do not merge automatically.
 
@@ -1058,7 +1217,9 @@ Stop and report instead of widening PR 4 if:
 - TargetState handoff does not reach the proven final screen-output draw;
 - correction appears to require direct backbuffer copy;
 - correction appears to require PrepareOutput replacement;
-- correction appears to require existing XeFG compatibility changes.
+- correction appears to require existing XeFG compatibility changes;
+- downstream RE4 GPU consumption cannot be retired with a same-queue marker and no confirmed device-removal terminal condition exists;
+- D3D12 debug-layer or narrow state-provenance evidence contradicts the COMMON/0xC0 contract.
 
 If TargetState handoff does not reach the final draw, the next action is the narrow final-draw descriptor/SRV provenance gate.
 
