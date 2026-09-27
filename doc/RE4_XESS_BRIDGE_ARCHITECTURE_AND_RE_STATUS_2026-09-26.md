@@ -3407,11 +3407,15 @@ Capture 29 now adds true pre-Overlay execution-order proof:
 - all 120 observed eight-slot reuses are fence-safe and nonblocking;
 - no bridge submission is skipped.
 
-The only unresolved timing-specific item is the true pre-Overlay Color/Depth/Velocity state tuple.
+Capture 29b closes the remaining timing-specific item. The shared implementation-level recording hooks, opened from the true pre callback, reproduce the production tuple in 124/124 stable frames:
 
-Capture 29's legacy `D3D12 resource states` path cannot answer it because that per-object vtable hook recorded zero target barriers. This is a diagnostic coverage limitation, not contradictory state evidence.
+~~~text
+Color    = 0xC0
+Depth    = 0xE0
+Velocity = 0x04
+~~~
 
-Capture 29b therefore reuses the Capture 26 shared implementation-level recording hooks from the true pre callback. Until that run closes the tuple, do not promote `0xC0 / 0xE0 / 0x04` from post-Overlay evidence to a true pre-Overlay production fact.
+This is now a true pre-Overlay production fact rather than a post-Overlay inference.
 
 No engine-owned command list should be modified.
 
@@ -3735,7 +3739,7 @@ Captures 20-22 establish:
 
 Use the explicit RE4 load window rather than a camera threshold for Load Save.
 
-### 18.6 Prove command-list/state insertion — ordering closed, state correction active
+### 18.6 Prove command-list/state insertion — CLOSED
 
 Captures 23-27 established the D3D12 queue/list/barrier machinery and bridge-owned lifetime model, but the later source audit showed that their Overlay-side boundary was post-Overlay.
 
@@ -3763,24 +3767,15 @@ Keep these now-proven facts:
 
 The old `D3D12 resource states` scenario produced zero target barriers in Capture 29, so do not infer a different state tuple from that run.
 
-Capture 29b needs only:
+Capture 29b has completed two 64-sample runs from true pre-Overlay while retaining the shared implementation hooks proven by Capture 26.
 
-~~~text
-D3D12 recording functions
-64 samples
-Reset capture
-64 samples
-~~~
-
-The scenario now runs from true pre-Overlay while retaining the shared implementation hooks proven by Capture 26.
-
-Reconfirm only:
+The stable result is:
 
 - Color = `0xC0`;
 - Depth subresources 0/1 = `0xE0`;
 - Velocity subresource 0 = `0x04`.
 
-Do not rerun bridge ordering and do not start production XeSS dispatch until this final Gate H state correction is closed.
+The full transition cycle restores that tuple in 124/124 stable frames. Gate H is closed; do not rerun bridge ordering or state capture.
 
 ### 18.6.1 Prove output integration path
 
@@ -3794,19 +3789,25 @@ Capture 28 closes the copy-only hypothesis:
 
 Therefore do not integrate XeSS by assuming an HDR -> swapchain copy chain.
 
-After Capture 29b closes the remaining true pre-Overlay state correction, Capture 30 is the next Gate I runtime test:
+Capture 30 has completed and narrows the final output path:
 
-- rediscover the current frame's Color -> HDR intermediate edge;
-- track legacy barriers only for Color/intermediate/active swapchain buffers;
-- preserve known swapchain state across frame boundaries;
-- invalidate previous-frame intermediate state when the new frame's copy is observed;
-- observe DrawInstanced/DrawIndexedInstanced only as a narrow candidate witness;
-- emit detailed draw records only while the current intermediate is shader-readable and an active swapchain buffer is in RENDER_TARGET;
-- correlate candidate draw lists with actual queue ordinals.
+- the current-frame Color -> same-format copy destination is rediscovered in 124/124 stable frames;
+- no current-frame legacy barrier establishes that copy destination as shader-readable before Present;
+- active swapchain transitions `0x00 -> 0x04`;
+- while the swapchain is RT, Color transitions `0x04 -> 0xC0`;
+- the swapchain then transitions `0x04 -> 0x00`;
+- this late sequence is on the final engine DIRECT submission before Present.
+
+Capture 30b is now the next Gate I runtime test:
+
+- keep `D3D12 final output composite`;
+- emit detailed DrawInstanced/DrawIndexedInstanced records only while **Color** is shader-readable and an active swapchain buffer is in `RENDER_TARGET`;
+- retain the copy-destination state only as context;
+- correlate candidate draw lists with the final engine queue ordinal.
 
 Do not hook descriptor heaps or trace all graphics commands yet.
 
-If Capture 30 identifies one stable final composite window, use it to choose the Gate I output handoff. Add descriptor-level SRV provenance only if the candidate stage remains ambiguous.
+If Capture 30b identifies one stable unique draw pattern, use it to choose the Gate I output handoff. Add descriptor-level SRV provenance only if multiple candidate draws remain ambiguous.
 
 ### 18.7 Add public XeSS producer
 
@@ -3880,7 +3881,7 @@ The RE4 bridge is ready to begin production XeSS dispatch only when all of the f
 
 The current project is **not yet at this gate**.
 
-The major resource and size-control uncertainty is now substantially closed: HDR/PostMain color, Depth, Velocity, the pre-Overlay engine boundary, SceneView-driven internal render size, Overlay working surfaces, and presentation output are mapped. MV semantics are closed through Capture 18, Capture 19 closes inverted depth plus near/far/FOV/projection metadata, Capture 22 closes the current Load Save reset/history gate, Capture 23 closes post-boundary DIRECT queue/list provenance, Capture 24 extends that to a stable seven-submit whole-frame topology while rejecting the submitted-base instance-vtable assumption, Capture 25 closes public GCL0-GCL7 interface/shared-method provenance, Capture 26 closes the actual legacy-barrier API path and proves the observed post-Overlay Color/Depth/Velocity state cycle, while Capture 27 proves post-Overlay REF-owned command-list insertion plus fence-safe allocator/list lifetime. A source-level audit then found that Captures 23-27 were labeled pre-Overlay even though they were running from the post-Overlay callback. Capture 29 now closes the true pre-Overlay ordering half of that correction: the REF-owned list is ordinal 3 in 126/126 stable complete frames, with fence-safe nonblocking reuse. Its legacy per-object resource-state probe recorded zero target barriers, so Capture 29b reuses the Capture 26 shared recording hooks solely to revalidate the true-pre 0xC0/0xE0/0x04 tuple. Capture 28 remains valid post-Overlay evidence: it closes the first Gate I output edge but rejects a copy-only path to the swapchain. After Capture 29b, Capture 30 will identify the final composite/output stage before standard XeSS producer validation and upstream OptiScaler/XeFG validation.
+The major resource, timing, and state uncertainty is now substantially closed: HDR/PostMain color, Depth, Velocity, the true pre-Overlay boundary, SceneView-driven internal render size, Overlay working surfaces, and presentation output are mapped. MV semantics are closed through Capture 18, Capture 19 closes inverted depth plus near/far/FOV/projection metadata, and Capture 22 closes the current Load Save reset/history gate. Captures 23-27 prove the DIRECT queue/list population, public GCL topology, shared recording implementations, actual legacy ResourceBarrier path, post-Overlay state behavior, and safe REF-owned allocator/list/fence lifetime. Capture 29 proves true-pre ordinal-3 insertion, and Capture 29b closes the timing correction with Color=0xC0, Depth=0xE0, Velocity=0x04 in 124/124 stable frames. Capture 28 proves the first Color -> same-format copy edge and rejects a copy-only path to swapchain. Capture 30 proves the final engine output list and narrows the non-copy presentation stage to a Color-shader-readable + swapchain-RT overlap immediately before Present, while showing that the discovered copy destination is not yet proven shader-readable in that current-frame window. Capture 30b now targets the exact draw before standard XeSS producer validation and upstream OptiScaler/XeFG validation.
 
 ---
 
@@ -3902,19 +3903,25 @@ R11G11B10_FLOAT
              ├─ Overlay main target points here
              └─ Overlay also has a separate B8G8R8A8 UI-like current surface
              │
-             ├─ CopyResource (Capture 28)
+             ├─ CopyResource (Capture 28/30)
              ▼
-same-format HDR intermediate
+same-format HDR copy destination
 R11G11B10_FLOAT
              │
-             ├─ final non-copy composite path (Gate I active)
-             ▼
-PrepareOutput / OutputTargetState
+             └─ post-copy role not yet proven
+
+HDR/PostMain Color
+R11G11B10_FLOAT
              │
+             ├─ final list: Color -> 0xC0
+             │   while active swapchain -> 0x04
+             │
+             ├─ exact final draw (Capture 30b active)
              ▼
 swapchain backbuffers
+             └─ 0x04 -> 0x00 -> Present
 ~~~
 
-Capture 9 identifies on_pre_overlay_layer_draw() as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Capture 10 establishes the native-resolution baseline. Capture 11 then proves that overriding SceneView.get_Size to 1920x1080 moves Color, Depth, and Velocity together while the 2560x1440 DXGI output remains unchanged. Captures 12-16 close render/display control, jitter injection/history, MV jitter exclusion, R=X, G=Y, and both axis polarities. Capture 17 adds the independent rotation-only witness, and Capture 18 closes the absolute MV scale at W/2,-H/2 while rejecting one fixed MV/camera frame offset as the primary source of spatial residuals. Initial zero/low-motion samples immediately after Reset remain a known UI-click input-interruption artifact, not failed directional evidence. Gate D is closed. Capture 19 proves SceneInfo/DepthStencilTex inverted depth in 128/128 samples and closes the producer camera metadata path: near/far come from primary via.Camera and vertical FOV is derived from SceneInfo projection. Capture 20 then proves that a real Load Save can preserve Scene/SceneInfo/Camera/Depth/Velocity/Color identity, render size, and render-frame continuity while still producing large camera-history discontinuities. Translation alone is not a safe reset heuristic; rotation separates strongly in this run, but no threshold is frozen. Capture 21 proves SceneInfo.old_view_projection_matrix does not expose a Load Save reset signal. Capture 22 then closes the current Load Save reset gate: two independent loads repeat the same SceneLoadZone pause window, history remains unstable after pause release, and GameSituation inhibit restoration marks the stable post-load return; the final quit path provides a negative control without a SceneLoadZone pause rise. Captures 23-27 still prove the DIRECT queue/list population, public GCL topology, shared recording implementations, actual legacy ResourceBarrier usage, post-Overlay state behavior, and safe REF-owned allocator/list/fence lifetime. The source-level timing audit corrects one earlier interpretation: those captures were opened from on_overlay_layer_draw(), not the true pre callback, so the 0xC0/0xE0/0x04 state tuple and ordinal-3 REF insertion are post-Overlay facts. Capture 29 has now rerun the timing-sensitive ordering witness from on_pre_overlay_layer_draw() and proves the true-pre ordinal-3 insertion; the state half remains for Capture 29b because the older per-object state probe saw no target barriers. Capture 28 independently remains valid as a post-Overlay output-path capture: it proves a repeated HDR/PostMain -> same-format HDR intermediate CopyResource edge in 124/124 post-warm-up samples, always on the final engine submission before Present, while the copy-connected graph never reaches an active swapchain buffer in 128/128 Present summaries. The remaining output edge is therefore non-copy. The already-prepared final-composite witness is deferred to Capture 30 after Capture 29b closes Gate H's remaining true pre-Overlay state correction. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
+Capture 9 identifies on_pre_overlay_layer_draw() as the verified engine-level insertion boundary and the semantic Overlay-main / HDR/PostMain resource as the production Color anchor. Captures 10-18 close render/display control, jitter injection/history, and MV semantics. Capture 19 closes inverted depth plus near/far/FOV/projection metadata, and Capture 22 closes the current Load Save reset/history gate. Captures 23-27 prove the DIRECT queue/list population, public GCL topology, shared recording implementations, actual legacy ResourceBarrier usage, post-Overlay state behavior, and safe REF-owned allocator/list/fence lifetime. The source-level timing audit corrected their original pre/post interpretation. Capture 29 proves the true-pre REF ordinal-3 insertion, and Capture 29b closes Gate H completely by reproducing Color=0xC0, Depth=0xE0, Velocity=0x04 at the actual pre-Overlay boundary in 124/124 stable frames. Capture 28 proves a repeated HDR/PostMain -> same-format CopyResource edge and rejects a copy-connected route to the swapchain. Capture 30 reproduces that edge but does not observe a current-frame shader-readable state for the copy destination; instead it proves the final engine DIRECT list contains a stable swapchain 0x00->0x04 transition followed by Color 0x04->0xC0, then swapchain 0x04->0x00 immediately before Present. Gate I is now narrowed to the draw window where Color is shader-readable and the active swapchain buffer is RENDER_TARGET. Capture 30b targets that exact draw. The production goal remains to insert standard XeSS SR at the pre-Overlay HDR scene boundary, keep the game's own Overlay/UI path intact, and let unmodified upstream OptiScaler intercept the standard XeSS producer calls for alternate SR and XeFG.
 
 Until the remaining gates are proven, the diagnostic stays passive and no production XeSS dispatch is enabled.
