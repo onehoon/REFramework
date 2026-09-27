@@ -1,13 +1,16 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
 
 #include "Mod.hpp"
 #include "RE4XeSSFrame.hpp"
+#include "RE4XeSSD3D12.hpp"
 #include "RE4XeSSRuntime.hpp"
 
 class RE4XeSS final : public Mod {
@@ -68,9 +71,36 @@ private:
         bool reset_history{};
     };
 
+    struct ProducerSnapshot {
+        bool context_ready{};
+        bool execution_ready{};
+        bool draining{};
+        bool faulted{};
+        UpscalingMode mode{ UpscalingMode::Off };
+        xess_quality_settings_t quality{ XESS_QUALITY_SETTING_AA };
+        xess_2d_t display{};
+        RE4XeSSRuntime::InputResolutionQuery input{};
+        uintptr_t device_identity{};
+        uintptr_t queue_identity{};
+        std::string failure_reason{};
+    };
+
+    struct OwnerConfiguration {
+        ID3D12Device* device{};
+        ID3D12CommandQueue* queue{};
+        UpscalingMode mode{ UpscalingMode::Off };
+        xess_quality_settings_t quality{ XESS_QUALITY_SETTING_AA };
+        xess_2d_t display{};
+        RE4XeSSRuntime::InputResolutionQuery input{};
+        bool valid{};
+    };
+
     void request_mode(UpscalingMode mode);
-    void apply_pending_transition();
-    void try_bootstrap();
+    bool service_owner_thread();
+    void publish_producer_snapshot(ProducerSnapshot snapshot);
+    ProducerSnapshot get_producer_snapshot() const;
+    void set_owner_unavailable(std::string reason, bool draining = false, bool faulted = false);
+    void mark_execution_fault(std::string reason);
     void update_temporal_configuration();
     void update_load_state();
     void invalidate_history(std::string_view reason, bool reset_jitter = true);
@@ -80,12 +110,28 @@ private:
     bool get_display_resolution(xess_2d_t& resolution) const;
     bool is_temporal_active() const;
 
-    UpscalingMode m_requested_mode{ UpscalingMode::Off };
-    bool m_transition_pending{};
-    bool m_bootstrap_pending{};
-    ID3D12Device* m_device_identity{};
+    std::atomic<UpscalingMode> m_requested_mode{ UpscalingMode::Off };
+    std::atomic<bool> m_bootstrap_requested{};
+    std::atomic<uint64_t> m_control_generation{};
+    std::atomic<uint64_t> m_device_reset_generation{};
+    std::atomic<uint64_t> m_last_frame_device_reset_generation{};
+    std::atomic<bool> m_owner_thread_violation{};
+    std::atomic_flag m_owner_thread_logged = ATOMIC_FLAG_INIT;
+    uint64_t m_owner_device_reset_generation{};
+    UpscalingMode m_last_frame_mode{ UpscalingMode::Off };
     std::string m_last_invalid_config_token{};
     RE4XeSSRuntime m_runtime{};
+    RE4XeSSD3D12 m_bridge{};
+    mutable std::mutex m_producer_snapshot_mutex{};
+    ProducerSnapshot m_producer_snapshot{};
+    OwnerConfiguration m_owner_configuration{};
+    std::atomic<DWORD> m_execution_owner_thread_id{};
+    bool m_owner_execution_faulted{};
+    uint64_t m_owner_fault_control_generation{};
+    uint64_t m_owner_fault_device_reset_generation{};
+    bool m_owner_waiting_for_new_device{};
+    ID3D12Device* m_removed_device_identity{};
+    std::string m_owner_failure_reason{};
 
     bool m_temporal_ready{};
     bool m_temporal_signature_valid{};

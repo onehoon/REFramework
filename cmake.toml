@@ -242,6 +242,7 @@ link-libraries = [
     "openvr",
     "openxr_loader",
     "delayimp",
+    "d3dcompiler",
     "DirectXTK",
     "DirectXTK12"
 ]

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 
 #include <d3d12.h>
 
@@ -22,8 +23,21 @@ typedef struct _xess_2d_t {
     uint32_t x;
     uint32_t y;
 } xess_2d_t;
-#pragma pack(pop)
 
+typedef xess_2d_t xess_coord_t;
+
+typedef enum _xess_init_flags_t : int32_t {
+    XESS_INIT_FLAG_NONE = 0,
+    XESS_INIT_FLAG_HIGH_RES_MV = 1 << 0,
+    XESS_INIT_FLAG_INVERTED_DEPTH = 1 << 1,
+    XESS_INIT_FLAG_EXPOSURE_SCALE_TEXTURE = 1 << 2,
+    XESS_INIT_FLAG_RESPONSIVE_PIXEL_MASK = 1 << 3,
+    XESS_INIT_FLAG_USE_NDC_VELOCITY = 1 << 4,
+    XESS_INIT_FLAG_EXTERNAL_DESCRIPTOR_HEAP = 1 << 5,
+    XESS_INIT_FLAG_LDR_INPUT_COLOR = 1 << 6,
+    XESS_INIT_FLAG_JITTERED_MV = 1 << 7,
+    XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE = 1 << 8,
+} xess_init_flags_t;
 typedef enum _xess_quality_settings_t : int32_t {
     XESS_QUALITY_SETTING_ULTRA_PERFORMANCE = 100,
     XESS_QUALITY_SETTING_PERFORMANCE = 101,
@@ -53,8 +67,42 @@ typedef enum _xess_result_t : int32_t {
     XESS_RESULT_ERROR_UNKNOWN = -1000,
 } xess_result_t;
 
-typedef struct _xess_d3d12_init_params_t xess_d3d12_init_params_t;
-typedef struct _xess_d3d12_execute_params_t xess_d3d12_execute_params_t;
+typedef struct _xess_d3d12_init_params_t {
+    xess_2d_t outputResolution;
+    xess_quality_settings_t qualitySetting;
+    uint32_t initFlags;
+    uint32_t creationNodeMask;
+    uint32_t visibleNodeMask;
+    ID3D12Heap* pTempBufferHeap;
+    uint64_t bufferHeapOffset;
+    ID3D12Heap* pTempTextureHeap;
+    uint64_t textureHeapOffset;
+    ID3D12PipelineLibrary* pPipelineLibrary;
+} xess_d3d12_init_params_t;
+
+typedef struct _xess_d3d12_execute_params_t {
+    ID3D12Resource* pColorTexture;
+    ID3D12Resource* pVelocityTexture;
+    ID3D12Resource* pDepthTexture;
+    ID3D12Resource* pExposureScaleTexture;
+    ID3D12Resource* pResponsivePixelMaskTexture;
+    ID3D12Resource* pOutputTexture;
+    float jitterOffsetX;
+    float jitterOffsetY;
+    float exposureScale;
+    uint32_t resetHistory;
+    uint32_t inputWidth;
+    uint32_t inputHeight;
+    xess_coord_t inputColorBase;
+    xess_coord_t inputMotionVectorBase;
+    xess_coord_t inputDepthBase;
+    xess_coord_t inputResponsiveMaskBase;
+    xess_coord_t reserved0;
+    xess_coord_t outputColorBase;
+    ID3D12DescriptorHeap* pDescriptorHeap;
+    uint32_t descriptorHeapOffset;
+} xess_d3d12_execute_params_t;
+#pragma pack(pop)
 
 xess_result_t __cdecl xessGetVersion(xess_version_t* pVersion);
 xess_result_t __cdecl xessGetOptimalInputResolution(
@@ -79,3 +127,12 @@ static_assert(sizeof(xess_version_t) == 8);
 static_assert(sizeof(xess_2d_t) == 8);
 static_assert(sizeof(xess_quality_settings_t) == 4);
 static_assert(sizeof(xess_result_t) == 4);
+static_assert(sizeof(xess_init_flags_t) == 4);
+static_assert(sizeof(xess_d3d12_init_params_t) == 64);
+static_assert(sizeof(xess_d3d12_execute_params_t) == 136);
+static_assert(offsetof(xess_d3d12_execute_params_t, pOutputTexture) == 40);
+static_assert(offsetof(xess_d3d12_execute_params_t, jitterOffsetX) == 48);
+static_assert(offsetof(xess_d3d12_execute_params_t, inputWidth) == 64);
+static_assert(offsetof(xess_d3d12_execute_params_t, inputColorBase) == 72);
+static_assert(offsetof(xess_d3d12_execute_params_t, pDescriptorHeap) == 120);
+static_assert(offsetof(xess_d3d12_execute_params_t, descriptorHeapOffset) == 128);
