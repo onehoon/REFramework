@@ -1191,6 +1191,12 @@ Do not create a second RE4-only debug toggle.
 
 ### PR 1 — production shell + public XeSS runtime lifecycle
 
+Implementation work order:
+
+~~~text
+doc/RE4_XESS_PR1_WORK_ORDER_2026-09-27.md
+~~~
+
 Scope:
 
 - create RE4-only Mod;
