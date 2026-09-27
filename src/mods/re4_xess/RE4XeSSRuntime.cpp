@@ -101,6 +101,64 @@ bool RE4XeSSRuntime::initialize(ID3D12Device* device, const std::filesystem::pat
     return true;
 }
 
+std::optional<RE4XeSSRuntime::InputResolutionQuery> RE4XeSSRuntime::query_optimal_input_resolution(
+    xess_2d_t output_resolution,
+    xess_quality_settings_t quality,
+    std::string& error) const {
+    error.clear();
+
+    if (m_state != State::ContextReady || m_context == nullptr || m_functions.get_optimal_input_resolution == nullptr) {
+        error = "The XeSS runtime context is not ready for an input-resolution query";
+        return std::nullopt;
+    }
+
+    if (output_resolution.x == 0 || output_resolution.y == 0) {
+        error = "The display/output resolution is zero";
+        return std::nullopt;
+    }
+
+    InputResolutionQuery query{};
+    const auto result = m_functions.get_optimal_input_resolution(
+        m_context,
+        &output_resolution,
+        quality,
+        &query.optimal,
+        &query.minimum,
+        &query.maximum);
+    if (result != XESS_RESULT_SUCCESS) {
+        error = result_message("xessGetOptimalInputResolution", result);
+        return std::nullopt;
+    }
+
+    if (query.optimal.x == 0 || query.optimal.y == 0) {
+        error = "xessGetOptimalInputResolution returned a zero optimal input extent";
+        return std::nullopt;
+    }
+
+    const bool all_range_dimensions_zero =
+        query.minimum.x == 0 && query.minimum.y == 0 &&
+        query.maximum.x == 0 && query.maximum.y == 0;
+    const bool all_range_dimensions_nonzero =
+        query.minimum.x != 0 && query.minimum.y != 0 &&
+        query.maximum.x != 0 && query.maximum.y != 0;
+
+    if (!all_range_dimensions_zero && !all_range_dimensions_nonzero) {
+        error = "xessGetOptimalInputResolution returned mixed zero/nonzero min/max metadata";
+        return std::nullopt;
+    }
+
+    if (all_range_dimensions_nonzero) {
+        if (query.minimum.x > query.maximum.x || query.minimum.y > query.maximum.y ||
+            query.optimal.x < query.minimum.x || query.optimal.x > query.maximum.x ||
+            query.optimal.y < query.minimum.y || query.optimal.y > query.maximum.y) {
+            error = "xessGetOptimalInputResolution returned an optimal extent outside its min/max range";
+            return std::nullopt;
+        }
+    }
+
+    return query;
+}
+
 void RE4XeSSRuntime::shutdown() noexcept {
     cleanup();
     m_failure_reason.clear();

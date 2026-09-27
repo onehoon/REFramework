@@ -11,6 +11,12 @@
 
 class RE4XeSSRuntime final {
 public:
+    struct InputResolutionQuery {
+        xess_2d_t optimal{};
+        xess_2d_t minimum{};
+        xess_2d_t maximum{};
+    };
+
     enum class State : uint8_t {
         Unloaded,
         ModuleReady,
@@ -28,6 +34,10 @@ public:
 
     bool initialize(ID3D12Device* device, const std::filesystem::path& reframework_directory);
     void shutdown() noexcept;
+    std::optional<InputResolutionQuery> query_optimal_input_resolution(
+        xess_2d_t output_resolution,
+        xess_quality_settings_t quality,
+        std::string& error) const;
 
     State state() const noexcept {
         return m_state;
