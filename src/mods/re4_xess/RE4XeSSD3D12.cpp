@@ -171,6 +171,7 @@ bool RE4XeSSD3D12::initialize(
 RE4XeSSD3D12::SubmitResult RE4XeSSD3D12::submit(
     const RE4XeSSFrame& frame,
     RE4XeSSRuntime& runtime,
+    const OutputBinding& output,
     std::string& error) {
     error.clear();
     if (!m_initialized || m_quarantined || m_device_removed) {
@@ -178,6 +179,10 @@ RE4XeSSD3D12::SubmitResult RE4XeSSD3D12::submit(
         return SubmitResult::NotReady;
     }
     if (!validate_frame(frame, error)) {
+        m_failure_reason = error;
+        return SubmitResult::Faulted;
+    }
+    if (!validate_output(output, error)) {
         m_failure_reason = error;
         return SubmitResult::Faulted;
     }
@@ -205,15 +210,17 @@ RE4XeSSD3D12::SubmitResult RE4XeSSD3D12::submit(
     slot.color_pin = frame.color;
     slot.depth_pin = frame.depth;
     slot.original_velocity_pin = frame.velocity;
+    slot.output_pin = output.resource;
     write_slot_descriptors(slot, frame.velocity);
 
-    if (!record_and_submit(slot, frame, runtime, selected_slot, error)) {
+    if (!record_and_submit(slot, frame, runtime, output, selected_slot, error)) {
         if (m_quarantined) {
             return SubmitResult::Faulted;
         }
         slot.color_pin.Reset();
         slot.depth_pin.Reset();
         slot.original_velocity_pin.Reset();
+        slot.output_pin.Reset();
         m_failure_reason = error;
         return SubmitResult::Faulted;
     }
@@ -247,6 +254,7 @@ RE4XeSSD3D12::PollResult RE4XeSSD3D12::poll() {
                 slot.color_pin.Reset();
                 slot.depth_pin.Reset();
                 slot.original_velocity_pin.Reset();
+                slot.output_pin.Reset();
                 slot.last_fence_value = 0;
             }
             m_quarantined = false;
@@ -291,6 +299,7 @@ RE4XeSSD3D12::PollResult RE4XeSSD3D12::poll() {
             slot.color_pin.Reset();
             slot.depth_pin.Reset();
             slot.original_velocity_pin.Reset();
+            slot.output_pin.Reset();
             slot.last_fence_value = 0;
         } else if (slot.last_fence_value != 0) {
             in_flight = true;
@@ -354,6 +363,7 @@ void RE4XeSSD3D12::shutdown() noexcept {
         slot.color_pin.Reset();
         slot.depth_pin.Reset();
         slot.original_velocity_pin.Reset();
+        slot.output_pin.Reset();
         slot.velocity_descriptors.Reset();
         slot.list.Reset();
         slot.allocator.Reset();
@@ -361,7 +371,6 @@ void RE4XeSSD3D12::shutdown() noexcept {
     }
     m_velocity_pipeline.Reset();
     m_velocity_root_signature.Reset();
-    m_detached_output.Reset();
     m_converted_velocity.Reset();
     m_fence.Reset();
     m_queue.Reset();
@@ -387,6 +396,7 @@ void RE4XeSSD3D12::shutdown_after_device_removed() noexcept {
         slot.color_pin.Reset();
         slot.depth_pin.Reset();
         slot.original_velocity_pin.Reset();
+        slot.output_pin.Reset();
         slot.velocity_descriptors.Reset();
         slot.list.Reset();
         slot.allocator.Reset();
@@ -394,7 +404,6 @@ void RE4XeSSD3D12::shutdown_after_device_removed() noexcept {
     }
     m_velocity_pipeline.Reset();
     m_velocity_root_signature.Reset();
-    m_detached_output.Reset();
     m_converted_velocity.Reset();
     m_fence.Reset();
     m_queue.Reset();
@@ -459,21 +468,6 @@ bool RE4XeSSD3D12::create_generation_resources(std::string& error) {
         return false;
     }
     set_name(m_converted_velocity.Get(), L"RE4XeSS ConvertedVelocity");
-
-    const auto output_description = texture_desc(
-        m_signature.display_width, m_signature.display_height, m_signature.color_format);
-    result = m_device->CreateCommittedResource(
-        &heap,
-        D3D12_HEAP_FLAG_NONE,
-        &output_description,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        nullptr,
-        IID_PPV_ARGS(&m_detached_output));
-    if (FAILED(result)) {
-        error = hresult_message("CreateCommittedResource(detached output)", result);
-        return false;
-    }
-    set_name(m_detached_output.Get(), L"RE4XeSS DetachedOutput");
     return true;
 }
 
@@ -666,6 +660,36 @@ bool RE4XeSSD3D12::validate_frame(const RE4XeSSFrame& frame, std::string& error)
     return true;
 }
 
+bool RE4XeSSD3D12::validate_output(const OutputBinding& output, std::string& error) const {
+    if (output.resource == nullptr) {
+        error = "The RE4 XeSS output binding has no engine-visible resource";
+        return false;
+    }
+    const auto description = output.resource->GetDesc();
+    constexpr auto required_flags = static_cast<D3D12_RESOURCE_FLAGS>(
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    if (description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        description.Width != m_signature.display_width ||
+        description.Height != m_signature.display_height ||
+        description.DepthOrArraySize != 1 || description.SampleDesc.Count != 1 ||
+        description.Format != m_signature.color_format ||
+        (description.Flags & required_flags) != required_flags) {
+        error = "The supplied RE4 XeSS output must be display-resolution R11G11B10_FLOAT Texture2D with render-target and UAV flags";
+        return false;
+    }
+    if (output.after_state != static_cast<D3D12_RESOURCE_STATES>(
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)) {
+        error = "The supplied RE4 XeSS output must return to the verified 0xC0 shader-readable state";
+        return false;
+    }
+    if (output.before_state != D3D12_RESOURCE_STATE_COMMON &&
+        output.before_state != output.after_state) {
+        error = "The supplied RE4 XeSS output must begin in COMMON on first use or 0xC0 on later use";
+        return false;
+    }
+    return true;
+}
+
 void RE4XeSSD3D12::write_slot_descriptors(CommandSlot& slot, ID3D12Resource* velocity) {
     const auto cpu = slot.velocity_descriptors->GetCPUDescriptorHandleForHeapStart();
 
@@ -689,6 +713,7 @@ bool RE4XeSSD3D12::record_and_submit(
     CommandSlot& slot,
     const RE4XeSSFrame& frame,
     RE4XeSSRuntime& runtime,
+    const OutputBinding& output,
     uint32_t slot_index,
     std::string& error) {
     auto result = slot.allocator->Reset();
@@ -718,6 +743,14 @@ bool RE4XeSSD3D12::record_and_submit(
         start_barriers[start_barrier_count++]);
     slot.list->ResourceBarrier(static_cast<UINT>(start_barrier_count), start_barriers.data());
 
+    D3D12_RESOURCE_BARRIER output_start{};
+    transition_barrier(
+        output.resource,
+        output.before_state,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        output_start);
+    slot.list->ResourceBarrier(1, &output_start);
+
     ID3D12DescriptorHeap* heaps[]{ slot.velocity_descriptors.Get() };
     slot.list->SetDescriptorHeaps(1, heaps);
     slot.list->SetComputeRootSignature(m_velocity_root_signature.Get());
@@ -739,7 +772,7 @@ bool RE4XeSSD3D12::record_and_submit(
     params.pDepthTexture = frame.depth;
     params.pExposureScaleTexture = nullptr;
     params.pResponsivePixelMaskTexture = nullptr;
-    params.pOutputTexture = m_detached_output.Get();
+    params.pOutputTexture = output.resource;
     params.jitterOffsetX = frame.jitter_x_pixels;
     params.jitterOffsetY = frame.jitter_y_pixels;
     params.exposureScale = 1.0f;
@@ -768,10 +801,13 @@ bool RE4XeSSD3D12::record_and_submit(
         restore_velocity);
     slot.list->ResourceBarrier(1, &restore_velocity);
 
-    D3D12_RESOURCE_BARRIER output_uav{};
-    output_uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    output_uav.UAV.pResource = m_detached_output.Get();
-    slot.list->ResourceBarrier(1, &output_uav);
+    D3D12_RESOURCE_BARRIER output_finish{};
+    transition_barrier(
+        output.resource,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        output.after_state,
+        output_finish);
+    slot.list->ResourceBarrier(1, &output_finish);
 
     result = slot.list->Close();
     if (FAILED(result)) {
@@ -811,7 +847,7 @@ bool RE4XeSSD3D12::record_and_submit(
 
     if (REFrameworkConfig::get()->is_debug_log_enabled() && m_submission_count <= 32) {
         spdlog::info(
-            "[RE4XeSS][Execute] frame={} slot={} fence={} resetHistory={} jitter=({:.5f},{:.5f}) input={}x{} output={}x{} color=0x{:x} depth=0x{:x} originalMV=0x{:x} convertedMV=0x{:x} detachedOutput=0x{:x} result=SUCCESS",
+            "[RE4XeSS][Execute] frame={} slot={} fence={} resetHistory={} jitter=({:.5f},{:.5f}) input={}x{} output={}x{} color=0x{:x} depth=0x{:x} originalMV=0x{:x} convertedMV=0x{:x} handoffOutput=0x{:x} beforeState=0x{:x} afterState=0x{:x} result=SUCCESS",
             static_cast<unsigned long long>(frame.frame_id),
             slot_index,
             static_cast<unsigned long long>(fence_value),
@@ -826,7 +862,9 @@ bool RE4XeSSD3D12::record_and_submit(
             reinterpret_cast<uintptr_t>(frame.depth),
             reinterpret_cast<uintptr_t>(frame.velocity),
             reinterpret_cast<uintptr_t>(m_converted_velocity.Get()),
-            reinterpret_cast<uintptr_t>(m_detached_output.Get()));
+            reinterpret_cast<uintptr_t>(output.resource),
+            static_cast<uint32_t>(output.before_state),
+            static_cast<uint32_t>(output.after_state));
     }
     return true;
 }
@@ -842,6 +880,7 @@ void RE4XeSSD3D12::quarantine_objects() noexcept {
         (void)slot.color_pin.Detach();
         (void)slot.depth_pin.Detach();
         (void)slot.original_velocity_pin.Detach();
+        (void)slot.output_pin.Detach();
         (void)slot.velocity_descriptors.Detach();
         (void)slot.list.Detach();
         (void)slot.allocator.Detach();
@@ -849,7 +888,6 @@ void RE4XeSSD3D12::quarantine_objects() noexcept {
     }
     (void)m_velocity_pipeline.Detach();
     (void)m_velocity_root_signature.Detach();
-    (void)m_detached_output.Detach();
     (void)m_converted_velocity.Detach();
     (void)m_fence.Detach();
     (void)m_queue.Detach();

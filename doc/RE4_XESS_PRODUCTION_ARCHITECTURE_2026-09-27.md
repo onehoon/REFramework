@@ -921,6 +921,8 @@ frame N XeSS write
     -> frame N+1 XeSS write
 ~~~
 
+Same-generation reuse is permitted only after the prior installed frame's post-Present marker has been queued. If the next pre-Overlay restoration occurs while that marker is still missing, do not submit or reinstall the same handoff generation. Wait nonblockingly for a later valid same-generation settlement marker, then resume reuse on a subsequent pre-Overlay callback. This prevents a late marker for frame N from being mistaken as evidence for a newly installed frame N+1 reader.
+
 For destruction/recreation, stronger proof is required.
 
 When an installed handoff reaches the presentation path, the existing Mod::on_post_present() callback signals a dedicated retirement fence on the same handoff-generation DIRECT queue.
@@ -937,7 +939,11 @@ the latest downstream retirement marker is complete
 
 unless confirmed device removal terminally ends the old D3D12 generation.
 
-If the post-Present callback is suppressed, the retirement Signal fails, the queue/device identity no longer matches, or no retirement marker exists, do not infer completion from time/frame count/bridge idleness. Quarantine the old handoff generation.
+If the post-Present callback is suppressed or no retirement marker exists, do not infer completion from time/frame count/bridge idleness. Keep an explicit missing-marker state and quarantine the old generation. After next-pre-Overlay restoration, a later valid Present may append a settlement marker to the pinned same-generation queue even if that later frame did not install the handoff; restoration ensures no new readers are added. If a valid marker is queued but incomplete, report nonblocking Draining and poll again on a later owner callback.
+
+If the retirement Signal fails or the callback observes a different active device/queue, hard-quarantine the old handoff generation. Do not signal a replacement queue or assume it covers the previous consumers. Confirmed device removal is the terminal exception.
+
+The post-Present callback is not assumed to run on the true pre-Overlay owner thread. It pins and synchronizes access to its generation's queue/fence, then only Signals and publishes marker evidence. It performs no XeSS API call, Overlay/TargetState access, TargetState release, or fence wait. The true pre-Overlay owner thread alone polls retirement and releases/recreates the engine TargetState after both writer and downstream proofs are safe.
 
 No public XeSS API is called from on_post_present().
 

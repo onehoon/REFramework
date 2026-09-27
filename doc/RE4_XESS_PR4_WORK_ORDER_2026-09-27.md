@@ -425,9 +425,18 @@ If the existing presentation compatibility path suppresses mod post-present call
 
 If the retirement `Signal` itself fails, quarantine the output generation.
 
+Distinguish a queued marker from a missing marker:
+
+- when a valid retirement value exists but `GetCompletedValue()` has not reached it, report a nonblocking **Draining** state and poll on a later owner callback; do not permanently quarantine solely because GPU work is still in flight;
+- when an installed frame has no marker yet, preserve an explicit pending-marker bit and treat lifetime as **MissingMarker/quarantined**; do not release the generation;
+- after next-pre-Overlay restoration, a later valid post-Present callback may enqueue a settlement marker on the same generation's pinned queue even if the current frame did not install the handoff. No new handoff readers are added after restoration, so this later queue marker covers the outstanding prior readers;
+- if the callback's active device/queue identity mismatches, or retirement `Signal` fails, hard-quarantine the generation. Do not signal a different queue or infer completion. Confirmed device removal remains terminal.
+
+The post-Present callback is not assumed to run on the pre-Overlay XeSS owner thread. Protect the retirement fence/queue lifetime and marker state with bounded synchronization (e.g. a short mutex around ComPtr pins and `Signal`, with owner-thread polling). The callback may signal and publish evidence only: no XeSS API, Overlay mutation, TargetState destruction, or blocking fence wait.
+
 ### 6.5 Same-generation frame reuse does not require a CPU wait
 
-Normal frame-to-frame reuse of the same handoff texture is ordered by the same DIRECT queue:
+Normal frame-to-frame reuse of the same handoff texture is ordered by the same DIRECT queue once the prior installed frame's post-Present retirement marker has been queued:
 
 ~~~text
 frame N XeSS write
@@ -442,6 +451,8 @@ The frame N+1 bridge list is submitted later to the same queue, so queue orderin
 Do not CPU-wait on the downstream retirement fence every frame.
 
 The retirement fence exists for **lifetime/destruction/recreation proof**, not normal steady-state reuse.
+
+If frame N reaches the next pre-Overlay restoration boundary before its post-Present callback has queued a marker, report **MissingMarker** and do not submit or reinstall the same handoff generation on frame N+1. A later valid same-generation post-Present callback may queue a settlement marker after restoration; normal submission/reuse may resume on a subsequent pre-Overlay callback after that marker is queued. This is nonblocking fail-closed behavior, not a CPU fence wait. Emit bounded diagnostics for the blocked reuse, settlement marker, and resumed installation.
 
 ### 6.6 Remove detached output from normal path
 
@@ -751,9 +762,9 @@ display extent
 
 Do not restore or mutate from this callback.
 
-`on_post_present()` has a different mandatory role: when the current frame presented an installed handoff and the active queue/device still match the handoff generation, enqueue the downstream retirement fence Signal described in section 6.4.
+`on_post_present()` has a different mandatory role: when an installed frame still needs retirement evidence, and the active queue/device match the handoff generation, enqueue the downstream retirement fence Signal described in section 6.4. This also permits a later valid Present to settle a previously missing marker after restoration, even when that later frame does not itself install the handoff.
 
-This callback must not call any public XeSS API and must not release the TargetState immediately. It only records retirement evidence for later owner-thread teardown/recreation.
+This callback must not call any public XeSS API and must not release the TargetState immediately. It only records retirement evidence for later owner-thread teardown/recreation. It may run on a different thread from pre-Overlay; pin and synchronize queue/fence access, never access engine TargetState objects here, and never wait for fence completion here.
 
 ---
 
@@ -1129,6 +1140,20 @@ Unrelated existing game/debug-layer messages do not automatically fail the test;
 ### Long session
 
 Check no refcount growth pattern, no per-frame TargetState churn, no ring starvation, no stale restoration, no downstream retirement backlog during normal operation, and no device removal.
+
+### Delayed post-Present marker regression
+
+Exercise a controlled callback delay for one installed handoff frame:
+
+~~~text
+frame N installs handoff; delay its post-Present callback
+frame N+1 pre-Overlay restores the original TargetState and reports MissingMarker
+frame N+1 submits/installs no handoff output
+later valid same-generation post-Present queues the settlement marker
+next eligible pre-Overlay resumes XeSS submit/install
+~~~
+
+Confirm the bounded log identifies the restored frame, blocked reuse, settlement marker, and resumed installation. No earlier marker may be accepted as proof for a later installed reader; no TargetState release/recreation is allowed until the retirement marker is complete when retirement is requested.
 
 ---
 
