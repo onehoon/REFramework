@@ -1,0 +1,1339 @@
+# RE4 XeSS Production Architecture — Final Target Design
+
+**Repository:** onehoon/REFramework  
+**Production branch:** feature/re4-xess  
+**Target game:** Resident Evil 4 (2023), Direct3D 12  
+**Validated game build:** RE4 1.5.9.0, Steam AppID 2050650, BuildID 22377325  
+**Design date:** 2026-09-27  
+**Status:** Final target architecture for production implementation
+
+---
+
+## 1. Purpose
+
+This document defines the production architecture for adding a native-looking XeSS D3D12 producer path to Resident Evil 4 through this custom REFramework fork.
+
+The reverse-engineering phase is complete through Capture 30b. The implementation phase begins from feature/re4-xess, which was created from the current XeFG-compatible master lineage.
+
+The production feature must make RE4 behave, from the outside, like a normal game that natively integrates public XeSS D3D12:
+
+~~~text
+RE4
+  -> REFramework RE4-only XeSS producer
+  -> public XeSS D3D12 API
+  -> libxess.dll
+      -> native Intel XeSS when used directly
+      -> or stock OptiScaler interception
+          -> selected SR backend
+          -> FGInput=Upscaler
+          -> XeFG
+~~~
+
+REFramework must not introduce a private REFramework-to-OptiScaler API, must not create an RE4-specific OptiScaler fork, and must not add its own XeFG frontend.
+
+---
+
+## 2. Frozen product requirements
+
+The following requirements are architectural invariants.
+
+### 2.1 RE4-only runtime scope
+
+The feature exists only for Resident Evil 4.
+
+The production Mod must be constructed only when:
+
+~~~cpp
+sdk::GameIdentity::get().is_re4()
+~~~
+
+is true.
+
+Important callbacks must also fail closed if the running title is not RE4.
+
+For every other RE Engine title:
+
+- no RE4 XeSS object is constructed;
+- no XeSS DLL is loaded by the RE4 module;
+- no XeSS context is created;
+- no RE4-specific D3D12 resource is allocated;
+- no SceneView size is modified;
+- no projection jitter is injected;
+- no RE4 resource pointer is inspected or changed by this subsystem;
+- no extra per-frame RE4 XeSS logging is emitted.
+
+Compiling the code into the universal REFramework DLL is acceptable. Runtime behavior outside RE4 must remain unchanged.
+
+### 2.2 Existing XeFG compatibility code is a protected subsystem
+
+The existing custom REFramework XeFG / OptiScaler compatibility work is not part of the RE4 XeSS implementation surface.
+
+The following area is treated as protected / no-touch for this feature:
+
+~~~text
+src/compatibility/xefg/**
+existing XeFG lifecycle logic in D3D12Hook
+existing XeFG loader handoff logic
+REFramework_XeFG_PreRetireSwapchainV1
+existing XeFG resize / binding / runtime-transition behavior
+~~~
+
+If a separate XeFG defect is discovered later, it must be handled as a separate compatibility change, not mixed into RE4 XeSS implementation PRs.
+
+The RE4 XeSS module may coexist with this compatibility layer but must not depend on its internal types or state.
+
+### 2.3 Stock OptiScaler remains unmodified
+
+The production contract is the public XeSS D3D12 API.
+
+REFramework must never require:
+
+- an OptiScaler-specific export;
+- a private ABI;
+- a custom OptiScaler build;
+- an OptiScaler patch for RE4;
+- direct access to OptiScaler internal state;
+- knowledge of which SR backend OptiScaler selected.
+
+The same RE4 producer must work in both cases:
+
+~~~text
+RE4 -> public XeSS -> native libxess.dll
+RE4 -> public XeSS -> OptiScaler XeSS frontend -> alternate SR backend
+~~~
+
+### 2.4 RE4 Frame Generation scope is only Upscaler -> XeFG
+
+RE4 has no native FG frontend.
+
+Therefore the RE4 implementation does not emulate DLSSG, FSR FG, or any other game FG API.
+
+For OptiScaler Frame Generation, the supported architecture is only:
+
+~~~text
+FGInput=Upscaler
+    -> OptiScaler consumes the intercepted upscaler frame data
+    -> XeFG
+~~~
+
+The RE4 module does not call libxess_fg.dll, does not create an XeFG context, and does not register XeFG resources.
+
+### 2.5 Upscaler backend substitution must continue to work
+
+RE4 always produces the public XeSS frontend contract.
+
+OptiScaler remains free to substitute another supported SR backend behind that frontend.
+
+REFramework must not branch on:
+
+~~~text
+native XeSS
+DLSS
+FSR
+other OptiScaler SR backend
+~~~
+
+and must not calculate different RE4 inputs for those backends.
+
+Quality selection and input resolution are expressed through the XeSS producer contract. Backend mapping remains OptiScaler responsibility.
+
+### 2.6 Existing REFramework Debug Log setting is reused
+
+The RE4 XeSS module may emit detailed diagnostics when the existing REFramework Debug Log option is enabled.
+
+Do not add a second global debug switch just for RE4 XeSS.
+
+The RE4 module should consume a neutral read-only debug-log accessor from REFrameworkConfig; it must not query XeFGCompatibility::is_debug_log_enabled(), because that would create an unnecessary dependency between the new RE4 module and the protected XeFG compatibility subsystem.
+
+---
+
+## 3. Branch and source ownership
+
+### 3.1 Branch roles
+
+~~~text
+master
+    current production baseline
+    existing XeFG / OptiScaler compatibility remains here
+
+refactor/re4-temporal-diagnostic
+    research/archive branch
+    Capture 1-30b evidence
+    not the production implementation base
+
+feature/re4-xess
+    production implementation branch
+    starts from current master lineage
+~~~
+
+Do not merge the diagnostic Mod wholesale into feature/re4-xess.
+
+Only production-relevant, verified facts and minimal RE4-specific SDK corrections should be ported.
+
+### 3.2 Production source layout
+
+Target source layout:
+
+~~~text
+src/mods/re4_xess/
+    RE4XeSS.hpp
+    RE4XeSS.cpp
+
+    RE4XeSSFrame.hpp
+
+    RE4XeSSRuntime.hpp
+    RE4XeSSRuntime.cpp
+
+    RE4XeSSD3D12.hpp
+    RE4XeSSD3D12.cpp
+
+    RE4XeSSOutputHandoff.hpp
+    RE4XeSSOutputHandoff.cpp
+~~~
+
+The layout may begin with fewer translation units and split as responsibilities grow, but these ownership boundaries should remain.
+
+### 3.3 Allowed shared changes
+
+Shared REFramework changes must be minimal and either behavior-neutral or explicitly RE4-gated.
+
+Expected shared changes:
+
+~~~text
+src/Mods.cpp
+    RE4-only registration
+
+shared/sdk/Renderer.hpp / Renderer.cpp
+    only RE4-specific, runtime-verified layout/accessor corrections
+
+src/mods/REFrameworkConfig.hpp
+    neutral read-only Debug Log accessor if needed
+
+build files
+    compile the new production sources
+~~~
+
+The RE4-specific Texture layout corrections proven by the diagnostic branch are expected to be ported:
+
+~~~text
+RE4 Texture desc offset:
+    RenderResource::get_runtime_size() + 0x18
+
+RE4 D3D12 resource-container offset:
+    0xB8
+~~~
+
+They must remain explicitly RE4-gated and must not change other TDB 71 titles.
+
+---
+
+## 4. Target runtime topology
+
+~~~text
+                    Resident Evil 4 D3D12
+                             |
+                  Scene / PostEffect pipeline
+                             |
+                render-resolution HDR scene
+                             |
+                +------------+------------+
+                |            |            |
+              Color        Depth       Velocity
+                |            |            |
+                +------------+------------+
+                             |
+                    true pre-Overlay
+                             |
+                  RE4XeSS frame builder
+                             |
+             REFramework-owned DIRECT cmd list
+                             |
+                  public xessD3D12Execute
+                             |
+                display-resolution HDR output
+                             |
+                  RE4XeSSOutputHandoff
+                             |
+               RE4 Overlay / UI / output path
+                             |
+               native final screen-out pass
+               DrawInstanced(3,1,0,0)
+                             |
+                       DXGI swapchain
+                             |
+                 existing presentation stack
+                             |
+            stock OptiScaler / XeFG when enabled
+~~~
+
+The architectural goal is:
+
+> upscale the 3D/HDR scene before RE4's UI/final presentation work, then keep RE4's own presentation path responsible for the final swapchain image.
+
+Direct XeSS-output-to-swapchain copying is not the target architecture.
+
+---
+
+## 5. Production components
+
+### 5.1 RE4XeSS — RE4 coordinator
+
+RE4XeSS is the only Mod-facing production object.
+
+Responsibilities:
+
+- RE4-only construction and callback gating;
+- configuration and enable/disable state;
+- SceneView render-size control;
+- projection jitter injection;
+- temporal input collection;
+- reset/history state machine;
+- coordination of XeSS runtime, D3D12 executor, and output handoff;
+- device/reset lifecycle;
+- fail-closed rollback to normal RE4 rendering.
+
+It must not contain OptiScaler-specific logic.
+
+It must not contain XeFG-specific logic.
+
+### 5.2 RE4XeSSFrame — normalized frame contract
+
+All RE4 engine semantics are normalized before the XeSS runtime sees them.
+
+Target frame packet:
+
+~~~cpp
+struct RE4XeSSFrame {
+    ID3D12Resource* color{};
+    ID3D12Resource* depth{};
+    ID3D12Resource* velocity{};
+
+    uint32_t render_width{};
+    uint32_t render_height{};
+    uint32_t display_width{};
+    uint32_t display_height{};
+
+    float jitter_x_pixels{};
+    float jitter_y_pixels{};
+
+    float motion_scale_x{};
+    float motion_scale_y{};
+
+    float near_plane{};
+    float far_plane{};
+    float vertical_fov{};
+
+    bool reset_history{};
+    uint64_t frame_id{};
+};
+~~~
+
+Exact type naming can change.
+
+No OptiScaler type belongs in this structure.
+
+### 5.3 RE4XeSSRuntime — public XeSS frontend
+
+This component owns only the public XeSS producer API contract.
+
+Responsibilities:
+
+- normal Windows loading/resolution of libxess.dll;
+- resolution of required public XeSS exports;
+- context creation;
+- quality/input-resolution query;
+- D3D12 initialization;
+- velocity scale configuration;
+- execute dispatch;
+- context destruction;
+- API result logging;
+- runtime capability/version reporting under Debug Log.
+
+Loading must use normal module resolution and must not force an absolute vendor-runtime path that would bypass an installed OptiScaler XeSS proxy.
+
+No libxess_fg.dll API is loaded here.
+
+### 5.4 RE4XeSSD3D12 — command submission and bridge-owned GPU lifetime
+
+Responsibilities:
+
+- own the REFramework command allocator/list ring;
+- use the active RE4 DIRECT queue;
+- own the fence used only for bridge allocator/list reuse;
+- own XeSS-specific output/conversion resources that are not engine objects;
+- perform required legacy ResourceBarrier transitions;
+- reset/recreate resources when display size or device identity changes;
+- never modify or append to an engine-owned command list.
+
+The research campaign proves that an REFramework-owned DIRECT list can be submitted from the true pre-Overlay callback safely.
+
+The implementation must rely on the semantic callback boundary, not on a hardcoded queue ordinal.
+
+### 5.5 RE4XeSSOutputHandoff — engine re-entry boundary
+
+This is intentionally a separate component because it is the highest-risk part of production integration.
+
+Its architectural contract is fixed:
+
+1. take a valid display-resolution HDR XeSS result;
+2. expose it to RE4's own downstream Overlay/UI/output pipeline;
+3. keep RE4's final screen-out/presentation path active;
+4. never use a direct copy to the swapchain as the normal path;
+5. never drain foreign COM references;
+6. restore original engine state cleanly on disable, failure, resize, or device reset.
+
+The preferred first implementation is an engine-visible display-resolution target-state handoff:
+
+- derive/clone an RE4 engine TargetState from the semantic Overlay/HDR target;
+- size that handoff target to the display resolution;
+- use the native D3D12 resource behind that handoff target as the XeSS output when its format/capabilities are valid;
+- at the proven pre-Overlay boundary, redirect only the RE4 downstream Overlay/output path to that display-resolution handoff state;
+- preserve the original engine state/pointers and restore them before the next scene render or on any teardown path.
+
+This architecture keeps RE4 responsible for its own UI and final presentation instead of replacing the final backbuffer.
+
+#### 5.5.1 Output-format adaptation
+
+Do not assume in advance that the preferred RE4 HDR target format is accepted as an XeSS output format by every supported XeSS runtime.
+
+The handoff layer may therefore contain two surfaces:
+
+~~~text
+XeSS-native output
+    format accepted by public XeSS runtime
+            |
+      optional conversion
+            |
+engine-visible HDR handoff target
+    format expected by RE4 downstream pipeline
+~~~
+
+If no conversion is required, both roles may use the same native resource.
+
+Any conversion pass is bridge-owned and happens on the same ordered REFramework command submission path.
+
+#### 5.5.2 Narrow validation gate
+
+Capture 30b proves the native final output window and one unique fullscreen-triangle style draw:
+
+~~~text
+Swapchain 0x00 -> 0x04
+Color     0x04 -> 0xC0
+DrawInstanced(3,1,0,0)
+Swapchain 0x04 -> 0x00
+Present
+~~~
+
+It does not prove descriptor binding for that draw.
+
+Therefore the first real output-handoff implementation must verify that the substituted engine-visible handoff target flows through the downstream final path.
+
+If it does not, do not fall back to copying the XeSS result directly to the swapchain.
+
+Instead, add the narrowest possible descriptor/SRV provenance probe around that already-proven single draw and adjust only RE4XeSSOutputHandoff.
+
+The rest of the producer architecture must remain unchanged.
+
+---
+
+## 6. Verified RE4 temporal input contract
+
+The production implementation uses the following runtime-verified semantics.
+
+### 6.1 Color
+
+~~~text
+semantic source:
+    Overlay main native resource
+    == Scene PostMainTarget
+    == Scene HDRTarget
+
+format observed:
+    R11G11B10_FLOAT
+
+true pre-Overlay state:
+    0xC0
+    PIXEL_SHADER_RESOURCE | NON_PIXEL_SHADER_RESOURCE
+~~~
+
+Do not use transient RenderContext::get_render_target() as the production Color anchor.
+
+### 6.2 Depth
+
+~~~text
+semantic source:
+    Scene::DepthStencilTex
+
+true pre-Overlay state:
+    0xE0
+    DEPTH_READ
+    | PIXEL_SHADER_RESOURCE
+    | NON_PIXEL_SHADER_RESOURCE
+
+depth convention:
+    inverted / reversed
+~~~
+
+XeSS initialization must include the inverted-depth producer flag.
+
+### 6.3 Motion vectors
+
+~~~text
+semantic source:
+    Scene::VelocityTarget
+
+channels:
+    R = X
+    G = Y
+
+jittered MV:
+    false
+
+true pre-Overlay state:
+    0x04
+    RENDER_TARGET
+
+motion scale:
+    X =  renderWidth / 2
+    Y = -renderHeight / 2
+~~~
+
+The RE4 bridge must transition Velocity to the state required for XeSS reading, then restore it to 0x04 before returning control to the engine.
+
+### 6.4 Camera metadata
+
+~~~text
+near plane:
+    primary via.Camera NearClipPlane
+
+far plane:
+    primary via.Camera FarClipPlane
+
+vertical FOV:
+    2 * atan(1 / SceneInfo.projection[1][1])
+~~~
+
+Do not hardcode the observed static ~45 degree state.
+
+### 6.5 Render and display sizes
+
+~~~text
+render size:
+    bridge-controlled SceneView size
+    must match Color / Depth / Velocity extents
+
+display size:
+    active DXGI swapchain/output size
+~~~
+
+Do not use D3D12Hook render-size hints as the authoritative scene-size source.
+
+Do not modify ImageQualityRate unless a later production contradiction proves it necessary.
+
+---
+
+## 7. XeSS producer contract
+
+### 7.1 Public API only
+
+The runtime uses normal XeSS D3D12 entry points.
+
+Expected public calls include the equivalent of:
+
+~~~text
+xessD3D12CreateContext
+xessGetOptimalInputResolution
+xessD3D12Init
+xessSetVelocityScale
+xessD3D12Execute
+xessDestroyContext
+~~~
+
+Optional public version/properties/logging calls may be used for diagnostics.
+
+The exact SDK version and signatures come from the official XeSS SDK integrated by the implementation PR.
+
+Do not duplicate private OptiScaler headers or internal types.
+
+### 7.2 Input resolution policy
+
+REFramework should request the optimal XeSS input resolution from the public XeSS frontend for the selected XeSS quality mode and current display size.
+
+Do not hardcode DLSS, FSR, or OptiScaler backend ratios in REFramework.
+
+This matters for OptiScaler compatibility because stock OptiScaler already implements the XeSS frontend resolution query and can apply its own configured override/mapping behind the same public contract.
+
+Flow:
+
+~~~text
+display size
+    -> xessGetOptimalInputResolution(...)
+    -> render size
+    -> SceneView size override
+    -> actual Color/Depth/Velocity extents
+~~~
+
+Before executing XeSS, the actual resource extents must match the requested render size.
+
+### 7.3 Initial quality policy
+
+The architecture supports XeSS quality settings as producer configuration.
+
+The first bring-up should expose or use only one controlled quality mode to reduce variables.
+
+After native XeSS and output handoff are stable, additional public XeSS quality modes can be exposed without changing the architecture.
+
+No REF UI should offer DLSS/FSR backend selection. That belongs to OptiScaler.
+
+### 7.4 Motion scale
+
+Use the verified RE4 producer conversion:
+
+~~~text
+xess velocity scale X =  renderWidth / 2
+xess velocity scale Y = -renderHeight / 2
+~~~
+
+This is expressed through the public XeSS producer API.
+
+The RE4 module does not special-case the downstream OptiScaler backend.
+
+### 7.5 Jitter
+
+RE4 projection injection mechanics are already proven.
+
+The production jitter generator must:
+
+- be deterministic;
+- follow the XeSS producer sampling policy selected by the integrated SDK/sample guidance;
+- pass the same pixel-space jitter values to XeSS execute metadata;
+- convert them into RE4 projection offsets using the proven RE4 mapping;
+- maintain previous/current projection history consistently;
+- never copy fixed values from external MOD screenshots.
+
+Verified RE4 matrix mapping:
+
+~~~text
+projection[2][0] += +2 * jitterX / renderWidth
+projection[2][1] += -2 * jitterY / renderHeight
+~~~
+
+### 7.6 Init flags and producer semantics
+
+Frozen producer semantics:
+
+~~~text
+inverted depth:
+    true
+
+jittered motion vectors:
+    false
+
+motion-vector resolution:
+    render resolution, not display resolution
+
+input scene color:
+    HDR scene color, not an LDR swapchain image
+~~~
+
+Exposure handling must use a documented public XeSS path. No unverified RE4 exposure texture should be added merely to imitate another implementation.
+
+---
+
+## 8. Per-frame execution timeline
+
+Target steady-state frame flow:
+
+~~~text
+[frame start]
+    |
+    | restore any temporary engine handoff from previous frame
+    | process pending recreation/reset
+    v
+RE4 SceneView size query
+    |
+    | return selected render resolution
+    v
+RE4 camera/projection queries
+    |
+    | inject current XeSS jitter
+    | maintain projection history
+    v
+RE4 scene / post processing
+    |
+    | produces render-resolution:
+    |   Color
+    |   Depth
+    |   Velocity
+    v
+on_pre_overlay_layer_draw()
+    |
+    | validate RE4 semantic resource invariants
+    | build RE4XeSSFrame
+    | set resetHistory if required
+    |
+    | bridge-owned DIRECT list:
+    |   transition Velocity 0x04 -> readable
+    |   prepare XeSS output
+    |   xessD3D12Execute
+    |   optional output conversion
+    |   prepare engine-visible handoff state
+    |   restore Velocity -> 0x04
+    |
+    | execute bridge list on active DIRECT queue
+    | install downstream output handoff
+    v
+original RE4 Overlay / UI path
+    |
+    v
+RE4 final output path
+    |
+    | proven unique final pass:
+    | DrawInstanced(3,1,0,0)
+    v
+swapchain Present
+    |
+    v
+existing REFramework / OptiScaler / XeFG presentation behavior
+~~~
+
+No CPU fence wait is performed every frame.
+
+GPU ordering comes from submitting the bridge list to the same DIRECT queue at the proven semantic boundary.
+
+The bridge fence exists for allocator/list reuse and lifecycle safety only.
+
+---
+
+## 9. Command-list and resource-state ownership
+
+### 9.1 Engine resources are borrowed
+
+The bridge borrows:
+
+~~~text
+Color
+Depth
+Velocity
+active D3D12 device
+active DIRECT queue
+engine semantic TargetState references needed for handoff
+~~~
+
+It does not own their lifetime and must not aggressively Release them.
+
+### 9.2 Bridge resources are owned
+
+The bridge owns:
+
+~~~text
+XeSS context
+bridge command allocators
+bridge command lists
+bridge fence
+XeSS-native output if separate
+output conversion resource if required
+cloned/bridge-owned engine handoff TargetState where used
+temporary descriptors required by bridge-owned passes
+~~~
+
+All bridge-owned resources must be destroyed or recreated on the correct lifecycle transitions.
+
+### 9.3 Allocator/list ring
+
+Use an REFramework-owned ring large enough to avoid normal CPU stalls.
+
+The diagnostic campaign proved safe nonblocking reuse with an eight-slot ring.
+
+The production implementation may retain eight slots unless a later simplification is demonstrated safe.
+
+Each slot contains at least:
+
+~~~text
+ID3D12CommandAllocator
+ID3D12GraphicsCommandList
+last fence value
+~~~
+
+Before resetting a slot, verify its previous fence has completed.
+
+Do not spin or block the render thread indefinitely.
+
+### 9.4 Resource-state rules
+
+At the true pre-Overlay boundary:
+
+~~~text
+Color    = 0xC0
+Depth    = 0xE0
+Velocity = 0x04
+~~~
+
+Color and Depth are already shader-readable for the verified path.
+
+Velocity requires a bridge transition for XeSS consumption and must be restored to 0x04.
+
+Output resources follow their own bridge-owned state tracker.
+
+Do not add redundant barriers to engine resources merely for diagnostics.
+
+---
+
+## 10. Reset and lifecycle state machine
+
+Target coordinator state:
+
+~~~text
+Disabled
+    |
+    v
+WaitingForD3D12
+    |
+    v
+WaitingForValidScene
+    |
+    v
+Ready
+    |
+    v
+Active
+    |
+    +--> RecreatePending
+    |       |
+    |       v
+    |      Ready
+    |
+    +--> Faulted
+            |
+            +--> retry only on explicit re-enable or valid device recreation
+~~~
+
+### 10.1 History reset conditions
+
+The first valid frame after any of the following uses XeSS history reset:
+
+- first enable;
+- first valid dispatch;
+- render-size change;
+- display-size change that recreates output;
+- Color identity change;
+- Depth identity change;
+- Velocity identity change;
+- XeSS context recreation;
+- D3D12 device recreation;
+- relevant swapchain recreation;
+- RE4 Load Save recovery;
+- recovery from a missing/invalid temporal input.
+
+### 10.2 RE4 Load Save rule
+
+Use the verified explicit RE4 load window:
+
+~~~text
+SceneLoadZoneManager._Pause false -> true
+    arm history-invalid state
+
+_Pause true -> false
+    do not immediately resume
+
+GameSituationManager.InhibitBit
+returns to remembered pre-load normal value
+    first valid gameplay frame:
+        resetHistory = true
+    then resume accumulation
+~~~
+
+Do not hardcode the observed inhibit-bit value.
+
+Do not use camera translation alone as a Load Save reset heuristic.
+
+### 10.3 Device / swapchain lifecycle
+
+On D3D12 device reset or incompatible swapchain/display-size recreation:
+
+1. stop scheduling new XeSS dispatches;
+2. restore any temporary RE4 output handoff;
+3. wait only as required for bridge-owned GPU work to retire;
+4. destroy bridge-owned output resources;
+5. destroy XeSS context;
+6. reset allocator/list/fence state;
+7. return to WaitingForD3D12 / RecreatePending;
+8. reinitialize only when the new D3D12 state is valid.
+
+The RE4 module must not call or alter XeFG lifecycle internals.
+
+---
+
+## 11. Fail-closed behavior
+
+A production failure must prefer native RE4 rendering over a partially active bridge.
+
+Examples that force a safe skip or session fault:
+
+~~~text
+not RE4
+not D3D12
+missing public XeSS runtime
+required XeSS export missing
+XeSS context creation failure
+XeSS init failure
+invalid Color / Depth / Velocity
+resource extent mismatch
+invalid active DIRECT queue
+output handoff invariant mismatch
+device identity mismatch
+bridge allocator/list reuse not safe
+~~~
+
+If a failure occurs after the bridge changed SceneView size or installed a temporary handoff:
+
+- restore native engine state;
+- stop injecting jitter;
+- stop submitting XeSS work;
+- mark temporal history invalid;
+- log the reason;
+- leave the game rendering through its normal path.
+
+Never keep low-resolution SceneView active while XeSS execution is unavailable.
+
+---
+
+## 12. OptiScaler compatibility contract
+
+The RE4 producer does not detect whether libxess.dll is Intel's runtime or OptiScaler's XeSS proxy path.
+
+That is intentional.
+
+The public call stream remains the same:
+
+~~~text
+CreateContext
+GetOptimalInputResolution
+Init
+SetVelocityScale
+Execute every valid frame
+DestroyContext
+~~~
+
+Stock OptiScaler can then:
+
+- intercept the XeSS producer;
+- capture Color / Depth / Velocity / Output / jitter / reset / sizes;
+- route the request to another SR backend;
+- keep REFramework unaware of the selected backend.
+
+The RE4 implementation must not call backend-specific code after OptiScaler is detected.
+
+No "OptiScaler mode" exists inside RE4XeSS.
+
+---
+
+## 13. XeFG compatibility contract
+
+RE4 has no native FG producer.
+
+Therefore the only supported FG validation path is:
+
+~~~text
+RE4 public XeSS producer
+    -> stock OptiScaler
+    -> selected SR backend
+    -> FGInput=Upscaler
+    -> XeFG
+~~~
+
+The existing REFramework XeFG compatibility subsystem remains responsible for:
+
+- libxess_fg.dll discovery/handoff;
+- XeFG swapchain proxy ownership;
+- presentation queue/swapchain binding;
+- resize lifecycle;
+- runtime transition handling;
+- hook-monitor compatibility;
+- public proxy retirement coordination.
+
+The new RE4 module must not duplicate any of those responsibilities.
+
+### 13.1 Validation order
+
+XeFG is not tested until the same producer is already correct in these stages:
+
+~~~text
+1. native RE4 without RE4XeSS enabled
+2. RE4 + native XeSS SR
+3. RE4 + stock OptiScaler + alternate SR backend
+4. RE4 + stock OptiScaler + FGInput=Upscaler + XeFG
+~~~
+
+If stage 3 works and stage 4 fails, do not immediately change the RE4 XeSS producer contract.
+
+First isolate whether the failure belongs to the existing presentation/XeFG compatibility layer.
+
+---
+
+## 14. Debug logging
+
+The existing REFrameworkConfig_DebugLog switch controls detailed RE4 XeSS diagnostics.
+
+Recommended log namespaces:
+
+~~~text
+[RE4XeSS][Init]
+[RE4XeSS][Runtime]
+[RE4XeSS][Frame]
+[RE4XeSS][Execute]
+[RE4XeSS][Output]
+[RE4XeSS][Reset]
+[RE4XeSS][Resize]
+[RE4XeSS][Failure]
+~~~
+
+Normal info/warn/error logs should be event-driven.
+
+Debug Log may additionally include frame-level state.
+
+Prefer logging state transitions instead of dumping every frame indefinitely.
+
+Important debug fields:
+
+~~~text
+enabled state
+XeSS runtime version/path
+device / queue identity
+quality mode
+render resolution
+display resolution
+Color / Depth / Velocity identities
+input resource states
+jitter
+motion scale
+resetHistory + reason
+XeSS execute result
+output identity/format/state
+handoff install/restore
+context generation
+device/swapchain generation
+~~~
+
+Do not reuse the [XeFG] prefix for RE4 XeSS logs.
+
+---
+
+## 15. Configuration policy
+
+Initial production configuration should be intentionally small.
+
+Required first-stage options:
+
+~~~text
+RE4 XeSS Enabled
+RE4 XeSS Quality
+~~~
+
+Recommended initial behavior:
+
+~~~text
+Enabled:
+    false by default during bring-up
+
+Quality:
+    one controlled XeSS quality mode during first runtime milestones
+    expand after native XeSS + handoff are stable
+~~~
+
+Do not add:
+
+- an OptiScaler backend selector;
+- an XeFG selector;
+- FG interpolation controls;
+- DLSS/FSR naming to the REFramework RE4 UI.
+
+Those belong to OptiScaler.
+
+---
+
+## 16. Implementation phases and PR boundaries
+
+### PR 1 — production shell + public XeSS runtime lifecycle
+
+Scope:
+
+- create RE4-only Mod;
+- RE4-only registration in Mods.cpp;
+- port only required RE4 SDK layout fixes;
+- add neutral Debug Log accessor;
+- add public XeSS runtime loader/export table;
+- context create/destroy scaffolding;
+- no SceneView modification;
+- no jitter;
+- no execute;
+- no output mutation.
+
+Acceptance:
+
+~~~text
+RE4:
+    module can initialize public XeSS runtime when enabled
+
+non-RE4:
+    no RE4XeSS construction/runtime activity
+
+protected XeFG compatibility code:
+    zero behavioral changes
+~~~
+
+### PR 2 — production temporal frame builder
+
+Scope:
+
+- semantic Color / Depth / Velocity accessors;
+- SceneView render-size control;
+- camera metadata;
+- jitter injection/history;
+- reset state machine;
+- no visible output handoff yet.
+
+Acceptance:
+
+~~~text
+frame packet matches research contract
+actual resource extents match requested input size
+native engine state restores cleanly on disable/failure
+~~~
+
+### PR 3 — real XeSS execute to detached output
+
+Scope:
+
+- allocator/list/fence ring;
+- input barriers;
+- public XeSS init/execute;
+- bridge-owned output;
+- Velocity restoration;
+- output not yet consumed by RE4 presentation.
+
+Acceptance:
+
+~~~text
+native XeSS execute succeeds repeatedly
+no GPU validation/state errors
+no allocator reuse hazard
+no engine input state corruption
+~~~
+
+### PR 4 — RE4 output handoff
+
+Scope:
+
+- engine-visible display-resolution handoff target;
+- optional output conversion;
+- pre-Overlay handoff installation;
+- downstream RE4 Overlay/UI/output path;
+- handoff restoration and lifecycle.
+
+Acceptance:
+
+~~~text
+visible XeSS SR output
+RE4 UI preserved
+no direct swapchain copy architecture
+final native screen-out path remains active
+resize / enable-disable safe
+~~~
+
+If the target-state handoff does not reach the proven final pass, add only the narrow final-draw descriptor provenance required to correct this component.
+
+### PR 5 — stock OptiScaler SR substitution
+
+Scope:
+
+- no producer architecture change;
+- validate stock OptiScaler interception;
+- test at least one non-XeSS SR backend through the XeSS frontend;
+- verify quality/input-resolution behavior;
+- verify reset and resize.
+
+Acceptance:
+
+~~~text
+same RE4 producer code
+OptiScaler successfully substitutes SR backend
+no private REF/OptiScaler ABI
+~~~
+
+### PR 6 — Upscaler -> XeFG validation
+
+Scope:
+
+- FGInput=Upscaler;
+- existing REFramework XeFG compatibility unchanged unless a separately proven defect exists;
+- generated-frame runtime;
+- resize/fullscreen/Alt+Tab;
+- context recreation;
+- long-session lifecycle.
+
+Acceptance:
+
+~~~text
+SR remains correct
+XeFG generated frames stable
+no swapchain lifecycle regression
+no impact on other games
+~~~
+
+### PR 7 — production polish
+
+Scope:
+
+- remaining XeSS quality modes;
+- UI/config polish;
+- diagnostic rate limiting;
+- cleanup of temporary implementation-only instrumentation;
+- final non-RE4 regression pass.
+
+---
+
+## 17. Regression and acceptance matrix
+
+Every production milestone must preserve these baselines.
+
+### Non-RE4 regression
+
+At minimum, verify representative D3D12 titles already supported by the custom fork still follow their normal path.
+
+Expected invariant:
+
+~~~text
+RE4XeSS object not constructed
+no libxess.dll load initiated by RE4XeSS
+no RE4 SceneView/jitter/resource mutations
+existing XeFG compatibility behavior unchanged
+~~~
+
+### RE4 native path
+
+~~~text
+RE4XeSS disabled
+    game behavior matches baseline custom REFramework
+~~~
+
+### RE4 native XeSS
+
+~~~text
+RE4XeSS enabled
+OptiScaler absent
+    public XeSS runtime works
+    render/display split works
+    UI remains correct
+~~~
+
+### RE4 OptiScaler SR
+
+~~~text
+same RE4XeSS producer
+stock OptiScaler installed
+alternate SR backend selected
+    output correct
+    no REF backend-specific code
+~~~
+
+### RE4 XeFG
+
+~~~text
+same RE4XeSS producer
+stock OptiScaler
+FGInput=Upscaler
+XeFG
+    generated frames stable
+    resize/fullscreen/Alt+Tab stable
+~~~
+
+---
+
+## 18. Explicitly rejected designs
+
+### 18.1 Do not use pd-upscaler as the production base
+
+Historical pd-upscaler is an oracle only.
+
+Do not merge/cherry-pick its broad branch history into production.
+
+Do not add PDPerfPlugin.dll.
+
+Its historical direct upscaled-output-to-backbuffer copy path is specifically not the desired architecture because the current project requires RE4's own Overlay/UI/presentation path to remain downstream of scene upscaling.
+
+### 18.2 Do not create a separate bridge DLL/ASI
+
+There is no production ATSBridge binary.
+
+The bridge is a logical RE4 subsystem inside REFramework.
+
+### 18.3 Do not implement a custom OptiScaler ABI
+
+No REF-to-OptiScaler private export or protocol.
+
+### 18.4 Do not implement an FG frontend in REFramework
+
+RE4 uses only OptiScaler FGInput=Upscaler for the XeFG target scenario.
+
+### 18.5 Do not directly replace the swapchain image with XeSS output
+
+Capture 28-30b show a native non-copy final presentation stage.
+
+The target architecture preserves that native downstream path.
+
+### 18.6 Do not generalize RE4 offsets to other games
+
+Every RE4-specific layout fix remains explicitly RE4-gated.
+
+### 18.7 Do not reuse diagnostic capture machinery as production code
+
+The diagnostic branch proved the contract.
+
+Production code should implement the minimum stable contract, not carry broad hook/tracing infrastructure forward.
+
+---
+
+## 19. Frozen architectural decisions
+
+| ID | Decision |
+|---|---|
+| AD-01 | Production implementation lives on the current custom REFramework master lineage, not pd-upscaler. |
+| AD-02 | Runtime construction and behavior are RE4-only. |
+| AD-03 | Existing XeFG compatibility code is a protected subsystem. |
+| AD-04 | Public XeSS D3D12 is the only game-facing upscaler producer contract. |
+| AD-05 | Stock OptiScaler must be able to intercept the same XeSS producer and substitute SR backends. |
+| AD-06 | RE4 Frame Generation support is only OptiScaler FGInput=Upscaler -> XeFG. |
+| AD-07 | REFramework never selects the OptiScaler SR backend. |
+| AD-08 | Scene input is semantic HDR/PostMain Color + DepthStencilTex + VelocityTarget. |
+| AD-09 | Scene render size is controlled through SceneView; display size stays DXGI-owned. |
+| AD-10 | XeSS work uses an REFramework-owned DIRECT list at true pre-Overlay. |
+| AD-11 | Engine-owned command lists are never modified. |
+| AD-12 | Velocity is transitioned for XeSS and restored to the verified RE4 state. |
+| AD-13 | XeSS output must re-enter RE4 before its native UI/final presentation path. |
+| AD-14 | Direct normal-path copy of XeSS output to the swapchain is rejected. |
+| AD-15 | Output handoff uncertainty is isolated inside RE4XeSSOutputHandoff. |
+| AD-16 | Existing global Debug Log controls detailed RE4 XeSS diagnostics. |
+| AD-17 | Failure is fail-closed to native RE4 rendering. |
+| AD-18 | Broad reverse-engineering tracing is finished; add new probes only for concrete implementation contradictions. |
+
+---
+
+## 20. Source of truth
+
+Reverse-engineering evidence and capture history:
+
+~~~text
+doc/RE4_XESS_BRIDGE_ARCHITECTURE_AND_RE_STATUS_2026-09-26.md
+~~~
+
+That document is the source of truth for what was proven.
+
+This production architecture document is the source of truth for what should now be built.
+
+If implementation behavior contradicts the research evidence:
+
+1. stop and record the exact contradiction;
+2. do not silently weaken RE4-only isolation or bypass the public XeSS contract;
+3. add the smallest targeted diagnostic necessary;
+4. update both the evidence record and this architecture document before changing a frozen architectural decision.
