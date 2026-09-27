@@ -394,23 +394,34 @@ This architecture keeps RE4 responsible for its own UI and final presentation in
 
 #### 5.5.1 Output-format adaptation
 
-Do not assume in advance that the preferred RE4 HDR target format is accepted as an XeSS output format by every supported XeSS runtime.
+The public XeSS SR contract requires the output texture to use the same color format and color space as the input Color texture.
 
-The handoff layer may therefore contain two surfaces:
+For the validated RE4 build:
 
 ~~~text
-XeSS-native output
-    format accepted by public XeSS runtime
-            |
-      optional conversion
-            |
-engine-visible HDR handoff target
-    format expected by RE4 downstream pipeline
+input Color:
+    DXGI_FORMAT_R11G11B10_FLOAT
+
+XeSS-native output:
+    DXGI_FORMAT_R11G11B10_FLOAT
+    display resolution
+    UNORDERED_ACCESS
 ~~~
 
-If no conversion is required, both roles may use the same native resource.
+Do not silently choose a different XeSS output format.
 
-Any conversion pass is bridge-owned and happens on the same ordered REFramework command submission path.
+If PR 4 needs a different engine-visible handoff format, any conversion happens **after** XeSS:
+
+~~~text
+XeSS output
+    same format/color space as input Color
+            |
+      optional post-XeSS conversion
+            |
+engine-visible HDR handoff target
+~~~
+
+Any such conversion is bridge-owned and happens on the same ordered REFramework command submission path.
 
 #### 5.5.2 Narrow validation gate
 
@@ -482,6 +493,9 @@ XeSS initialization must include the inverted-depth producer flag.
 semantic source:
     Scene::VelocityTarget
 
+current RE4 native format:
+    DXGI_FORMAT_R16G16B16A16_SNORM
+
 channels:
     R = X
     G = Y
@@ -498,7 +512,11 @@ motion scale:
     Y = -renderHeight / 2
 ~~~
 
-The RE4 bridge must transition Velocity to the state required for XeSS reading, then restore it to 0x04 before returning control to the engine.
+The public XeSS low-resolution motion-vector contract uses `DXGI_FORMAT_R16G16_FLOAT`. Therefore the semantic source remains `Scene::VelocityTarget`, but the production XeSS execute path converts RE4 R/G normalized values into a bridge-owned `R16G16_FLOAT` texture before dispatch.
+
+The conversion does not apply pixel scaling. `xessSetVelocityScale(renderWidth / 2, -renderHeight / 2)` remains the public producer conversion from normalized RE4 velocity values to pixel motion.
+
+The original engine VelocityTarget is transitioned from 0x04 for the bridge conversion and restored to 0x04 before returning control to RE4.
 
 ### 6.4 Camera metadata
 
@@ -748,12 +766,13 @@ on_pre_overlay_layer_draw()
     | set resetHistory if required
     |
     | bridge-owned DIRECT list:
-    |   transition Velocity 0x04 -> readable
+    |   transition original Velocity 0x04 -> readable
+    |   convert RE4 SNORM RG -> bridge R16G16_FLOAT MV
     |   prepare XeSS output
     |   xessD3D12Execute
-    |   optional output conversion
+    |   optional post-XeSS output conversion
     |   prepare engine-visible handoff state
-    |   restore Velocity -> 0x04
+    |   restore original Velocity -> 0x04
     |
     | execute bridge list on active DIRECT queue
     | install downstream output handoff
@@ -808,8 +827,10 @@ XeSS context
 bridge command allocators
 bridge command lists
 bridge fence
-XeSS-native output if separate
-output conversion resource if required
+bridge R16G16_FLOAT motion-vector conversion resource
+motion-vector conversion descriptors/root signature/PSO
+XeSS-native output
+post-XeSS output conversion resource if required
 cloned/bridge-owned engine handoff TargetState where used
 temporary descriptors required by bridge-owned passes
 ~~~
@@ -848,7 +869,9 @@ Velocity = 0x04
 
 Color and Depth are already shader-readable for the verified path.
 
-Velocity requires a bridge transition for XeSS consumption and must be restored to 0x04.
+Original RE4 Velocity requires a bridge transition for the conversion pass and must be restored to 0x04.
+
+The converted bridge-owned `R16G16_FLOAT` motion-vector resource is transitioned from UAV write to NON_PIXEL_SHADER_RESOURCE before XeSS consumes it.
 
 Output resources follow their own bridge-owned state tracker.
 
@@ -1283,13 +1306,20 @@ native engine state restores cleanly on disable/failure
 
 ### PR 3 — real XeSS execute to detached output
 
+Implementation work order:
+
+~~~text
+doc/RE4_XESS_PR3_WORK_ORDER_2026-09-27.md
+~~~
+
 Scope:
 
 - allocator/list/fence ring;
 - input barriers;
+- RE4 SNORM -> XeSS R16G16_FLOAT motion-vector conversion;
 - public XeSS init/execute;
-- bridge-owned output;
-- Velocity restoration;
+- same-format bridge-owned detached output;
+- original Velocity restoration;
 - output not yet consumed by RE4 presentation.
 
 Acceptance:
@@ -1485,11 +1515,11 @@ Production code should implement the minimum stable contract, not carry broad ho
 | AD-05 | Stock OptiScaler must be able to intercept the same XeSS producer and substitute SR backends. |
 | AD-06 | RE4 Frame Generation support is only OptiScaler FGInput=Upscaler -> XeFG. |
 | AD-07 | REFramework never selects the OptiScaler SR backend. |
-| AD-08 | Scene input is semantic HDR/PostMain Color + DepthStencilTex + VelocityTarget. |
+| AD-08 | Scene input is semantic HDR/PostMain Color + DepthStencilTex + VelocityTarget; RE4 Velocity RG is converted from R16G16B16A16_SNORM to bridge-owned R16G16_FLOAT before public XeSS execute. |
 | AD-09 | Scene render size is controlled through SceneView; display size stays DXGI-owned. |
 | AD-10 | XeSS work uses an REFramework-owned DIRECT list at true pre-Overlay. |
 | AD-11 | Engine-owned command lists are never modified. |
-| AD-12 | Velocity is transitioned for XeSS and restored to the verified RE4 state. |
+| AD-12 | Original RE4 Velocity is transitioned for the bridge MV conversion, converted RG16F is consumed by XeSS, and original Velocity is restored to the verified RE4 state. |
 | AD-13 | XeSS output must re-enter RE4 before its native UI/final presentation path. |
 | AD-14 | Direct normal-path copy of XeSS output to the swapchain is rejected. |
 | AD-15 | Output handoff uncertainty is isolated inside RE4XeSSOutputHandoff. |
