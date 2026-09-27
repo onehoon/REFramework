@@ -4905,6 +4905,83 @@ void RE4TemporalProbe::on_present() {
     }
 
     if (m_enabled.load(std::memory_order_relaxed) &&
+        re4_temporal_probe::is_final_composite_scenario(
+            m_scenario.load(std::memory_order_relaxed))) {
+        const auto sample =
+            m_final_composite_boundary_sample.load(std::memory_order_relaxed);
+        const auto boundary_frame =
+            m_final_composite_boundary_frame.load(std::memory_order_relaxed);
+
+        if (sample != 0 && boundary_frame != 0) {
+            m_final_composite_capture_open.store(false, std::memory_order_release);
+
+            uint32_t whole_frame_submits = 0;
+            size_t tracked_resources = 0;
+            size_t swapchain_buffers = 0;
+            uint32_t intermediate_state = 0;
+            uintptr_t intermediate =
+                m_final_composite_intermediate.load(std::memory_order_relaxed);
+
+            {
+                std::scoped_lock lock{m_final_composite_mutex};
+                if (m_final_composite_last_submit_frame == boundary_frame) {
+                    whole_frame_submits = m_final_composite_submit_ordinal;
+                }
+                tracked_resources = m_final_composite_tracked_resources.size();
+                swapchain_buffers = m_final_composite_swapchain_buffers.size();
+                if (const auto it =
+                        m_final_composite_resource_states.find(intermediate);
+                    it != m_final_composite_resource_states.end()) {
+                    intermediate_state = it->second;
+                }
+            }
+
+            const auto event_count =
+                m_final_composite_event_sequence.load(std::memory_order_relaxed);
+            const auto event_base =
+                m_final_composite_boundary_event_base.load(std::memory_order_relaxed);
+            const auto candidate_count =
+                m_final_composite_candidate_draws.load(std::memory_order_relaxed);
+            const auto candidate_base =
+                m_final_composite_boundary_candidate_base.load(std::memory_order_relaxed);
+            const auto total_draw_count =
+                m_final_composite_total_draws.load(std::memory_order_relaxed);
+            const auto total_draw_base =
+                m_final_composite_boundary_total_draw_base.load(std::memory_order_relaxed);
+
+            spdlog::info(
+                "[RE4TemporalProbe] finalCompositePresent sample={} boundaryFrame={} "
+                "wholeFrameObservedSubmits={} eventsSinceBoundary={} "
+                "drawsSinceBoundary={} candidateDrawsSinceBoundary={} "
+                "trackedResources={} swapchainBuffers={} intermediate={:p} "
+                "intermediateState=0x{:x} hooksReady={} thread={}",
+                sample,
+                boundary_frame,
+                whole_frame_submits,
+                event_count >= event_base ? event_count - event_base : 0,
+                total_draw_count >= total_draw_base
+                    ? total_draw_count - total_draw_base
+                    : 0,
+                candidate_count >= candidate_base
+                    ? candidate_count - candidate_base
+                    : 0,
+                tracked_resources,
+                swapchain_buffers,
+                reinterpret_cast<void*>(intermediate),
+                intermediate_state,
+                m_recording_hooks_ready.load(std::memory_order_relaxed),
+                GetCurrentThreadId());
+
+            m_final_composite_boundary_sample.store(0, std::memory_order_release);
+            m_final_composite_boundary_frame.store(0, std::memory_order_relaxed);
+
+            if (sample >= re4_temporal_probe::FINAL_COMPOSITE_MAX_SAMPLES) {
+                m_final_composite_capture_open.store(false, std::memory_order_release);
+            }
+        }
+    }
+
+    if (m_enabled.load(std::memory_order_relaxed) &&
         re4_temporal_probe::is_output_copy_scenario(
             m_scenario.load(std::memory_order_relaxed))) {
         const auto sample =
