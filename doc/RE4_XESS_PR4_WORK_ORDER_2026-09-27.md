@@ -21,6 +21,9 @@ Previous production milestones:
 - PR 3: detached real XeSS execution
 - PR 3 merged as 4e185455e8b49ee496b20f79cfb152e33243c906
 
+
+> **Runtime correction after first PR4 in-game test:** the true pre-Overlay semantic boundary remains valid, but its CPU thread identity is not stable. The callback moved from thread 1304 to 28692 in the first production capture. Thread-ownership clauses in this document are superseded by `doc/RE4_XESS_PR4_RUNTIME_BLOCKER_FIX_WORK_ORDER_2026-09-27.md` and the updated production architecture. Also, expected absence of `<REF>\libxess.dll` must fall through to `<REF>\OptiScaler\libxess.dll`.
+
 ---
 
 ## 1. Objective
