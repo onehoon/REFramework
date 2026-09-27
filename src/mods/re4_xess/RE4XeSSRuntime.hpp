@@ -4,6 +4,8 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <cstdint>
 
 #include <Windows.h>
 
@@ -33,7 +35,22 @@ public:
     RE4XeSSRuntime& operator=(RE4XeSSRuntime&&) = delete;
 
     bool initialize(ID3D12Device* device, const std::filesystem::path& reframework_directory);
+    bool bind_owner_thread(std::string& error);
+    struct InitSignature {
+        xess_2d_t output_resolution{};
+        xess_quality_settings_t quality{ XESS_QUALITY_SETTING_QUALITY };
+        uint32_t init_flags{ XESS_INIT_FLAG_INVERTED_DEPTH };
+        float velocity_scale_x{};
+        float velocity_scale_y{};
+    };
+
+    bool initialize_sr(const InitSignature& signature, std::string& error);
+    bool execute(
+        ID3D12GraphicsCommandList* command_list,
+        const xess_d3d12_execute_params_t& params,
+        std::string& error);
     void shutdown() noexcept;
+    void quarantine() noexcept;
     std::optional<InputResolutionQuery> query_optimal_input_resolution(
         xess_2d_t output_resolution,
         xess_quality_settings_t quality,
@@ -41,6 +58,16 @@ public:
 
     State state() const noexcept {
         return m_state;
+    }
+
+    bool sr_initialized() const noexcept {
+        return m_sr_initialized;
+    }
+
+    bool is_owner_thread() const noexcept;
+
+    DWORD owner_thread_id() const noexcept {
+        return m_owner_thread_id.load(std::memory_order_acquire);
     }
 
     const std::string& failure_reason() const noexcept {
@@ -71,6 +98,8 @@ private:
     };
 
     bool resolve_required_exports(std::string& missing_export);
+    bool bind_or_check_owner_thread(std::string& error);
+    bool check_owner_thread(std::string_view operation, std::string& error) const;
     void cleanup() noexcept;
     void fail(std::string reason);
 
@@ -82,4 +111,7 @@ private:
     std::array<std::filesystem::path, 2> m_candidates{};
     std::filesystem::path m_selected_path{};
     std::optional<xess_version_t> m_runtime_version{};
+    std::atomic<DWORD> m_owner_thread_id{};
+    bool m_sr_initialized{};
+    bool m_quarantined{};
 };

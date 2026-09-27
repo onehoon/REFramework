@@ -1,11 +1,21 @@
 #include "mods/re4_xess/RE4XeSSRuntime.hpp"
 
+#include <atomic>
+#include <cmath>
 #include <spdlog/spdlog.h>
 
 #include <system_error>
 #include <utility>
 
 namespace {
+
+std::atomic_flag owner_thread_violation_logged = ATOMIC_FLAG_INIT;
+
+void log_owner_thread_violation_once(const std::string& error) {
+    if (!owner_thread_violation_logged.test_and_set(std::memory_order_relaxed)) {
+        spdlog::error("[RE4XeSS][Failure] {}", error);
+    }
+}
 
 template <typename Function>
 Function resolve_xess_export(HMODULE module, const char* name) {
@@ -23,6 +33,19 @@ RE4XeSSRuntime::~RE4XeSSRuntime() {
 }
 
 bool RE4XeSSRuntime::initialize(ID3D12Device* device, const std::filesystem::path& reframework_directory) {
+    std::string owner_error;
+    if (!bind_or_check_owner_thread(owner_error)) {
+        m_failure_reason = std::move(owner_error);
+        m_state = State::Faulted;
+        return false;
+    }
+
+    if (m_quarantined) {
+        m_failure_reason = "The XeSS runtime is quarantined and cannot be initialized again";
+        m_state = State::Faulted;
+        return false;
+    }
+
     shutdown();
 
     if (device == nullptr) {
@@ -107,6 +130,10 @@ std::optional<RE4XeSSRuntime::InputResolutionQuery> RE4XeSSRuntime::query_optima
     std::string& error) const {
     error.clear();
 
+    if (!check_owner_thread("xessGetOptimalInputResolution", error)) {
+        return std::nullopt;
+    }
+
     if (m_state != State::ContextReady || m_context == nullptr || m_functions.get_optimal_input_resolution == nullptr) {
         error = "The XeSS runtime context is not ready for an input-resolution query";
         return std::nullopt;
@@ -159,13 +186,127 @@ std::optional<RE4XeSSRuntime::InputResolutionQuery> RE4XeSSRuntime::query_optima
     return query;
 }
 
+bool RE4XeSSRuntime::bind_owner_thread(std::string& error) {
+    return bind_or_check_owner_thread(error);
+}
+
+bool RE4XeSSRuntime::initialize_sr(const InitSignature& signature, std::string& error) {
+    error.clear();
+
+    if (!check_owner_thread("xessD3D12Init", error)) {
+        return false;
+    }
+    if (m_state != State::ContextReady || m_context == nullptr ||
+        m_functions.d3d12_init == nullptr || m_functions.set_velocity_scale == nullptr) {
+        error = "The XeSS runtime context is not ready for D3D12 initialization";
+        return false;
+    }
+    if (signature.output_resolution.x == 0 || signature.output_resolution.y == 0 ||
+        !std::isfinite(signature.velocity_scale_x) || !std::isfinite(signature.velocity_scale_y)) {
+        error = "The XeSS D3D12 initialization signature is invalid";
+        return false;
+    }
+
+    xess_d3d12_init_params_t params{};
+    params.outputResolution = signature.output_resolution;
+    params.qualitySetting = signature.quality;
+    params.initFlags = signature.init_flags;
+    params.creationNodeMask = 0;
+    params.visibleNodeMask = 0;
+    params.pTempBufferHeap = nullptr;
+    params.bufferHeapOffset = 0;
+    params.pTempTextureHeap = nullptr;
+    params.textureHeapOffset = 0;
+    params.pPipelineLibrary = nullptr;
+
+    m_sr_initialized = false;
+    const auto init_result = m_functions.d3d12_init(m_context, &params);
+    if (init_result != XESS_RESULT_SUCCESS) {
+        error = result_message("xessD3D12Init", init_result);
+        m_failure_reason = error;
+        m_state = State::Faulted;
+        return false;
+    }
+
+    const auto velocity_result = m_functions.set_velocity_scale(
+        m_context, signature.velocity_scale_x, signature.velocity_scale_y);
+    if (velocity_result != XESS_RESULT_SUCCESS) {
+        error = result_message("xessSetVelocityScale", velocity_result);
+        m_failure_reason = error;
+        m_state = State::Faulted;
+        return false;
+    }
+
+    m_sr_initialized = true;
+    return true;
+}
+
+bool RE4XeSSRuntime::execute(
+    ID3D12GraphicsCommandList* command_list,
+    const xess_d3d12_execute_params_t& params,
+    std::string& error) {
+    error.clear();
+
+    if (!check_owner_thread("xessD3D12Execute", error)) {
+        return false;
+    }
+    if (!m_sr_initialized || m_context == nullptr || m_functions.d3d12_execute == nullptr) {
+        error = "The XeSS D3D12 producer is not initialized";
+        return false;
+    }
+    if (command_list == nullptr) {
+        error = "The XeSS D3D12 command list is null";
+        return false;
+    }
+
+    const auto result = m_functions.d3d12_execute(m_context, command_list, &params);
+    if (result != XESS_RESULT_SUCCESS) {
+        error = result_message("xessD3D12Execute", result);
+        m_failure_reason = error;
+        return false;
+    }
+
+    return true;
+}
+
 void RE4XeSSRuntime::shutdown() noexcept {
+    if (m_quarantined) {
+        return;
+    }
+    if (m_owner_thread_id.load(std::memory_order_acquire) != 0 && !is_owner_thread()) {
+        quarantine();
+        return;
+    }
     cleanup();
     m_failure_reason.clear();
     m_candidates = {};
     m_selected_path.clear();
     m_runtime_version.reset();
     m_state = State::Unloaded;
+    m_sr_initialized = false;
+}
+
+void RE4XeSSRuntime::quarantine() noexcept {
+    if (m_quarantined) {
+        return;
+    }
+
+    m_quarantined = true;
+    m_sr_initialized = false;
+    m_state = State::Faulted;
+    m_failure_reason = "XeSS context/module quarantined until process teardown";
+
+    // Intentionally keep the module loaded and lose the raw handles. Calling
+    // XeSS from a non-owner thread or unloading code with possible GPU work in
+    // flight is less safe than retaining these process-lifetime references.
+    m_context = nullptr;
+    m_module = nullptr;
+    m_functions = {};
+}
+
+bool RE4XeSSRuntime::is_owner_thread() const noexcept {
+    const auto owner_thread_id = m_owner_thread_id.load(std::memory_order_acquire);
+    return owner_thread_id != 0 && GetCurrentThreadId() == owner_thread_id;
 }
 
 bool RE4XeSSRuntime::resolve_required_exports(std::string& missing_export) {
@@ -189,6 +330,11 @@ bool RE4XeSSRuntime::resolve_required_exports(std::string& missing_export) {
 }
 
 void RE4XeSSRuntime::cleanup() noexcept {
+    if (m_owner_thread_id.load(std::memory_order_acquire) != 0 && !is_owner_thread()) {
+        quarantine();
+        return;
+    }
+
     if (m_context != nullptr) {
         const auto result = m_functions.destroy_context != nullptr
             ? m_functions.destroy_context(m_context)
@@ -212,10 +358,45 @@ void RE4XeSSRuntime::cleanup() noexcept {
 
     m_functions = {};
     m_state = State::Unloaded;
+    m_sr_initialized = false;
 }
 
 void RE4XeSSRuntime::fail(std::string reason) {
     cleanup();
     m_failure_reason = std::move(reason);
     m_state = State::Faulted;
+}
+
+bool RE4XeSSRuntime::bind_or_check_owner_thread(std::string& error) {
+    const auto current_thread_id = GetCurrentThreadId();
+    DWORD expected_thread_id{};
+    if (m_owner_thread_id.compare_exchange_strong(
+            expected_thread_id,
+            current_thread_id,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        spdlog::info("[RE4XeSS][Init] owner thread established: {}", current_thread_id);
+        return true;
+    }
+    if (expected_thread_id == current_thread_id) {
+        return true;
+    }
+
+    error = "XeSS API owner-thread violation: expected thread " +
+        std::to_string(expected_thread_id) + ", got " + std::to_string(current_thread_id);
+    log_owner_thread_violation_once(error);
+    return false;
+}
+
+bool RE4XeSSRuntime::check_owner_thread(std::string_view operation, std::string& error) const {
+    const auto owner_thread_id = m_owner_thread_id.load(std::memory_order_acquire);
+    if (owner_thread_id != 0 && owner_thread_id == GetCurrentThreadId()) {
+        return true;
+    }
+
+    error = "XeSS API owner-thread violation in " + std::string{ operation } +
+        ": expected thread " + std::to_string(owner_thread_id) +
+        ", got " + std::to_string(GetCurrentThreadId());
+    log_owner_thread_violation_once(error);
+    return false;
 }
