@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <optional>
 
 #include <spdlog/spdlog.h>
 
@@ -6,6 +7,7 @@
 #include <utility/Module.hpp>
 
 #include "Application.hpp"
+#include "GameIdentity.hpp"
 #include "RETypeDB.hpp"
 #include "RETypes.hpp"
 #include "SceneManager.hpp"
@@ -1508,6 +1510,73 @@ static CreateRenderTargetViewFn get_create_render_target_view_fn() {
                 spdlog::info("Found create_render_target_view: {:x}", (uintptr_t)result);
 
                 return result;
+            }
+
+            if (sdk::GameIdentity::get().is_re4()) {
+                const auto module_size = utility::get_module_size(game);
+                const auto module_base = reinterpret_cast<uintptr_t>(game);
+                const auto module_end = module_size ? module_base + *module_size : module_base;
+
+                const auto find_unique_ref = [&](const char* label, const char* pattern) -> std::optional<uintptr_t> {
+                    const auto match = utility::scan(game, pattern);
+                    if (!match) {
+                        spdlog::debug("[Renderer][RE4] create_render_target_view signature miss: {}", label);
+                        return std::nullopt;
+                    }
+
+                    if (!module_size || module_end < module_base || *match < module_base || *match >= module_end) {
+                        spdlog::warn("[Renderer][RE4] executable bounds unavailable for signature uniqueness check: {}", label);
+                        return std::nullopt;
+                    }
+
+                    if (const auto duplicate = utility::scan(*match + 1, module_end - (*match + 1), pattern)) {
+                        spdlog::warn("[Renderer][RE4] create_render_target_view signature is ambiguous: {} first=0x{:x} second=0x{:x}",
+                            label, *match, *duplicate);
+                        return std::nullopt;
+                    }
+
+                    return match;
+                };
+
+                const auto resolve_re4_callsite = [&](const char* label, const char* pattern, size_t displacement_offset) -> CreateRenderTargetViewFn {
+                    const auto callsite = find_unique_ref(label, pattern);
+                    if (!callsite) {
+                        return nullptr;
+                    }
+
+                    const auto target = utility::calculate_absolute(*callsite + displacement_offset);
+                    constexpr size_t thunk_signature_size = 24;
+                    constexpr auto thunk_signature =
+                        "48 8B 0D ? ? ? ? 48 85 C9 75 07 48 8B 0D ? ? ? ? E9 ? ? ? ?";
+
+                    if (!module_size || *module_size < thunk_signature_size || target < module_base ||
+                        target - module_base > *module_size - thunk_signature_size) {
+                        spdlog::warn("[Renderer][RE4] create_render_target_view target is outside the executable image: {} target=0x{:x}",
+                            label, target);
+                        return nullptr;
+                    }
+
+                    const auto thunk = utility::scan(target, thunk_signature_size, thunk_signature);
+                    if (!thunk || *thunk != target) {
+                        spdlog::warn("[Renderer][RE4] create_render_target_view target failed thunk validation: {} target=0x{:x}",
+                            label, target);
+                        return nullptr;
+                    }
+
+                    spdlog::info("[Renderer][RE4] Found create_render_target_view via {}: {:x}", label, target);
+                    return reinterpret_cast<CreateRenderTargetViewFn>(target);
+                };
+
+                // RE4 1.5.9.0 call-site signatures. Both resolve to the
+                // singleton-loading thunk, which supplies the receiver before
+                // tail-calling the render-target-view factory body.
+                if (const auto result = resolve_re4_callsite("RVA 0x447AF5A", "49 8B CC 44 89 AD D0 06 00 00 E8 ? ? ? ?", 11)) {
+                    return result;
+                }
+
+                if (const auto result = resolve_re4_callsite("RVA 0x44AD6AD", "49 8B CC C7 44 24 20 3D 00 00 00 E8 ? ? ? ?", 12)) {
+                    return result;
+                }
             }
 
             spdlog::error("Failed to find create_render_target_view (no ref)");
