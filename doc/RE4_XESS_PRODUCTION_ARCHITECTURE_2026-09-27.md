@@ -338,7 +338,7 @@ This component owns only the public XeSS producer API contract.
 
 Responsibilities:
 
-- normal Windows loading/resolution of libxess.dll;
+- discovery of libxess.dll only at <REF>\libxess.dll or <REF>\OptiScaler\libxess.dll, followed by exact-path loading;
 - resolution of required public XeSS exports;
 - context creation;
 - quality/input-resolution query;
@@ -349,7 +349,7 @@ Responsibilities:
 - API result logging;
 - runtime capability/version reporting under Debug Log.
 
-Loading must use normal module resolution and must not force an absolute vendor-runtime path that would bypass an installed OptiScaler XeSS proxy.
+REFramework does not distribute the XeSS runtime. Resolve the directory containing the loaded REFramework DLL, prefer <REF>\libxess.dll, then <REF>\OptiScaler\libxess.dll, and load the selected DLL by exact path. Do not search arbitrary PATH/current-working-directory locations or mutate process-wide DLL search state.
 
 No libxess_fg.dll API is loaded here.
 
@@ -551,7 +551,7 @@ xessDestroyContext
 
 Optional public version/properties/logging calls may be used for diagnostics.
 
-The exact SDK version and signatures come from the official XeSS SDK integrated by the implementation PR.
+REFramework does not integrate or redistribute the XeSS SDK package for this feature. Keep only the minimal public XeSS ABI declarations required by the producer inside the RE4 XeSS subsystem, and resolve the runtime functions dynamically from the selected libxess.dll.
 
 Do not duplicate private OptiScaler headers or internal types.
 
