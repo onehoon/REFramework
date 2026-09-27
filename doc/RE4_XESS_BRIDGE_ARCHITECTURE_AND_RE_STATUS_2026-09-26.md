@@ -2868,6 +2868,172 @@ The probe still does **not**:
 - dump full-frame MV content;
 - add a diagnostic barrier to the original VelocityTarget.
 
+### huutaiii MOD screenshot anaysis
+
+A screenshot from the separate **huutaiii RE4 upscaler MOD** was supplied as an external reference. The MOD is not REFramework-based, and no source-code or runtime trace from that MOD has been inspected here.
+
+Treat this subsection as **cross-check evidence only**. The labels visible in the screenshot are useful for comparing pipeline shape, but they do not independently prove that huutaiii's named resources are the exact same native RE4 resources identified by this project.
+
+#### Directly visible screenshot facts
+
+The screenshot reports:
+
+~~~text
+Swap chain format
+    DXGI_FORMAT_R8G8B8A8_UNORM
+
+HDR
+    Off
+
+Render scale
+    1
+
+FSRInColor
+    1920x1080
+    DXGI_FORMAT_R11G11B10_FLOAT
+
+FSRInMV
+    1920x1080
+    DXGI_FORMAT_R16G16_FLOAT
+
+FSRInDepth
+    1920x1080
+    DXGI_FORMAT_R32_FLOAT
+
+FSR jitter
+    -0.87500, +0.77778
+
+FSRUpscaledColor
+    1920x1080
+    DXGI_FORMAT_R16G16B16A16_FLOAT
+
+FSRSharpenedColor
+    1920x1080
+    DXGI_FORMAT_R11G11B10_FLOAT
+
+ToneMapOut
+    1920x1080
+    DXGI_FORMAT_R11G11B10_FLOAT
+
+ScreenOutPassInput
+    1920x1080
+    DXGI_FORMAT_R11G11B10_FLOAT
+
+ScreenOutPassOutput
+    1920x1080
+    DXGI_FORMAT_R8G8B8A8_UNORM
+~~~
+
+The screenshot also exposes view, inverse-view, and projection matrices together with the FSR jitter value.
+
+The visible `FSR accumulate` line reports both extents as `uvec2(1920, 1080)`. Combined with `Render scale 1`, this screenshot is a **1:1 input/output-resolution observation**. It does not by itself prove render/display size separation during actual upscaling.
+
+#### Correspondence with this project's RE4 evidence
+
+The screenshot is notably consistent with several independently established RE4 facts:
+
+~~~text
+huutaiii screenshot                  This project
+
+FSRInColor R11G11B10_FLOAT    <->   HDR/PostMain Color R11G11B10_FLOAT
+FSRInDepth                     <->   Scene::DepthStencilTex
+FSRInMV                        <->   Scene::VelocityTarget
+FSR jitter                     <->   projection-jitter producer path
+R11G11B10 post-upscale stages  <->   HDR/post-processing path
+R8G8B8A8 ScreenOut output      <->   SDR swapchain/output family
+~~~
+
+The correspondence is strongest at the **pipeline-shape level**, not at raw pointer/name identity.
+
+This project has stronger controlled evidence for render/display separation than the supplied screenshot:
+
+~~~text
+SceneView.get_Size = 1920x1080
+Color              = 1920x1080
+Depth              = 1920x1080
+Velocity           = 1920x1080
+
+DXGI swapchain/display
+                   = 2560x1440
+~~~
+
+Therefore the huutaiii screenshot is consistent with the input grouping already selected for the XeSS producer, but it does not replace the Capture 10/11 size-control evidence.
+
+#### Output-chain implication for Capture 30
+
+The most useful new external clue is the visible post-upscaler chain:
+
+~~~text
+FSRUpscaledColor
+R16G16B16A16_FLOAT
+        ↓
+FSRSharpenedColor
+R11G11B10_FLOAT
+        ↓
+SDR tone map
+        ↓
+ToneMapOut
+R11G11B10_FLOAT
+        ↓
+ScreenOutPass
+        ↓
+ScreenOutPassOutput
+R8G8B8A8_UNORM
+        ↓
+swapchain
+R8G8B8A8_UNORM
+~~~
+
+This is consistent with the unresolved edge left by Capture 28.
+
+Capture 28 already proves:
+
+~~~text
+HDR/PostMain/Overlay-main Color
+R11G11B10_FLOAT
+        ↓ CopyResource
+stable same-format HDR intermediate
+R11G11B10_FLOAT
+        ↓
+no further tracked copy edge to swapchain
+~~~
+
+The huutaiii screenshot therefore provides a plausible external interpretation of the missing **non-copy** portion:
+
+~~~text
+HDR intermediate
+        ↓
+tone-map / final composite stage
+        ↓
+screen-output pass
+        ↓
+R8G8B8A8_UNORM swapchain
+~~~
+
+This is **not proof** that this project's Capture 28 intermediate is exactly huutaiii's `ToneMapOut`, `FSRSharpenedColor`, or `ScreenOutPassInput`. Those labels come from another implementation and may refer to MOD-owned or differently intercepted resources.
+
+For Capture 30, use these names only as interpretive hints when classifying the observed candidate draw window. The evidence target remains unchanged:
+
+- current-frame HDR intermediate becomes shader-readable;
+- an active swapchain buffer becomes `RENDER_TARGET`;
+- a graphics draw occurs while both conditions are true;
+- the list/ordinal containing that draw is identified;
+- descriptor-level provenance is added only if multiple candidate draws remain ambiguous.
+
+Do **not** modify the Capture 30 probe or production design solely to reproduce huutaiii's resource names or formats.
+
+#### Matrix and jitter note
+
+The screenshot's matrix/jitter display is useful corroboration that another RE4 temporal-upscaler implementation also tracks camera transforms plus a pixel-space jitter term.
+
+However, its matrix layout, handedness, frame-history convention, and jitter-sequence generator are not documented by the screenshot. Therefore:
+
+- do not copy the displayed matrix values;
+- do not copy the specific jitter sample `-0.87500, +0.77778`;
+- keep this project's independently verified RE4 projection-jitter conversion and MV/camera semantics as the production contract.
+
+The screenshot is best treated as **independent convergence on the same broad RE4 temporal/post-processing pipeline**, with its strongest practical value being the external hint that the unresolved Capture 28 HDR intermediate is consumed through a tone-map/final-screen-output path rather than a simple copy-to-swapchain chain.
+
 ---
 
 ## 11. Canonical RE4 temporal-frame contract
