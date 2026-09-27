@@ -1513,6 +1513,7 @@ if(REF_BUILD_FRAMEWORK AND CMAKE_SIZEOF_VOID_P EQUAL 8) # build-framework
 		"src/mods/re4_xess/RE4XeSS.cpp"
 		"src/mods/re4_xess/RE4XeSS.hpp"
 		"src/mods/re4_xess/RE4XeSSApi.hpp"
+		"src/mods/re4_xess/RE4XeSSFrame.hpp"
 		"src/mods/re4_xess/RE4XeSSRuntime.cpp"
 		"src/mods/re4_xess/RE4XeSSRuntime.hpp"
 		"src/mods/spritefonts/Roboto.spritefont.h"
