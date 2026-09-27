@@ -797,6 +797,8 @@ engine semantic TargetState references needed for handoff
 
 It does not own their lifetime and must not aggressively Release them.
 
+For the production frame contract, Color/Depth/Velocity pointers are valid only as borrowed resources during the current true pre-Overlay callback. PR 3 must consume them synchronously at that boundary. Pointer-bearing frame packets must not be queued to another thread or retained for later resource use. Cross-frame diagnostics/identity tracking may retain only opaque address values, not reusable COM-resource ownership.
+
 ### 9.2 Bridge resources are owned
 
 The bridge owns:
@@ -904,23 +906,54 @@ The first valid frame after any of the following uses XeSS history reset:
 
 ### 10.2 RE4 Load Save rule
 
-Use the verified explicit RE4 load window:
+Capture 22 shows that GameSituationManager.InhibitBit can leave its normal value **before** SceneLoadZoneManager._Pause rises. The captured ordering was:
 
 ~~~text
-SceneLoadZoneManager._Pause false -> true
-    arm history-invalid state
+normal InhibitBit
+    -> departure value
 
+later:
+_Pause false -> true
+
+later:
 _Pause true -> false
+
+later:
+InhibitBit returns to the original pre-load normal value
+~~~
+
+Therefore production code must freeze the remembered normal inhibit baseline when the first departure is observed and must not overwrite that baseline merely because _Pause has not risen yet.
+
+Evidence-backed normal path:
+
+~~~text
+stable gameplay
+    remember normal InhibitBit
+
+current InhibitBit != remembered normal
+    freeze remembered normal value
+    arm history-invalid / pending-load state
+
+_Pause becomes true
+    confirm load-transition state
+    keep frozen normal value
+
+_Pause becomes false
     do not immediately resume
 
-GameSituationManager.InhibitBit
-returns to remembered pre-load normal value
-    first valid gameplay frame:
-        resetHistory = true
+current InhibitBit == frozen remembered normal
+    recovery is armed
+
+first fully valid gameplay frame
+    resetHistory = true
     then resume accumulation
 ~~~
 
-Do not hardcode the observed inhibit-bit value.
+If InhibitBit returns to the frozen baseline before _Pause ever rises, clear the pending-load suspicion but still reset temporal history on the next fully valid frame.
+
+If the first observation occurs while _Pause is already true, enter history-invalid load state immediately and do not invent a pre-load baseline. A conservative implementation may rebaseline only after _Pause is false and a subsequent InhibitBit transition establishes a new stable value; it must never hardcode the observed 0xB9 value.
+
+Do not hardcode the inhibit-bit value.
 
 Do not use camera translation alone as a Load Save reset heuristic.
 
