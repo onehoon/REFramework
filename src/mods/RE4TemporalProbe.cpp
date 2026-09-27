@@ -443,6 +443,8 @@ void RE4TemporalProbe::reset_temporal_state() {
     m_final_composite_boundary_sample.store(0, std::memory_order_relaxed);
     m_final_composite_event_sequence.store(0, std::memory_order_relaxed);
     m_final_composite_boundary_event_base.store(0, std::memory_order_relaxed);
+    m_final_composite_boundary_candidate_base.store(0, std::memory_order_relaxed);
+    m_final_composite_boundary_total_draw_base.store(0, std::memory_order_relaxed);
     m_final_composite_color.store(0, std::memory_order_relaxed);
     m_final_composite_intermediate.store(0, std::memory_order_relaxed);
     m_final_composite_candidate_draws.store(0, std::memory_order_relaxed);
@@ -1141,6 +1143,213 @@ void STDMETHODCALLTYPE RE4TemporalProbe::recording_enhanced_barrier_hook(
 }
 
 
+
+
+void STDMETHODCALLTYPE RE4TemporalProbe::recording_draw_instanced_hook(
+    ID3D12GraphicsCommandList* command_list,
+    UINT vertex_count_per_instance,
+    UINT instance_count,
+    UINT start_vertex_location,
+    UINT start_instance_location) {
+    auto* self = s_execution_probe_instance;
+    if (self == nullptr || self->m_recording_draw_instanced_original == nullptr) {
+        return;
+    }
+
+    const auto key = reinterpret_cast<uintptr_t>(command_list);
+    bool tracked_list = false;
+    {
+        std::scoped_lock lock{self->m_recording_mutex};
+        tracked_list = self->m_recording_tracked_lists.contains(key);
+    }
+
+    if (tracked_list &&
+        self->m_final_composite_capture_open.load(std::memory_order_relaxed) &&
+        self->m_enabled.load(std::memory_order_relaxed) &&
+        re4_temporal_probe::is_final_composite_scenario(
+            self->m_scenario.load(std::memory_order_relaxed))) {
+        const auto total = self->m_final_composite_total_draws.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+
+        uintptr_t intermediate = 0;
+        uint32_t intermediate_state = 0;
+        uintptr_t render_target_swapchain = 0;
+        uint32_t swapchain_state = 0;
+
+        {
+            std::scoped_lock lock{self->m_final_composite_mutex};
+            intermediate =
+                self->m_final_composite_intermediate.load(std::memory_order_relaxed);
+
+            if (const auto it =
+                    self->m_final_composite_resource_states.find(intermediate);
+                it != self->m_final_composite_resource_states.end()) {
+                intermediate_state = it->second;
+            }
+
+            for (const auto buffer : self->m_final_composite_swapchain_buffers) {
+                const auto it =
+                    self->m_final_composite_resource_states.find(buffer);
+                if (it != self->m_final_composite_resource_states.end() &&
+                    (it->second & D3D12_RESOURCE_STATE_RENDER_TARGET) != 0) {
+                    render_target_swapchain = buffer;
+                    swapchain_state = it->second;
+                    break;
+                }
+            }
+        }
+
+        const auto shader_read_mask =
+            static_cast<uint32_t>(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) |
+            static_cast<uint32_t>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        const auto candidate =
+            intermediate != 0 &&
+            (intermediate_state & shader_read_mask) != 0 &&
+            render_target_swapchain != 0;
+
+        if (candidate) {
+            const auto candidate_index =
+                self->m_final_composite_candidate_draws.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+            const auto event = self->m_final_composite_event_sequence.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+
+            spdlog::info(
+                "[RE4TemporalProbe] finalCompositeDraw event={} candidate={} totalDraw={} "
+                "sample={} frame={} type=DrawInstanced list={:p} thread={} "
+                "vertices={} instances={} startVertex={} startInstance={} "
+                "intermediate={:p} intermediateState=0x{:x} "
+                "swapchain={:p} swapchainState=0x{:x}",
+                event,
+                candidate_index,
+                total,
+                self->m_final_composite_boundary_sample.load(std::memory_order_relaxed),
+                self->m_final_composite_boundary_frame.load(std::memory_order_relaxed),
+                static_cast<void*>(command_list),
+                GetCurrentThreadId(),
+                vertex_count_per_instance,
+                instance_count,
+                start_vertex_location,
+                start_instance_location,
+                reinterpret_cast<void*>(intermediate),
+                intermediate_state,
+                reinterpret_cast<void*>(render_target_swapchain),
+                swapchain_state);
+        }
+    }
+
+    self->m_recording_draw_instanced_original(
+        command_list,
+        vertex_count_per_instance,
+        instance_count,
+        start_vertex_location,
+        start_instance_location);
+}
+
+void STDMETHODCALLTYPE RE4TemporalProbe::recording_draw_indexed_instanced_hook(
+    ID3D12GraphicsCommandList* command_list,
+    UINT index_count_per_instance,
+    UINT instance_count,
+    UINT start_index_location,
+    INT base_vertex_location,
+    UINT start_instance_location) {
+    auto* self = s_execution_probe_instance;
+    if (self == nullptr ||
+        self->m_recording_draw_indexed_instanced_original == nullptr) {
+        return;
+    }
+
+    const auto key = reinterpret_cast<uintptr_t>(command_list);
+    bool tracked_list = false;
+    {
+        std::scoped_lock lock{self->m_recording_mutex};
+        tracked_list = self->m_recording_tracked_lists.contains(key);
+    }
+
+    if (tracked_list &&
+        self->m_final_composite_capture_open.load(std::memory_order_relaxed) &&
+        self->m_enabled.load(std::memory_order_relaxed) &&
+        re4_temporal_probe::is_final_composite_scenario(
+            self->m_scenario.load(std::memory_order_relaxed))) {
+        const auto total = self->m_final_composite_total_draws.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+
+        uintptr_t intermediate = 0;
+        uint32_t intermediate_state = 0;
+        uintptr_t render_target_swapchain = 0;
+        uint32_t swapchain_state = 0;
+
+        {
+            std::scoped_lock lock{self->m_final_composite_mutex};
+            intermediate =
+                self->m_final_composite_intermediate.load(std::memory_order_relaxed);
+
+            if (const auto it =
+                    self->m_final_composite_resource_states.find(intermediate);
+                it != self->m_final_composite_resource_states.end()) {
+                intermediate_state = it->second;
+            }
+
+            for (const auto buffer : self->m_final_composite_swapchain_buffers) {
+                const auto it =
+                    self->m_final_composite_resource_states.find(buffer);
+                if (it != self->m_final_composite_resource_states.end() &&
+                    (it->second & D3D12_RESOURCE_STATE_RENDER_TARGET) != 0) {
+                    render_target_swapchain = buffer;
+                    swapchain_state = it->second;
+                    break;
+                }
+            }
+        }
+
+        const auto shader_read_mask =
+            static_cast<uint32_t>(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) |
+            static_cast<uint32_t>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        const auto candidate =
+            intermediate != 0 &&
+            (intermediate_state & shader_read_mask) != 0 &&
+            render_target_swapchain != 0;
+
+        if (candidate) {
+            const auto candidate_index =
+                self->m_final_composite_candidate_draws.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+            const auto event = self->m_final_composite_event_sequence.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+
+            spdlog::info(
+                "[RE4TemporalProbe] finalCompositeDraw event={} candidate={} totalDraw={} "
+                "sample={} frame={} type=DrawIndexedInstanced list={:p} thread={} "
+                "indices={} instances={} startIndex={} baseVertex={} startInstance={} "
+                "intermediate={:p} intermediateState=0x{:x} "
+                "swapchain={:p} swapchainState=0x{:x}",
+                event,
+                candidate_index,
+                total,
+                self->m_final_composite_boundary_sample.load(std::memory_order_relaxed),
+                self->m_final_composite_boundary_frame.load(std::memory_order_relaxed),
+                static_cast<void*>(command_list),
+                GetCurrentThreadId(),
+                index_count_per_instance,
+                instance_count,
+                start_index_location,
+                base_vertex_location,
+                start_instance_location,
+                reinterpret_cast<void*>(intermediate),
+                intermediate_state,
+                reinterpret_cast<void*>(render_target_swapchain),
+                swapchain_state);
+        }
+    }
+
+    self->m_recording_draw_indexed_instanced_original(
+        command_list,
+        index_count_per_instance,
+        instance_count,
+        start_index_location,
+        base_vertex_location,
+        start_instance_location);
+}
 
 void RE4TemporalProbe::refresh_output_copy_swapchain_buffers() {
     std::unordered_set<uintptr_t> buffers{};
