@@ -301,6 +301,8 @@ private:
     std::atomic<uint32_t> m_final_composite_boundary_sample{0};
     std::atomic<uint64_t> m_final_composite_event_sequence{0};
     std::atomic<uint64_t> m_final_composite_boundary_event_base{0};
+    std::atomic<uint64_t> m_final_composite_boundary_candidate_base{0};
+    std::atomic<uint64_t> m_final_composite_boundary_total_draw_base{0};
     std::atomic<uintptr_t> m_final_composite_color{0};
     std::atomic<uintptr_t> m_final_composite_intermediate{0};
     std::atomic<uint64_t> m_final_composite_candidate_draws{0};
