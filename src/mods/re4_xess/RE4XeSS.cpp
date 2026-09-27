@@ -11,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include <sdk/GameIdentity.hpp>
 #include <sdk/RETypeDB.hpp>
@@ -140,6 +141,7 @@ enum class LoadSnapshotFailure : uint8_t {
     InhibitStorageTypeMismatch,
     InhibitStorageWidthInvalid,
     InhibitFieldAddressUnavailable,
+    InhibitFieldValueInvalid,
 };
 
 std::string_view load_snapshot_failure_name(LoadSnapshotFailure failure) {
@@ -165,6 +167,7 @@ std::string_view load_snapshot_failure_name(LoadSnapshotFailure failure) {
     case LoadSnapshotFailure::InhibitStorageTypeMismatch: return "InhibitStorageTypeMismatch";
     case LoadSnapshotFailure::InhibitStorageWidthInvalid: return "InhibitStorageWidthInvalid";
     case LoadSnapshotFailure::InhibitFieldAddressUnavailable: return "InhibitFieldAddressUnavailable";
+    case LoadSnapshotFailure::InhibitFieldValueInvalid: return "InhibitFieldValueInvalid";
     }
     return "Unknown";
 }
@@ -176,6 +179,9 @@ struct LoadFieldObservation {
     sdk::RETypeDefinition* storage_type{};
     const void* address{};
     uint32_t field_size{};
+    uint32_t field_value_type_size{};
+    uint32_t storage_size{};
+    uint32_t storage_value_type_size{};
     uint32_t storage_width{};
     bool is_static{};
     std::optional<uint64_t> raw_value{};
@@ -188,6 +194,7 @@ struct LoadAccessorObservation {
     sdk::RETypeDefinition* situation_type{};
     sdk::REMethodDefinition* situation_getter{};
     LoadFieldObservation inhibit_field{};
+    sdk::RETypeDefinition* situation_runtime_type{};
     void* thread_context{};
     REManagedObject* pause_instance{};
     REManagedObject* situation_instance{};
@@ -226,6 +233,31 @@ struct LoadStateAccessors {
     }
 };
 
+uint32_t managed_integral_width(const sdk::RETypeDefinition* type) {
+    if (type == nullptr) {
+        return 0;
+    }
+
+    auto* value_type = const_cast<sdk::RETypeDefinition*>(type);
+    if (value_type->is_enum()) {
+        value_type = value_type->get_underlying_type();
+        if (value_type == nullptr) {
+            return 0;
+        }
+    }
+
+    const auto name = value_type->get_full_name();
+    if (name == "System.Boolean" || name == "System.SByte" || name == "System.Byte") return 1;
+    if (name == "System.Char" || name == "System.Int16" || name == "System.UInt16") return 2;
+    if (name == "System.Int32" || name == "System.UInt32") return 4;
+    if (name == "System.Int64" || name == "System.UInt64") return 8;
+    return 0;
+}
+
+bool is_boolean_type(const sdk::RETypeDefinition* type) {
+    return type != nullptr && type->get_full_name() == "System.Boolean";
+}
+
 void observe_field_metadata(LoadFieldObservation& observation, sdk::REField* field) {
     observation.field = field;
     if (field == nullptr) {
@@ -237,25 +269,20 @@ void observe_field_metadata(LoadFieldObservation& observation, sdk::REField* fie
     observation.is_static = field->is_static();
     if (observation.field_type != nullptr) {
         observation.field_size = observation.field_type->get_size();
+        observation.field_value_type_size = observation.field_type->get_valuetype_size();
         observation.storage_type = observation.field_type->is_enum()
             ? observation.field_type->get_underlying_type()
             : observation.field_type;
         if (observation.storage_type != nullptr) {
-            observation.storage_width = observation.storage_type->get_size();
+            observation.storage_size = observation.storage_type->get_size();
+            observation.storage_value_type_size = observation.storage_type->get_valuetype_size();
+            observation.storage_width = managed_integral_width(observation.storage_type);
         }
     }
 }
 
 bool is_integral_type(const sdk::RETypeDefinition* type) {
-    if (type == nullptr) {
-        return false;
-    }
-
-    const auto name = type->get_full_name();
-    return name == "System.Byte" || name == "System.SByte" ||
-        name == "System.UInt16" || name == "System.Int16" ||
-        name == "System.UInt32" || name == "System.Int32" ||
-        name == "System.UInt64" || name == "System.Int64";
+    return managed_integral_width(type) != 0;
 }
 
 struct BoolFieldReadResult {
@@ -273,7 +300,7 @@ BoolFieldReadResult read_bool_field(LoadFieldObservation& observation, REManaged
     if (type == nullptr) {
         return { std::nullopt, LoadSnapshotFailure::PauseFieldTypeUnavailable };
     }
-    if (type->get_full_name() != "System.Boolean" || type->get_size() != sizeof(uint8_t)) {
+    if (!is_boolean_type(type) || managed_integral_width(type) != sizeof(uint8_t)) {
         return { std::nullopt, LoadSnapshotFailure::PauseFieldTypeMismatch };
     }
 
@@ -317,6 +344,9 @@ IntegralFieldReadResult read_integral_field(LoadFieldObservation& observation, R
     uint64_t value{};
     std::memcpy(&value, observation.address, width);
     observation.raw_value = value;
+    if (is_boolean_type(observation.storage_type) && value > 1) {
+        return { std::nullopt, LoadSnapshotFailure::InhibitFieldValueInvalid };
+    }
     return { value, LoadSnapshotFailure::None };
 }
 
@@ -332,7 +362,10 @@ void append_type(std::ostringstream& stream, const sdk::RETypeDefinition* type) 
     append_pointer(stream, type);
     stream << "(" << (type != nullptr ? type->get_full_name() : "null");
     if (type != nullptr) {
-        stream << ",size=" << type->get_size() << ",enum=" << (type->is_enum() ? "true" : "false");
+        stream << ",typeSizeMetadata=" << type->get_size()
+               << ",valueTypeSizeMetadata=" << type->get_valuetype_size()
+               << ",managedIntegralWidth=" << managed_integral_width(type)
+               << ",enum=" << (type->is_enum() ? "true" : "false");
     }
     stream << ")";
 }
@@ -370,10 +403,15 @@ void append_field(std::ostringstream& stream, std::string_view label, const Load
     append_type(stream, field.declaring_type);
     stream << ",name=" << (name != nullptr ? name : "null") << ",type=";
     append_type(stream, field.field_type);
-    stream << ",fieldSize=" << field.field_size << ",static=" << (field.is_static ? "true" : "false")
+    stream << ",typeSizeMetadata=" << field.field_size
+           << ",valueTypeSizeMetadata=" << field.field_value_type_size
+           << ",managedIntegralWidth=" << managed_integral_width(field.storage_type)
+           << ",static=" << (field.is_static ? "true" : "false")
            << ",storage=";
     append_type(stream, field.storage_type);
-    stream << ",storageWidth=" << field.storage_width << ",address=";
+    stream << ",storageTypeSizeMetadata=" << field.storage_size
+           << ",storageValueTypeSizeMetadata=" << field.storage_value_type_size
+           << ",storageManagedIntegralWidth=" << field.storage_width << ",address=";
     append_pointer(stream, field.address);
     if (field.raw_value) {
         stream << ",rawValue=0x" << std::hex << *field.raw_value << std::dec;
@@ -399,6 +437,8 @@ std::string format_load_accessor_observation(const GameLoadSnapshotResult& resul
     append_field(stream, "inhibitField", observation.inhibit_field);
     stream << " situationManager=";
     append_pointer(stream, observation.situation_instance);
+    stream << " situationRuntimeType=";
+    append_type(stream, observation.situation_runtime_type);
     if (result.snapshot) {
         stream << " pause=" << (result.snapshot->pause ? 1 : 0)
                << " inhibit=0x" << std::hex << result.snapshot->inhibit << std::dec;
@@ -418,6 +458,9 @@ bool same_load_field_observation(const LoadFieldObservation& lhs, const LoadFiel
     return lhs.field == rhs.field && lhs.declaring_type == rhs.declaring_type &&
         lhs.field_type == rhs.field_type && lhs.storage_type == rhs.storage_type &&
         lhs.address == rhs.address && lhs.field_size == rhs.field_size &&
+        lhs.field_value_type_size == rhs.field_value_type_size &&
+        lhs.storage_size == rhs.storage_size &&
+        lhs.storage_value_type_size == rhs.storage_value_type_size &&
         lhs.storage_width == rhs.storage_width && lhs.is_static == rhs.is_static &&
         lhs.raw_value == rhs.raw_value;
 }
@@ -438,7 +481,276 @@ bool same_load_accessor_observation(const GameLoadSnapshotResult& lhs, const Gam
         same_load_field_observation(lhs_observation.inhibit_field, rhs_observation.inhibit_field) &&
         lhs_observation.thread_context == rhs_observation.thread_context &&
         lhs_observation.pause_instance == rhs_observation.pause_instance &&
-        lhs_observation.situation_instance == rhs_observation.situation_instance;
+        lhs_observation.situation_instance == rhs_observation.situation_instance &&
+        lhs_observation.situation_runtime_type == rhs_observation.situation_runtime_type;
+}
+
+constexpr size_t MAX_LOAD_SCHEMA_TYPES = 16;
+constexpr size_t MAX_LOAD_SCHEMA_FIELDS = 128;
+constexpr size_t MAX_LOAD_SCHEMA_METHODS = 512;
+constexpr size_t MAX_LOAD_SCHEMA_METHOD_LOGS = 64;
+constexpr size_t MAX_LOAD_SCHEMA_STATES = 32;
+
+template <typename T>
+void hash_load_schema_value(uint64_t& hash, const T& value) {
+    const auto* bytes = reinterpret_cast<const uint8_t*>(&value);
+    for (size_t i = 0; i < sizeof(value); ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+}
+
+void hash_load_schema_string(uint64_t& hash, std::string_view value) {
+    for (const auto character : value) {
+        hash ^= static_cast<uint8_t>(character);
+        hash *= 1099511628211ull;
+    }
+    hash ^= 0xff;
+    hash *= 1099511628211ull;
+}
+
+bool contains_inhibit_case_insensitive(std::string_view value) {
+    constexpr std::string_view needle{ "inhibit" };
+    if (value.size() < needle.size()) {
+        return false;
+    }
+
+    for (size_t start = 0; start <= value.size() - needle.size(); ++start) {
+        bool matches = true;
+        for (size_t i = 0; i < needle.size(); ++i) {
+            auto character = value[start + i];
+            if (character >= 'A' && character <= 'Z') {
+                character = static_cast<char>(character - 'A' + 'a');
+            }
+            if (character != needle[i]) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) {
+            return true;
+        }
+    }
+    return false;
+}
+
+uint64_t load_schema_signature(sdk::RETypeDefinition* runtime_type) {
+    uint64_t hash = 14695981039346656037ull;
+    hash_load_schema_value(hash, sdk::GameIdentity::get().tdb_ver());
+    size_t field_count{};
+    size_t method_count{};
+    size_t type_count{};
+    auto* current_type = runtime_type;
+
+    for (; current_type != nullptr && type_count < MAX_LOAD_SCHEMA_TYPES;
+         current_type = current_type->get_parent_type(), ++type_count) {
+        hash_load_schema_value(hash, reinterpret_cast<uintptr_t>(current_type));
+        hash_load_schema_string(hash, current_type->get_full_name());
+
+        const auto fields = current_type->get_fields();
+        hash_load_schema_value(hash, fields.size());
+        for (auto* field : fields) {
+            if (field_count >= MAX_LOAD_SCHEMA_FIELDS) {
+                hash_load_schema_value(hash, static_cast<uint8_t>(1));
+                break;
+            }
+            ++field_count;
+            const auto* field_name = field != nullptr ? field->get_name() : nullptr;
+            auto* field_type = field != nullptr ? field->get_type() : nullptr;
+            auto* declaring_type = field != nullptr ? field->get_declaring_type() : nullptr;
+            hash_load_schema_value(hash, reinterpret_cast<uintptr_t>(field));
+            hash_load_schema_string(hash, field_name != nullptr ? field_name : "<null>");
+            hash_load_schema_value(hash, reinterpret_cast<uintptr_t>(declaring_type));
+            hash_load_schema_value(hash, reinterpret_cast<uintptr_t>(field_type));
+            hash_load_schema_string(hash, field_type != nullptr ? field_type->get_full_name() : "<null>");
+            hash_load_schema_value(hash, field != nullptr ? field->is_static() : false);
+            hash_load_schema_value(hash, field != nullptr ? field->is_literal() : false);
+            hash_load_schema_value(hash, field != nullptr ? field->get_offset_from_base() : 0u);
+            hash_load_schema_value(hash, field != nullptr ? field->get_offset_from_fieldptr() : 0u);
+            if (field_type != nullptr) {
+                hash_load_schema_value(hash, field_type->get_size());
+                hash_load_schema_value(hash, field_type->get_valuetype_size());
+                hash_load_schema_value(hash, field_type->is_enum());
+                auto* underlying_type = field_type->is_enum() ? field_type->get_underlying_type() : nullptr;
+                hash_load_schema_value(hash, reinterpret_cast<uintptr_t>(underlying_type));
+                hash_load_schema_string(hash, underlying_type != nullptr ? underlying_type->get_full_name() : "<none>");
+            }
+        }
+
+        const auto methods = current_type->get_methods();
+        hash_load_schema_value(hash, methods.size());
+        for (auto& method : methods) {
+            if (method_count >= MAX_LOAD_SCHEMA_METHODS) {
+                hash_load_schema_value(hash, static_cast<uint8_t>(1));
+                break;
+            }
+            ++method_count;
+            const auto* method_name = method.get_name();
+            if (method_name == nullptr || !contains_inhibit_case_insensitive(method_name)) {
+                continue;
+            }
+            auto* return_type = method.get_return_type();
+            auto* declaring_type = method.get_declaring_type();
+            hash_load_schema_value(hash, reinterpret_cast<uintptr_t>(&method));
+            hash_load_schema_string(hash, method_name);
+            hash_load_schema_value(hash, reinterpret_cast<uintptr_t>(declaring_type));
+            hash_load_schema_value(hash, method.is_static());
+            hash_load_schema_value(hash, method.get_num_params());
+            hash_load_schema_value(hash, reinterpret_cast<uintptr_t>(method.get_function()));
+            hash_load_schema_value(hash, reinterpret_cast<uintptr_t>(return_type));
+            hash_load_schema_string(hash, return_type != nullptr ? return_type->get_full_name() : "<null>");
+        }
+    }
+
+    hash_load_schema_value(hash, type_count);
+    hash_load_schema_value(hash, field_count);
+    hash_load_schema_value(hash, method_count);
+    hash_load_schema_value(hash, current_type != nullptr);
+    return hash;
+}
+
+struct LoadAccessorSchemaState {
+    sdk::RETypeDefinition* runtime_type{};
+    uint64_t signature{};
+};
+
+void dump_load_accessor_schema_once(const LoadAccessorObservation& observation) {
+    if (observation.inhibit_field.field != nullptr || observation.situation_instance == nullptr ||
+        observation.situation_runtime_type == nullptr) {
+        return;
+    }
+
+    const auto signature = load_schema_signature(observation.situation_runtime_type);
+    static std::vector<LoadAccessorSchemaState> logged_states{};
+    static bool state_limit_logged{};
+    const auto already_logged = std::find_if(logged_states.begin(), logged_states.end(), [&](const auto& state) {
+        return state.runtime_type == observation.situation_runtime_type && state.signature == signature;
+    });
+    if (already_logged != logged_states.end()) {
+        return;
+    }
+    if (logged_states.size() >= MAX_LOAD_SCHEMA_STATES) {
+        if (!state_limit_logged) {
+            state_limit_logged = true;
+            spdlog::warn("[RE4XeSS][LoadAccessorSchema] further schema states suppressed after {} distinct states",
+                MAX_LOAD_SCHEMA_STATES);
+        }
+        return;
+    }
+    logged_states.push_back({ observation.situation_runtime_type, signature });
+
+    std::vector<sdk::RETypeDefinition*> hierarchy{};
+    hierarchy.reserve(MAX_LOAD_SCHEMA_TYPES);
+    for (auto* current_type = observation.situation_runtime_type;
+         current_type != nullptr && hierarchy.size() < MAX_LOAD_SCHEMA_TYPES;
+         current_type = current_type->get_parent_type()) {
+        hierarchy.push_back(current_type);
+    }
+    const bool hierarchy_truncated = !hierarchy.empty() && hierarchy.size() == MAX_LOAD_SCHEMA_TYPES &&
+        hierarchy.back()->get_parent_type() != nullptr;
+
+    std::ostringstream hierarchy_stream;
+    for (size_t i = 0; i < hierarchy.size(); ++i) {
+        if (i != 0) hierarchy_stream << " <- ";
+        hierarchy_stream << hierarchy[i]->get_full_name();
+    }
+    spdlog::info(
+        "[RE4XeSS][LoadAccessorSchema] tdbVersion={} declaredType={} runtimeObject={} runtimeType={} runtimeEqualsDeclared={} hierarchy={} hierarchyTruncated={} metadataSignature={:016x}",
+        sdk::GameIdentity::get().tdb_ver(),
+        observation.situation_type != nullptr ? observation.situation_type->get_full_name() : "<null>",
+        static_cast<const void*>(observation.situation_instance),
+        observation.situation_runtime_type->get_full_name(),
+        observation.situation_runtime_type == observation.situation_type,
+        hierarchy_stream.str(),
+        hierarchy_truncated,
+        static_cast<unsigned long long>(signature));
+
+    size_t field_count{};
+    bool exact_inhibit_field_found{};
+    bool field_dump_truncated{};
+    for (auto* current_type : hierarchy) {
+        for (auto* field : current_type->get_fields()) {
+            if (field_count >= MAX_LOAD_SCHEMA_FIELDS) {
+                field_dump_truncated = true;
+                break;
+            }
+            ++field_count;
+            if (field == nullptr) {
+                spdlog::info("[RE4XeSS][LoadAccessorSchema] runtimeType={} field=<null>",
+                    observation.situation_runtime_type->get_full_name());
+                continue;
+            }
+
+            const auto* name = field->get_name();
+            const auto* field_type = field->get_type();
+            auto* underlying_type = field_type != nullptr && field_type->is_enum()
+                ? field_type->get_underlying_type()
+                : nullptr;
+            const auto* declaring_type = field->get_declaring_type();
+            exact_inhibit_field_found = exact_inhibit_field_found ||
+                (name != nullptr && std::string_view{ name } == "InhibitBit");
+            spdlog::info(
+                "[RE4XeSS][LoadAccessorSchema] field runtimeType={} declaringType={} fieldName={} fieldType={} typeSizeMetadata={} valueTypeSizeMetadata={} managedIntegralWidth={} static={} literal={} offset={} offsetFromFieldptr={} enum={} enumUnderlyingType={}",
+                observation.situation_runtime_type->get_full_name(),
+                declaring_type != nullptr ? declaring_type->get_full_name() : "<null>",
+                name != nullptr ? name : "<null>",
+                field_type != nullptr ? field_type->get_full_name() : "<null>",
+                field_type != nullptr ? field_type->get_size() : 0u,
+                field_type != nullptr ? field_type->get_valuetype_size() : 0u,
+                managed_integral_width(field_type),
+                field->is_static(), field->is_literal(),
+                field->get_offset_from_base(), field->get_offset_from_fieldptr(),
+                field_type != nullptr && field_type->is_enum(),
+                underlying_type != nullptr ? underlying_type->get_full_name() : "<none>");
+        }
+        if (field_dump_truncated) break;
+    }
+    if (field_dump_truncated) {
+        spdlog::warn("[RE4XeSS][LoadAccessorSchema] field dump truncated after {} fields",
+            MAX_LOAD_SCHEMA_FIELDS);
+    }
+    spdlog::info(
+        "[RE4XeSS][LoadAccessorSchema] exactInhibitFieldFound={} fieldSearchComplete={} fieldCount={} hierarchyTruncated={}",
+        exact_inhibit_field_found, !field_dump_truncated && !hierarchy_truncated, field_count, hierarchy_truncated);
+
+    if (exact_inhibit_field_found || field_dump_truncated || hierarchy_truncated) {
+        return;
+    }
+
+    size_t inspected_methods{};
+    size_t logged_methods{};
+    bool method_dump_truncated{};
+    for (auto* current_type : hierarchy) {
+        for (auto& method : current_type->get_methods()) {
+            if (inspected_methods >= MAX_LOAD_SCHEMA_METHODS) {
+                method_dump_truncated = true;
+                break;
+            }
+            ++inspected_methods;
+            const auto* name = method.get_name();
+            if (name == nullptr || !contains_inhibit_case_insensitive(name)) {
+                continue;
+            }
+            if (logged_methods >= MAX_LOAD_SCHEMA_METHOD_LOGS) {
+                method_dump_truncated = true;
+                break;
+            }
+            ++logged_methods;
+            const auto* declaring_type = method.get_declaring_type();
+            const auto* return_type = method.get_return_type();
+            spdlog::info(
+                "[RE4XeSS][LoadAccessorSchema] method declaringType={} methodName={} static={} parameterCount={} returnType={} function={}",
+                declaring_type != nullptr ? declaring_type->get_full_name() : "<null>",
+                name, method.is_static(), method.get_num_params(),
+                return_type != nullptr ? return_type->get_full_name() : "<null>",
+                method.get_function());
+        }
+        if (method_dump_truncated) break;
+    }
+    if (method_dump_truncated) {
+        spdlog::warn("[RE4XeSS][LoadAccessorSchema] inhibit-related method dump truncated after {} inspected and {} logged",
+            inspected_methods, logged_methods);
+    }
 }
 
 void log_load_accessor_observation(const GameLoadSnapshotResult& result) {
@@ -446,6 +758,8 @@ void log_load_accessor_observation(const GameLoadSnapshotResult& result) {
     if (config == nullptr || !config->is_debug_log_enabled()) {
         return;
     }
+
+    dump_load_accessor_schema_once(result.observation);
 
     static LoadAccessorLogState state{};
     const bool changed = !state.initialized || !same_load_accessor_observation(state.last_result, result);
@@ -514,10 +828,6 @@ GameLoadSnapshotResult read_game_load_snapshot() {
         result.failure = LoadSnapshotFailure::SituationGetterUnavailable;
         return result;
     }
-    if (observation.inhibit_field.field == nullptr) {
-        result.failure = LoadSnapshotFailure::InhibitFieldUnavailable;
-        return result;
-    }
     if (!valid_zero_parameter_static_getter(observation.pause_getter)) {
         result.failure = LoadSnapshotFailure::PauseGetterInvalidSignature;
         return result;
@@ -534,12 +844,19 @@ GameLoadSnapshotResult read_game_load_snapshot() {
 
     observation.pause_instance = observation.pause_getter->call_safe<REManagedObject*>(observation.thread_context);
     observation.situation_instance = observation.situation_getter->call_safe<REManagedObject*>(observation.thread_context);
+    if (observation.situation_instance != nullptr) {
+        observation.situation_runtime_type = observation.situation_instance->get_type_definition();
+    }
     if (observation.pause_instance == nullptr) {
         result.failure = LoadSnapshotFailure::PauseInstanceUnavailable;
         return result;
     }
     if (observation.situation_instance == nullptr) {
         result.failure = LoadSnapshotFailure::SituationInstanceUnavailable;
+        return result;
+    }
+    if (observation.inhibit_field.field == nullptr) {
+        result.failure = LoadSnapshotFailure::InhibitFieldUnavailable;
         return result;
     }
 
