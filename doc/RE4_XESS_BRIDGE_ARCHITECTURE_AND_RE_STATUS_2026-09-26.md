@@ -2488,6 +2488,8 @@ outputCopy events  = 124
 
 The first two samples of each run are shared-hook/list discovery warm-up.
 
+Capture 28 was opened from `on_overlay_layer_draw()`, i.e. **after** the original RE4 Overlay draw. The runtime record still printed `stage=preOverlay` because that diagnostic string was inherited from the earlier insertion-boundary probes. That label is stale only; it does not change the recorded callback timing. Capture 29 corrects the label to `stage=postOverlay`.
+
 From sample 3 through sample 64 in both runs — **124/124 stable samples** — exactly one tracked copy occurs per frame.
 
 Every tracked copy is:
@@ -2629,7 +2631,7 @@ This deliberately avoids broad draw-call tracing.
 
 Swapchain state is tracked continuously once the active buffers are known.
 
-Capture 29 preserves swapchain state across Present -> next-frame pre-Overlay intervals so a transition recorded before the next pre-Overlay callback is not lost.
+Capture 29 preserves swapchain state across Present -> next-frame post-Overlay observation intervals so a swapchain transition recorded earlier in the frame is not lost before the next output-composite boundary.
 
 Per-frame intermediate state is **not** carried forward blindly. When the current frame's `Color -> intermediate` copy is observed, the previous intermediate-state witness is invalidated. A later current-frame barrier must establish its shader-readable state before a draw can qualify as a candidate.
 
