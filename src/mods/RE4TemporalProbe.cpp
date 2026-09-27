@@ -1265,6 +1265,8 @@ void STDMETHODCALLTYPE RE4TemporalProbe::recording_draw_instanced_hook(
         const auto total = self->m_final_composite_total_draws.fetch_add(
             1, std::memory_order_relaxed) + 1;
 
+        uintptr_t color = 0;
+        uint32_t color_state = 0;
         uintptr_t intermediate = 0;
         uint32_t intermediate_state = 0;
         uintptr_t render_target_swapchain = 0;
@@ -1272,8 +1274,15 @@ void STDMETHODCALLTYPE RE4TemporalProbe::recording_draw_instanced_hook(
 
         {
             std::scoped_lock lock{self->m_final_composite_mutex};
+            color = self->m_final_composite_color.load(std::memory_order_relaxed);
             intermediate =
                 self->m_final_composite_intermediate.load(std::memory_order_relaxed);
+
+            if (const auto it =
+                    self->m_final_composite_resource_states.find(color);
+                it != self->m_final_composite_resource_states.end()) {
+                color_state = it->second;
+            }
 
             if (const auto it =
                     self->m_final_composite_resource_states.find(intermediate);
@@ -1297,8 +1306,8 @@ void STDMETHODCALLTYPE RE4TemporalProbe::recording_draw_instanced_hook(
             static_cast<uint32_t>(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) |
             static_cast<uint32_t>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         const auto candidate =
-            intermediate != 0 &&
-            (intermediate_state & shader_read_mask) != 0 &&
+            color != 0 &&
+            (color_state & shader_read_mask) != 0 &&
             render_target_swapchain != 0;
 
         if (candidate) {
@@ -1312,6 +1321,7 @@ void STDMETHODCALLTYPE RE4TemporalProbe::recording_draw_instanced_hook(
                 "[RE4TemporalProbe] finalCompositeDraw event={} candidate={} totalDraw={} "
                 "sample={} frame={} type=DrawInstanced list={:p} thread={} "
                 "vertices={} instances={} startVertex={} startInstance={} "
+                "color={:p} colorState=0x{:x} "
                 "intermediate={:p} intermediateState=0x{:x} "
                 "swapchain={:p} swapchainState=0x{:x}",
                 event,
@@ -1325,6 +1335,8 @@ void STDMETHODCALLTYPE RE4TemporalProbe::recording_draw_instanced_hook(
                 instance_count,
                 start_vertex_location,
                 start_instance_location,
+                reinterpret_cast<void*>(color),
+                color_state,
                 reinterpret_cast<void*>(intermediate),
                 intermediate_state,
                 reinterpret_cast<void*>(render_target_swapchain),
@@ -1368,6 +1380,8 @@ void STDMETHODCALLTYPE RE4TemporalProbe::recording_draw_indexed_instanced_hook(
         const auto total = self->m_final_composite_total_draws.fetch_add(
             1, std::memory_order_relaxed) + 1;
 
+        uintptr_t color = 0;
+        uint32_t color_state = 0;
         uintptr_t intermediate = 0;
         uint32_t intermediate_state = 0;
         uintptr_t render_target_swapchain = 0;
@@ -1375,8 +1389,15 @@ void STDMETHODCALLTYPE RE4TemporalProbe::recording_draw_indexed_instanced_hook(
 
         {
             std::scoped_lock lock{self->m_final_composite_mutex};
+            color = self->m_final_composite_color.load(std::memory_order_relaxed);
             intermediate =
                 self->m_final_composite_intermediate.load(std::memory_order_relaxed);
+
+            if (const auto it =
+                    self->m_final_composite_resource_states.find(color);
+                it != self->m_final_composite_resource_states.end()) {
+                color_state = it->second;
+            }
 
             if (const auto it =
                     self->m_final_composite_resource_states.find(intermediate);
@@ -1400,8 +1421,8 @@ void STDMETHODCALLTYPE RE4TemporalProbe::recording_draw_indexed_instanced_hook(
             static_cast<uint32_t>(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) |
             static_cast<uint32_t>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         const auto candidate =
-            intermediate != 0 &&
-            (intermediate_state & shader_read_mask) != 0 &&
+            color != 0 &&
+            (color_state & shader_read_mask) != 0 &&
             render_target_swapchain != 0;
 
         if (candidate) {
@@ -1415,6 +1436,7 @@ void STDMETHODCALLTYPE RE4TemporalProbe::recording_draw_indexed_instanced_hook(
                 "[RE4TemporalProbe] finalCompositeDraw event={} candidate={} totalDraw={} "
                 "sample={} frame={} type=DrawIndexedInstanced list={:p} thread={} "
                 "indices={} instances={} startIndex={} baseVertex={} startInstance={} "
+                "color={:p} colorState=0x{:x} "
                 "intermediate={:p} intermediateState=0x{:x} "
                 "swapchain={:p} swapchainState=0x{:x}",
                 event,
@@ -1429,6 +1451,8 @@ void STDMETHODCALLTYPE RE4TemporalProbe::recording_draw_indexed_instanced_hook(
                 start_index_location,
                 base_vertex_location,
                 start_instance_location,
+                reinterpret_cast<void*>(color),
+                color_state,
                 reinterpret_cast<void*>(intermediate),
                 intermediate_state,
                 reinterpret_cast<void*>(render_target_swapchain),
@@ -3363,13 +3387,13 @@ void RE4TemporalProbe::on_draw_ui() {
     }
 
     ImGui::TextWrapped(
-        "RE4-only diagnostic. Capture 29 proves true pre-Overlay REF-owned DIRECT-list ordering: "
-        "two engine submits, REF at ordinal 3, then five engine submits, with fence-safe reuse. "
-        "The legacy D3D12 resource-states vtable probe did not observe the real barrier path, so "
-        "revalidate only Color/Depth/Velocity states now with D3D12 recording functions for two "
-        "64-sample runs. That scenario is routed through the restored true pre-Overlay callback "
-        "and reuses the Capture 26 shared implementation hooks. D3D12 final output composite "
-        "remains the following post-Overlay Gate I capture. No production XeSS work is submitted.");
+        "RE4-only diagnostic. Capture 29b closes Gate H at true pre-Overlay: Color=0xC0, "
+        "Depth=0xE0, Velocity=0x04. Capture 30 then narrows the final presentation window to "
+        "Color in shader-readable state while an active swapchain buffer is RENDER_TARGET on "
+        "the final engine DIRECT submission. The discovered Color copy destination did not "
+        "establish a current-frame shader-readable state, so the final-output draw candidate "
+        "now keys on Color + swapchain state concurrence. Run D3D12 final output composite for "
+        "Capture 30b. No production XeSS work is submitted.");
 
     if (ImGui::Button("Reset capture")) {
         reset_temporal_state();
