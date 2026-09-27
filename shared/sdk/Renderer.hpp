@@ -96,7 +96,7 @@ private:
     static inline uintptr_t get_s_desc_offset() {
         const auto& gi = sdk::GameIdentity::get();
         const auto v = gi.tdb_ver();
-        if (v >= 73 || gi.is_sf6()) {
+        if (v >= 73 || gi.is_sf6() || gi.is_re4()) {
             return RenderResource::get_runtime_size() + 0x18;
         }
         return RenderResource::get_runtime_size() + sizeof(void*);
@@ -107,7 +107,7 @@ private:
         const auto v = gi.tdb_ver();
         if (v >= 73) return 0xE0;
         if (v >= 71) {
-            if (gi.is_sf6()) return 0xB8;
+            if (gi.is_sf6() || gi.is_re4()) return 0xB8;
             if (gi.is_mhrise()) return 0x98; // WHAT THE HECK!!!
             return 0xA0;
         }
