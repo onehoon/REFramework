@@ -37,6 +37,10 @@ public:
         return m_always_show_cursor->value();
     }
 
+    bool is_debug_log_enabled() const noexcept {
+        return m_debug_log->value();
+    }
+
     void set_ui_layout_state(int32_t width, int32_t height, float font_size) {
         m_ui_monitor_width->value() = width;
         m_ui_monitor_height->value() = height;

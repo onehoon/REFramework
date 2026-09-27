@@ -14,6 +14,7 @@
 #include "mods/PluginLoader.hpp"
 #include "mods/REFrameworkConfig.hpp"
 #include "mods/MethodDatabase.hpp"
+#include "mods/re4_xess/RE4XeSS.hpp"
 #include "mods/Scene.hpp"
 #include "mods/ScriptRunner.hpp"
 #include "mods/VR.hpp"
@@ -69,6 +70,10 @@ Mods::Mods() {
 
     if (sdk::GameIdentity::get().tdb_ver() > 49) {
         m_mods.emplace_back(std::make_unique<SceneMods>());
+    }
+
+    if (sdk::GameIdentity::get().is_re4()) {
+        m_mods.emplace_back(std::make_unique<RE4XeSS>());
     }
 
 #endif
