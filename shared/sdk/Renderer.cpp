@@ -1336,6 +1336,10 @@ TargetState* create_target_state(TargetState::Desc* desc) {
         return nullptr;
     }();
 
+    if (fn == nullptr) {
+        return nullptr;
+    }
+
     return fn(nullptr, desc);
 }
 
@@ -1427,7 +1431,15 @@ Texture* create_texture(Texture::Desc* desc) {
         return result;
     }();
 
+    if (fn == nullptr) {
+        return nullptr;
+    }
+
     static auto renderer = sdk::renderer::get_renderer();
+    if (renderer == nullptr || renderer->get_device() == nullptr) {
+        return nullptr;
+    }
+
     return fn(renderer->get_device(), desc);
 }
 
@@ -1478,8 +1490,10 @@ E8 ? ? ? ?                                    call    create_render_target_view
 48 8B D8                                      mov     rbx, rax
 4C 89 BF F0 04 00 00                          mov     [rdi+4F0h], r15
 */
-RenderTargetView* create_render_target_view(sdk::renderer::RenderResource* resource, void* desc) {
-    static auto fn = []() -> RenderTargetView* (*)(void*, sdk::renderer::RenderResource* resource, void*) {
+using CreateRenderTargetViewFn = RenderTargetView* (*)(void*, sdk::renderer::RenderResource*, void*);
+
+static CreateRenderTargetViewFn get_create_render_target_view_fn() {
+    static auto fn = []() -> CreateRenderTargetViewFn {
         spdlog::info("Searching for create_render_target_view");
 
         const auto game = utility::get_executable();
@@ -1505,6 +1519,15 @@ RenderTargetView* create_render_target_view(sdk::renderer::RenderResource* resou
 
         return result;
     }();
+
+    return fn;
+}
+
+RenderTargetView* create_render_target_view(sdk::renderer::RenderResource* resource, void* desc) {
+    const auto fn = get_create_render_target_view_fn();
+    if (fn == nullptr) {
+        return nullptr;
+    }
 
     return fn(nullptr, resource, desc);
 }
@@ -1621,6 +1644,10 @@ Texture* Texture::clone() {
 }
 
 sdk::intrusive_ptr<RenderTargetView> RenderTargetView::clone() {
+    if (get_create_render_target_view_fn() == nullptr) {
+        return nullptr;
+    }
+
     auto tex = this->get_texture_d3d12();
 
     if (tex == nullptr) {
@@ -1631,6 +1658,10 @@ sdk::intrusive_ptr<RenderTargetView> RenderTargetView::clone() {
 }
 
 sdk::intrusive_ptr<RenderTargetView> RenderTargetView::clone(uint32_t new_width, uint32_t new_height) {
+    if (get_create_render_target_view_fn() == nullptr) {
+        return nullptr;
+    }
+
     auto tex = this->get_texture_d3d12();
 
     if (tex == nullptr) {
@@ -1699,39 +1730,72 @@ sdk::intrusive_ptr<TargetState>& RenderTargetView::get_target_state_d3d12() cons
     return *(sdk::intrusive_ptr<TargetState>*)((uintptr_t)this + detail::rtv_size());
 }
 
+namespace {
+void release_cloned_target_state_rtvs(TargetState::Desc& desc) {
+    if (desc.rtvs == nullptr) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < desc.num_rtv; ++i) {
+        desc.rtvs[i].reset();
+    }
+
+    sdk::memory::deallocate(desc.rtvs);
+    desc.rtvs = nullptr;
+}
+}
+
 sdk::intrusive_ptr<TargetState> TargetState::clone() const {
     auto cloned_desc = get_desc();
 
     if (cloned_desc.num_rtv > 0) {
-        cloned_desc.rtvs = (decltype(cloned_desc.rtvs))sdk::memory::allocate(cloned_desc.num_rtv * sizeof(void*));
+        cloned_desc.rtvs = (decltype(cloned_desc.rtvs))sdk::memory::allocate(
+            cloned_desc.num_rtv * sizeof(*cloned_desc.rtvs));
+        if (cloned_desc.rtvs == nullptr) {
+            return nullptr;
+        }
 
         for (auto i = 0; i < cloned_desc.num_rtv; ++i) {
             auto rtv = get_rtv(i);
 
             if (rtv == nullptr) {
-                continue;
+                release_cloned_target_state_rtvs(cloned_desc);
+                return nullptr;
             }
 
             cloned_desc.rtvs[i] = rtv->clone();
+            if (cloned_desc.rtvs[i] == nullptr) {
+                release_cloned_target_state_rtvs(cloned_desc);
+                return nullptr;
+            }
         }
     } else {
         cloned_desc.rtvs = nullptr;
     }
 
-    return sdk::renderer::create_target_state(&cloned_desc);
+    auto* cloned_state = sdk::renderer::create_target_state(&cloned_desc);
+    if (cloned_state == nullptr) {
+        release_cloned_target_state_rtvs(cloned_desc);
+    }
+    return cloned_state;
 }
 
 sdk::intrusive_ptr<TargetState> TargetState::clone(const std::vector<std::array<uint32_t, 2>>& new_dimensions) const {
     auto cloned_desc = get_desc();
 
     if (cloned_desc.num_rtv > 0) {
-        cloned_desc.rtvs = (decltype(cloned_desc.rtvs))sdk::memory::allocate(cloned_desc.num_rtv * sizeof(void*), true);
+        cloned_desc.rtvs = (decltype(cloned_desc.rtvs))sdk::memory::allocate(
+            cloned_desc.num_rtv * sizeof(*cloned_desc.rtvs), true);
+        if (cloned_desc.rtvs == nullptr) {
+            return nullptr;
+        }
 
         for (auto i = 0; i < cloned_desc.num_rtv; ++i) {
             auto rtv = get_rtv(i);
 
             if (rtv == nullptr) {
-                continue;
+                release_cloned_target_state_rtvs(cloned_desc);
+                return nullptr;
             }
 
             if (i < new_dimensions.size()) {
@@ -1744,12 +1808,21 @@ sdk::intrusive_ptr<TargetState> TargetState::clone(const std::vector<std::array<
             } else {
                 cloned_desc.rtvs[i] = rtv->clone();
             }
+
+            if (cloned_desc.rtvs[i] == nullptr) {
+                release_cloned_target_state_rtvs(cloned_desc);
+                return nullptr;
+            }
         }
     } else {
         cloned_desc.rtvs = nullptr;
     }
 
-    return sdk::renderer::create_target_state(&cloned_desc);
+    auto* cloned_state = sdk::renderer::create_target_state(&cloned_desc);
+    if (cloned_state == nullptr) {
+        release_cloned_target_state_rtvs(cloned_desc);
+    }
+    return cloned_state;
 }
 
 void*& layer::Output::get_present_state() {
