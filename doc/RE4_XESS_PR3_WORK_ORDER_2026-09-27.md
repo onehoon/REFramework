@@ -34,6 +34,9 @@ commit 81602c9aee972589bf9a3ed68a4fbb90f9365328
 
 The external references are used only to verify the public producer ABI/contract. REFramework still does not add an XeSS SDK package or OptiScaler private dependency.
 
+
+> **Runtime correction after first PR4 in-game test:** the earlier assumption that the true pre-Overlay callback thread itself can own all XeSS API calls is superseded. The semantic boundary remains correct, but public XeSS calls and RE4XeSSD3D12 ownership now move to a dedicated RE4XeSS worker thread. See `doc/RE4_XESS_PR4_RUNTIME_BLOCKER_FIX_WORK_ORDER_2026-09-27.md` and the updated production architecture.
+
 ---
 
 ## 1. Objective
