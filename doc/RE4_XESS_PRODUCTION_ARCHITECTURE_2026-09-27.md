@@ -393,8 +393,12 @@ The preferred first implementation is an engine-visible display-resolution targe
 - derive/clone an RE4 engine TargetState from the semantic Overlay/HDR target;
 - size that handoff target to the display resolution;
 - use the native D3D12 resource behind that handoff target as the XeSS output when its format/capabilities are valid;
-- at the proven pre-Overlay boundary, redirect only the RE4 downstream Overlay/output path to that display-resolution handoff state;
-- preserve the original engine state/pointers and restore them before the next scene render or on any teardown path.
+- at the proven pre-Overlay boundary, redirect only Overlay::get_main_target_state() to that display-resolution handoff state;
+- do not modify PrepareOutput / OutputTargetState for the first handoff because current RE4 evidence identifies it as swapchain presentation state;
+- keep the handoff installed across the original Overlay draw and later output/composite recording;
+- restore the saved original Overlay main TargetState at the **next** true pre-Overlay callback, before resolving the next frame's semantic Color;
+- perform install/restore through sdk::intrusive_ptr assignment so refcount changes remain balanced;
+- preserve the original engine state/pointers and restore or safely retire them on disable, failure, resize, or device-generation change.
 
 This architecture keeps RE4 responsible for its own UI and final presentation instead of replacing the final backbuffer.
 
@@ -1394,6 +1398,12 @@ no engine input state corruption
 ~~~
 
 ### PR 4 — RE4 output handoff
+
+Implementation work order:
+
+~~~text
+doc/RE4_XESS_PR4_WORK_ORDER_2026-09-27.md
+~~~
 
 Scope:
 
