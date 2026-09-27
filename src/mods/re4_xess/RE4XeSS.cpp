@@ -619,6 +619,7 @@ void RE4XeSS::reset_temporal_state(std::string_view reason, bool reset_load_stat
     m_departure_inhibit = 0;
     m_startup_mid_load = false;
     m_post_pause_rebaseline_candidate_valid = false;
+    m_post_pause_rebaseline_transition_seen = false;
     m_post_pause_rebaseline_candidate = 0;
     m_post_pause_rebaseline_stable_count = 0;
     m_load_observation_valid = false;
@@ -796,6 +797,7 @@ void RE4XeSS::update_load_state() {
             m_load_transition_active = true;
             m_remembered_normal_inhibit_valid = false;
             m_post_pause_rebaseline_candidate_valid = false;
+            m_post_pause_rebaseline_transition_seen = false;
             m_post_pause_rebaseline_stable_count = 0;
             invalidate_history("startup-observed-mid-load");
             log_load_event("load pause observed at startup; no pre-load baseline assumed");
@@ -808,19 +810,29 @@ void RE4XeSS::update_load_state() {
 
     if (snapshot->pause) {
         if (!m_pause_previous) {
+            const bool witnessed_pre_pause_departure =
+                m_inhibit_departure_pending && m_remembered_normal_inhibit_valid;
             if (m_remembered_normal_inhibit_valid && snapshot->inhibit != m_remembered_normal_inhibit) {
                 m_departure_inhibit = snapshot->inhibit;
             }
 
             m_load_transition_active = true;
             m_inhibit_departure_pending = false;
-            if (!m_remembered_normal_inhibit_valid) {
+            if (!witnessed_pre_pause_departure) {
                 m_startup_mid_load = true;
+                m_remembered_normal_inhibit_valid = false;
+                m_post_pause_rebaseline_candidate_valid = false;
+                m_post_pause_rebaseline_transition_seen = false;
+                m_post_pause_rebaseline_stable_count = 0;
+                log_load_event("load pause entered without a witnessed pre-pause departure; treating the remembered baseline as untrusted");
+            } else if (REFrameworkConfig::get()->is_debug_log_enabled()) {
+                spdlog::info("[RE4XeSS][Reset] load pause confirmed; keeping frozen normal InhibitBit={:#x}",
+                    static_cast<unsigned long long>(m_remembered_normal_inhibit));
             }
             m_post_pause_rebaseline_candidate_valid = false;
+            m_post_pause_rebaseline_transition_seen = false;
             m_post_pause_rebaseline_stable_count = 0;
             invalidate_history("load-pause-entered");
-            log_load_event("load pause entered; frozen normal InhibitBit preserved");
         }
         m_pause_previous = true;
         return;
@@ -833,14 +845,34 @@ void RE4XeSS::update_load_state() {
         if (pause_just_released) {
             m_post_pause_rebaseline_candidate = snapshot->inhibit;
             m_post_pause_rebaseline_candidate_valid = true;
-            m_post_pause_rebaseline_stable_count = 1;
+            m_post_pause_rebaseline_transition_seen = false;
+            m_post_pause_rebaseline_stable_count = 0;
+            log_load_event("load pause released; keeping history blocked until a post-pause InhibitBit transition and stable rebaseline");
             return;
         }
 
         if (!m_post_pause_rebaseline_candidate_valid) {
             m_post_pause_rebaseline_candidate = snapshot->inhibit;
             m_post_pause_rebaseline_candidate_valid = true;
+            m_post_pause_rebaseline_transition_seen = false;
+            m_post_pause_rebaseline_stable_count = 0;
+            return;
+        }
+
+        if (!m_post_pause_rebaseline_transition_seen) {
+            if (snapshot->inhibit == m_post_pause_rebaseline_candidate) {
+                return;
+            }
+
+            const auto previous_candidate = m_post_pause_rebaseline_candidate;
+            m_post_pause_rebaseline_candidate = snapshot->inhibit;
+            m_post_pause_rebaseline_transition_seen = true;
             m_post_pause_rebaseline_stable_count = 1;
+            if (REFrameworkConfig::get()->is_debug_log_enabled()) {
+                spdlog::info("[RE4XeSS][Reset] post-pause InhibitBit transition {:#x}->{:#x}; beginning stable rebaseline observations",
+                    static_cast<unsigned long long>(previous_candidate),
+                    static_cast<unsigned long long>(m_post_pause_rebaseline_candidate));
+            }
             return;
         }
 
@@ -859,14 +891,23 @@ void RE4XeSS::update_load_state() {
             m_startup_mid_load = false;
             m_load_transition_active = false;
             m_inhibit_departure_pending = false;
+            m_post_pause_rebaseline_candidate_valid = false;
+            m_post_pause_rebaseline_transition_seen = false;
+            m_post_pause_rebaseline_stable_count = 0;
             m_first_valid_frame_reset_pending = true;
             invalidate_history("startup-load-rebaseline-complete");
-            log_load_event("startup-mid-load fallback rebaseline stable for three observations");
+            if (REFrameworkConfig::get()->is_debug_log_enabled()) {
+                spdlog::info("[RE4XeSS][Reset] adopted post-pause InhibitBit baseline={:#x} after three stable observations",
+                    static_cast<unsigned long long>(m_remembered_normal_inhibit));
+            }
         }
         return;
     }
 
     if (m_load_transition_active) {
+        if (pause_just_released) {
+            log_load_event("load pause released; keeping temporal history blocked until frozen normal InhibitBit returns");
+        }
         if (!m_remembered_normal_inhibit_valid) {
             return;
         }
@@ -879,6 +920,7 @@ void RE4XeSS::update_load_state() {
         m_load_transition_active = false;
         m_inhibit_departure_pending = false;
         m_post_pause_rebaseline_candidate_valid = false;
+        m_post_pause_rebaseline_transition_seen = false;
         m_post_pause_rebaseline_stable_count = 0;
         m_first_valid_frame_reset_pending = true;
         invalidate_history("load-recovery-complete");
@@ -897,7 +939,11 @@ void RE4XeSS::update_load_state() {
             m_inhibit_departure_pending = true;
             m_departure_inhibit = snapshot->inhibit;
             invalidate_history("pre-pause-inhibit-departure");
-            log_load_event("InhibitBit departed before Pause; preserving the previous normal baseline");
+            if (REFrameworkConfig::get()->is_debug_log_enabled()) {
+                spdlog::info("[RE4XeSS][Reset] frozen normal InhibitBit={:#x} departed to {:#x}; keeping history blocked until Pause or return",
+                    static_cast<unsigned long long>(m_remembered_normal_inhibit),
+                    static_cast<unsigned long long>(m_departure_inhibit));
+            }
         }
         return;
     }
@@ -976,6 +1022,11 @@ void RE4XeSS::on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* re
         return;
     }
 
+    if (m_inhibit_departure_pending || m_load_transition_active || m_startup_mid_load || !m_load_observation_valid) {
+        invalidate_history("load-history-invalid");
+        return;
+    }
+
     const auto* renderer = sdk::renderer::get_renderer();
     const auto frame = renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
     if (!frame) {
@@ -995,11 +1046,6 @@ void RE4XeSS::on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* re
         invalidate_history("primary-scene-frame-gap");
     }
     m_last_processed_scene_frame = frame_id;
-
-    if (m_load_transition_active || m_startup_mid_load || !m_load_observation_valid) {
-        invalidate_history("load-history-invalid");
-        return;
-    }
 
     if (!m_camera_frame || *m_camera_frame != frame_id || !m_camera_metadata_valid) {
         invalidate_history("same-frame-camera-metadata-unavailable");
@@ -1085,6 +1131,11 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         clear_frame_state();
         return true;
     }
+    if (m_inhibit_departure_pending || m_load_transition_active || m_startup_mid_load || !m_load_observation_valid) {
+        invalidate_history("load-history-invalid");
+        clear_frame_state();
+        return true;
+    }
     if (layer == nullptr) {
         invalidate_history("pre-overlay-layer-unavailable");
         clear_frame_state();
@@ -1100,8 +1151,7 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         return true;
     }
 
-    if (m_load_transition_active || m_startup_mid_load || !m_load_observation_valid ||
-        !m_camera_metadata_valid || !m_camera_frame || *m_camera_frame != *m_cached_scene_frame) {
+    if (!m_camera_metadata_valid || !m_camera_frame || *m_camera_frame != *m_cached_scene_frame) {
         invalidate_history("pre-overlay-temporal-gate-invalid");
         clear_frame_state();
         return true;
@@ -1182,7 +1232,7 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
     };
 
     if (packet.reset_history && REFrameworkConfig::get()->is_debug_log_enabled()) {
-        spdlog::info("[RE4XeSS][Frame] first valid packet after generation change: frame={} input={}x{} display={}x{}",
+        spdlog::info("[RE4XeSS][Frame] first valid resetHistory packet: frame={} input={}x{} display={}x{}",
             static_cast<unsigned long long>(packet.frame_id),
             packet.render_width,
             packet.render_height,

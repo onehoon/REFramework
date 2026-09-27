@@ -131,6 +131,7 @@ private:
     uint64_t m_departure_inhibit{};
     bool m_startup_mid_load{};
     bool m_post_pause_rebaseline_candidate_valid{};
+    bool m_post_pause_rebaseline_transition_seen{};
     uint64_t m_post_pause_rebaseline_candidate{};
     uint32_t m_post_pause_rebaseline_stable_count{};
     bool m_load_observation_valid{};
