@@ -575,15 +575,90 @@ display size
 
 Before executing XeSS, the actual resource extents must match the requested render size.
 
-### 7.3 Initial quality policy
+### 7.3 Upscaling-mode and XeSS quality policy
 
-The architecture supports XeSS quality settings as producer configuration.
+REFramework must expose a **RE4-only Upscaling Mode** selector in the REFramework UI.
 
-The first bring-up should expose or use only one controlled quality mode to reduce variables.
+The UI contract is:
 
-After native XeSS and output handoff are stable, additional public XeSS quality modes can be exposed without changing the architecture.
+~~~text
+RE4 XeSS
+  Upscaling Mode
+    Off
+    Native AA
+    Ultra Quality Plus
+    Ultra Quality
+    Quality
+    Balanced
+    Performance
+    Ultra Performance
+~~~
 
-No REF UI should offer DLSS/FSR backend selection. That belongs to OptiScaler.
+`Off` is a local REFramework state, not an XeSS quality enum.
+
+The active modes map directly to the public XeSS producer quality settings:
+
+| REFramework UI | XeSS producer setting |
+|---|---|
+| Native AA | `XESS_QUALITY_SETTING_AA` |
+| Ultra Quality Plus | `XESS_QUALITY_SETTING_ULTRA_QUALITY_PLUS` |
+| Ultra Quality | `XESS_QUALITY_SETTING_ULTRA_QUALITY` |
+| Quality | `XESS_QUALITY_SETTING_QUALITY` |
+| Balanced | `XESS_QUALITY_SETTING_BALANCED` |
+| Performance | `XESS_QUALITY_SETTING_PERFORMANCE` |
+| Ultra Performance | `XESS_QUALITY_SETTING_ULTRA_PERFORMANCE` |
+
+The RE4 UI must **not** display or select the actual OptiScaler SR backend. It selects only the XeSS frontend quality preset presented by RE4.
+
+Therefore the same selection remains valid whether the public XeSS calls reach:
+
+~~~text
+native Intel XeSS
+or
+stock OptiScaler -> XeSS / DLSS / FSR / another supported SR backend
+~~~
+
+REFramework must not translate these modes into hardcoded DLSS/FSR scaling ratios.
+
+For every non-Off mode:
+
+~~~text
+selected XeSS quality
+    -> xessGetOptimalInputResolution(display size, quality)
+    -> returned render size
+    -> SceneView size
+    -> Color / Depth / Velocity extents
+~~~
+
+`Native AA` is the 1:1 temporal-AA mode:
+
+~~~text
+render size  = display size
+XeSS execute = active
+~~~
+
+A change between any active modes is a temporal/lifecycle event, not a simple UI-only change. The implementation must:
+
+1. record the new XeSS quality setting;
+2. query the new optimal input resolution;
+3. update SceneView render size;
+4. recreate or reinitialize XeSS/output resources if the active runtime requires it;
+5. invalidate temporal history;
+6. submit the first valid frame with `resetHistory = true`.
+
+Changing to `Off` must stop XeSS execution and restore the complete native RE4 path:
+
+- native SceneView sizing;
+- no XeSS projection jitter injection;
+- no XeSS output handoff;
+- no RE4 XeSS command submission;
+- temporal history invalidated for any later re-enable.
+
+The UI itself must be registered/rendered only for RE4.
+
+During early bring-up, implementation PRs may validate one preset at a time, but the final configuration contract is the full selector above.
+
+No REF UI should offer DLSS/FSR backend selection, XeFG backend selection, or FG interpolation controls. Those belong to OptiScaler.
 
 ### 7.4 Motion scale
 
@@ -813,6 +888,8 @@ Active
 The first valid frame after any of the following uses XeSS history reset:
 
 - first enable;
+- re-enable after Off;
+- Upscaling Mode / XeSS quality change;
 - first valid dispatch;
 - render-size change;
 - display-size change that recreates output;
@@ -1019,36 +1096,94 @@ Do not reuse the [XeFG] prefix for RE4 XeSS logs.
 
 ---
 
-## 15. Configuration policy
+## 15. Configuration and REFramework UI policy
 
-Initial production configuration should be intentionally small.
-
-Required first-stage options:
+The production UI is **RE4-only** and intentionally exposes one primary control:
 
 ~~~text
-RE4 XeSS Enabled
-RE4 XeSS Quality
+RE4 XeSS
+  Upscaling Mode:
+    Off
+    Native AA
+    Ultra Quality Plus
+    Ultra Quality
+    Quality
+    Balanced
+    Performance
+    Ultra Performance
 ~~~
 
-Recommended initial behavior:
+A separate global `Enabled` checkbox is not required. `Off` is the disabled state.
+
+Recommended persisted configuration model:
 
 ~~~text
-Enabled:
-    false by default during bring-up
-
-Quality:
-    one controlled XeSS quality mode during first runtime milestones
-    expand after native XeSS + handoff are stable
+RE4XeSS_UpscalingMode
 ~~~
 
-Do not add:
+The stored value should map to a stable REFramework enum/string and then to the public XeSS quality enum at runtime. Do not persist an OptiScaler backend name in REFramework.
 
-- an OptiScaler backend selector;
-- an XeFG selector;
-- FG interpolation controls;
-- DLSS/FSR naming to the REFramework RE4 UI.
+The UI must not be rendered for non-RE4 games.
 
-Those belong to OptiScaler.
+### 15.1 Mode behavior
+
+~~~text
+Off
+    native RE4 rendering
+    native SceneView size
+    no XeSS jitter
+    no XeSS execute
+    no XeSS output handoff
+
+Native AA
+    render size = display size
+    XeSS temporal AA active
+
+all other active modes
+    query render size through xessGetOptimalInputResolution
+    SceneView uses the returned render size
+    XeSS outputs at display resolution
+~~~
+
+Changing the mode at runtime must be treated as a controlled reconfiguration:
+
+~~~text
+mode changed
+    -> mark current XeSS generation invalid
+    -> restore any temporary output handoff
+    -> query new input size if active
+    -> recreate/reinit resources as required
+    -> reset temporal history
+    -> resume on first fully valid frame
+~~~
+
+### 15.2 OptiScaler ownership boundary
+
+Do not add any of the following to REFramework UI:
+
+- OptiScaler SR backend selector;
+- DLSS/FSR-specific quality labels;
+- XeFG backend selector;
+- FG interpolation count;
+- OptiScaler-specific toggles.
+
+The REFramework selector describes only the public XeSS frontend contract. If OptiScaler intercepts it, backend substitution remains completely owned by OptiScaler.
+
+### 15.3 Debug logging
+
+Detailed UI/mode transition logs use the existing global REFramework Debug Log setting.
+
+Recommended events:
+
+~~~text
+[RE4XeSS][Config] oldMode=... newMode=...
+[RE4XeSS][Config] quality=... display=... requestedInput=...
+[RE4XeSS][Reset] reason=quality_change
+[RE4XeSS][Reset] reason=enable
+[RE4XeSS][Reset] reason=disable
+~~~
+
+Do not create a second RE4-only debug toggle.
 
 ---
 
@@ -1185,7 +1320,7 @@ no impact on other games
 
 Scope:
 
-- remaining XeSS quality modes;
+- validate all exposed XeSS Upscaling Mode entries;
 - UI/config polish;
 - diagnostic rate limiting;
 - cleanup of temporary implementation-only instrumentation;
@@ -1315,7 +1450,9 @@ Production code should implement the minimum stable contract, not carry broad ho
 | AD-15 | Output handoff uncertainty is isolated inside RE4XeSSOutputHandoff. |
 | AD-16 | Existing global Debug Log controls detailed RE4 XeSS diagnostics. |
 | AD-17 | Failure is fail-closed to native RE4 rendering. |
-| AD-18 | Broad reverse-engineering tracing is finished; add new probes only for concrete implementation contradictions. |
+| AD-18 | RE4 UI exposes one Upscaling Mode selector: Off plus the public XeSS Native AA / UQ+ / UQ / Quality / Balanced / Performance / Ultra Performance presets. |
+| AD-19 | Preset-to-render-size mapping is obtained through the public XeSS frontend query; REFramework does not hardcode backend-specific SR ratios. |
+| AD-20 | Broad reverse-engineering tracing is finished; add new probes only for concrete implementation contradictions. |
 
 ---
 
