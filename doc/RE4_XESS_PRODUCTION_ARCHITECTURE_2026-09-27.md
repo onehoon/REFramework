@@ -856,14 +856,29 @@ The bridge owns:
 XeSS context
 bridge command allocators
 bridge command lists
-bridge fence
+bridge writer fence
 bridge R16G16_FLOAT motion-vector conversion resource
 motion-vector conversion descriptors/root signature/PSO
 XeSS-native output
 post-XeSS output conversion resource if required
 cloned/bridge-owned engine handoff TargetState where used
+handoff downstream-retirement fence
 temporary descriptors required by bridge-owned passes
 ~~~
+
+The two fence domains have different meanings:
+
+~~~text
+bridge writer fence
+    proves completion of REF/XeSS commands that write/read bridge inputs/output
+
+downstream retirement fence
+    is signaled on the same active DIRECT queue after Present
+    and proves completion ordering for RE4 command submissions that consumed
+    the installed handoff output later in the frame
+~~~
+
+Bridge writer completion alone is never sufficient evidence to destroy a handoff TargetState that RE4 may still be consuming.
 
 All bridge-owned resources must be destroyed or recreated on the correct lifecycle transitions.
 
@@ -884,7 +899,8 @@ slot-local descriptor heap
 ComPtr<Color>
 ComPtr<Depth>
 ComPtr<original Velocity>
-last fence value
+ComPtr<supplied XeSS output>
+last writer-fence value
 ~~~
 
 Before resetting a slot, verify its previous fence has completed. Only then release the old engine-resource pins and rewrite/reset the slot.
@@ -893,7 +909,39 @@ Before resetting a slot, verify its previous fence has completed. Only then rele
 
 Do not spin or block the render thread indefinitely.
 
-### 9.4 Resource-state rules
+### 9.4 Handoff downstream retirement
+
+The engine-visible output TargetState remains owned by RE4XeSSOutputHandoff across the frame after installation.
+
+Normal frame-to-frame reuse is safe without a CPU wait only while all relevant work remains ordered on the same active DIRECT queue:
+
+~~~text
+frame N XeSS write
+    -> frame N RE4 Overlay/final-output reads
+    -> frame N+1 XeSS write
+~~~
+
+For destruction/recreation, stronger proof is required.
+
+When an installed handoff reaches the presentation path, the existing Mod::on_post_present() callback signals a dedicated retirement fence on the same handoff-generation DIRECT queue.
+
+Completion of that fence value proves queue retirement of the RE4 downstream consumers submitted before Present.
+
+Therefore a handoff generation may be destroyed/recreated only when:
+
+~~~text
+writer-side bridge work is safe
+AND
+the latest downstream retirement marker is complete
+~~~
+
+unless confirmed device removal terminally ends the old D3D12 generation.
+
+If the post-Present callback is suppressed, the retirement Signal fails, the queue/device identity no longer matches, or no retirement marker exists, do not infer completion from time/frame count/bridge idleness. Quarantine the old handoff generation.
+
+No public XeSS API is called from on_post_present().
+
+### 9.5 Resource-state rules
 
 At the true pre-Overlay boundary:
 
@@ -1029,15 +1077,17 @@ Do not use camera translation alone as a Load Save reset heuristic.
 On D3D12 device reset or incompatible swapchain/display-size recreation:
 
 1. stop scheduling new XeSS dispatches immediately;
-2. restore any temporary RE4 output handoff;
+2. restore any temporary RE4 output handoff when the old Overlay object is still valid;
 3. mark the old execution generation draining or terminal;
-4. poll the bridge fence without per-frame blocking;
-5. release slot-local engine-resource pins only after normal fence completion is proven;
-6. destroy bridge-owned output/conversion resources only after the old generation is safe;
-7. destroy the XeSS context only on the recorded XeSS owner thread;
-8. reset allocator/list/fence state;
-9. return to WaitingForD3D12 / RecreatePending;
-10. reinitialize only when the new D3D12 state is valid.
+4. poll the bridge writer fence without per-frame blocking;
+5. release slot-local engine input/output pins only after normal writer-fence completion is proven;
+6. require completion of the latest downstream-retirement fence before releasing an engine-visible handoff TargetState;
+7. if the downstream marker is missing/unprovable, quarantine the old handoff generation instead of releasing it;
+8. destroy bridge-owned output/conversion resources only after the applicable writer/consumer lifetime proofs are safe;
+9. destroy the XeSS context only on the recorded XeSS owner thread;
+10. reset allocator/list/fence state;
+11. return to WaitingForD3D12 / RecreatePending;
+12. reinitialize only when the new D3D12 state is valid.
 
 Fence rule:
 
@@ -1053,9 +1103,11 @@ otherwise
     -> normal completion comparison is allowed
 ~~~
 
-A Signal failure after `ExecuteCommandLists` is special: the list may have been accepted while completion proof was lost. That execution generation must keep its slot pins, command objects, bridge-owned resources, and XeSS context quarantined until either normal completion becomes provable or an explicit device-removal/reset terminal condition disposes the old device generation.
+A Signal failure after `ExecuteCommandLists` is special: the list may have been accepted while writer completion proof was lost. That execution generation must keep its slot pins, command objects, bridge-owned resources, and XeSS context quarantined until either normal completion becomes provable or an explicit device-removal/reset terminal condition disposes the old device generation.
 
-If neither can be proven, keep that generation quarantined for the rest of the process rather than guessing completion.
+A downstream-retirement Signal failure is independently terminal for handoff lifetime: keep the handoff TargetState/resource generation quarantined until a valid same-generation retirement proof or confirmed device removal exists.
+
+If neither writer nor downstream-consumer completion can be proven as required, keep that generation quarantined for the rest of the process rather than guessing completion.
 
 Non-owner callbacks such as device-reset notification may only request teardown. They must not call public XeSS APIs directly.
 
@@ -1420,6 +1472,8 @@ visible XeSS SR output
 RE4 UI preserved
 no direct swapchain copy architecture
 final native screen-out path remains active
+bridge writer lifetime and downstream RE4 consumer lifetime are both proven before handoff release
+fresh COMMON -> UAV -> 0xC0 and steady 0xC0 -> UAV -> 0xC0 validated by D3D12 debug-layer evidence or narrow provenance
 resize / enable-disable safe
 ~~~
 
@@ -1603,6 +1657,9 @@ Production code should implement the minimum stable contract, not carry broad ho
 | AD-21 | Every public XeSS API call is serialized on the stable true pre-Overlay owner thread; non-owner callbacks only request state transitions. |
 | AD-22 | The RE4XeSSFrame remains callback-scoped CPU data, while submitted Color/Depth/original-Velocity resources are retained by slot-local COM pins until fence completion is proven. |
 | AD-23 | `GetCompletedValue()==UINT64_MAX` is device removal, never completion; unprovable post-submit generations are quarantined rather than reused or freed speculatively. |
+| AD-24 | The PR3 bridge fence proves only REF/XeSS writer completion. Engine-visible handoff TargetState release/recreation additionally requires a same-DIRECT-queue downstream-retirement fence signaled after Present, unless confirmed device removal terminally ends the old generation. |
+| AD-25 | Normal handoff texture reuse relies on same-queue GPU ordering and does not CPU-wait every frame; teardown/recreation uses the downstream retirement proof. |
+| AD-26 | Fresh cloned handoff state COMMON -> UAV -> 0xC0 and steady 0xC0 -> UAV -> 0xC0 are runtime validation gates that require D3D12 debug-layer evidence or a narrow handoff-resource state-provenance capture. |
 
 ---
 
