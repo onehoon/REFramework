@@ -17,7 +17,9 @@
 #include <sdk/RETypeDB.hpp>
 #include <sdk/SceneManager.hpp>
 #include <spdlog/spdlog.h>
+#include <utility/Address.hpp>
 #include <utility/Module.hpp>
+#include <utility/VtableHook.hpp>
 
 #include "mods/REFrameworkConfig.hpp"
 #include "REFramework.hpp"
@@ -893,6 +895,269 @@ constexpr std::array<std::string_view, 6> SCENE_INFO_NAMES{
     "main", "depthDistortion", "filter", "jitterDisable", "jitterDisablePost", "zPrepass",
 };
 
+class CreateRenderTargetViewProbe final {
+public:
+    using Function = void(STDMETHODCALLTYPE*)(
+        ID3D12Device4*,
+        ID3D12Resource*,
+        const D3D12_RENDER_TARGET_VIEW_DESC*,
+        D3D12_CPU_DESCRIPTOR_HANDLE);
+
+    static CreateRenderTargetViewProbe& instance() {
+        static CreateRenderTargetViewProbe probe{};
+        return probe;
+    }
+
+    bool ensure(ID3D12Device4* device) {
+        if (device == nullptr) {
+            reset();
+            return false;
+        }
+
+        if (s_active_device.load(std::memory_order_acquire) == device) {
+            if (limits_reached()) {
+                std::lock_guard lock{ m_mutex };
+                if (m_device.Get() == device) {
+                    detach_locked();
+                }
+                log_limit_once();
+                return false;
+            }
+            return true;
+        }
+
+        std::lock_guard lock{ m_mutex };
+        if (m_device.Get() == device && m_hook != nullptr) {
+            return !limits_reached();
+        }
+
+        detach_locked();
+        if (limits_reached()) {
+            log_limit_once();
+            return false;
+        }
+
+        [[maybe_unused]] Microsoft::WRL::ComPtr<ID3D12Device4> device_keepalive{ device };
+        auto hook = std::make_unique<VtableHook>();
+        if (!hook->create(Address{ device })) {
+            spdlog::warn("[RE4XeSS][RTVProbe] could not copy the D3D12 device vtable");
+            return false;
+        }
+
+        constexpr uint32_t create_render_target_view_slot = 20;
+        const auto original = hook->get_method<Function>(create_render_target_view_slot);
+        if (original == nullptr || !register_original(device, original)) {
+            spdlog::warn("[RE4XeSS][RTVProbe] could not register the original CreateRenderTargetView method");
+            return false;
+        }
+
+        m_device = device;
+        m_hook = std::move(hook);
+        s_active_device.store(device, std::memory_order_release);
+        if (!m_hook->hook_method(
+                create_render_target_view_slot,
+                Address{ reinterpret_cast<void*>(&CreateRenderTargetViewProbe::create_render_target_view) })) {
+            s_active_device.store(nullptr, std::memory_order_release);
+            unregister_original(device, original);
+            detach_locked();
+            spdlog::warn("[RE4XeSS][RTVProbe] could not hook the D3D12 device method");
+            return false;
+        }
+
+        spdlog::info("[RE4XeSS][RTVProbe] armed device=0x{:x} vtableSlot={} captureLimit={} callLimit={}",
+            reinterpret_cast<uintptr_t>(device),
+            create_render_target_view_slot,
+            MAX_CAPTURES,
+            MAX_CALLS);
+        return true;
+    }
+
+    void reset() {
+        if (s_active_device.load(std::memory_order_acquire) == nullptr) {
+            return;
+        }
+
+        std::lock_guard lock{ m_mutex };
+        detach_locked();
+    }
+
+private:
+    struct OriginalEntry {
+        ID3D12Device4* device{};
+        Function function{};
+    };
+
+    static constexpr uint32_t MAX_CAPTURES = 8;
+    static constexpr uint32_t MAX_CALLS = 512;
+    static constexpr size_t MAX_REGISTERED_DEVICES = 4;
+    static constexpr USHORT MAX_STACK_FRAMES = 16;
+
+    static void STDMETHODCALLTYPE create_render_target_view(
+        ID3D12Device4* device,
+        ID3D12Resource* resource,
+        const D3D12_RENDER_TARGET_VIEW_DESC* description,
+        D3D12_CPU_DESCRIPTOR_HANDLE destination) {
+        auto& probe = instance();
+        const auto original = probe.find_original(device);
+        if (original == nullptr) {
+            spdlog::error("[RE4XeSS][RTVProbe] original CreateRenderTargetView was unavailable; call skipped");
+            return;
+        }
+
+        original(device, resource, description, destination);
+
+        if (s_active_device.load(std::memory_order_acquire) == device) {
+            probe.capture(device, resource, description);
+        }
+    }
+
+    static bool register_original(ID3D12Device4* device, Function function) {
+        std::lock_guard lock{ s_registry_mutex };
+        for (auto& entry : s_originals) {
+            if (entry.device == device) {
+                entry.function = function;
+                return true;
+            }
+        }
+
+        for (auto& entry : s_originals) {
+            if (entry.device == nullptr) {
+                entry = { device, function };
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static Function find_original(ID3D12Device4* device) {
+        std::lock_guard lock{ s_registry_mutex };
+        for (const auto& entry : s_originals) {
+            if (entry.device == device) {
+                return entry.function;
+            }
+        }
+        return nullptr;
+    }
+
+    static void unregister_original(ID3D12Device4* device, Function function) {
+        std::lock_guard lock{ s_registry_mutex };
+        for (auto& entry : s_originals) {
+            if (entry.device == device && entry.function == function) {
+                entry = {};
+                return;
+            }
+        }
+    }
+
+    static bool limits_reached() noexcept {
+        return s_capture_count.load(std::memory_order_acquire) >= MAX_CAPTURES ||
+            s_call_count.load(std::memory_order_acquire) >= MAX_CALLS;
+    }
+
+    static void log_limit_once() {
+        if (!s_limit_logged.exchange(true, std::memory_order_acq_rel)) {
+            spdlog::info("[RE4XeSS][RTVProbe] disarmed after captures={} calls={}",
+                s_capture_count.load(std::memory_order_acquire),
+                s_call_count.load(std::memory_order_acquire));
+        }
+    }
+
+    static std::pair<uintptr_t, uintptr_t> main_module_range() noexcept {
+        const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        if (base == 0) {
+            return {};
+        }
+
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+            return {};
+        }
+
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.SizeOfImage == 0) {
+            return {};
+        }
+        return { base, base + nt->OptionalHeader.SizeOfImage };
+    }
+
+    void capture(
+        ID3D12Device4* device,
+        ID3D12Resource* resource,
+        const D3D12_RENDER_TARGET_VIEW_DESC* description) noexcept {
+        const auto call_index = s_call_count.fetch_add(1, std::memory_order_acq_rel);
+        if (call_index >= MAX_CALLS || s_capture_count.load(std::memory_order_acquire) >= MAX_CAPTURES) {
+            return;
+        }
+
+        try {
+            std::array<void*, MAX_STACK_FRAMES> frames{};
+            const auto frame_count = RtlCaptureStackBackTrace(
+                0,
+                MAX_STACK_FRAMES,
+                frames.data(),
+                nullptr);
+            const auto [module_begin, module_end] = main_module_range();
+            bool has_game_frame = false;
+            for (USHORT index = 0; index < frame_count; ++index) {
+                const auto address = reinterpret_cast<uintptr_t>(frames[index]);
+                has_game_frame = has_game_frame || (module_begin != 0 && address >= module_begin && address < module_end);
+            }
+            if (!has_game_frame) {
+                return;
+            }
+
+            const auto capture_index = s_capture_count.fetch_add(1, std::memory_order_acq_rel);
+            if (capture_index >= MAX_CAPTURES) {
+                return;
+            }
+
+            std::ostringstream stack;
+            stack << std::hex;
+            for (USHORT index = 0; index < frame_count; ++index) {
+                if (index != 0) {
+                    stack << ',';
+                }
+                const auto address = reinterpret_cast<uintptr_t>(frames[index]);
+                if (module_begin != 0 && address >= module_begin && address < module_end) {
+                    stack << "re4+0x" << (address - module_begin);
+                } else {
+                    stack << "0x" << address;
+                }
+            }
+
+            const auto format = description == nullptr ? 0 : static_cast<uint32_t>(description->Format);
+            const auto dimension = description == nullptr ? 0 : static_cast<uint32_t>(description->ViewDimension);
+            spdlog::info("[RE4XeSS][RTVProbe] capture={} attempt={} device=0x{:x} resource=0x{:x} format={} dimension={} stack=[{}]",
+                capture_index + 1,
+                call_index + 1,
+                reinterpret_cast<uintptr_t>(device),
+                reinterpret_cast<uintptr_t>(resource),
+                format,
+                dimension,
+                stack.str());
+        } catch (...) {
+            // Diagnostics must never change the D3D12 call's behavior.
+        }
+    }
+
+    void detach_locked() {
+        s_active_device.store(nullptr, std::memory_order_release);
+        m_hook.reset();
+        m_device.Reset();
+    }
+
+    std::mutex m_mutex{};
+    Microsoft::WRL::ComPtr<ID3D12Device4> m_device{};
+    std::unique_ptr<VtableHook> m_hook{};
+
+    static inline std::mutex s_registry_mutex{};
+    static inline std::array<OriginalEntry, MAX_REGISTERED_DEVICES> s_originals{};
+    static inline std::atomic<ID3D12Device4*> s_active_device{};
+    static inline std::atomic<uint32_t> s_call_count{};
+    static inline std::atomic<uint32_t> s_capture_count{};
+    static inline std::atomic<bool> s_limit_logged{};
+};
+
 bool is_valid_texture_extent(ID3D12Resource* resource, uint32_t width, uint32_t height) {
     if (resource == nullptr) {
         return false;
@@ -916,6 +1181,7 @@ std::filesystem::path reframework_module_directory() {
 }
 
 RE4XeSS::~RE4XeSS() {
+    CreateRenderTargetViewProbe::instance().reset();
     m_worker.stop();
 }
 
@@ -1072,6 +1338,7 @@ void RE4XeSS::on_device_reset() {
     if (!sdk::GameIdentity::get().is_re4()) {
         return;
     }
+    CreateRenderTargetViewProbe::instance().reset();
     m_device_reset_generation.fetch_add(1, std::memory_order_acq_rel);
 }
 
@@ -1917,11 +2184,17 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
     if (control_request.active) {
         (void)get_display_resolution(control_request.display);
     }
+    if (requested_mode == UpscalingMode::Off) {
+        CreateRenderTargetViewProbe::instance().reset();
+    }
     if (g_framework != nullptr && g_framework->get_renderer_type() == REFramework::RendererType::D3D12) {
         const auto& hook = g_framework->get_d3d12_hook();
         if (hook != nullptr) {
             control_request.device = hook->get_device();
             control_request.queue = hook->get_command_queue();
+            if (control_request.active) {
+                (void)CreateRenderTargetViewProbe::instance().ensure(hook->get_device());
+            }
         }
     }
 
