@@ -3363,11 +3363,12 @@ void RE4TemporalProbe::on_draw_ui() {
     }
 
     ImGui::TextWrapped(
-        "RE4-only diagnostic. Gate H is closed. Capture 28 proves HDR/PostMain is copied once per stable frame "
-        "to a same-format HDR intermediate, but the copy graph never reaches the swapchain. For Gate I Capture 29, "
-        "select D3D12 final output composite. The probe remains observe-only and follows only Color/intermediate/"
-        "swapchain legacy barriers plus DrawInstanced/DrawIndexedInstanced calls that occur while the discovered "
-        "HDR intermediate is shader-readable and a swapchain buffer is in RENDER_TARGET. No GPU work is added.");
+        "RE4-only diagnostic. Timing audit found that Gate H Captures 23-27 were recorded from the "
+        "post-Overlay callback after the MV probe moved there. Capture 9 remains the true pre-Overlay "
+        "semantic boundary proof. Revalidate Gate H now by running D3D12 resource states for 64 samples, "
+        "then D3D12 bridge ordering for 64 samples; both scenarios are routed through the restored true "
+        "pre-Overlay callback. The D3D12 final output composite scenario remains prepared for the following "
+        "post-Overlay Gate I capture. No production XeSS work is submitted.");
 
     if (ImGui::Button("Reset capture")) {
         reset_temporal_state();
