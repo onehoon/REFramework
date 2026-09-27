@@ -90,6 +90,19 @@ private:
         ID3D12GraphicsCommandList* command_list,
         ID3D12Resource* dst,
         ID3D12Resource* src);
+    static void STDMETHODCALLTYPE recording_draw_instanced_hook(
+        ID3D12GraphicsCommandList* command_list,
+        UINT vertex_count_per_instance,
+        UINT instance_count,
+        UINT start_vertex_location,
+        UINT start_instance_location);
+    static void STDMETHODCALLTYPE recording_draw_indexed_instanced_hook(
+        ID3D12GraphicsCommandList* command_list,
+        UINT index_count_per_instance,
+        UINT instance_count,
+        UINT start_index_location,
+        INT base_vertex_location,
+        UINT start_instance_location);
 
     std::atomic<bool> m_enabled{false};
     std::atomic<int> m_scenario{0};
@@ -103,6 +116,7 @@ private:
     re4_temporal_probe::FrameBudget m_recording_function_budget;
     re4_temporal_probe::FrameBudget m_bridge_order_budget;
     re4_temporal_probe::FrameBudget m_output_copy_budget;
+    re4_temporal_probe::FrameBudget m_final_composite_budget;
 
     bool m_reset_witness_valid{false};
     uint32_t m_reset_previous_frame{0};
@@ -157,6 +171,19 @@ private:
         ID3D12GraphicsCommandList*,
         ID3D12Resource*,
         ID3D12Resource*);
+    using CommandListDrawInstancedFn = void (STDMETHODCALLTYPE*)(
+        ID3D12GraphicsCommandList*,
+        UINT,
+        UINT,
+        UINT,
+        UINT);
+    using CommandListDrawIndexedInstancedFn = void (STDMETHODCALLTYPE*)(
+        ID3D12GraphicsCommandList*,
+        UINT,
+        UINT,
+        UINT,
+        INT,
+        UINT);
 
     struct ResourceCommandListHookState {
         std::unique_ptr<VtableHook> hook{};
@@ -212,12 +239,16 @@ private:
     std::unique_ptr<FunctionHook> m_recording_enhanced_barrier_hook{};
     std::unique_ptr<FunctionHook> m_recording_copy_texture_region_hook{};
     std::unique_ptr<FunctionHook> m_recording_copy_resource_hook{};
+    std::unique_ptr<FunctionHook> m_recording_draw_instanced_hook{};
+    std::unique_ptr<FunctionHook> m_recording_draw_indexed_instanced_hook{};
     CommandListCloseFn m_recording_close_original{nullptr};
     CommandListResetFn m_recording_reset_original{nullptr};
     CommandListResourceBarrierFn m_recording_resource_barrier_original{nullptr};
     CommandListEnhancedBarrierFn m_recording_enhanced_barrier_original{nullptr};
     CommandListCopyTextureRegionFn m_recording_copy_texture_region_original{nullptr};
     CommandListCopyResourceFn m_recording_copy_resource_original{nullptr};
+    CommandListDrawInstancedFn m_recording_draw_instanced_original{nullptr};
+    CommandListDrawIndexedInstancedFn m_recording_draw_indexed_instanced_original{nullptr};
     std::atomic<bool> m_recording_hooks_ready{false};
     std::atomic<bool> m_recording_capture_open{false};
     std::atomic<uint32_t> m_recording_boundary_frame{0};
@@ -260,6 +291,22 @@ private:
     std::atomic<uintptr_t> m_output_copy_color{0};
     uint32_t m_output_copy_last_submit_frame{0};
     uint32_t m_output_copy_submit_ordinal{0};
+
+    std::mutex m_final_composite_mutex{};
+    std::unordered_set<uintptr_t> m_final_composite_tracked_resources{};
+    std::unordered_set<uintptr_t> m_final_composite_swapchain_buffers{};
+    std::unordered_map<uintptr_t, uint32_t> m_final_composite_resource_states{};
+    std::atomic<bool> m_final_composite_capture_open{false};
+    std::atomic<uint32_t> m_final_composite_boundary_frame{0};
+    std::atomic<uint32_t> m_final_composite_boundary_sample{0};
+    std::atomic<uint64_t> m_final_composite_event_sequence{0};
+    std::atomic<uint64_t> m_final_composite_boundary_event_base{0};
+    std::atomic<uintptr_t> m_final_composite_color{0};
+    std::atomic<uintptr_t> m_final_composite_intermediate{0};
+    std::atomic<uint64_t> m_final_composite_candidate_draws{0};
+    std::atomic<uint64_t> m_final_composite_total_draws{0};
+    uint32_t m_final_composite_last_submit_frame{0};
+    uint32_t m_final_composite_submit_ordinal{0};
 
     std::atomic<uintptr_t> m_camera_ptr{0};
     std::atomic<uint32_t> m_camera_frame{0};
