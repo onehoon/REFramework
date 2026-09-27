@@ -27,6 +27,7 @@ namespace {
 using UpscalingMode = RE4XeSS::UpscalingMode;
 
 constexpr std::string_view UPSCALING_MODE_CONFIG_KEY{ "RE4XeSS_UpscalingMode" };
+constexpr char INHIBIT_BIT_BACKING_FIELD_NAME[]{ "<InhibitBit>k__BackingField" };
 
 constexpr std::array<const char*, 8> UPSCALING_MODE_LABELS{
     "Off",
@@ -228,7 +229,7 @@ struct LoadStateAccessors {
         }
         if (situation_type != nullptr) {
             if (situation_instance_getter == nullptr) situation_instance_getter = situation_type->get_method("get_Instance");
-            if (inhibit_field == nullptr) inhibit_field = situation_type->get_field("InhibitBit");
+            if (inhibit_field == nullptr) inhibit_field = situation_type->get_field(INHIBIT_BIT_BACKING_FIELD_NAME);
         }
     }
 };
@@ -611,6 +612,7 @@ uint64_t load_schema_signature(sdk::RETypeDefinition* runtime_type) {
 
 struct LoadAccessorSchemaState {
     sdk::RETypeDefinition* runtime_type{};
+    int tdb_version{};
     uint64_t signature{};
 };
 
@@ -620,11 +622,11 @@ void dump_load_accessor_schema_once(const LoadAccessorObservation& observation) 
         return;
     }
 
-    const auto signature = load_schema_signature(observation.situation_runtime_type);
     static std::vector<LoadAccessorSchemaState> logged_states{};
     static bool state_limit_logged{};
+    const auto tdb_version = sdk::GameIdentity::get().tdb_ver();
     const auto already_logged = std::find_if(logged_states.begin(), logged_states.end(), [&](const auto& state) {
-        return state.runtime_type == observation.situation_runtime_type && state.signature == signature;
+        return state.runtime_type == observation.situation_runtime_type && state.tdb_version == tdb_version;
     });
     if (already_logged != logged_states.end()) {
         return;
@@ -637,7 +639,8 @@ void dump_load_accessor_schema_once(const LoadAccessorObservation& observation) 
         }
         return;
     }
-    logged_states.push_back({ observation.situation_runtime_type, signature });
+    const auto signature = load_schema_signature(observation.situation_runtime_type);
+    logged_states.push_back({ observation.situation_runtime_type, tdb_version, signature });
 
     std::vector<sdk::RETypeDefinition*> hierarchy{};
     hierarchy.reserve(MAX_LOAD_SCHEMA_TYPES);
@@ -656,7 +659,7 @@ void dump_load_accessor_schema_once(const LoadAccessorObservation& observation) 
     }
     spdlog::info(
         "[RE4XeSS][LoadAccessorSchema] tdbVersion={} declaredType={} runtimeObject={} runtimeType={} runtimeEqualsDeclared={} hierarchy={} hierarchyTruncated={} metadataSignature={:016x}",
-        sdk::GameIdentity::get().tdb_ver(),
+        tdb_version,
         observation.situation_type != nullptr ? observation.situation_type->get_full_name() : "<null>",
         static_cast<const void*>(observation.situation_instance),
         observation.situation_runtime_type->get_full_name(),
@@ -666,7 +669,7 @@ void dump_load_accessor_schema_once(const LoadAccessorObservation& observation) 
         static_cast<unsigned long long>(signature));
 
     size_t field_count{};
-    bool exact_inhibit_field_found{};
+    bool exact_inhibit_backing_field_found{};
     bool field_dump_truncated{};
     for (auto* current_type : hierarchy) {
         for (auto* field : current_type->get_fields()) {
@@ -687,8 +690,8 @@ void dump_load_accessor_schema_once(const LoadAccessorObservation& observation) 
                 ? field_type->get_underlying_type()
                 : nullptr;
             const auto* declaring_type = field->get_declaring_type();
-            exact_inhibit_field_found = exact_inhibit_field_found ||
-                (name != nullptr && std::string_view{ name } == "InhibitBit");
+            exact_inhibit_backing_field_found = exact_inhibit_backing_field_found ||
+                (name != nullptr && std::string_view{ name } == INHIBIT_BIT_BACKING_FIELD_NAME);
             spdlog::info(
                 "[RE4XeSS][LoadAccessorSchema] field runtimeType={} declaringType={} fieldName={} fieldType={} typeSizeMetadata={} valueTypeSizeMetadata={} managedIntegralWidth={} static={} literal={} offset={} offsetFromFieldptr={} enum={} enumUnderlyingType={}",
                 observation.situation_runtime_type->get_full_name(),
@@ -710,10 +713,10 @@ void dump_load_accessor_schema_once(const LoadAccessorObservation& observation) 
             MAX_LOAD_SCHEMA_FIELDS);
     }
     spdlog::info(
-        "[RE4XeSS][LoadAccessorSchema] exactInhibitFieldFound={} fieldSearchComplete={} fieldCount={} hierarchyTruncated={}",
-        exact_inhibit_field_found, !field_dump_truncated && !hierarchy_truncated, field_count, hierarchy_truncated);
+        "[RE4XeSS][LoadAccessorSchema] exactInhibitBackingFieldFound={} fieldSearchComplete={} fieldCount={} hierarchyTruncated={}",
+        exact_inhibit_backing_field_found, !field_dump_truncated && !hierarchy_truncated, field_count, hierarchy_truncated);
 
-    if (exact_inhibit_field_found || field_dump_truncated || hierarchy_truncated) {
+    if (exact_inhibit_backing_field_found || field_dump_truncated || hierarchy_truncated) {
         return;
     }
 
