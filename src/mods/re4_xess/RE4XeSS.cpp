@@ -908,7 +908,7 @@ public:
         return probe;
     }
 
-    bool ensure(ID3D12Device4* device) {
+    bool ensure(ID3D12Device4* device, uint64_t handoff_frame, uint32_t output_width, uint32_t output_height) {
         if (device == nullptr) {
             reset();
             return false;
@@ -964,7 +964,10 @@ public:
             return false;
         }
 
-        spdlog::info("[RE4XeSS][RTVProbe] armed device=0x{:x} vtableSlot={} captureLimit={} callLimit={}",
+        spdlog::info("[RE4XeSS][RTVProbe] armed for output-handoff attempt frame={} expectedOutput={}x{} device=0x{:x} vtableSlot={} captureLimit={} callLimit={}",
+            static_cast<unsigned long long>(handoff_frame),
+            output_width,
+            output_height,
             reinterpret_cast<uintptr_t>(device),
             create_render_target_view_slot,
             MAX_CAPTURES,
@@ -2181,6 +2184,7 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
     control_request.caller_thread_id = callback_thread_id;
     control_request.external_fault = pending_worker_fault(control_generation, reset_generation);
     control_request.reframework_directory = reframework_module_directory();
+    ID3D12Device4* rtv_probe_device{};
     if (control_request.active) {
         (void)get_display_resolution(control_request.display);
     }
@@ -2190,11 +2194,9 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
     if (g_framework != nullptr && g_framework->get_renderer_type() == REFramework::RendererType::D3D12) {
         const auto& hook = g_framework->get_d3d12_hook();
         if (hook != nullptr) {
+            rtv_probe_device = hook->get_device();
             control_request.device = hook->get_device();
             control_request.queue = hook->get_command_queue();
-            if (control_request.active) {
-                (void)CreateRenderTargetViewProbe::instance().ensure(hook->get_device());
-            }
         }
     }
 
@@ -2425,6 +2427,11 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
     };
     RE4XeSSD3D12::OutputBinding output{};
     std::string handoff_error;
+    (void)CreateRenderTargetViewProbe::instance().ensure(
+        rtv_probe_device,
+        packet.frame_id,
+        packet.display_width,
+        packet.display_height);
     if (!m_output_handoff.prepare(
             layer,
             control_request.device.Get(),
