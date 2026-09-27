@@ -4064,3 +4064,149 @@ doc/RE4_XESS_PRODUCTION_ARCHITECTURE_2026-09-27.md
 ~~~
 
 That document is the source of truth for what should now be built. If implementation contradicts a proven runtime fact, update the evidence record first instead of silently changing a frozen production assumption.
+
+---
+
+## 22. PR4 first production runtime validation — callback thread assumption corrected
+
+Runtime evidence was collected after PR4 merge using:
+
+~~~text
+GoogleDrive/ETS2ATS/RE4/PR4 Log/re2_framework_log.txt
+GoogleDrive/ETS2ATS/RE4/PR4 Log/OptiScaler.log
+~~~
+
+REFramework runtime log build identity:
+
+~~~text
+Commit hash: 6484ec35ac043d441c857c929552ad7a0246bf39
+Build date: 27.09.2026
+Game: re4
+~~~
+
+OptiScaler runtime identity:
+
+~~~text
+OptiScaler v10.0.0-dev
+commit/log identity: 44cfee4d
+~~~
+
+### 22.1 OptiScaler deployment was valid
+
+OptiScaler successfully loaded:
+
+~~~text
+<RE4>\OptiScaler\libxess.dll
+<RE4>\OptiScaler\libxess_dx11.dll
+<RE4>\OptiScaler\libxess_fg.dll
+~~~
+
+Therefore the tested deployment layout itself was valid.
+
+### 22.2 REFramework runtime discovery stopped incorrectly on candidate 1
+
+REFramework attempted the supported order:
+
+~~~text
+1. <RE4>\libxess.dll
+2. <RE4>\OptiScaler\libxess.dll
+~~~
+
+Candidate 1 did not exist.
+
+The current implementation converted that expected miss into:
+
+~~~text
+Could not inspect runtime candidate:
+The system cannot find the file specified.
+~~~
+
+and aborted before candidate 2.
+
+This is an implementation bug, not a deployment contradiction.
+
+The production rule is now:
+
+~~~text
+candidate 1 missing
+    -> continue
+
+candidate 2 exists
+    -> select exact path
+    -> LoadLibraryExW exact path
+~~~
+
+Unexpected file-inspection errors remain fatal.
+
+### 22.3 The true pre-Overlay semantic boundary is stable, but its CPU thread identity is not
+
+The first active callback logged:
+
+~~~text
+owner thread established: 1304
+pre-Overlay callback owner verified:
+    ownerThread=1304 callbackThread=1304
+~~~
+
+Approximately 5 ms later the same semantic callback arrived on:
+
+~~~text
+thread 28692
+~~~
+
+and the implementation quarantined itself.
+
+This disproves only the earlier CPU-thread-affinity assumption.
+
+It does **not** invalidate:
+
+- the true pre-Overlay semantic boundary;
+- its resource identities;
+- its queue ordering;
+- Color/Depth/Velocity state evidence;
+- the output-handoff timing evidence.
+
+Production correction:
+
+~~~text
+true pre-Overlay callback
+    = semantic ordering boundary
+    != XeSS API owner thread
+~~~
+
+All public XeSS calls move to one dedicated RE4XeSS worker thread.
+
+The varying pre-Overlay callback synchronously dispatches CPU record/submit work to that worker, then continues engine-side handoff only after the worker returns.
+
+### 22.4 No XeSS producer execution was reached in this capture
+
+Neither REFramework nor OptiScaler logged producer calls corresponding to:
+
+~~~text
+xessD3D12CreateContext
+xessGetOptimalInputResolution
+xessD3D12Init
+xessSetVelocityScale
+xessD3D12Execute
+~~~
+
+Therefore this capture does not validate or invalidate:
+
+- RG16F motion-vector conversion;
+- bridge command-list execution;
+- PR4 TargetState output handoff;
+- COMMON/UAV/0xC0 output-state contract;
+- visible SR quality;
+- OptiScaler backend substitution;
+- XeFG.
+
+The next production retest must first clear runtime discovery and dedicated-worker ownership, then resume validation from context creation onward.
+
+### 22.5 Corrective implementation work order
+
+~~~text
+doc/RE4_XESS_PR4_RUNTIME_BLOCKER_FIX_WORK_ORDER_2026-09-27.md
+~~~
+
+This correction supersedes the earlier assumption that the pre-Overlay callback thread itself can own the XeSS API.
+
