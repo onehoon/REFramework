@@ -346,10 +346,15 @@ Responsibilities:
 - velocity scale configuration;
 - execute dispatch;
 - context destruction;
+- **single-thread ownership of every public XeSS API call**;
 - API result logging;
 - runtime capability/version reporting under Debug Log.
 
 REFramework does not distribute the XeSS runtime. Resolve the directory containing the loaded REFramework DLL, prefer <REF>\libxess.dll, then <REF>\OptiScaler\libxess.dll, and load the selected DLL by exact path. Do not search arbitrary PATH/current-working-directory locations or mutate process-wide DLL search state.
+
+XeSS-SR is not thread-safe. The production owner thread is the stable thread executing the true RE4 `on_pre_overlay_layer_draw()` callback. Context creation, version query, optimal-input query, initialization, velocity-scale setup, execute, and context destruction all run only on that recorded owner thread.
+
+Non-owner callbacks may request state transitions but must not call public XeSS functions. If an owner-thread callback is not available for an otherwise necessary teardown, fail closed and quarantine the old XeSS context/module rather than making a cross-thread XeSS call.
 
 No libxess_fg.dll API is loaded here.
 
@@ -359,7 +364,8 @@ Responsibilities:
 
 - own the REFramework command allocator/list ring;
 - use the active RE4 DIRECT queue;
-- own the fence used only for bridge allocator/list reuse;
+- own the fence used for allocator/list reuse **and fence-scoped lifetime proof**;
+- own temporary per-slot COM pins for submitted RE4 Color/Depth/original-Velocity resources;
 - own XeSS-specific output/conversion resources that are not engine objects;
 - perform required legacy ResourceBarrier transitions;
 - reset/recreate resources when display size or device identity changes;
@@ -801,7 +807,7 @@ The bridge fence exists for allocator/list reuse and lifecycle safety only.
 
 ## 9. Command-list and resource-state ownership
 
-### 9.1 Engine resources are borrowed
+### 9.1 Engine resources are borrowed semantically, but submitted GPU inputs are fence-pinned
 
 The bridge borrows:
 
@@ -814,9 +820,29 @@ active DIRECT queue
 engine semantic TargetState references needed for handoff
 ~~~
 
-It does not own their lifetime and must not aggressively Release them.
+It does not take semantic ownership and must never aggressively drain COM references.
 
-For the production frame contract, Color/Depth/Velocity pointers are valid only as borrowed resources during the current true pre-Overlay callback. PR 3 must consume them synchronously at that boundary. Pointer-bearing frame packets must not be queued to another thread or retained for later resource use. Cross-frame diagnostics/identity tracking may retain only opaque address values, not reusable COM-resource ownership.
+The pointer-bearing `RE4XeSSFrame` is callback-scoped CPU data and must not be queued to another thread.
+
+However, D3D12 XeSS Execute only records commands; actual GPU execution happens after submission. Therefore a submitted command slot must hold balanced strong COM references to the engine Color, Depth, and original Velocity resource until that slot's fence completion is proven.
+
+The ownership rule is:
+
+~~~text
+CPU packet:
+    valid only during true pre-Overlay callback
+
+submitted GPU inputs:
+    slot-local ComPtr pin
+    acquire before recording/submission
+    retain through fence completion
+    release only on proven safe slot reuse
+
+cross-frame diagnostics:
+    opaque address values only
+~~~
+
+This bounded AddRef/Release pair is a lifetime pin, not ownership transfer. No refcount-draining or foreign-resource retirement logic is permitted.
 
 ### 9.2 Bridge resources are owned
 
@@ -850,10 +876,16 @@ Each slot contains at least:
 ~~~text
 ID3D12CommandAllocator
 ID3D12GraphicsCommandList
+slot-local descriptor heap
+ComPtr<Color>
+ComPtr<Depth>
+ComPtr<original Velocity>
 last fence value
 ~~~
 
-Before resetting a slot, verify its previous fence has completed.
+Before resetting a slot, verify its previous fence has completed. Only then release the old engine-resource pins and rewrite/reset the slot.
+
+`ID3D12Fence::GetCompletedValue() == UINT64_MAX` is a device-removal sentinel and must never be interpreted as normal completion.
 
 Do not spin or block the render thread indefinitely.
 
@@ -890,6 +922,9 @@ Disabled
 WaitingForD3D12
     |
     v
+WaitingForOwnerThread
+    |
+    v
 WaitingForValidScene
     |
     v
@@ -904,8 +939,13 @@ Active
     |      Ready
     |
     +--> Faulted
+    |       |
+    |       +--> retry only on explicit re-enable or valid device recreation
+    |
+    +--> Quarantined
             |
-            +--> retry only on explicit re-enable or valid device recreation
+            +--> no slot reuse / no guessed completion
+            +--> exit only after safe terminal condition
 ~~~
 
 ### 10.1 History reset conditions
@@ -984,14 +1024,36 @@ Do not use camera translation alone as a Load Save reset heuristic.
 
 On D3D12 device reset or incompatible swapchain/display-size recreation:
 
-1. stop scheduling new XeSS dispatches;
+1. stop scheduling new XeSS dispatches immediately;
 2. restore any temporary RE4 output handoff;
-3. wait only as required for bridge-owned GPU work to retire;
-4. destroy bridge-owned output resources;
-5. destroy XeSS context;
-6. reset allocator/list/fence state;
-7. return to WaitingForD3D12 / RecreatePending;
-8. reinitialize only when the new D3D12 state is valid.
+3. mark the old execution generation draining or terminal;
+4. poll the bridge fence without per-frame blocking;
+5. release slot-local engine-resource pins only after normal fence completion is proven;
+6. destroy bridge-owned output/conversion resources only after the old generation is safe;
+7. destroy the XeSS context only on the recorded XeSS owner thread;
+8. reset allocator/list/fence state;
+9. return to WaitingForD3D12 / RecreatePending;
+10. reinitialize only when the new D3D12 state is valid.
+
+Fence rule:
+
+~~~text
+completed = bridgeFence->GetCompletedValue()
+
+completed == UINT64_MAX
+    -> DeviceRemoved
+    -> never treat as completed >= target
+    -> never reuse old slots
+
+otherwise
+    -> normal completion comparison is allowed
+~~~
+
+A Signal failure after `ExecuteCommandLists` is special: the list may have been accepted while completion proof was lost. That execution generation must keep its slot pins, command objects, bridge-owned resources, and XeSS context quarantined until either normal completion becomes provable or an explicit device-removal/reset terminal condition disposes the old device generation.
+
+If neither can be proven, keep that generation quarantined for the rest of the process rather than guessing completion.
+
+Non-owner callbacks such as device-reset notification may only request teardown. They must not call public XeSS APIs directly.
 
 The RE4 module must not call or alter XeFG lifecycle internals.
 
@@ -1037,7 +1099,7 @@ The RE4 producer does not detect whether libxess.dll is Intel's runtime or OptiS
 
 That is intentional.
 
-The public call stream remains the same:
+The public call stream remains the same and is serialized on the single pre-Overlay XeSS owner thread:
 
 ~~~text
 CreateContext
@@ -1528,6 +1590,9 @@ Production code should implement the minimum stable contract, not carry broad ho
 | AD-18 | RE4 UI exposes one Upscaling Mode selector: Off plus the public XeSS Native AA / UQ+ / UQ / Quality / Balanced / Performance / Ultra Performance presets. |
 | AD-19 | Preset-to-render-size mapping is obtained through the public XeSS frontend query; REFramework does not hardcode backend-specific SR ratios. |
 | AD-20 | Broad reverse-engineering tracing is finished; add new probes only for concrete implementation contradictions. |
+| AD-21 | Every public XeSS API call is serialized on the stable true pre-Overlay owner thread; non-owner callbacks only request state transitions. |
+| AD-22 | The RE4XeSSFrame remains callback-scoped CPU data, while submitted Color/Depth/original-Velocity resources are retained by slot-local COM pins until fence completion is proven. |
+| AD-23 | `GetCompletedValue()==UINT64_MAX` is device removal, never completion; unprovable post-submit generations are quarantined rather than reused or freed speculatively. |
 
 ---
 
