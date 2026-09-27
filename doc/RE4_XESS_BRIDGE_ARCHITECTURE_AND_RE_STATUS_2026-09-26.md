@@ -4210,3 +4210,161 @@ doc/RE4_XESS_PR4_RUNTIME_BLOCKER_FIX_WORK_ORDER_2026-09-27.md
 
 This correction supersedes the earlier assumption that the pre-Overlay callback thread itself can own the XeSS API.
 
+---
+
+## 23. PR4-Log after PR65 — standard XeSS producer path reached OptiScaler; Load Save accessor is the next blocker
+
+Runtime evidence:
+
+~~~text
+GoogleDrive/ETS2ATS/RE4/PR4-Log/re2_framework_log.txt
+GoogleDrive/ETS2ATS/RE4/PR4-Log/OptiScaler.log
+~~~
+
+### 23.1 Dedicated worker and runtime discovery correction succeeded
+
+Observed:
+
+~~~text
+[RE4XeSS][Worker] started thread=29452
+
+candidate 1:
+    <RE4>\libxess.dll
+    missing -> continued
+
+candidate 2:
+    <RE4>\OptiScaler\libxess.dll
+    selected
+
+LoadLibraryExW exact path = success
+~~~
+
+The true pre-Overlay callback moved across multiple RE Engine threads while the dedicated worker remained stable.
+
+No callback-thread migration quarantine occurred.
+
+### 23.2 Stock OptiScaler is already loaded and intercepting the public producer API
+
+OptiScaler logged:
+
+~~~text
+OptiScaler v10.0.0-dev loaded
+working as dxgi.dll
+XeSSProxy::InitXeSS LoadResult: true
+~~~
+
+and intercepted:
+
+~~~text
+hk_xessGetVersion
+hk_xessD3D12CreateContext
+hk_xessGetOptimalInputResolution
+hk_xessD3D12Init
+hk_xessSetVelocityScale
+~~~
+
+For the first Ultra Quality configuration both sides agreed on:
+
+~~~text
+display       = 2560x1440
+optimal input = 1969x1107
+velocityScale = (984.5, -553.5)
+~~~
+
+Therefore the standard:
+
+~~~text
+REFramework
+    -> public XeSS API
+    -> stock OptiScaler XeSS frontend
+~~~
+
+producer path is now runtime-proven through initialization.
+
+The early OptiScaler warning:
+
+~~~text
+Config::CheckUpscalerFiles libxess.dll not found!
+~~~
+
+does not represent the final load result in this capture; OptiScaler subsequently loaded `OptiScaler\libxess.dll` successfully.
+
+### 23.3 Actual XeSS dispatch was still never reached
+
+Observed counts:
+
+~~~text
+OptiScaler hk_xessGetVersion          = 18
+OptiScaler hk_xessD3D12CreateContext  = 18
+OptiScaler hk_xessD3D12Init           = 18
+OptiScaler hk_xessSetVelocityScale    = 18
+
+RE4XeSS Worker submit                 = 0
+RE4XeSS first resetHistory packet     = 0
+RE4XeSS Output handoff                = 0
+OptiScaler hk_xessD3D12Execute        = 0
+~~~
+
+The repeated context recreation corresponds to user-driven quality-mode changes during the test.
+
+### 23.4 Production Load Save accessor failed continuously
+
+Observed:
+
+~~~text
+load-state-observation-unavailable = 18,743
+load-history-invalid               = 18,726
+~~~
+
+No valid production load snapshot was recorded.
+
+Current production accessor attempts:
+
+~~~text
+chainsaw.SceneLoadZoneManager
+    get_Instance
+    _Pause
+
+chainsaw.GameSituationManager
+    get_Instance
+    InhibitBit
+~~~
+
+The startup type registry log proves both manager types exist, but the production accessor currently collapses type/method/field/context/instance/raw-field failures into one `std::nullopt`.
+
+This prevents identifying the exact contradiction.
+
+### 23.5 Capture 22 semantics remain valid
+
+Do not discard the proven load window:
+
+~~~text
+_Pause false -> true
+    => history invalid
+
+_Pause true -> false
+    => still invalid
+
+InhibitBit returns to remembered normal baseline
+    => first resumed frame resetHistory = true
+~~~
+
+The current blocker is accessor implementation, not the state-machine model.
+
+### 23.6 Next work order
+
+~~~text
+doc/RE4_XESS_LOAD_STATE_ACCESSOR_DIAGNOSTIC_WORK_ORDER_2026-09-27.md
+~~~
+
+The next runtime milestone is:
+
+~~~text
+valid LoadAccessor snapshot
+    -> first temporal frame packet
+    -> Worker submit
+    -> OptiScaler hk_xessD3D12Execute
+    -> PR4 OutputHandoff validation resumes
+~~~
+
+
