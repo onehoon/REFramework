@@ -103,6 +103,8 @@ bool RE4XeSSOutputHandoff::restore(
         return false;
     }
 
+    bool log_missing_marker{};
+    uint64_t missing_marker_frame{};
     {
         std::lock_guard lock{ m_retirement_mutex };
         m_installed = false;
@@ -114,9 +116,19 @@ bool RE4XeSSOutputHandoff::restore(
             if (m_failure_reason.empty()) {
                 m_failure_reason = "The previous installed handoff frame has no post-Present retirement marker yet";
             }
+            m_marker_wait_logged = true;
+            if (m_delayed_marker_log_count < 8) {
+                ++m_delayed_marker_log_count;
+                log_missing_marker = true;
+                missing_marker_frame = m_installed_frame;
+            }
         } else if (m_retirement_requested) {
             m_retirement_status = RetirementStatus::Draining;
         }
+    }
+    if (log_missing_marker) {
+        spdlog::warn("[RE4XeSS][Output] restored handoff frame={} without its post-Present marker; next submission/install is blocked until same-generation settlement",
+            static_cast<unsigned long long>(missing_marker_frame));
     }
     bool log_restore{};
     {
@@ -313,10 +325,32 @@ bool RE4XeSSOutputHandoff::prepare(
     };
 
     bool existing_generation_usable{};
+    bool waiting_for_marker{};
+    bool log_marker_block{};
+    uint64_t waiting_marker_frame{};
     {
         std::lock_guard lock{ m_retirement_mutex };
+        waiting_for_marker = m_marker_pending || m_missing_marker;
         existing_generation_usable = !m_retirement_requested && !m_hard_quarantined &&
-            !m_bridge_writer_uncertain && !m_device_removed;
+            !m_bridge_writer_uncertain && !m_device_removed && !waiting_for_marker;
+        if (waiting_for_marker) {
+            m_missing_marker = true;
+            m_retirement_status = RetirementStatus::MissingMarker;
+            if (!m_marker_wait_logged && m_delayed_marker_log_count < 8) {
+                m_marker_wait_logged = true;
+                ++m_delayed_marker_log_count;
+                log_marker_block = true;
+                waiting_marker_frame = m_installed_frame;
+            }
+        }
+    }
+    if (m_handoff_state != nullptr && m_signature == requested_signature && waiting_for_marker) {
+        error = "Previous RE4 XeSS handoff frame is waiting for its downstream post-Present retirement marker";
+        if (log_marker_block) {
+            spdlog::warn("[RE4XeSS][Output] refusing handoff reuse while frame={} awaits post-Present settlement; no new XeSS output submit/install",
+                static_cast<unsigned long long>(waiting_marker_frame));
+        }
+        return false;
     }
     if (m_handoff_state != nullptr && m_signature == requested_signature && existing_generation_usable) {
         output.resource = m_resource_pin.Get();
@@ -376,6 +410,7 @@ bool RE4XeSSOutputHandoff::prepare(
     m_installed_frame = 0;
     m_retirement_log_count = 0;
     m_restore_log_count = 0;
+    m_delayed_marker_log_count = 0;
     m_installed = false;
     m_installed_overlay = nullptr;
     m_saved_original_state.reset();
@@ -383,6 +418,8 @@ bool RE4XeSSOutputHandoff::prepare(
     m_downstream_use_seen = false;
     m_marker_pending = false;
     m_missing_marker = false;
+    m_marker_wait_logged = false;
+    m_marker_recovery_pending = false;
     m_hard_quarantined = false;
     m_bridge_writer_uncertain = false;
     m_missing_marker_logged = false;
@@ -506,6 +543,14 @@ bool RE4XeSSOutputHandoff::install(
         error = "The RE4 XeSS output generation is retiring or quarantined";
         return false;
     }
+    const auto previous_frame = m_installed_frame;
+    const bool log_marker_recovery = m_marker_recovery_pending && m_delayed_marker_log_count < 8;
+    if (m_marker_recovery_pending) {
+        m_marker_recovery_pending = false;
+        if (log_marker_recovery) {
+            ++m_delayed_marker_log_count;
+        }
+    }
     auto& main_state = layer->get_main_target_state();
     if (main_state.get() != reinterpret_cast<sdk::renderer::TargetState*>(m_signature.template_state) ||
         m_expected_state != OUTPUT_READ_STATE) {
@@ -547,6 +592,11 @@ bool RE4XeSSOutputHandoff::install(
             reinterpret_cast<uintptr_t>(m_resource_pin.Get()),
             m_signature.display_width,
             m_signature.display_height);
+    }
+    if (log_marker_recovery) {
+        spdlog::info("[RE4XeSS][Output] resumed handoff after frame={} marker settlement; installed frame={}",
+            static_cast<unsigned long long>(previous_frame),
+            static_cast<unsigned long long>(frame_id));
     }
     return true;
 }
@@ -596,6 +646,7 @@ void RE4XeSSOutputHandoff::on_post_present(
         return;
     }
 
+    const bool settled_missing_marker = m_missing_marker;
     const auto value = m_next_retirement_value++;
     const auto result = m_queue->Signal(m_retirement_fence.Get(), value);
     if (FAILED(result)) {
@@ -613,6 +664,10 @@ void RE4XeSSOutputHandoff::on_post_present(
     m_last_signaled_retirement_value = value;
     m_marker_pending = false;
     m_missing_marker = false;
+    m_marker_wait_logged = false;
+    if (settled_missing_marker) {
+        m_marker_recovery_pending = true;
+    }
     m_retirement_status = m_retirement_requested ? RetirementStatus::Draining : RetirementStatus::Active;
     const bool log_marker = m_retirement_log_count < 32;
     if (log_marker) {
@@ -620,12 +675,21 @@ void RE4XeSSOutputHandoff::on_post_present(
     }
     const auto frame = m_installed_frame;
     const auto queue_identity = reinterpret_cast<uintptr_t>(m_queue.Get());
+    const bool log_marker_settlement = settled_missing_marker && m_delayed_marker_log_count < 8;
+    if (log_marker_settlement) {
+        ++m_delayed_marker_log_count;
+    }
     lock.unlock();
     if (log_marker) {
         spdlog::info("[RE4XeSS][Output] downstream retirement marker queued value={} frame={} queue=0x{:x}",
             static_cast<unsigned long long>(value),
             static_cast<unsigned long long>(frame),
             queue_identity);
+    }
+    if (log_marker_settlement) {
+        spdlog::info("[RE4XeSS][Output] queued delayed-marker settlement for restored handoff frame={} value={}; no additional output reader was installed before this marker",
+            static_cast<unsigned long long>(frame),
+            static_cast<unsigned long long>(value));
     }
 }
 

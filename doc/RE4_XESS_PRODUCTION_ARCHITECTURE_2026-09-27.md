@@ -921,6 +921,8 @@ frame N XeSS write
     -> frame N+1 XeSS write
 ~~~
 
+Same-generation reuse is permitted only after the prior installed frame's post-Present marker has been queued. If the next pre-Overlay restoration occurs while that marker is still missing, do not submit or reinstall the same handoff generation. Wait nonblockingly for a later valid same-generation settlement marker, then resume reuse on a subsequent pre-Overlay callback. This prevents a late marker for frame N from being mistaken as evidence for a newly installed frame N+1 reader.
+
 For destruction/recreation, stronger proof is required.
 
 When an installed handoff reaches the presentation path, the existing Mod::on_post_present() callback signals a dedicated retirement fence on the same handoff-generation DIRECT queue.

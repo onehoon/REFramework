@@ -436,7 +436,7 @@ The post-Present callback is not assumed to run on the pre-Overlay XeSS owner th
 
 ### 6.5 Same-generation frame reuse does not require a CPU wait
 
-Normal frame-to-frame reuse of the same handoff texture is ordered by the same DIRECT queue:
+Normal frame-to-frame reuse of the same handoff texture is ordered by the same DIRECT queue once the prior installed frame's post-Present retirement marker has been queued:
 
 ~~~text
 frame N XeSS write
@@ -451,6 +451,8 @@ The frame N+1 bridge list is submitted later to the same queue, so queue orderin
 Do not CPU-wait on the downstream retirement fence every frame.
 
 The retirement fence exists for **lifetime/destruction/recreation proof**, not normal steady-state reuse.
+
+If frame N reaches the next pre-Overlay restoration boundary before its post-Present callback has queued a marker, report **MissingMarker** and do not submit or reinstall the same handoff generation on frame N+1. A later valid same-generation post-Present callback may queue a settlement marker after restoration; normal submission/reuse may resume on a subsequent pre-Overlay callback after that marker is queued. This is nonblocking fail-closed behavior, not a CPU fence wait. Emit bounded diagnostics for the blocked reuse, settlement marker, and resumed installation.
 
 ### 6.6 Remove detached output from normal path
 
@@ -1138,6 +1140,20 @@ Unrelated existing game/debug-layer messages do not automatically fail the test;
 ### Long session
 
 Check no refcount growth pattern, no per-frame TargetState churn, no ring starvation, no stale restoration, no downstream retirement backlog during normal operation, and no device removal.
+
+### Delayed post-Present marker regression
+
+Exercise a controlled callback delay for one installed handoff frame:
+
+~~~text
+frame N installs handoff; delay its post-Present callback
+frame N+1 pre-Overlay restores the original TargetState and reports MissingMarker
+frame N+1 submits/installs no handoff output
+later valid same-generation post-Present queues the settlement marker
+next eligible pre-Overlay resumes XeSS submit/install
+~~~
+
+Confirm the bounded log identifies the restored frame, blocked reuse, settlement marker, and resumed installation. No earlier marker may be accepted as proof for a later installed reader; no TargetState release/recreation is allowed until the retirement marker is complete when retirement is requested.
 
 ---
 

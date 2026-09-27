@@ -106,11 +106,14 @@ private:
     uint64_t m_installed_frame{};
     mutable uint32_t m_retirement_log_count{};
     uint32_t m_restore_log_count{};
+    uint32_t m_delayed_marker_log_count{};
     bool m_installed{};
     bool m_retirement_requested{};
     bool m_downstream_use_seen{};
     bool m_marker_pending{};
     bool m_missing_marker{};
+    bool m_marker_wait_logged{};
+    bool m_marker_recovery_pending{};
     bool m_hard_quarantined{};
     bool m_bridge_writer_uncertain{};
     bool m_missing_marker_logged{};
