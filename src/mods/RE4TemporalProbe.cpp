@@ -1020,6 +1020,78 @@ void STDMETHODCALLTYPE RE4TemporalProbe::recording_resource_barrier_hook(
         }
     }
 
+
+    if (tracked &&
+        self->m_final_composite_capture_open.load(std::memory_order_relaxed) &&
+        self->m_enabled.load(std::memory_order_relaxed) &&
+        re4_temporal_probe::is_final_composite_scenario(
+            self->m_scenario.load(std::memory_order_relaxed)) &&
+        barriers != nullptr) {
+        for (UINT i = 0; i < num_barriers; ++i) {
+            const auto& barrier = barriers[i];
+            if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ||
+                barrier.Transition.pResource == nullptr) {
+                continue;
+            }
+
+            auto* resource = barrier.Transition.pResource;
+            const auto resource_key = reinterpret_cast<uintptr_t>(resource);
+            bool is_tracked = false;
+            bool is_swapchain = false;
+            bool is_color = false;
+            bool is_intermediate = false;
+
+            {
+                std::scoped_lock lock{self->m_final_composite_mutex};
+                is_tracked =
+                    self->m_final_composite_tracked_resources.contains(resource_key);
+                is_swapchain =
+                    self->m_final_composite_swapchain_buffers.contains(resource_key);
+                is_color =
+                    resource_key ==
+                    self->m_final_composite_color.load(std::memory_order_relaxed);
+                is_intermediate =
+                    resource_key ==
+                    self->m_final_composite_intermediate.load(std::memory_order_relaxed);
+
+                if (is_tracked || is_swapchain || is_color || is_intermediate) {
+                    self->m_final_composite_resource_states[resource_key] =
+                        static_cast<uint32_t>(barrier.Transition.StateAfter);
+                }
+            }
+
+            if (!(is_tracked || is_swapchain || is_color || is_intermediate)) {
+                continue;
+            }
+
+            const char* target =
+                is_color ? "Color" :
+                is_intermediate ? "Intermediate" :
+                is_swapchain ? "Swapchain" :
+                "Tracked";
+
+            const auto event =
+                self->m_final_composite_event_sequence.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+
+            spdlog::info(
+                "[RE4TemporalProbe] finalCompositeBarrier event={} sample={} frame={} "
+                "list={:p} thread={} target={} resource={:p} subresource={} "
+                "before=0x{:x} after=0x{:x} flags={}",
+                event,
+                self->m_final_composite_boundary_sample.load(std::memory_order_relaxed),
+                self->m_final_composite_boundary_frame.load(std::memory_order_relaxed),
+                static_cast<void*>(command_list),
+                GetCurrentThreadId(),
+                target,
+                static_cast<void*>(resource),
+                barrier.Transition.Subresource,
+                static_cast<uint32_t>(barrier.Transition.StateBefore),
+                static_cast<uint32_t>(barrier.Transition.StateAfter),
+                static_cast<uint32_t>(barrier.Flags));
+        }
+    }
+
     self->m_recording_resource_barrier_original(
         command_list,
         num_barriers,
@@ -1468,6 +1540,87 @@ void STDMETHODCALLTYPE RE4TemporalProbe::recording_copy_resource_hook(
         }
     }
 
+
+    if (tracked_list &&
+        self->m_final_composite_capture_open.load(std::memory_order_relaxed) &&
+        self->m_enabled.load(std::memory_order_relaxed) &&
+        re4_temporal_probe::is_final_composite_scenario(
+            self->m_scenario.load(std::memory_order_relaxed)) &&
+        src != nullptr &&
+        dst != nullptr) {
+        const auto src_key = reinterpret_cast<uintptr_t>(src);
+        const auto dst_key = reinterpret_cast<uintptr_t>(dst);
+        const auto color =
+            self->m_final_composite_color.load(std::memory_order_relaxed);
+
+        bool touched = false;
+        bool src_swapchain = false;
+        bool dst_swapchain = false;
+        size_t tracked_count = 0;
+
+        {
+            std::scoped_lock lock{self->m_final_composite_mutex};
+            const auto src_tracked =
+                self->m_final_composite_tracked_resources.contains(src_key);
+            const auto dst_tracked =
+                self->m_final_composite_tracked_resources.contains(dst_key);
+            touched = src_tracked || dst_tracked || src_key == color;
+
+            if (touched) {
+                self->m_final_composite_tracked_resources.insert(src_key);
+                self->m_final_composite_tracked_resources.insert(dst_key);
+
+                if (src_key == color && dst_key != color) {
+                    self->m_final_composite_intermediate.store(
+                        dst_key, std::memory_order_relaxed);
+                }
+            }
+
+            src_swapchain =
+                self->m_final_composite_swapchain_buffers.contains(src_key);
+            dst_swapchain =
+                self->m_final_composite_swapchain_buffers.contains(dst_key);
+            tracked_count =
+                self->m_final_composite_tracked_resources.size();
+        }
+
+        if (touched) {
+            const auto event =
+                self->m_final_composite_event_sequence.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+            const auto src_shape = resource_shape(src);
+            const auto dst_shape = resource_shape(dst);
+
+            spdlog::info(
+                "[RE4TemporalProbe] finalCompositeCopy event={} sample={} frame={} "
+                "type=CopyResource list={:p} thread={} src={:p} dst={:p} "
+                "srcColor={} intermediate={:p} srcSwapchain={} dstSwapchain={} "
+                "trackedResources={} srcDesc={{w={},h={},format={},flags=0x{:x}}} "
+                "dstDesc={{w={},h={},format={},flags=0x{:x}}}",
+                event,
+                self->m_final_composite_boundary_sample.load(std::memory_order_relaxed),
+                self->m_final_composite_boundary_frame.load(std::memory_order_relaxed),
+                static_cast<void*>(command_list),
+                GetCurrentThreadId(),
+                static_cast<void*>(src),
+                static_cast<void*>(dst),
+                src_key == color,
+                reinterpret_cast<void*>(
+                    self->m_final_composite_intermediate.load(std::memory_order_relaxed)),
+                src_swapchain,
+                dst_swapchain,
+                tracked_count,
+                src_shape.width,
+                src_shape.height,
+                src_shape.format,
+                src_shape.flags,
+                dst_shape.width,
+                dst_shape.height,
+                dst_shape.format,
+                dst_shape.flags);
+        }
+    }
+
     self->m_recording_copy_resource_original(command_list, dst, src);
 }
 
@@ -1581,6 +1734,59 @@ void STDMETHODCALLTYPE RE4TemporalProbe::recording_copy_texture_region_hook(
                 dst_shape.height,
                 dst_shape.format,
                 dst_shape.flags);
+        }
+    }
+
+
+    if (tracked_list &&
+        self->m_final_composite_capture_open.load(std::memory_order_relaxed) &&
+        self->m_enabled.load(std::memory_order_relaxed) &&
+        re4_temporal_probe::is_final_composite_scenario(
+            self->m_scenario.load(std::memory_order_relaxed)) &&
+        src_resource != nullptr &&
+        dst_resource != nullptr) {
+        const auto src_key = reinterpret_cast<uintptr_t>(src_resource);
+        const auto dst_key = reinterpret_cast<uintptr_t>(dst_resource);
+        const auto color =
+            self->m_final_composite_color.load(std::memory_order_relaxed);
+
+        bool touched = false;
+        {
+            std::scoped_lock lock{self->m_final_composite_mutex};
+            const auto src_tracked =
+                self->m_final_composite_tracked_resources.contains(src_key);
+            const auto dst_tracked =
+                self->m_final_composite_tracked_resources.contains(dst_key);
+            touched = src_tracked || dst_tracked || src_key == color;
+
+            if (touched) {
+                self->m_final_composite_tracked_resources.insert(src_key);
+                self->m_final_composite_tracked_resources.insert(dst_key);
+                if (src_key == color && dst_key != color) {
+                    self->m_final_composite_intermediate.store(
+                        dst_key, std::memory_order_relaxed);
+                }
+            }
+        }
+
+        if (touched) {
+            const auto event =
+                self->m_final_composite_event_sequence.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+            spdlog::info(
+                "[RE4TemporalProbe] finalCompositeCopy event={} sample={} frame={} "
+                "type=CopyTextureRegion list={:p} thread={} src={:p} dst={:p} "
+                "srcColor={} intermediate={:p}",
+                event,
+                self->m_final_composite_boundary_sample.load(std::memory_order_relaxed),
+                self->m_final_composite_boundary_frame.load(std::memory_order_relaxed),
+                static_cast<void*>(command_list),
+                GetCurrentThreadId(),
+                static_cast<void*>(src_resource),
+                static_cast<void*>(dst_resource),
+                src_key == color,
+                reinterpret_cast<void*>(
+                    self->m_final_composite_intermediate.load(std::memory_order_relaxed)));
         }
     }
 
