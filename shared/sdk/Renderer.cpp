@@ -1293,6 +1293,16 @@ TargetState* create_target_state(TargetState::Desc* desc) {
         spdlog::info("Searching for create_target_state");
 
         const auto game = utility::get_executable();
+        // The legacy string-relative call-order heuristic below is not valid
+        // for RE4 1.5.9.0. Runtime evidence showed that its third-call
+        // candidate resolves to a member helper which dereferences RCX, not a
+        // TargetState factory. Do not invoke an unvalidated candidate; the
+        // clone caller already handles nullptr and releases its temporary RTVs.
+        if (sdk::GameIdentity::get().is_re4()) {
+            spdlog::warn("[Renderer][RE4] TargetState factory is unresolved; refusing the legacy call-order candidate");
+            return nullptr;
+        }
+
         const auto string = utility::scan_string(game, "CircularDOF_SceneMipTexture");
 
         if (!string) {
@@ -1302,8 +1312,8 @@ TargetState* create_target_state(TargetState::Desc* desc) {
 
         const auto string_ref = utility::scan_displacement_reference(game, *string);
 
-            spdlog::error("Failed to find create_target_state (no string ref)");
         if (!string_ref) {
+            spdlog::error("Failed to find create_target_state (no string ref)");
             return nullptr;
         }
 
