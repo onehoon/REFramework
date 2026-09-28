@@ -5217,3 +5217,287 @@ actual TargetState creator/factory ABI unknown
 ~~~
 
 Keep PR66 Draft and unmerged.
+
+
+---
+
+## 32. PR66 14:05 runtime — TargetState xrefs classified
+
+Latest runtime evidence:
+
+~~~text
+file: re2_framework_log(20260928-050834).txt
+commit header: 42c3b66fd5163c331ecb1247e42b25cfc13e9d40
+branch: feature/re4-xess-load-state-accessor-diagnostic
+build date/time: 2026-09-28 14:05
+~~~
+
+The current remote PR66 source subsequently advanced to:
+
+~~~text
+06a50b2572a19ba0f4ff977babd2a786273a8bfe
+Log bounded TargetState vtable xref context
+~~~
+
+and now contains the bounded xref-context scanner represented by this capture.
+
+### 32.1 RUNTIME_FUNCTION scanner acceptance is complete
+
+The scanner still reports incomplete exhaustive coverage:
+
+~~~text
+functions=508868
+scannedFunctions=507568
+failedFunctions=1300
+xrefCount=2
+complete=false
+~~~
+
+but individual decoder failures are now rate-limited correctly:
+
+~~~text
+decodeFailureDetailsLogged=12
+decodeFailureDetailsSuppressed=true
+~~~
+
+The two exact positive vtable xrefs remain valid.
+
+The live anchor also remains correctly trusted independently of full scan completeness:
+
+~~~text
+liveVtable=0x7ff6396ec148
+expectedVtable=0x7ff6396ec148
+imageIdentityValid=true
+match=true
+discoveryComplete=false
+trusted=true
+~~~
+
+### 32.2 Candidate 0 is destructor/deallocation-side evidence
+
+Candidate 0:
+
+~~~text
+functionBeginRva = 0x47C3E00
+functionEndRva   = 0x47C3E58
+xrefRva          = 0x47C3E0A
+~~~
+
+Observed flow:
+
+~~~asm
+LEA  RAX, TargetState_vtable
+MOV  EDI, EDX
+MOV  [RCX], RAX
+MOV  RBX, RCX
+CALL re4+0x446EE30
+TEST DIL, 1
+...
+MOV  RCX, RBX
+TEST DIL, 4
+...
+CALL re4+0x3ACC670
+MOV  RAX, RBX
+~~~
+
+This is strongly consistent with a deleting-destructor/deallocation thunk:
+
+~~~text
+existing object arrives in RCX
+EDX is preserved as destruction flags
+TargetState vtable is restored onto the existing object
+destructor-side work is called
+flags gate a deallocation-like call
+the original object pointer is returned
+~~~
+
+Status:
+
+~~~text
+re4+0x47C3E00 -> retire as TargetState creator/factory lead
+~~~
+
+This RVA remains useful as destructor/ownership evidence only.
+
+Do not dynamically probe it in the next capture.
+
+### 32.3 Candidate 1 is the strongest TargetState creator/factory lead
+
+Candidate 1:
+
+~~~text
+functionBeginRva = 0x47D2180
+functionEndRva   = 0x47D21D2
+xrefRva          = 0x47D21AF
+~~~
+
+Observed flow:
+
+~~~asm
+MOV  EDX, 0xA8
+CALL re4+0x3AB27F0
+MOV  RBX, RAX
+TEST RAX, RAX
+JZ   failure
+
+MOV  RDX, RDI
+MOV  RCX, RAX
+CALL re4+0x446E790
+
+LEA  RAX, TargetState_vtable
+MOV  [RBX], RAX
+MOV  RAX, RBX
+RET
+~~~
+
+This is materially stronger than every previous TargetState candidate.
+
+The function:
+
+~~~text
+requests a fixed 0xA8-byte allocation
+retains the allocated object in RBX
+passes the new object to an initializer/constructor-like call
+installs the exact proven live TargetState vtable into [RBX]
+returns the same object pointer in RAX
+~~~
+
+Current classification:
+
+~~~text
+re4+0x47D2180 -> allocation + initialization wrapper / TargetState creator candidate
+~~~
+
+This is not yet a production create_target_state resolver.
+
+The following remain unproven:
+
+~~~text
+input ABI
+meaning of the argument forwarded through RDI/RDX
+allocator semantics
+initial refcount / ownership transfer
+whether created objects are the same TargetState type instance used by Overlay
+whether descriptor/RTV fields are ready immediately after construction
+safe lifetime contract for OutputHandoff
+~~~
+
+### 32.4 Old site-1 probe is now fully exhausted
+
+The old isolated 0x47212A6 path ran again and reproduced the known re4+0x78F42D0 result:
+
+~~~text
+numRtv=1
+rtv0=null
+overlayVtableMatch=false
+targetStateLike=false
+~~~
+
+No new information was produced.
+
+Do not run the old provider-return probe in the next capture.
+
+### 32.5 Next diagnostic — early 0x47D2180 creator correlation
+
+PR66 work-order comment:
+
+~~~text
+5863904529
+~~~
+
+The next diagnostic must target only re4+0x47D2180.
+
+Arm it at the early REFramework bootstrap point:
+
+~~~text
+REFramework-constructor-after-integrity
+before-plugin-init=true
+~~~
+
+Do not wait for the first valid XeSS frame.
+
+The TargetState used by Overlay may be constructed during renderer initialization.
+
+The probe remains read-only and bounded.
+
+Required real-call observations:
+
+~~~text
+caller RVA / callsite
+effective input registers
+allocation result
+post-initializer object
+post-vtable-store object
+returned object
+TargetState structural snapshot
+RTV/texture identity where readable
+~~~
+
+The most important acceptance is raw pointer correlation:
+
+~~~text
+observed object created by re4+0x47D2180
+        ==
+later live Overlay main TargetState
+~~~
+
+If true, this directly proves that the candidate path creates the live engine TargetState instance class used by Overlay.
+
+If false, preserve the result and compare structure/callers without weakening the criterion.
+
+Also enumerate bounded direct CALL-rel32 references resolving exactly to re4+0x47D2180 so caller-side argument setup can be reconstructed.
+
+### 32.6 Production state remains fail-closed
+
+The latest capture still reaches:
+
+~~~text
+create_render_target_view  ✅
+create_texture             ✅
+create_target_state        ❌ unresolved
+TargetState::clone         ❌
+OutputHandoff              ❌
+xessD3D12Execute           0 calls
+~~~
+
+The repeated xessDestroyContext=-8 remains the known downstream symptom before first Execute.
+
+Do not wire re4+0x47D2180 into production until object identity, ABI, descriptor semantics, and ownership/refcount behavior are runtime-proven.
+
+---
+
+## 33. Handoff state after xref classification
+
+### Proven / strongest evidence
+
+~~~text
+TargetState vtable RVA 0x7B1C148             proven exact-image anchor
+0x47C3E0A vtable xref                        proven
+0x47D21AF vtable xref                        proven
+0x47C3E00 function                           destructor/deallocation-side
+0x47D2180 function                           strongest creator/factory lead
+0x47D2180 allocation size                    0xA8
+0x47D2180 vtable write                       [RBX] = TargetState vtable
+0x47D2180 return                             RAX = RBX
+~~~
+
+### Current task
+
+~~~text
+early read-only observe re4+0x47D2180
+    -> identify real callers and input ABI
+    -> snapshot constructed object
+    -> correlate created object pointer with live Overlay TargetState
+    -> prove ownership/refcount semantics
+~~~
+
+### Current production blocker
+
+~~~text
+actual production-safe TargetState creation ABI not yet proven
+    -> distinct single-RTV handoff state unavailable
+    -> OutputHandoff unavailable
+    -> no XeSS Execute
+~~~
+
+Keep PR66 Draft and unmerged.
