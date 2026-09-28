@@ -1506,7 +1506,6 @@ public:
         if (!image.valid || image.size != EXPECTED_IMAGE_SIZE || image.checksum != EXPECTED_IMAGE_CHECKSUM ||
             slot_address != overlay_address + RE4_TARGET_STATE_SLOT_OFFSET ||
             !read_private_memory(overlay_address, &overlay_vtable, sizeof(overlay_vtable)) ||
-            overlay_vtable != image.base + 0x7A8F118 ||
             !read_memory(overlay_vtable + 0x40, &writer_method, sizeof(writer_method)) ||
             writer_method != image.base + 0x44AF030 ||
             !is_executable_range(image, 0x44AF030, 0x449) ||
@@ -1550,8 +1549,8 @@ public:
         }
         m_overlay_writer_image_base.store(image.base, std::memory_order_release);
         m_overlay_writer_active.store(true, std::memory_order_release);
-        spdlog::info("[RE4XeSS][OverlayWriter] armed imageBase=0x{:x} overlay=0x{:x} slot=0x{:x} vtableRva=0x7a8f118 methodRva=0x44af030 sites=[0x44af179,0x44af478] capture=64 pre-Overlay frames per mode transition",
-            image.base, overlay_address, slot_address);
+        spdlog::info("[RE4XeSS][OverlayWriter] armed imageBase=0x{:x} overlay=0x{:x} slot=0x{:x} liveVtable=0x{:x} liveVcall40=0x{:x} nativeMethodRva=0x44af030 sites=[0x44af179,0x44af478] capture=64 pre-Overlay frames per mode transition",
+            image.base, overlay_address, slot_address, overlay_vtable, writer_method);
     }
 
 private:
