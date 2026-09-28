@@ -4368,3 +4368,598 @@ valid LoadAccessor snapshot
 ~~~
 
 
+
+
+---
+
+## 24. PR66 handoff checkpoint — LoadAccessor resolved, TargetState creation remains the production blocker
+
+This section supersedes the older statement in Section 23 that the Load Save accessor is the next blocker.
+
+Active PR:
+
+~~~text
+PR #66
+branch: feature/re4-xess-load-state-accessor-diagnostic
+state: Draft / open / unmerged
+~~~
+
+Latest runtime capture used for this checkpoint:
+
+~~~text
+re2_framework_log(10).txt
+log header commit: 88d6714eda4869661335de89ea86298c5fe29512
+branch: feature/re4-xess-load-state-accessor-diagnostic
+build date/time: 2026-09-28 13:30
+game: re4
+~~~
+
+The runtime functionality in this local build includes the TargetState-vtable discovery work represented by the current PR66 development line. Local build stamping may therefore lag the exact remote head; use the runtime behavior as the evidence and Git history as the implementation record.
+
+### 24.1 LoadAccessor is now runtime-proven
+
+The production accessor reaches:
+
+~~~text
+[RE4XeSS][LoadAccessor] stage=Valid
+~~~
+
+with the concrete TDB71 schema:
+
+~~~text
+pause manager:
+    chainsaw.SceneLoadZoneManager
+    get_Instance
+    _Pause
+    System.Boolean
+    managed storage width = 1
+
+situation manager:
+    chainsaw.GameSituationManager
+    get_Instance
+    <InhibitBit>k__BackingField
+    System.UInt64
+    managed storage width = 8
+~~~
+
+Important implementation rule:
+
+> REFramework metadata type size is not the managed primitive storage width.
+
+The runtime must continue deriving Boolean/integral/enum widths from managed primitive identity instead of using the TDB metadata size directly.
+
+### 24.2 Capture 22 load semantics survived production validation
+
+The latest runtime begins while the game is already in a pause/load state:
+
+~~~text
+_Pause = true
+InhibitBit = 0x0
+~~~
+
+No normal gameplay baseline is invented.
+
+Later:
+
+~~~text
+_Pause true -> false
+    -> keep temporal history blocked
+
+InhibitBit 0x0 -> 0xB9
+    -> begin stable post-pause rebaseline
+
+three stable observations
+    -> adopt current normal baseline dynamically
+    -> first valid packet uses resetHistory=true
+~~~
+
+Observed production log:
+
+~~~text
+load pause released; keeping history blocked until a post-pause InhibitBit transition and stable rebaseline
+post-pause InhibitBit transition 0x0->0xb9; beginning stable rebaseline observations
+adopted post-pause InhibitBit baseline=0xb9 after three stable observations
+first valid resetHistory packet
+~~~
+
+0xB9 is evidence from this run only.
+
+Do not hardcode it.
+
+The frozen semantics remain:
+
+- remember the stable gameplay InhibitBit value dynamically;
+- if InhibitBit departs before Pause rises, freeze the remembered normal value and arm load suspicion;
+- Pause=true confirms the load window;
+- Pause=false alone does not resume temporal history;
+- resume only after InhibitBit returns/rebaselines to a stable normal value;
+- the first valid gameplay packet after the load window sets resetHistory=true;
+- startup while Pause=true never invents a baseline;
+- no camera-threshold fallback.
+
+The LoadAccessor is no longer the current blocker.
+
+---
+
+## 25. PR66 TargetState / OutputHandoff reverse-engineering status
+
+The current production blocker is the engine-visible TargetState required by RE4XeSSOutputHandoff.
+
+The following parts are runtime-proven:
+
+~~~text
+first valid temporal packet                 ✅
+RE4 semantic Color/Depth/Velocity packet    ✅
+public XeSS runtime discovery/init           ✅
+stock OptiScaler public XeSS interception    ✅ through init/velocity scale
+create_render_target_view                    ✅
+create_texture                               ✅
+live Overlay main TargetState layout         ✅
+live Overlay main TargetState slot (+0x90)   ✅
+live TargetState vtable anchor               ✅
+create_target_state                          ❌ unresolved
+distinct single-RTV handoff TargetState      ❌
+Worker XeSS submit                           ⏸ blocked before submit
+OptiScaler hk_xessD3D12Execute               0 calls
+OutputHandoff install                        ⏸
+downstream retirement validation             ⏸
+~~~
+
+### 25.1 RE4 RTV resolver is closed
+
+Generic signatures may fail on RE4 1.5.9.0, but the RE4-only validated callsite fallback succeeds.
+
+Stable evidence:
+
+~~~text
+callsite RVA: 0x447AF5A
+resolved target: re4+0x4470470
+runtime log:
+    Found create_render_target_view via RVA 0x447AF5A
+~~~
+
+create_texture also resolves.
+
+Do not reopen the RTV resolver unless new evidence contradicts it.
+
+### 25.2 create_target_state remains intentionally fail-closed
+
+The generic legacy CircularDOF_SceneMipTexture / call-order candidate is not accepted for RE4.
+
+Current behavior remains correct:
+
+~~~text
+Searching for create_target_state
+[Renderer][RE4] TargetState factory is unresolved; refusing the legacy call-order candidate
+TargetState::clone did not produce a distinct single-RTV handoff target
+~~~
+
+Do not convert any diagnostic RVA into a production call until the ABI, ownership, descriptor semantics, and returned object are proven.
+
+### 25.3 Rejected TargetState candidates — do not repeat these experiments
+
+#### Site 2 / re4+0x44C7A27
+
+Paired returns were scalar-like values (0x1EB, 0x5A0) rather than TargetState pointers.
+
+Status:
+
+~~~text
+re4+0x44C7A27 -> rejected as TargetState factory
+~~~
+
+#### Site 1 / re4+0x47212A6
+
+This is a polymorphic vtable + 0x40 dispatch site, not a fixed factory.
+
+Observed dynamic callees from the same callsite included:
+
+~~~text
+re4+0x44742F0
+re4+0x447A540
+re4+0x78F42D0
+re4+0x44AF030
+~~~
+
+Status:
+
+~~~text
+re4+0x47212A6 -> rejected as fixed TargetState factory
+~~~
+
+#### re4+0x78F42D0 return
+
+The return is readable and superficially follows the same coarse 0x40-byte layout:
+
+~~~text
+valid image vtable
+refCount = -2
+numRtv = 1
+display-sized rect = 2560x1440
+~~~
+
+but decisive validation fails:
+
+~~~text
+candidate vtable != live Overlay TargetState vtable
+candidate rect = display extent, not current Overlay target extent
+rtvs[0] = nullptr
+no valid RTV format/dimension/texture
+targetStateLike = false
+~~~
+
+Vtable mismatch alone would not reject a subclass, but numRtv=1 with a null RTV entry means this is not the complete usable TargetState required by OutputHandoff.
+
+Status:
+
+~~~text
+re4+0x78F42D0 return -> rejected as usable live TargetState
+~~~
+
+It may remain a rendering-state/container clue, but must not be wired into create_target_state().
+
+### 25.4 re4+0x4597A0 writer candidate is retired
+
+Static analysis showed a plausible intrusive-pointer style assignment pattern around:
+
+~~~text
+source owner + 0x60
+AddRef incoming
+receiver + 0x90 assignment
+Release previous
+~~~
+
+The initial provenance probe was accidentally coupled to the short TargetStateProbe and only lived for two frames. That lifecycle bug was fixed and a later run observed the candidate for the full 1800-frame bounded window with zero writes.
+
+A final timing test then moved the hook to the core REFramework startup path after integrity bootstrap and before the first render frame.
+
+Required ordering was achieved:
+
+~~~text
+TargetState provenance early arm
+    < Render frame: 1
+~~~
+
+Even with the hook proven active before rendering, the bounded run recorded:
+
+~~~text
+writes = 0
+earlyCaptured = 0
+earlyCorrelated = 0
+~~~
+
+Status:
+
+~~~text
+re4+0x4597A0 -> retired as Overlay main TargetState writer candidate
+~~~
+
+Do not move this hook earlier again.
+
+Do not add it back as an active writer candidate.
+
+---
+
+## 26. Proven live TargetState vtable anchor and latest discovery blocker
+
+The strongest current TargetState reverse-engineering anchor is the real live Overlay main TargetState object.
+
+For the exact validated RE4 1.5.9.0 image:
+
+~~~text
+image base in latest run  = 0x7ff631bd0000
+TargetState vtable RVA    = 0x7B1C148
+expected vtable           = 0x7ff6396ec148
+live TargetState vtable   = 0x7ff6396ec148
+match                     = true
+~~~
+
+The fixed RVA is diagnostic evidence for this exact image identity only.
+
+Do not generalize it to other RE Engine games or unvalidated RE4 builds.
+
+### 26.1 Latest TargetStateVtableProbe result
+
+The new bounded discovery pass starts very early:
+
+~~~text
+[TargetStateVtableProbe] bootstrap-begin
+point=REFramework-constructor-after-integrity
+before-plugin-init=true
+
+[TargetStateVtableProbe] discovery-begin
+imageSize=0xe405000
+checksum=0xdee3479
+vtableRva=0x7b1c148
+~~~
+
+The current full executable-section decoder does not complete:
+
+~~~text
+decode stopped:
+    sectionIndex=0
+    sectionRva=0x1000
+    offset=0xb73860
+
+decode stopped:
+    sectionIndex=7
+    sectionRva=0xe3cb000
+    offset=0x0
+
+discovery-summary:
+    xrefCount=0
+    truncated=false
+    complete=false
+~~~
+
+This is an incomplete scan, not evidence that no vtable xrefs exist.
+
+The current log line:
+
+~~~text
+bootstrap-result discovered=true
+~~~
+
+is misleading because the scan was attempted but not completed and discovered zero xrefs.
+
+### 26.2 Live anchor is correct but incorrectly marked untrusted
+
+Later the real Overlay TargetState proves the anchor:
+
+~~~text
+live-anchor:
+    liveVtable         = expectedVtable
+    match              = true
+    discoveryComplete  = false
+    trusted            = false
+~~~
+
+Current code couples:
+
+~~~text
+live anchor trust
+    = exact live vtable match
+      AND full static xref scan completed
+~~~
+
+That coupling is now the immediate diagnostic blocker.
+
+Because trusted=false, the bounded TargetState probe refuses to arm:
+
+~~~text
+[TargetStateProbe] not armed: live TargetState vtable anchor is untrusted
+~~~
+
+The production handoff then reaches the already-known failure:
+
+~~~text
+create_render_target_view ✅
+create_texture            ✅
+create_target_state       ❌
+TargetState::clone        ❌
+~~~
+
+No xessD3D12Execute is reached.
+
+### 26.3 Required correction already issued on PR66
+
+PR66 comment:
+
+~~~text
+5863592995
+~~~
+
+Required change:
+
+1. keep exact RE4 image identity validation;
+2. keep the validated Overlay slot;
+3. keep readable live TargetState structural validation;
+4. require exact liveVtable == imageBase + 0x7B1C148;
+5. keep existing callsite byte validation before installing any dynamic hook;
+6. do not require full-image xref scan completion merely to trust the read-only live anchor diagnostic.
+
+The static xref scanner must be repaired independently.
+
+Preferred bounded approaches:
+
+~~~text
+A. decode per proven x64 RUNTIME_FUNCTION range from the PE exception directory
+   so one data island/bad range does not terminate the rest of .text;
+
+or
+
+B. candidate-driven RIP-relative reference search
+   -> fully decode/validate only candidate instruction starts
+   -> accept only references resolving exactly to imageBase + 0x7B1C148
+~~~
+
+Do not use blind byte resynchronization solely to force complete=true.
+
+Discovery logging must distinguish:
+
+~~~text
+attempted
+complete
+xrefCount
+truncated
+~~~
+
+rather than reporting discovered=true for an incomplete zero-xref pass.
+
+### 26.4 Next acceptance point
+
+The next runtime capture should first prove:
+
+~~~text
+TargetStateVtableProbe live-anchor:
+    match=true
+    trusted=true
+
+TargetStateProbe:
+    armed
+~~~
+
+Static xref discovery may continue to report incomplete coverage while that diagnostic correction is being validated; it must not silently become production TargetState resolution.
+
+The primary reverse-engineering goal remains:
+
+> Find the actual TargetState allocation/constructor/factory path from the proven live TargetState type, then prove its ABI and ownership contract.
+
+Do not productionize 0x78F42D0, 0x4597A0, or any newly found xref from static evidence alone.
+
+---
+
+## 27. XeSS / OptiScaler teardown note from the latest capture
+
+The latest log reports:
+
+~~~text
+xessDestroyContext returned XeSS result -8
+~~~
+
+XeSS defines -8 as:
+
+~~~text
+XESS_RESULT_ERROR_INVALID_CONTEXT
+~~~
+
+In current stock OptiScaler, hk_xessDestroyContext() returns INVALID_CONTEXT when its internal context map has no entry.
+
+That map is populated on the Execute/CreateDLSSContext path.
+
+This capture never reaches the first xessD3D12Execute, because OutputHandoff fails earlier.
+
+Therefore for the current evidence:
+
+~~~text
+xessDestroyContext -8
+    = downstream teardown symptom
+    != current primary blocker
+~~~
+
+Do not widen PR66 into an XeSS teardown redesign unless this becomes independently reproducible after Execute is actually reached.
+
+---
+
+## 28. External corroboration — DLSS5-Feeder does not change the RE4 architecture
+
+Repository reviewed:
+
+~~~text
+https://github.com/jlrouzies-fr/DLSS5-Feeder
+~~~
+
+That project demonstrates a closely related integration pattern:
+
+~~~text
+synthetic standard NGX/DLSS producer calls
+    -> stock OptiScaler interception
+    -> OptiScaler-selected SR backend
+~~~
+
+This supports the general producer/interceptor design already used here.
+
+It does not solve the current RE4 OutputHandoff problem.
+
+DLSS5-Feeder operates from a ReShade/post-process style boundary and can write the processed result back to the completed frame/backbuffer. It therefore does not need to manufacture an RE Engine TargetState or re-enter RE4 before Overlay/UI.
+
+The RE4 production target is different:
+
+~~~text
+low-resolution RE4 SceneView
+    -> pre-Overlay HDR/PostMain Color + true Depth + true Velocity + true Jitter
+    -> public XeSS producer
+    -> display-resolution SR output
+    -> engine-visible TargetState handoff
+    -> native RE4 Overlay/UI/final output
+    -> Present
+~~~
+
+Therefore:
+
+- keep public XeSS as the RE4 producer contract;
+- do not switch to a synthetic NGX producer merely because DLSS5-Feeder works;
+- do not adopt its final-backbuffer copy as the normal RE4 output architecture;
+- the current blocker remains RE Engine TargetState creation/handoff.
+
+---
+
+## 29. Handoff state — 2026-09-28
+
+A new engineer/session can continue from this exact state.
+
+### Frozen proven facts
+
+~~~text
+RE4-only isolation                         proven
+true pre-Overlay semantic boundary         proven
+Color = HDR/PostMain                       proven
+Depth = Scene::DepthStencilTex             proven, inverted
+Velocity = Scene::VelocityTarget           proven
+MV conversion/sign/scale                   proven
+SceneView render-size control              proven
+jitter injection/history                   proven
+near/far/FOV                               proven
+LoadAccessor                               proven Valid
+Capture 22 load-state semantics            proven in production behavior
+dedicated XeSS worker ownership            proven
+public XeSS -> stock OptiScaler init path  proven
+RTV factory                                proven
+create_texture                             proven
+live Overlay TargetState layout            proven
+Overlay main TargetState slot +0x90        proven
+live TargetState vtable RVA 0x7B1C148      proven for exact RE4 image
+~~~
+
+### Rejected/retired leads
+
+~~~text
+legacy generic create_target_state candidate   rejected for RE4
+0x44C7A27                                     rejected as TargetState factory
+0x47212A6                                     polymorphic dispatch, not fixed factory
+0x78F42D0 return                              rejected as usable TargetState
+0x4597A0                                      retired as Overlay TargetState writer
+direct normal-path XeSS output -> swapchain   rejected architecture
+~~~
+
+### Current blocker
+
+~~~text
+actual RE4 TargetState creator/factory ABI    unknown
+    -> no distinct single-RTV handoff TargetState
+    -> no OutputHandoff install
+    -> no worker XeSS submit
+    -> no hk_xessD3D12Execute
+~~~
+
+The immediately preceding diagnostic blocker is narrower:
+
+~~~text
+live TargetState vtable anchor matches exactly
+but
+static xref scan incomplete
+    -> current code marks anchor untrusted
+    -> TargetStateProbe does not arm
+~~~
+
+### Next action
+
+Implement the narrow PR66 correction from comment 5863592995:
+
+~~~text
+decouple live-anchor trust from full static-xref scan completeness
+repair xref discovery independently
+keep all production paths fail-closed
+~~~
+
+Then collect the next runtime log.
+
+Do not merge PR66 yet.
+
+Do not start XeFG validation yet.
+
+Do not add another broad D3D12 trace.
+
+Do not bypass OutputHandoff by copying XeSS output directly to the swapchain.
+
+The next meaningful milestone is a proven TargetState construction path and a distinct engine-visible single-RTV handoff state.
