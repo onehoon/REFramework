@@ -1792,6 +1792,9 @@ Production code should implement the minimum stable contract, not carry broad ho
 | AD-52 | At OptiScaler 44cfee4d, the final paired log line "XeSSFeatureDx12::EvaluateInternal Executing!!" is immediately before XeSSProxy::D3D12Execute. Until exception address/module evidence exists, treat the fault as inside the intercepted/native XeSS backend boundary without assigning ownership to OptiScaler, Intel XeSS, or the driver. |
 | AD-53 | For the next failure capture, use only a narrow observation mechanism around m_functions.d3d12_execute that records the native exception code/address/module/RVA and continues exception search. Do not add process-wide VEH, worker-wide SEH translation, recovery, or retry. |
 | AD-54 | CreateRenderTargetViewProbe is no longer required in the normal producer path. Its factory/format/handoff questions are already proven; remove it from normal execution or gate it behind explicit diagnostic opt-in while preserving the actual RE4 RTV resolver. |
+| AD-55 | The 16:10 capture identifies a native 0xC0000005 near-null write to address 0xC at game-directory OptiScaler dxgi.dll+0x21256f. This identifies the instruction module, not the underlying pointer origin or correct fix. Symbolize the exact OptiScaler binary before changing SR integration behavior. |
+| AD-56 | The completed narrow SEH observation retains EXCEPTION_CONTINUE_SEARCH and terminal worker/bridge/output/runtime quarantine. Debugging may obtain first-chance call stacks with a debugger or optionally copy bounded GPRs as POD in that same filter; do not add broad handlers or same-process retry. |
+| AD-57 | The production runtime no longer arms the completed CreateRenderTargetViewProbe in its normal RE4 XeSS path. Preserve the actual validated RTV factory resolver and OutputHandoff while locating the fault. |
 
 ---
 
@@ -2904,3 +2907,195 @@ XeFG validation                 deferred
 ~~~
 
 Keep PR66 Draft and unmerged.
+
+
+---
+
+## 27. PR66 OptiScaler-proxy native fault checkpoint — 2026-09-28 16:10
+
+This section supersedes Section 26's statement that the faulting binary is
+unidentified. Previous call-boundary and retirement evidence remains valid.
+
+Paired logs:
+
+~~~text
+REFramework: re2_framework_log(20260928-071122).txt
+    reported stamp fa05355903a1b9e9e16b5e45c5c28feb0512a96b
+    branch feature/re4-xess-load-state-accessor-diagnostic
+    build time 2026-09-28 15:37
+
+OptiScaler: OptiScaler(3).log
+    v10.0.0-dev / 44cfee4d / build 20260926_090919
+    OptiScaler working as game-directory dxgi.dll
+~~~
+
+PR66 HEAD at checkpoint:
+
+~~~text
+75c93f2374254e7b91d59df73a78d6ad41ded9d1
+Capture native XeSS execute exceptions
+~~~
+
+The log records the new native-exception diagnostics present in the current
+PR HEAD even though the stamped SHA is older. The logged SHA alone must not be
+treated as proof of the exact built source.
+
+PR66 action comment:
+
+~~~text
+5865230623
+~~~
+
+### 27.1 Exception location is now concrete
+
+The terminal failure:
+
+~~~text
+frame=8343
+submission=200
+slot=7
+controlGeneration=1
+resetGeneration=0
+input=853x480
+output=2560x1440
+code=0xc0000005
+ExceptionAddress=0x7ffda8e0256f
+Rip=0x7ffda8e0256f
+module=E:\SteamLibrary\steamapps\common\RESIDENT EVIL 4  BIOHAZARD RE4\dxgi.dll
+moduleRVA=0x21256f
+ExceptionFlags=0x0
+NumberParameters=2
+accessKind=write
+targetAddress=0xc
+~~~
+
+is a Windows access violation writing to a near-null address.
+
+This identifies the faulting instruction as belonging to OptiScaler's
+game-directory DXGI proxy, not the system DXGI or native libxess.dll image.
+
+A faulting instruction inside that module is **not**, by itself, proof that
+OptiScaler created the invalid pointer. The source, caller chain, and object
+state must be identified before making a defect/fix attribution.
+
+### 27.2 Preserve the public interception contract
+
+The external path remains:
+
+~~~text
+REFramework
+    -> public xessD3D12Execute
+        -> stock OptiScaler hk_xessD3D12Execute
+            -> NVSDK_NGX_D3D12_EvaluateFeature
+                -> XeSSFeatureDx12::EvaluateInternal
+                    -> XeSSProxy::D3D12Execute / callbacks
+~~~
+
+The OptiScaler trace reaches Evaluating/Executing!! immediately before the
+captured AV, but only the faulting instruction's module is proven.
+
+Do not assume that the native Intel XeSS library itself faulted.
+
+Do not introduce private OptiScaler exports, a custom XeSS ABI, direct XeFG
+frontend calls, or a swapchain-copy shortcut.
+
+### 27.3 This is a recurring, not yet explained, ~2.1-second boundary
+
+~~~text
+Capture 1: first success -> failure ~2.06s (Ultra Quality, 1969x1107)
+Capture 2: first call -> failure ~2.12s (Ultra Performance, 853x480), submit 201
+Capture 3: first call -> failure ~2.11s (Ultra Performance, 853x480), submit 200
+~~~
+
+Treat the similarity as a valuable test condition.
+
+Neither exactly 200 submissions nor a literal timer or frame-count switch has
+been proven causal.
+
+### 27.4 The PR66 fix is no longer blind REFramework execute-path modification
+
+Current requirements:
+
+~~~text
+1. symbolize/disassemble the exact OptiScaler 44cfee4d dxgi.dll
+   at RVA 0x21256f;
+2. identify faulting function/instruction and caller chain;
+3. identify register/pointer that produces write to 0xC;
+4. determine whether the invalid state originates inside the proxy,
+   comes from XeSS callback/interception, or was passed from the producer;
+5. only then make the smallest targeted source change in the correct owner;
+6. run a sustained >300 XeSS-submit validation.
+~~~
+
+A first-chance debugger dump taken before outer C++ unwinding is preferable to
+broad additional runtime hooks.
+
+If debugger/symbol access is unavailable, an optional bounded diagnostic may
+copy the integer registers in ContextRecord as POD through the existing
+narrow SEH observation filter and log later in the existing catch.
+
+No process-wide VEH, generic exception translator, stack unwind inside the SEH
+filter, false-success return, unsafe retry, or automatic context recreation.
+
+### 27.5 Already-correct paths must remain unchanged
+
+~~~text
+validated RE4 TargetState creator                 PASS
+distinct display-resolution TargetState clone    PASS
+post-Overlay handoff                              PASS
+same-generation delayed-marker settlement        OBSERVED
+CreateRenderTargetViewProbe normal-path removal  VERIFIED
+public XeSS normal result=0 for early submissions OBSERVED
+exception fail-closed quarantine                 PASS
+~~~
+
+The current log contains no old RTV, TargetState creator, or vtable-probe
+capture records. The runtime still shows delayed-marker settlement and
+continues using controlGeneration=1/resetGeneration=0 until the terminal AV.
+
+Mode changes after the fault do not silently reactivate the uncertain
+generation.
+
+Keep intact:
+
+~~~text
+RE4-only isolation
+public XeSS-only frontend
+worker API ownership and resource pins
+pre-overlay non-reentrant gate
+generation checks
+output retirement proofs
+fail-closed native rendering fallback
+existing XeFG/D3D12Hook subsystem
+~~~
+
+Defer:
+
+~~~text
+clone temporary RTV-array ownership cleanup
+new resource-state or barrier changes
+automatic exception recovery
+XeFG production validation
+~~~
+
+### 27.6 Acceptance checkpoint
+
+The next implementation decision depends on **exact function and pointer
+provenance at OptiScaler dxgi.dll+0x21256f**, not on additional speculative
+changes to REFramework.
+
+Production status:
+
+~~~text
+Architecture implemented          YES
+First end-to-end SR execution      PROVEN
+Delayed marker context churn      NO LONGER REPRODUCES
+Faulting module                   OptiScaler game-directory dxgi.dll
+Exception                         0xC0000005 WRITE to 0xC
+Faulting RVA                      0x21256f
+Underlying pointer origin         UNKNOWN
+Sustained SR stability            BLOCKED
+XeFG production validation        DEFERRED
+~~~
+
+Keep PR66 Draft, Open, and unmerged.
