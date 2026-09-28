@@ -1363,7 +1363,7 @@ private:
         0x447AF53,
         0x47212A0,
         0x44C7A21,
-        0x47D0FC5,
+        0x47D0FC8,
     };
     static constexpr std::array<uint32_t, SITE_COUNT> CALLSITE_RVAS{
         0x447AF5A,
@@ -1521,9 +1521,11 @@ private:
                     0x48, 0xC7, 0x84, 0x24, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
         case 3:
             return is_executable_range(image, 0x47D0FBE, 23) &&
-                is_executable_range(image, PRE_HOOK_RVAS[index], 10) &&
+                is_executable_range(image, PRE_HOOK_RVAS[index], 7) &&
                 is_executable_range(image, CALLSITE_RVAS[index], 6) &&
                 is_executable_range(image, RETURN_RVAS[index], 5) &&
+                matches_bytes(image.base + PRE_HOOK_RVAS[index], {
+                    0x48, 0x8B, 0x52, 0x18, 0x48, 0x8B, 0x01 }) &&
                 matches_bytes(image.base + 0x47D0FBE, {
                        0x48, 0x8B, 0x88, 0x08, 0x6C, 0xC0, 0x00, 0x4D, 0x8B, 0xCF,
                        0x48, 0x8B, 0x52, 0x18, 0x48, 0x8B, 0x01, 0xFF, 0x90, 0xA0, 0x00, 0x00, 0x00 }) &&
