@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <filesystem>
 #include <initializer_list>
@@ -16,6 +17,7 @@
 
 #include <sdk/GameIdentity.hpp>
 #include <sdk/RETypeDB.hpp>
+#include <sdk/RETypes.hpp>
 #include <sdk/SceneManager.hpp>
 #include <spdlog/spdlog.h>
 #include <safetyhook.hpp>
@@ -1206,12 +1208,14 @@ public:
         m_frame_id = frame_id;
         m_arm_thread_id = GetCurrentThreadId();
         m_overlay_state = reinterpret_cast<uintptr_t>(overlay_state);
-        m_overlay_desc = overlay_state->get_desc_base();
-        m_overlay_rtv_array = reinterpret_cast<uintptr_t>(overlay_state->get_rtvs_ptr());
+        m_overlay_desc = m_overlay_state + RE4_RENDER_RESOURCE_SIZE;
+        m_overlay_snapshot_valid = read_private_memory(m_overlay_state, &m_overlay_snapshot, sizeof(m_overlay_snapshot));
+        m_overlay_rtv_array = m_overlay_snapshot_valid ? m_overlay_snapshot.rtvs : 0;
         m_overlay_rtv = 0;
-        if (overlay_state->get_rtv_count() != 0 && overlay_state->get_rtvs_ptr() != nullptr) {
+        if (m_overlay_snapshot_valid && m_overlay_snapshot.num_rtv != 0 &&
+            m_overlay_snapshot.num_rtv <= MAX_TARGET_STATE_RTVS && m_overlay_snapshot.rtvs != 0) {
             // Read the intrusive pointer's raw value only; do not AddRef/Release it.
-            m_overlay_rtv = reinterpret_cast<uintptr_t>(overlay_state->get_rtvs_ptr()[0].get());
+            read_private_memory(m_overlay_snapshot.rtvs, &m_overlay_rtv, sizeof(m_overlay_rtv));
         }
         m_semantic_color = reinterpret_cast<uintptr_t>(semantic_color);
         m_calls_captured.store(0, std::memory_order_release);
@@ -1283,7 +1287,7 @@ public:
             MAX_CAPTURED_CALLS,
             MAX_CAPTURED_CALLS_PER_SITE,
             MAX_PENDING_PRESENT_GRACE);
-        log_overlay_state_snapshot(overlay_state);
+        log_overlay_state_snapshot();
         return true;
     }
 
@@ -1389,8 +1393,49 @@ private:
         uintptr_t callee{};
     };
 
+    struct TargetStateLayoutSnapshot {
+        uintptr_t vtable{};
+        int32_t ref_count{};
+        uint32_t render_frame{};
+        uintptr_t padding{};
+        uintptr_t rtvs{};
+        uintptr_t dsv{};
+        uint32_t num_rtv{};
+        float rect_left{};
+        float rect_top{};
+        float rect_right{};
+        float rect_bottom{};
+        uint32_t flag{};
+    };
+
+    struct RenderResourceHeaderSnapshot {
+        uintptr_t vtable{};
+        int32_t ref_count{};
+        uint32_t render_frame{};
+        uintptr_t padding{};
+    };
+
+    struct RenderTargetViewSnapshot {
+        RenderResourceHeaderSnapshot header{};
+        uint32_t format{};
+        uint32_t dimension{};
+    };
+
+    static_assert(sizeof(TargetStateLayoutSnapshot) == 0x40);
+    static_assert(offsetof(TargetStateLayoutSnapshot, rtvs) == 0x18);
+    static_assert(offsetof(TargetStateLayoutSnapshot, dsv) == 0x20);
+    static_assert(offsetof(TargetStateLayoutSnapshot, num_rtv) == 0x28);
+    static_assert(offsetof(TargetStateLayoutSnapshot, rect_left) == 0x2C);
+    static_assert(offsetof(TargetStateLayoutSnapshot, flag) == 0x3C);
+    static_assert(sizeof(RenderResourceHeaderSnapshot) == 0x18);
+    static_assert(sizeof(RenderTargetViewSnapshot) == 0x20);
+    static_assert(offsetof(RenderTargetViewSnapshot, format) == 0x18);
+
     static constexpr uint32_t EXPECTED_IMAGE_SIZE = 0x0E405000;
     static constexpr uint32_t EXPECTED_IMAGE_CHECKSUM = 0x0DEE3479;
+    static constexpr uint32_t RE4_PROVIDER_CALLEE_RVA = 0x78F42D0;
+    static constexpr uintptr_t RE4_RENDER_RESOURCE_SIZE = 0x18;
+    static constexpr uint32_t MAX_TARGET_STATE_RTVS = D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT;
     static constexpr size_t SITE_COUNT = 4;
     // Isolate the nested owner vcall so its ABI and return can be measured without other probe hooks.
     static constexpr size_t ISOLATED_SITE_INDEX = 1;
@@ -1446,6 +1491,8 @@ private:
     uintptr_t m_overlay_rtv_array{};
     uintptr_t m_overlay_rtv{};
     uintptr_t m_semantic_color{};
+    TargetStateLayoutSnapshot m_overlay_snapshot{};
+    bool m_overlay_snapshot_valid{};
     std::array<safetyhook::MidHook, HOOK_COUNT> m_hooks{};
     inline static thread_local std::array<PendingObservation, MAX_CAPTURED_CALLS> s_pending_observations{};
 
@@ -1461,6 +1508,41 @@ private:
                    size,
                    &bytes_read) != FALSE &&
             bytes_read == size;
+    }
+
+    static bool is_private_readable(uintptr_t address, size_t size) noexcept {
+        if (address == 0 || size == 0 || address > UINTPTR_MAX - size) {
+            return false;
+        }
+
+        const auto end = address + size;
+        auto cursor = address;
+        while (cursor < end) {
+            MEMORY_BASIC_INFORMATION memory{};
+            if (VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory) ||
+                memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE ||
+                (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+                return false;
+            }
+
+            const auto protection = memory.Protect & 0xFF;
+            if (protection != PAGE_READONLY && protection != PAGE_READWRITE && protection != PAGE_WRITECOPY &&
+                protection != PAGE_EXECUTE_READ && protection != PAGE_EXECUTE_READWRITE &&
+                protection != PAGE_EXECUTE_WRITECOPY) {
+                return false;
+            }
+
+            const auto region_end = reinterpret_cast<uintptr_t>(memory.BaseAddress) + memory.RegionSize;
+            if (region_end <= cursor) {
+                return false;
+            }
+            cursor = std::min(end, region_end);
+        }
+        return true;
+    }
+
+    static bool read_private_memory(uintptr_t address, void* destination, size_t size) noexcept {
+        return is_private_readable(address, size) && read_memory(address, destination, size);
     }
 
     static ImageInfo inspect_main_image() noexcept {
@@ -1786,6 +1868,144 @@ private:
         return text.str();
     }
 
+    bool is_re4_executable(uintptr_t address) const noexcept {
+        if (address < m_image_base || address >= m_image_end) {
+            return false;
+        }
+
+        MEMORY_BASIC_INFORMATION memory{};
+        if (VirtualQuery(reinterpret_cast<const void*>(address), &memory, sizeof(memory)) != sizeof(memory) ||
+            memory.State != MEM_COMMIT || memory.Type != MEM_IMAGE ||
+            (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+            return false;
+        }
+
+        const auto protection = memory.Protect & 0xFF;
+        return protection == PAGE_EXECUTE || protection == PAGE_EXECUTE_READ ||
+            protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
+    }
+
+    bool has_re4_vtable(uintptr_t vtable) const noexcept {
+        if (vtable < m_image_base || vtable >= m_image_end || vtable > UINTPTR_MAX - sizeof(uintptr_t)) {
+            return false;
+        }
+        return is_re4_executable(read_pointer(vtable));
+    }
+
+    bool plausible_rect(const TargetStateLayoutSnapshot& snapshot) const noexcept {
+        const std::array<float, 4> rect{
+            snapshot.rect_left, snapshot.rect_top, snapshot.rect_right, snapshot.rect_bottom};
+        if (!std::all_of(rect.begin(), rect.end(), [](float value) {
+                return std::isfinite(value) && std::abs(value) <= 65536.0f;
+            })) {
+            return false;
+        }
+
+        const auto width = snapshot.rect_right - snapshot.rect_left;
+        const auto height = snapshot.rect_bottom - snapshot.rect_top;
+        return width > 0.0f && height > 0.0f && width <= 32768.0f && height <= 32768.0f;
+    }
+
+    bool inspect_render_resource_header(uintptr_t address, RenderResourceHeaderSnapshot& header) const noexcept {
+        return read_private_memory(address, &header, sizeof(header)) && has_re4_vtable(header.vtable);
+    }
+
+    bool inspect_rtv(uintptr_t address, RenderTargetViewSnapshot& rtv) const noexcept {
+        if (!read_private_memory(address, &rtv, sizeof(rtv)) || !has_re4_vtable(rtv.header.vtable)) {
+            return false;
+        }
+        return rtv.format != 0 && rtv.dimension >= D3D12_RTV_DIMENSION_BUFFER &&
+            rtv.dimension <= D3D12_RTV_DIMENSION_TEXTURE3D;
+    }
+
+    bool read_rtv_texture_pointer(uintptr_t address, uintptr_t& texture) const noexcept {
+        texture = 0;
+        if (address > UINTPTR_MAX - 0x1000 || !is_private_readable(address, sizeof(RenderTargetViewSnapshot))) {
+            return false;
+        }
+
+        try {
+            if (reframework::get_types() == nullptr) {
+                return false;
+            }
+            auto& texture_ref = reinterpret_cast<sdk::renderer::RenderTargetView*>(address)->get_texture_d3d12();
+            const auto slot = reinterpret_cast<uintptr_t>(&texture_ref);
+            return read_private_memory(slot, &texture, sizeof(texture));
+        } catch (...) {
+            return false;
+        }
+    }
+
+    void inspect_provider_return(uint64_t id, uintptr_t candidate_address) const noexcept {
+        if (candidate_address == 0 || (candidate_address & (alignof(uintptr_t) - 1)) != 0) {
+            spdlog::info("[RE4XeSS][TargetStateProbe] providerReturn id={} callee=re4+0x{:x} rax=0x{:x} privateReadable=false reason=null-or-unaligned",
+                static_cast<unsigned long long>(id), RE4_PROVIDER_CALLEE_RVA, candidate_address);
+            return;
+        }
+
+        TargetStateLayoutSnapshot candidate{};
+        if (!read_private_memory(candidate_address, &candidate, sizeof(candidate))) {
+            spdlog::info("[RE4XeSS][TargetStateProbe] providerReturn id={} callee=re4+0x{:x} rax=0x{:x} privateReadable=false snapshotBytes=0x40",
+                static_cast<unsigned long long>(id), RE4_PROVIDER_CALLEE_RVA, candidate_address);
+            return;
+        }
+
+        const auto vtable_valid = has_re4_vtable(candidate.vtable);
+        const auto count_sane = candidate.num_rtv > 0 && candidate.num_rtv <= MAX_TARGET_STATE_RTVS;
+        const auto rect_valid = plausible_rect(candidate);
+        const auto dsv_valid = candidate.dsv == 0 || [&] {
+            RenderResourceHeaderSnapshot dsv_header{};
+            return inspect_render_resource_header(candidate.dsv, dsv_header);
+        }();
+
+        std::array<uintptr_t, 2> rtv_entries{};
+        size_t entries_read{};
+        bool rtv_array_readable{};
+        if (count_sane && candidate.rtvs != 0) {
+            entries_read = std::min<size_t>(candidate.num_rtv, rtv_entries.size());
+            const auto bytes = entries_read * sizeof(uintptr_t);
+            rtv_array_readable = read_private_memory(candidate.rtvs, rtv_entries.data(), bytes);
+        }
+
+        RenderTargetViewSnapshot rtv0{};
+        const auto rtv0_valid = rtv_array_readable && rtv_entries[0] != 0 && inspect_rtv(rtv_entries[0], rtv0);
+        uintptr_t texture{};
+        const auto texture_slot_readable = rtv0_valid && read_rtv_texture_pointer(rtv_entries[0], texture);
+        RenderResourceHeaderSnapshot texture_header{};
+        const auto texture_header_valid = texture != 0 && inspect_render_resource_header(texture, texture_header);
+
+        const auto overlay_vtable_match = m_overlay_snapshot_valid && candidate.vtable == m_overlay_snapshot.vtable;
+        const auto overlay_rtv_count_match = m_overlay_snapshot_valid && candidate.num_rtv == m_overlay_snapshot.num_rtv;
+        const auto overlay_rtv0_match = m_overlay_rtv != 0 && rtv_entries[0] == m_overlay_rtv;
+        RenderTargetViewSnapshot overlay_rtv0{};
+        const auto overlay_rtv0_valid = m_overlay_rtv != 0 && inspect_rtv(m_overlay_rtv, overlay_rtv0);
+        const auto overlay_rtv_desc_match = rtv0_valid && overlay_rtv0_valid &&
+            rtv0.format == overlay_rtv0.format && rtv0.dimension == overlay_rtv0.dimension;
+        const auto overlay_rect_match = m_overlay_snapshot_valid &&
+            std::abs(candidate.rect_left - m_overlay_snapshot.rect_left) <= 1.0f &&
+            std::abs(candidate.rect_top - m_overlay_snapshot.rect_top) <= 1.0f &&
+            std::abs(candidate.rect_right - m_overlay_snapshot.rect_right) <= 1.0f &&
+            std::abs(candidate.rect_bottom - m_overlay_snapshot.rect_bottom) <= 1.0f;
+
+        const bool target_state_like = vtable_valid && overlay_vtable_match && count_sane &&
+            rtv_array_readable && rtv0_valid && rect_valid && dsv_valid;
+
+        spdlog::info("[RE4XeSS][TargetStateProbe] providerReturn id={} callee=re4+0x{:x} rax=0x{:x} privateReadable=true snapshotBytes=0x40 vtable=0x{:x} vtableValid={} refCount={} renderFrame={} padding=0x{:x} rtvs=0x{:x} dsv=0x{:x} numRtv={} rect=({:.1f},{:.1f},{:.1f},{:.1f}) rectValid={} flag=0x{:x} countSane={} dsvValid={} overlaySnapshotValid={} overlayVtableMatch={} overlayCountMatch={} overlayRectMatch={} overlayRtv0Match={} targetStateLike={} entriesRead={}",
+            static_cast<unsigned long long>(id), RE4_PROVIDER_CALLEE_RVA, candidate_address,
+            candidate.vtable, vtable_valid, candidate.ref_count, candidate.render_frame, candidate.padding,
+            candidate.rtvs, candidate.dsv, candidate.num_rtv,
+            candidate.rect_left, candidate.rect_top, candidate.rect_right, candidate.rect_bottom,
+            rect_valid, candidate.flag, count_sane, dsv_valid, m_overlay_snapshot_valid,
+            overlay_vtable_match, overlay_rtv_count_match, overlay_rect_match, overlay_rtv0_match,
+            target_state_like, entries_read);
+
+        spdlog::info("[RE4XeSS][TargetStateProbe] providerRtv id={} arrayReadable={} rtv0=0x{:x} rtv0Valid={} format={} dimension={} overlayRtv0=0x{:x} overlayRtvValid={} overlayFormat={} overlayDimension={} descMatch={} textureSlotReadable={} texture=0x{:x} textureHeaderValid={}",
+            static_cast<unsigned long long>(id), rtv_array_readable, rtv_entries[0], rtv0_valid,
+            rtv0.format, rtv0.dimension, m_overlay_rtv, overlay_rtv0_valid,
+            overlay_rtv0.format, overlay_rtv0.dimension, overlay_rtv_desc_match,
+            texture_slot_readable, texture, texture_header_valid);
+    }
+
     std::string identity_matches(uintptr_t value) const {
         std::ostringstream text;
         text << "state=" << (value == m_overlay_state)
@@ -1796,22 +2016,28 @@ private:
         return text.str();
     }
 
-    void log_overlay_state_snapshot(sdk::renderer::TargetState* state) const {
-        if (state == nullptr) {
+    void log_overlay_state_snapshot() const {
+        if (!m_overlay_snapshot_valid) {
+            spdlog::warn("[RE4XeSS][TargetStateProbe] overlaySnapshot unavailable state=0x{:x} bytes=0x40 privateReadable=false",
+                m_overlay_state);
             return;
         }
-        const auto& desc = state->get_desc();
-        spdlog::info("[RE4XeSS][TargetStateProbe] overlaySnapshot state=0x{:x} desc=0x{:x} rtvArray=0x{:x} count={} rtv0=0x{:x} rect=({:.1f},{:.1f},{:.1f},{:.1f}) flag=0x{:x} color=0x{:x}",
+        spdlog::info("[RE4XeSS][TargetStateProbe] overlaySnapshot state=0x{:x} desc=0x{:x} vtable=0x{:x} refCount={} renderFrame={} padding=0x{:x} rtvArray=0x{:x} dsv=0x{:x} count={} rtv0=0x{:x} rect=({:.1f},{:.1f},{:.1f},{:.1f}) flag=0x{:x} color=0x{:x}",
             m_overlay_state,
             m_overlay_desc,
+            m_overlay_snapshot.vtable,
+            m_overlay_snapshot.ref_count,
+            m_overlay_snapshot.render_frame,
+            m_overlay_snapshot.padding,
             m_overlay_rtv_array,
-            state->get_rtv_count(),
+            m_overlay_snapshot.dsv,
+            m_overlay_snapshot.num_rtv,
             m_overlay_rtv,
-            desc.rect.left,
-            desc.rect.top,
-            desc.rect.right,
-            desc.rect.bottom,
-            desc.flag,
+            m_overlay_snapshot.rect_left,
+            m_overlay_snapshot.rect_top,
+            m_overlay_snapshot.rect_right,
+            m_overlay_snapshot.rect_bottom,
+            m_overlay_snapshot.flag,
             m_semantic_color);
     }
 
@@ -1951,6 +2177,9 @@ private:
             m_site_return_counts[site].fetch_add(1, std::memory_order_acq_rel);
             m_returns_captured.fetch_add(1, std::memory_order_acq_rel);
             log_observation("post", observation.id, site, context, observation.arguments, observation.callee);
+            if (site == ISOLATED_SITE_INDEX && observation.callee == m_image_base + RE4_PROVIDER_CALLEE_RVA) {
+                inspect_provider_return(observation.id, static_cast<uintptr_t>(context.rax));
+            }
         } catch (...) {
             // Probe failures must not affect the original engine call.
         }
