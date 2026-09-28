@@ -38,14 +38,27 @@ public:
         std::string failure_reason{};
     };
 
+    struct ObservationContext {
+        int32_t requested_mode_token{};
+        uint64_t control_generation{};
+        uint64_t device_reset_generation{};
+        uint64_t frame_id{};
+        uint32_t callback_thread_id{};
+        bool frame_id_valid{};
+    };
+
     RE4XeSSOutputHandoff() = default;
     ~RE4XeSSOutputHandoff();
 
     RE4XeSSOutputHandoff(const RE4XeSSOutputHandoff&) = delete;
     RE4XeSSOutputHandoff& operator=(const RE4XeSSOutputHandoff&) = delete;
 
-    bool restore(sdk::renderer::layer::Overlay* layer, std::string& error);
+    bool restore(
+        sdk::renderer::layer::Overlay* layer,
+        const ObservationContext& observation,
+        std::string& error);
     void request_retirement(std::string_view reason);
+    void note_mode_transition(uint64_t control_generation) noexcept;
     RetirementStatus poll_retirement(bool bridge_writer_idle, bool bridge_device_removed);
     PrepareResult prepare(
         sdk::renderer::layer::Overlay* layer,
@@ -62,10 +75,19 @@ public:
         RE4XeSSD3D12::OutputBinding& output,
         std::string& error);
     void note_submission_succeeded();
-    bool install(sdk::renderer::layer::Overlay* layer, uint64_t frame_id, std::string& error);
+    bool install(
+        sdk::renderer::layer::Overlay* layer,
+        const ObservationContext& observation,
+        std::string& error);
     void quarantine(std::string_view reason, bool bridge_writer_uncertain = false) noexcept;
-    void on_post_present(ID3D12Device* active_device, ID3D12CommandQueue* active_queue) noexcept;
-    void observe_overlay(sdk::renderer::layer::Overlay* layer) const;
+    void on_post_present(
+        ID3D12Device* active_device,
+        ID3D12CommandQueue* active_queue,
+        const ObservationContext& observation) noexcept;
+    void observe_overlay(
+        sdk::renderer::layer::Overlay* layer,
+        const ObservationContext& observation);
+    bool identity_mismatch_latched() const noexcept;
     Snapshot snapshot() const;
 
 private:
@@ -95,6 +117,7 @@ private:
     void release_generation() noexcept;
     void preserve_quarantined_generation() noexcept;
     bool confirmed_device_removal(bool bridge_device_removed) const noexcept;
+    bool consume_mode_transition_observation(const ObservationContext& observation) noexcept;
 
     sdk::intrusive_ptr<sdk::renderer::TargetState> m_handoff_state{};
     sdk::intrusive_ptr<sdk::renderer::TargetState> m_saved_original_state{};
@@ -109,6 +132,11 @@ private:
     uint64_t m_last_signaled_retirement_value{};
     uint64_t m_last_completed_retirement_value{};
     uint64_t m_installed_frame{};
+    uint64_t m_installed_device_reset_generation{};
+    int32_t m_installed_mode_token{};
+    uintptr_t m_last_confirmed_post_overlay_layer{};
+    uintptr_t m_last_confirmed_post_overlay_state{};
+    uint64_t m_last_confirmed_post_overlay_frame{};
     mutable uint32_t m_retirement_log_count{};
     uint32_t m_restore_log_count{};
     uint32_t m_delayed_marker_log_count{};
@@ -124,6 +152,11 @@ private:
     bool m_missing_marker_logged{};
     bool m_quarantine_logged{};
     bool m_device_removed{};
+    bool m_post_overlay_mismatch_logged{};
+    bool m_last_confirmed_post_overlay_valid{};
+    std::atomic<bool> m_identity_mismatch_latched{};
+    std::atomic<uint64_t> m_mode_transition_generation{};
+    std::atomic<uint32_t> m_mode_transition_observation_budget{};
     std::atomic<bool> m_has_generation_snapshot{};
     std::atomic<bool> m_installed_snapshot{};
     RetirementStatus m_retirement_status{ RetirementStatus::NoGeneration };

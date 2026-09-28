@@ -3835,7 +3835,15 @@ void RE4XeSS::on_post_present() {
     if (hook == nullptr) {
         return;
     }
-    m_output_handoff.on_post_present(hook->get_device(), hook->get_command_queue());
+    const RE4XeSSOutputHandoff::ObservationContext observation{
+        static_cast<int32_t>(m_requested_mode.load(std::memory_order_acquire)),
+        m_control_generation.load(std::memory_order_acquire),
+        m_device_reset_generation.load(std::memory_order_acquire),
+        0,
+        GetCurrentThreadId(),
+        false,
+    };
+    m_output_handoff.on_post_present(hook->get_device(), hook->get_command_queue(), observation);
 }
 
 void RE4XeSS::on_device_reset() {
@@ -3884,9 +3892,14 @@ void RE4XeSS::request_mode(UpscalingMode mode) {
     }
 
     m_requested_mode.store(mode, std::memory_order_release);
-    m_control_generation.fetch_add(1, std::memory_order_acq_rel);
-    spdlog::info("[RE4XeSS][Config] mode changed: {} -> {}",
-        mode_to_display_label(old_mode), mode_to_display_label(mode));
+    const auto control_generation = m_control_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const auto request_thread_id = GetCurrentThreadId();
+    m_output_handoff.note_mode_transition(control_generation);
+    spdlog::info("[RE4XeSS][Config] mode changed: {} -> {} controlGeneration={} requestThread={}",
+        mode_to_display_label(old_mode),
+        mode_to_display_label(mode),
+        static_cast<unsigned long long>(control_generation),
+        request_thread_id);
 
     if (REFrameworkConfig::get()->is_debug_log_enabled()) {
         const auto quality = mode_to_quality_setting(mode);
@@ -4640,6 +4653,11 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         callback_thread_id,
         overlap_epoch,
     };
+    if (m_output_handoff.identity_mismatch_latched()) {
+        const auto producer = get_producer_snapshot();
+        (void)m_output_handoff.poll_retirement(producer.bridge_idle, producer.bridge_device_removed);
+        return true;
+    }
     if (log_coordinator) {
         spdlog::info("[RE4XeSS][Coordinator] callbackThread={} workerThread={} overlapEpoch={}",
             callback_thread_id,
@@ -4654,9 +4672,18 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
     const auto requested_mode = m_requested_mode.load(std::memory_order_acquire);
     const auto control_generation = m_control_generation.load(std::memory_order_acquire);
     const auto reset_generation = m_device_reset_generation.load(std::memory_order_acquire);
+    const auto cached_scene_frame = m_cached_scene_frame;
+    const RE4XeSSOutputHandoff::ObservationContext handoff_observation{
+        static_cast<int32_t>(requested_mode),
+        control_generation,
+        reset_generation,
+        cached_scene_frame.value_or(0),
+        callback_thread_id,
+        cached_scene_frame.has_value(),
+    };
 
     std::string restore_error;
-    if (!m_output_handoff.restore(layer, restore_error)) {
+    if (!m_output_handoff.restore(layer, handoff_observation, restore_error)) {
         const auto handoff = m_output_handoff.snapshot();
         set_owner_unavailable(restore_error, true,
             handoff.retirement == RE4XeSSOutputHandoff::RetirementStatus::Quarantined);
@@ -4999,7 +5026,15 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         }
 
         std::string install_error;
-        if (!m_output_handoff.install(layer, packet.frame_id, install_error)) {
+        const RE4XeSSOutputHandoff::ObservationContext install_observation{
+            static_cast<int32_t>(requested_mode),
+            control_generation,
+            reset_generation,
+            packet.frame_id,
+            callback_thread_id,
+            true,
+        };
+        if (!m_output_handoff.install(layer, install_observation, install_error)) {
             m_output_handoff.request_retirement("XeSS output was submitted but Overlay installation failed");
             set_owner_unavailable(install_error, true, true);
             invalidate_history("output-handoff-install-failed");
@@ -5078,5 +5113,16 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
 
 void RE4XeSS::on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* render_context) {
     (void)render_context;
-    m_output_handoff.observe_overlay(layer);
+    if (m_output_handoff.identity_mismatch_latched()) {
+        return;
+    }
+    const RE4XeSSOutputHandoff::ObservationContext observation{
+        static_cast<int32_t>(m_requested_mode.load(std::memory_order_acquire)),
+        m_control_generation.load(std::memory_order_acquire),
+        m_device_reset_generation.load(std::memory_order_acquire),
+        0,
+        GetCurrentThreadId(),
+        false,
+    };
+    m_output_handoff.observe_overlay(layer, observation);
 }

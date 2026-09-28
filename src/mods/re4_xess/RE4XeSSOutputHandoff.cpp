@@ -16,6 +16,7 @@ constexpr auto OUTPUT_READ_STATE = static_cast<D3D12_RESOURCE_STATES>(
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 constexpr auto REQUIRED_OUTPUT_FLAGS = static_cast<D3D12_RESOURCE_FLAGS>(
     D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+constexpr uint32_t MODE_TRANSITION_OBSERVATION_BUDGET = 4;
 
 struct RetainedOutputGeneration {
     sdk::intrusive_ptr<sdk::renderer::TargetState> handoff_state{};
@@ -61,8 +62,13 @@ RE4XeSSOutputHandoff::~RE4XeSSOutputHandoff() {
 
 bool RE4XeSSOutputHandoff::restore(
     sdk::renderer::layer::Overlay* layer,
+    const ObservationContext& observation,
     std::string& error) {
     error.clear();
+    if (m_identity_mismatch_latched.load(std::memory_order_acquire)) {
+        error = "Overlay main TargetState identity mismatch is terminally quarantined";
+        return false;
+    }
     if (!m_installed) {
         return true;
     }
@@ -89,12 +95,133 @@ bool RE4XeSSOutputHandoff::restore(
     }
 
     auto& main_state = layer->get_main_target_state();
-    if (main_state.get() == m_handoff_state.get()) {
+    auto* const observed_target_state = main_state.get();
+    const bool transition_observation = consume_mode_transition_observation(observation);
+    if (observed_target_state == m_handoff_state.get()) {
         main_state = m_saved_original_state;
-    } else if (main_state.get() != m_saved_original_state.get()) {
+    } else if (observed_target_state != m_saved_original_state.get()) {
         error = "Overlay main TargetState changed to an unexpected object while the XeSS handoff was installed";
-        quarantine(error);
+        bool first_mismatch{};
+        uintptr_t installed_layer_identity{};
+        uintptr_t installed_state_identity{};
+        uintptr_t saved_state_identity{};
+        uintptr_t template_state_identity{};
+        uintptr_t last_confirmed_overlay_layer{};
+        uintptr_t last_confirmed_overlay_state{};
+        uint64_t installed_frame{};
+        uint64_t last_confirmed_overlay_frame{};
+        uint64_t installed_control_generation{};
+        uint64_t installed_device_reset_generation{};
+        uint64_t signaled_fence_value{};
+        uint64_t completed_fence_value{};
+        int32_t installed_mode_token{};
+        bool installed{};
+        bool marker_pending{};
+        bool retirement_requested{};
+        bool hard_quarantined{};
+        bool bridge_writer_uncertain{};
+        bool last_confirmed_overlay_valid{};
+        bool same_layer_as_last_confirmed{};
+        {
+            std::lock_guard lock{ m_retirement_mutex };
+            if (!m_identity_mismatch_latched.exchange(true, std::memory_order_acq_rel)) {
+                first_mismatch = true;
+                m_hard_quarantined = true;
+                m_retirement_requested = true;
+                m_retirement_status = RetirementStatus::Quarantined;
+                m_failure_reason = error;
+                m_quarantine_logged = true;
+            }
+            installed_layer_identity = reinterpret_cast<uintptr_t>(m_installed_overlay);
+            installed_state_identity = reinterpret_cast<uintptr_t>(m_handoff_state.get());
+            saved_state_identity = reinterpret_cast<uintptr_t>(m_saved_original_state.get());
+            template_state_identity = m_signature.template_state;
+            installed_frame = m_installed_frame;
+            last_confirmed_overlay_layer = m_last_confirmed_post_overlay_layer;
+            last_confirmed_overlay_state = m_last_confirmed_post_overlay_state;
+            last_confirmed_overlay_frame = m_last_confirmed_post_overlay_frame;
+            last_confirmed_overlay_valid = m_last_confirmed_post_overlay_valid;
+            same_layer_as_last_confirmed = last_confirmed_overlay_valid &&
+                last_confirmed_overlay_layer == reinterpret_cast<uintptr_t>(layer);
+            installed_control_generation = m_signature.control_generation;
+            installed_device_reset_generation = m_installed_device_reset_generation;
+            installed_mode_token = m_installed_mode_token;
+            signaled_fence_value = m_last_signaled_retirement_value;
+            completed_fence_value = m_last_completed_retirement_value;
+            installed = m_installed;
+            marker_pending = m_marker_pending;
+            retirement_requested = m_retirement_requested;
+            hard_quarantined = m_hard_quarantined;
+            bridge_writer_uncertain = m_bridge_writer_uncertain;
+        }
+        if (first_mismatch) {
+            spdlog::error(
+                "[RE4XeSS][OutputHandoffMismatch] phase=pre-overlay-restore tid={} frameKnown={} frame={} requestedModeToken={} controlGeneration={} deviceResetGeneration={} installedModeToken={} installedControlGeneration={} installedDeviceResetGeneration={} installedFrame={} currentLayer=0x{:x} installedLayer=0x{:x} sameLayerAsLastConfirmedPostOverlay={} observedMainTargetState=0x{:x} observedTargetRelation=third-object expectedHandoffState=0x{:x} savedOriginalState=0x{:x} lastTemplateTargetState=0x{:x} lastConfirmedPostOverlayValid={} lastConfirmedPostOverlayFrame={} lastConfirmedPostOverlayLayer=0x{:x} lastConfirmedPostOverlayTargetState=0x{:x} installed={} markerPending={} retirementRequested={} hardQuarantined={} bridgeWriterUncertain={} downstreamFenceLastSignaled={} downstreamFenceLastCompleted={} transitionObservation={}",
+                observation.callback_thread_id,
+                observation.frame_id_valid,
+                static_cast<unsigned long long>(observation.frame_id),
+                observation.requested_mode_token,
+                static_cast<unsigned long long>(observation.control_generation),
+                static_cast<unsigned long long>(observation.device_reset_generation),
+                installed_mode_token,
+                static_cast<unsigned long long>(installed_control_generation),
+                static_cast<unsigned long long>(installed_device_reset_generation),
+                static_cast<unsigned long long>(installed_frame),
+                reinterpret_cast<uintptr_t>(layer),
+                installed_layer_identity,
+                same_layer_as_last_confirmed,
+                reinterpret_cast<uintptr_t>(observed_target_state),
+                installed_state_identity,
+                saved_state_identity,
+                template_state_identity,
+                last_confirmed_overlay_valid,
+                static_cast<unsigned long long>(last_confirmed_overlay_frame),
+                last_confirmed_overlay_layer,
+                last_confirmed_overlay_state,
+                installed,
+                marker_pending,
+                retirement_requested,
+                hard_quarantined,
+                bridge_writer_uncertain,
+                static_cast<unsigned long long>(signaled_fence_value),
+                static_cast<unsigned long long>(completed_fence_value),
+                transition_observation);
+        }
         return false;
+    }
+
+    if (transition_observation) {
+        uintptr_t expected_state_identity{};
+        uintptr_t saved_state_identity{};
+        uint64_t installed_frame{};
+        uint64_t signaled_fence_value{};
+        uint64_t completed_fence_value{};
+        bool marker_pending{};
+        {
+            std::lock_guard lock{ m_retirement_mutex };
+            expected_state_identity = reinterpret_cast<uintptr_t>(m_handoff_state.get());
+            saved_state_identity = reinterpret_cast<uintptr_t>(m_saved_original_state.get());
+            installed_frame = m_installed_frame;
+            marker_pending = m_marker_pending;
+            signaled_fence_value = m_last_signaled_retirement_value;
+            completed_fence_value = m_last_completed_retirement_value;
+        }
+        spdlog::info(
+            "[RE4XeSS][ModeTransition] phase=pre-overlay-restore tid={} frameKnown={} frame={} requestedModeToken={} controlGeneration={} deviceResetGeneration={} layer=0x{:x} observedMainTargetState=0x{:x} expectedHandoffState=0x{:x} savedOriginalState=0x{:x} installedFrame={} markerPending={} lastSignaled={} lastCompleted={}",
+            observation.callback_thread_id,
+            observation.frame_id_valid,
+            static_cast<unsigned long long>(observation.frame_id),
+            observation.requested_mode_token,
+            static_cast<unsigned long long>(observation.control_generation),
+            static_cast<unsigned long long>(observation.device_reset_generation),
+            reinterpret_cast<uintptr_t>(layer),
+            reinterpret_cast<uintptr_t>(observed_target_state),
+            expected_state_identity,
+            saved_state_identity,
+            static_cast<unsigned long long>(installed_frame),
+            marker_pending,
+            static_cast<unsigned long long>(signaled_fence_value),
+            static_cast<unsigned long long>(completed_fence_value));
     }
 
     bool log_missing_marker{};
@@ -162,6 +289,32 @@ void RE4XeSSOutputHandoff::request_retirement(std::string_view reason) {
     }
 }
 
+void RE4XeSSOutputHandoff::note_mode_transition(uint64_t control_generation) noexcept {
+    m_mode_transition_generation.store(control_generation, std::memory_order_release);
+    m_mode_transition_observation_budget.store(MODE_TRANSITION_OBSERVATION_BUDGET, std::memory_order_release);
+}
+
+bool RE4XeSSOutputHandoff::consume_mode_transition_observation(
+    const ObservationContext& observation) noexcept {
+    if (observation.control_generation == 0 ||
+        observation.control_generation != m_mode_transition_generation.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    auto remaining = m_mode_transition_observation_budget.load(std::memory_order_acquire);
+    while (remaining != 0) {
+        if (m_mode_transition_observation_budget.compare_exchange_weak(
+                remaining, remaining - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool RE4XeSSOutputHandoff::identity_mismatch_latched() const noexcept {
+    return m_identity_mismatch_latched.load(std::memory_order_acquire);
+}
+
 RE4XeSSOutputHandoff::RetirementStatus RE4XeSSOutputHandoff::poll_retirement(
     bool bridge_writer_idle,
     bool bridge_device_removed) {
@@ -180,7 +333,9 @@ RE4XeSSOutputHandoff::RetirementStatus RE4XeSSOutputHandoff::poll_retirement(
         }
         if (m_installed) {
             m_hard_quarantined = true;
-            m_failure_reason = "Refusing to retire an output TargetState while it is still installed in Overlay";
+            if (!m_identity_mismatch_latched.load(std::memory_order_acquire)) {
+                m_failure_reason = "Refusing to retire an output TargetState while it is still installed in Overlay";
+            }
         }
 
         if (confirmed_device_removal(bridge_device_removed)) {
@@ -213,7 +368,9 @@ RE4XeSSOutputHandoff::RetirementStatus RE4XeSSOutputHandoff::poll_retirement(
                     status = RetirementStatus::WriterPending;
                 } else if (m_installed) {
                     m_hard_quarantined = true;
-                    m_failure_reason = "Refusing to retire an output TargetState while it is still installed in Overlay";
+                    if (!m_identity_mismatch_latched.load(std::memory_order_acquire)) {
+                        m_failure_reason = "Refusing to retire an output TargetState while it is still installed in Overlay";
+                    }
                     status = RetirementStatus::Quarantined;
                 } else if (!m_downstream_use_seen) {
                     status = RetirementStatus::Ready;
@@ -401,6 +558,12 @@ RE4XeSSOutputHandoff::PrepareResult RE4XeSSOutputHandoff::prepare(
     m_last_signaled_retirement_value = 0;
     m_last_completed_retirement_value = 0;
     m_installed_frame = 0;
+    m_installed_device_reset_generation = 0;
+    m_installed_mode_token = 0;
+    m_last_confirmed_post_overlay_layer = 0;
+    m_last_confirmed_post_overlay_state = 0;
+    m_last_confirmed_post_overlay_frame = 0;
+    m_last_confirmed_post_overlay_valid = false;
     m_retirement_log_count = 0;
     m_restore_log_count = 0;
     m_delayed_marker_log_count = 0;
@@ -417,6 +580,7 @@ RE4XeSSOutputHandoff::PrepareResult RE4XeSSOutputHandoff::prepare(
     m_bridge_writer_uncertain = false;
     m_missing_marker_logged = false;
     m_quarantine_logged = false;
+    m_post_overlay_mismatch_logged = false;
     m_device_removed = false;
     {
         std::lock_guard lock{ m_retirement_mutex };
@@ -524,7 +688,7 @@ void RE4XeSSOutputHandoff::note_submission_succeeded() {
 
 bool RE4XeSSOutputHandoff::install(
     sdk::renderer::layer::Overlay* layer,
-    uint64_t frame_id,
+    const ObservationContext& observation,
     std::string& error) {
     error.clear();
     if (layer == nullptr || m_handoff_state == nullptr || m_resource_pin == nullptr) {
@@ -561,7 +725,9 @@ bool RE4XeSSOutputHandoff::install(
     main_state = m_handoff_state;
     m_installed_overlay = layer;
     m_installed = true;
-    m_installed_frame = frame_id;
+    m_installed_frame = observation.frame_id;
+    m_installed_mode_token = observation.requested_mode_token;
+    m_installed_device_reset_generation = observation.device_reset_generation;
     m_downstream_use_seen = true;
     m_marker_pending = true;
     m_missing_marker = false;
@@ -578,9 +744,15 @@ bool RE4XeSSOutputHandoff::install(
         }
     }
     if (log_install) {
-        spdlog::info("[RE4XeSS][Output] installed handoff frame={} template=0x{:x} state=0x{:x} resource=0x{:x} extent={}x{} state=0xC0",
-            static_cast<unsigned long long>(frame_id),
+        spdlog::info("[RE4XeSS][Output] installed handoff frame={} tid={} modeToken={} controlGeneration={} deviceResetGeneration={} overlay=0x{:x} template=0x{:x} savedOriginalState=0x{:x} state=0x{:x} resource=0x{:x} extent={}x{} state=0xC0",
+            static_cast<unsigned long long>(observation.frame_id),
+            observation.callback_thread_id,
+            observation.requested_mode_token,
+            static_cast<unsigned long long>(observation.control_generation),
+            static_cast<unsigned long long>(observation.device_reset_generation),
+            reinterpret_cast<uintptr_t>(layer),
             m_signature.template_state,
+            reinterpret_cast<uintptr_t>(m_saved_original_state.get()),
             reinterpret_cast<uintptr_t>(m_handoff_state.get()),
             reinterpret_cast<uintptr_t>(m_resource_pin.Get()),
             m_signature.display_width,
@@ -589,30 +761,89 @@ bool RE4XeSSOutputHandoff::install(
     if (log_marker_recovery) {
         spdlog::info("[RE4XeSS][Output] resumed handoff after frame={} marker settlement; installed frame={}",
             static_cast<unsigned long long>(previous_frame),
-            static_cast<unsigned long long>(frame_id));
+            static_cast<unsigned long long>(observation.frame_id));
     }
     return true;
 }
 
 void RE4XeSSOutputHandoff::quarantine(std::string_view reason, bool bridge_writer_uncertain) noexcept {
     std::string failure;
+    bool log_quarantine{};
     {
         std::lock_guard lock{ m_retirement_mutex };
+        const bool same_terminal_quarantine =
+            m_retirement_requested &&
+            m_retirement_status == RetirementStatus::Quarantined &&
+            m_bridge_writer_uncertain == bridge_writer_uncertain &&
+            (reason.empty() || m_failure_reason == reason);
         m_bridge_writer_uncertain = bridge_writer_uncertain;
         m_hard_quarantined = !bridge_writer_uncertain;
         m_retirement_requested = true;
         m_retirement_status = RetirementStatus::Quarantined;
-        if (!reason.empty()) {
+        if (!reason.empty() && !same_terminal_quarantine) {
             m_failure_reason.assign(reason);
         }
         failure = m_failure_reason;
+        log_quarantine = !same_terminal_quarantine;
+        m_quarantine_logged = true;
     }
-    spdlog::error("[RE4XeSS][Failure] output handoff quarantined: {}", failure);
+    if (log_quarantine) {
+        spdlog::error("[RE4XeSS][Failure] output handoff quarantined: {}", failure);
+    }
 }
 
 void RE4XeSSOutputHandoff::on_post_present(
     ID3D12Device* active_device,
-    ID3D12CommandQueue* active_queue) noexcept {
+    ID3D12CommandQueue* active_queue,
+    const ObservationContext& observation) noexcept {
+    if (REFrameworkConfig::get()->is_debug_log_enabled() &&
+        consume_mode_transition_observation(observation)) {
+        uintptr_t installed_layer_identity{};
+        uintptr_t installed_state_identity{};
+        uintptr_t saved_state_identity{};
+        uint64_t installed_frame{};
+        uint64_t signaled_fence_value{};
+        uint64_t completed_fence_value{};
+        bool installed{};
+        bool marker_pending{};
+        bool retirement_requested{};
+        bool hard_quarantined{};
+        bool bridge_writer_uncertain{};
+        {
+            std::lock_guard observation_lock{ m_retirement_mutex };
+            installed_layer_identity = reinterpret_cast<uintptr_t>(m_installed_overlay);
+            installed_state_identity = reinterpret_cast<uintptr_t>(m_handoff_state.get());
+            saved_state_identity = reinterpret_cast<uintptr_t>(m_saved_original_state.get());
+            installed_frame = m_installed_frame;
+            signaled_fence_value = m_last_signaled_retirement_value;
+            completed_fence_value = m_last_completed_retirement_value;
+            installed = m_installed;
+            marker_pending = m_marker_pending;
+            retirement_requested = m_retirement_requested;
+            hard_quarantined = m_hard_quarantined;
+            bridge_writer_uncertain = m_bridge_writer_uncertain;
+        }
+        spdlog::info(
+            "[RE4XeSS][ModeTransition] phase=post-present-marker-state tid={} frameKnown={} frame={} requestedModeToken={} controlGeneration={} deviceResetGeneration={} installedFrame={} installedLayer=0x{:x} handoffState=0x{:x} savedOriginalState=0x{:x} installed={} markerPending={} retirementRequested={} hardQuarantined={} bridgeWriterUncertain={} lastSignaled={} lastCompleted={}",
+            observation.callback_thread_id,
+            observation.frame_id_valid,
+            static_cast<unsigned long long>(observation.frame_id),
+            observation.requested_mode_token,
+            static_cast<unsigned long long>(observation.control_generation),
+            static_cast<unsigned long long>(observation.device_reset_generation),
+            static_cast<unsigned long long>(installed_frame),
+            installed_layer_identity,
+            installed_state_identity,
+            saved_state_identity,
+            installed,
+            marker_pending,
+            retirement_requested,
+            hard_quarantined,
+            bridge_writer_uncertain,
+            static_cast<unsigned long long>(signaled_fence_value),
+            static_cast<unsigned long long>(completed_fence_value));
+    }
+
     std::unique_lock lock{ m_retirement_mutex };
     if (!m_has_generation_snapshot.load(std::memory_order_acquire) || !m_marker_pending ||
         m_hard_quarantined || m_retirement_fence == nullptr || m_queue == nullptr || m_device == nullptr) {
@@ -696,40 +927,117 @@ RE4XeSSOutputHandoff::Snapshot RE4XeSSOutputHandoff::snapshot() const {
     };
 }
 
-void RE4XeSSOutputHandoff::observe_overlay(sdk::renderer::layer::Overlay* layer) const {
-    if (layer == nullptr || !REFrameworkConfig::get()->is_debug_log_enabled()) {
+void RE4XeSSOutputHandoff::observe_overlay(
+    sdk::renderer::layer::Overlay* layer,
+    const ObservationContext& observation) {
+    if (layer == nullptr) {
         return;
     }
+    const bool debug_log = REFrameworkConfig::get()->is_debug_log_enabled();
     uintptr_t expected_state{};
+    uintptr_t saved_state{};
     uintptr_t resource_identity{};
+    uintptr_t installed_layer_identity{};
     uint64_t frame{};
+    uint64_t control_generation{};
+    uint64_t installed_device_reset_generation{};
+    int32_t installed_mode_token{};
     uint32_t width{};
     uint32_t height{};
     bool should_log{};
     {
         std::lock_guard lock{ m_retirement_mutex };
-        if (!m_installed || layer != m_installed_overlay || m_retirement_log_count >= 32) {
+        if (!m_installed || layer != m_installed_overlay) {
             return;
         }
-        ++m_retirement_log_count;
+        should_log = debug_log && m_retirement_log_count < 32;
+        if (should_log) {
+            ++m_retirement_log_count;
+        }
         expected_state = reinterpret_cast<uintptr_t>(m_handoff_state.get());
+        saved_state = reinterpret_cast<uintptr_t>(m_saved_original_state.get());
         resource_identity = reinterpret_cast<uintptr_t>(m_resource_pin.Get());
+        installed_layer_identity = reinterpret_cast<uintptr_t>(m_installed_overlay);
         frame = m_installed_frame;
+        control_generation = m_signature.control_generation;
+        installed_device_reset_generation = m_installed_device_reset_generation;
+        installed_mode_token = m_installed_mode_token;
         width = m_signature.display_width;
         height = m_signature.display_height;
-        should_log = true;
-    }
-    if (!should_log) {
-        return;
     }
     const auto& main_state = layer->get_main_target_state();
-    const bool still_installed = reinterpret_cast<uintptr_t>(main_state.get()) == expected_state;
+    const auto observed_state = reinterpret_cast<uintptr_t>(main_state.get());
+    const bool still_installed = observed_state == expected_state;
+    const char* observed_target_relation = still_installed
+        ? "handoff"
+        : observed_state == saved_state ? "saved-original" : "third-object";
+    bool log_mismatch{};
     if (still_installed) {
-        spdlog::info("[RE4XeSS][Output] post-Overlay observation confirms handoff remains installed frame={} state=0x{:x} resource=0x{:x} extent={}x{}",
-            static_cast<unsigned long long>(frame), expected_state, resource_identity, width, height);
-    } else {
-        spdlog::error("[RE4XeSS][Failure] Overlay main TargetState changed before the post-Overlay observation frame={}",
-            static_cast<unsigned long long>(frame));
+        std::lock_guard lock{ m_retirement_mutex };
+        if (m_installed && layer == m_installed_overlay &&
+            expected_state == reinterpret_cast<uintptr_t>(m_handoff_state.get()) &&
+            frame == m_installed_frame) {
+            m_last_confirmed_post_overlay_layer = reinterpret_cast<uintptr_t>(layer);
+            m_last_confirmed_post_overlay_state = observed_state;
+            m_last_confirmed_post_overlay_frame = frame;
+            m_last_confirmed_post_overlay_valid = true;
+        }
+    } else if (debug_log) {
+        std::lock_guard lock{ m_retirement_mutex };
+        if (!m_post_overlay_mismatch_logged) {
+            m_post_overlay_mismatch_logged = true;
+            log_mismatch = true;
+        }
+    }
+    if (still_installed && should_log) {
+        spdlog::info("[RE4XeSS][Output] post-Overlay identity frame={} tid={} modeToken={} controlGeneration={} deviceResetGeneration={} layer=0x{:x} installedLayer=0x{:x} observedMainTargetState=0x{:x} handoffState=0x{:x} savedOriginalState=0x{:x} resource=0x{:x} extent={}x{}",
+            static_cast<unsigned long long>(frame),
+            observation.callback_thread_id,
+            installed_mode_token,
+            static_cast<unsigned long long>(control_generation),
+            static_cast<unsigned long long>(installed_device_reset_generation),
+            reinterpret_cast<uintptr_t>(layer),
+            installed_layer_identity,
+            observed_state,
+            expected_state,
+            saved_state,
+            resource_identity,
+            width,
+            height);
+    } else if (log_mismatch) {
+        uintptr_t last_confirmed_layer{};
+        uintptr_t last_confirmed_state{};
+        uint64_t last_confirmed_frame{};
+        bool last_confirmed_valid{};
+        bool same_layer_as_last_confirmed{};
+        {
+            std::lock_guard lock{ m_retirement_mutex };
+            last_confirmed_layer = m_last_confirmed_post_overlay_layer;
+            last_confirmed_state = m_last_confirmed_post_overlay_state;
+            last_confirmed_frame = m_last_confirmed_post_overlay_frame;
+            last_confirmed_valid = m_last_confirmed_post_overlay_valid;
+            same_layer_as_last_confirmed = last_confirmed_valid &&
+                last_confirmed_layer == reinterpret_cast<uintptr_t>(layer);
+        }
+        spdlog::error("[RE4XeSS][OutputHandoffMismatch] phase=post-overlay-observation frameKnown={} frame={} tid={} requestedModeToken={} controlGeneration={} deviceResetGeneration={} installedFrame={} currentLayer=0x{:x} installedLayer=0x{:x} sameLayerAsLastConfirmedPostOverlay={} observedMainTargetState=0x{:x} observedTargetRelation={} expectedHandoffState=0x{:x} savedOriginalState=0x{:x} lastConfirmedPostOverlayValid={} lastConfirmedPostOverlayFrame={} lastConfirmedPostOverlayLayer=0x{:x} lastConfirmedPostOverlayTargetState=0x{:x}",
+            observation.frame_id_valid,
+            static_cast<unsigned long long>(observation.frame_id),
+            observation.callback_thread_id,
+            observation.requested_mode_token,
+            static_cast<unsigned long long>(observation.control_generation),
+            static_cast<unsigned long long>(observation.device_reset_generation),
+            static_cast<unsigned long long>(frame),
+            reinterpret_cast<uintptr_t>(layer),
+            installed_layer_identity,
+            same_layer_as_last_confirmed,
+            observed_state,
+            observed_target_relation,
+            expected_state,
+            saved_state,
+            last_confirmed_valid,
+            static_cast<unsigned long long>(last_confirmed_frame),
+            last_confirmed_layer,
+            last_confirmed_state);
     }
 }
 
@@ -766,6 +1074,12 @@ void RE4XeSSOutputHandoff::release_generation() noexcept {
     m_last_signaled_retirement_value = 0;
     m_last_completed_retirement_value = 0;
     m_installed_frame = 0;
+    m_installed_device_reset_generation = 0;
+    m_installed_mode_token = 0;
+    m_last_confirmed_post_overlay_layer = 0;
+    m_last_confirmed_post_overlay_state = 0;
+    m_last_confirmed_post_overlay_frame = 0;
+    m_last_confirmed_post_overlay_valid = false;
     m_installed_overlay = nullptr;
     m_downstream_use_seen = false;
     m_bridge_writer_uncertain = false;
