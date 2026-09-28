@@ -1237,12 +1237,14 @@ public:
         for (size_t index = 0; index < SITE_COUNT; ++index) {
             const auto expected_span = CALLSITE_RVAS[index] - PRE_HOOK_RVAS[index];
             const auto actual_span = m_hooks[index].original_bytes().size();
-            if (actual_span != expected_span) {
-                spdlog::warn("[RE4XeSS][TargetStateProbe] not armed: pre-hook span would move callsite index={} expected={} actual={}",
+            if (actual_span == 0 || actual_span > expected_span) {
+                spdlog::warn("[RE4XeSS][TargetStateProbe] not armed: pre-hook span would overlap callsite index={} expectedMax={} actual={}",
                     index, expected_span, actual_span);
                 disarm("pre-hook span overlaps callsite");
                 return false;
             }
+            spdlog::info("[RE4XeSS][TargetStateProbe] pre-hook span validated index={} startRva=0x{:x} callsiteRva=0x{:x} expectedMax={} actual={} callsitePreserved=true",
+                index, PRE_HOOK_RVAS[index], CALLSITE_RVAS[index], expected_span, actual_span);
         }
 
         for (size_t index = 0; index < HOOK_COUNT; ++index) {
