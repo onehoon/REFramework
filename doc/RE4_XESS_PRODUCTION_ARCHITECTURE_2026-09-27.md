@@ -1780,6 +1780,10 @@ Production code should implement the minimum stable contract, not carry broad ho
 | AD-40 | RE4 RVA 0x47C3E00 is destructor/deallocation-side evidence for the exact validated image and must not be used as a TargetState creator/factory path. |
 | AD-41 | RE4 RVA 0x47D2180 is the strongest current TargetState creator candidate because it allocates 0xA8 bytes, invokes an initializer-like routine, installs the exact live TargetState vtable, and returns the object. It remains diagnostic-only until ABI, ownership, and live-object identity are runtime-proven. |
 | AD-42 | The next creator proof is an early read-only observation of real engine calls to 0x47D2180 plus raw-pointer correlation against the later live Overlay main TargetState. No diagnostic probe may invoke the candidate function itself or retain engine objects through AddRef/Release. |
+| AD-43 | Runtime observation promotes RE4 RVA 0x47D2180 from diagnostic candidate to the proven exact-image TargetState allocation/construction wrapper. It allocates 0xA8 bytes, consumes TargetState::Desc* through RDX, initializes the new object, installs the exact TargetState vtable, returns the allocation, and produces valid TargetState layouts with refCount=1. |
+| AD-44 | Raw pointer identity between an early object created by 0x47D2180 and a later live Overlay TargetState is not required for production promotion. The prior correlation requirement is superseded because the wrapper has been observed creating multiple valid fresh TargetState instances, while the 16-entry probe exhausted before the live Overlay anchor existed. |
+| AD-45 | shared/sdk/Renderer.cpp may resolve RE4 create_target_state to RVA 0x47D2180 only after exact image/function validation. The existing TargetState* (*)(void*, TargetState::Desc*) ABI and fn(nullptr, desc) call shape are compatible with the proven RE4 body. Any validation mismatch must return nullptr; non-RE4 resolver behavior remains unchanged. |
+| AD-46 | RE4 TargetState objects produced by 0x47D2180 point Desc::rtvs at internal storage at object+0x68. Clone-side temporary RTV-array cleanup is a separate ownership task and must not be changed in the same commit that first enables the production resolver. |
 
 ---
 
@@ -2192,5 +2196,169 @@ XeSS Execute                              not reached
 Do not bypass the handoff with a swapchain copy.
 
 Do not start XeFG validation.
+
+Keep PR66 Draft and unmerged.
+
+
+---
+
+## 24. PR66 TargetState factory promotion checkpoint — 2026-09-28 14:34 build
+
+This section supersedes the diagnostic-only status in Section 23.
+
+Latest runtime:
+
+~~~text
+re2_framework_log(20260928-054035).txt
+stamped commit: f99742e77f8b3df4db81bec639110183b967296e
+branch: feature/re4-xess-load-state-accessor-diagnostic
+~~~
+
+Current remote implementation:
+
+~~~text
+27fa92f75b1b4da985749bcd3a2b729b75cf0d9f
+Add bounded RE4 TargetState creator probe
+~~~
+
+### 24.1 0x47D2180 is now proven as the generic RE4 TargetState creator
+
+Runtime observed real engine calls producing multiple fresh TargetState objects.
+
+Single-RTV examples have:
+
+~~~text
+vtable       exact TargetState vtable
+refCount     1
+numRtv       1
+valid RTV    yes
+valid Texture yes
+~~~
+
+The same wrapper also creates multi-RTV states with the same vtable and valid resource graph.
+
+Therefore:
+
+~~~text
+0x47D2180 = proven RE4 TargetState allocation/construction wrapper
+~~~
+
+for the exact validated image.
+
+This is no longer only a reverse-engineering lead.
+
+### 24.2 Production ABI is established
+
+The existing SDK factory type is:
+
+~~~cpp
+TargetState* (*)(void*, TargetState::Desc*)
+~~~
+
+and the call site already uses:
+
+~~~cpp
+fn(nullptr, desc)
+~~~
+
+The exact RE4 wrapper:
+
+~~~text
+preserves incoming RDX as Desc*
+does not consume incoming RCX
+allocates 0xA8 bytes
+passes RCX=new object / RDX=Desc* to re4+0x446E790
+installs the TargetState vtable
+returns the new object
+~~~
+
+Therefore the existing SDK ABI is compatible.
+
+The next change is no longer another creator probe.
+
+It is the exact-image RE4 resolver in shared/sdk/Renderer.cpp.
+
+### 24.3 Previous Overlay pointer-correlation requirement is retired as a gate
+
+The diagnostic stored only the first 16 creator observations.
+
+Those 16 entries were exhausted during initialization and the hooks disarmed before the first live Overlay TargetState was available.
+
+Later matchedObservation=false results therefore did not observe the relevant creation interval.
+
+More importantly, a generic factory does not need to be proven by showing that one arbitrary early-created instance later becomes the Overlay main state.
+
+The direct creation evidence is stronger and sufficient for promotion.
+
+Do not increase the capture budget merely to chase pointer identity.
+
+### 24.4 Exact-image resolver requirements
+
+PR66 implementation comment:
+
+~~~text
+5864220846
+~~~
+
+For RE4 only, shared/sdk/Renderer.cpp::create_target_state() may resolve:
+
+~~~text
+RVA                    0x47D2180
+RUNTIME_FUNCTION       0x47D2180..0x47D21D2
+TargetState vtable RVA 0x7B1C148
+image size             0x0E405000
+PE checksum            0x0DEE3479
+~~~
+
+The implementation must validate the proven function bytes and relative call targets before returning the function pointer.
+
+Fail closed:
+
+~~~text
+validation mismatch -> nullptr
+~~~
+
+Keep non-RE4 behavior unchanged.
+
+Do not make shared/sdk depend on the RE4XeSS mod.
+
+### 24.5 Ownership remains a separate safety gate
+
+Captured objects consistently show:
+
+~~~text
+TargetState::Desc::rtvs == object + 0x68
+~~~
+
+inside the 0xA8 allocation.
+
+This proves the final object does not retain the caller's RTV-array pointer as its own array location.
+
+The current TargetState::clone() success path does not release its temporary cloned_desc.rtvs allocation.
+
+That may need an RE4-specific cleanup once AddRef/copy ownership is proven.
+
+Do not combine that cleanup with the first factory-resolver commit.
+
+First validate factory resolution and OutputHandoff with the existing conservative ownership behavior.
+
+### 24.6 Next runtime acceptance
+
+The next capture should prove:
+
+~~~text
+RE4 create_target_state resolver validates
+TargetState::clone returns a distinct valid state
+single cloned RTV remains valid
+OutputHandoff prepare succeeds
+OutputHandoff install succeeds
+worker reaches public XeSS Execute
+stock OptiScaler observes xessD3D12Execute
+post-present retirement remains safe
+~~~
+
+If clone succeeds and a later stage fails, that newly exposed stage becomes the next blocker.
+
+Do not start XeFG validation before this SR/output-handoff path is stable.
 
 Keep PR66 Draft and unmerged.
