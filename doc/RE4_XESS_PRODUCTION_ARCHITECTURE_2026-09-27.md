@@ -1800,6 +1800,8 @@ Production code should implement the minimum stable contract, not carry broad ho
 | AD-60 | A repeatable native write AV at game-directory OptiScaler dxgi.dll+0x21256f, with first-chance RAX=0 and write target=0xc, requires disassembly of that exact binary and pointer-producer provenance before any semantic fix. Registers alone do not prove the instruction addressing mode or owning component. |
 | AD-61 | Treat 128 ordinary Execute api-enter/api-return logs as the deliberate MAX_EXECUTE_API_LOGS budget, not the total submission count; terminal submission=205 and 205 paired OptiScaler XeSS intercepts are separate evidence. Keep the narrow SEH filter and fail-closed quarantine intact. |
 | AD-62 | Post-fault quality requests do not validate healthy in-flight quality transition. Verify the same-Overlay third-TargetState mode-change issue separately from the exact-binary native OptiScaler AV. |
+| AD-63 | Exact-binary analysis of SHA-256 60E6FB52F924C1C47ED7ECE4B19B747112FA09C2492F323E558E30957196C2B8 proves dxgi.dll+0x212568 loads RAX from module-global +0x18521B8 and dxgi.dll+0x21256F executes OR dword ptr [RAX+0xC],0x10; captured RAX=0 therefore explains 0xC0000005 WRITE 0xC. The direct faulting pointer does not come from the call's RCX/RDX/R8, but ultimate initialization/ownership remains unknown. |
+| AD-64 | Treat a rebuilt PDB as applicable to the captured OptiScaler DLL only when debug signature GUID/Age matches. Otherwise reproduce with the newly built DLL/PDB pair. No REF-side workaround, pointer repair, or lifetime change is authorized merely by identifying the OptiScaler-internal global dereference. |
 
 ---
 
@@ -3270,3 +3272,71 @@ fake XeSS success, automatic context restart, or forced Overlay state
 repair without independent ownership proof.
 
 Keep PR66 Draft / Open / unmerged.
+
+
+---
+
+## 30. Exact OptiScaler proxy instruction checkpoint — 2026-09-28
+
+This section **supersedes only the earlier “instruction unknown” and “immediate pointer source unknown” parts of Section 29**. It does not supersede independent live quality-transition concerns from Section 28.
+
+Evidence: [PR66 comment 5865873929](https://github.com/onehoon/REFramework/pull/66#issuecomment-5865873929), produced by disassembling the exact game-directory dxgi.dll from the paired 16:49 REFramework/OptiScaler capture.
+
+### 30.1 Pinned image and native fault
+
+~~~text
+File         <RE4 game directory>\dxgi.dll (OptiScaler proxy)
+SHA-256      60E6FB52F924C1C47ED7ECE4B19B747112FA09C2492F323E558E30957196C2B8
+OptiScaler   44cfee4d / 20260926_090919
+PE32+ x64    preferred base 0x180000000
+SizeOfImage  0x18AB000
+File size    25,743,872 bytes
+.pdata       enclosing RVA range [0x2124C0, 0x212949)
+Observed AV  0xC0000005 WRITE 0xC, RAX=0, submission 205
+~~~
+
+### 30.2 Proven instruction, direct caller, and pointer source
+
+~~~asm
+; RVA 0x212568, bytes: 48 8B 05 49 FC 63 01
+mov rax, qword ptr [rip+0x163fc49] ; dxgi.dll+0x18521B8
+
+; RVA 0x21256F, bytes: 83 48 0C 10
+or dword ptr [rax+0xC], 0x10
+~~~
+
+Because RAX=0, the effective address is 0xC. The faulting pointer comes directly from a **global pointer slot in the OptiScaler module**, not from an incoming RCX/RDX/R8 argument.
+
+Static caller and writers:
+
+~~~text
+direct CALL at dxgi.dll+0x1D1945 -> function dxgi.dll+0x2124C0
+caller's RCX loads from separate module global dxgi.dll+0x1845FA8
+static stores to faulting pointer slot dxgi.dll+0x18521B8:
+    dxgi.dll+0x20CF06
+    dxgi.dll+0x20CF17
+    dxgi.dll+0x20D6C1
+~~~
+
+These static facts do not yet identify the C++ owner or whether the null was caused by startup initialization, a state transition, teardown, an external callback, or another upstream event. Do not infer root cause from the faulting module alone.
+
+### 30.3 Symbolization gate and next owner-correct action
+
+The captured binary has no locally available matching PDB in the investigation described in the PR comment. The analyst's local checkout lacked commit 44cfee4d, although [that upstream OptiScaler commit](https://github.com/optiscaler/OptiScaler/commit/44cfee4d436857742a9bf71bbe81396ec9989715) is accessible on GitHub.
+
+First choice: matching original PDB (verify GUID/Age) and first-chance call stack. If no matching PDB exists, check out exact upstream source at 44cfee4d, build ReleaseDebug, and reproduce **with that newly built DLL and its own PDB**. Do not assume a recompiled binary retains the original RVA-to-line mapping.
+
+Trace the slot at +0x18521B8, its three known static stores, and the immediate caller at +0x1D1945. Determine which source object owns the slot and why it is null before proposing a patch in OptiScaler or REFramework.
+
+No REF behavior modification, new DLL, or code commit was made by the exact-binary step; the previously posted PR66 comment is the source of the new evidence. Preserve terminal quarantine. Keep a healthy-generation in-flight Quality -> Ultra Quality verification as a separate pending test.
+
+~~~text
+Faulting instruction and immediate global source   PROVEN
+C++ symbol / slot lifecycle / null origin          UNKNOWN
+Native AV reproducibility (~200 submissions)       PROVEN IN PRIOR CAPTURES
+Healthy quality-mode transition                    NOT PROVEN
+Sustained SR beyond 300 successful submissions     BLOCKED
+XeFG production validation                         DEFERRED
+~~~
+
+PR66 stays Draft/Open/unmerged.
