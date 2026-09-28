@@ -1392,8 +1392,8 @@ private:
     static constexpr uint32_t EXPECTED_IMAGE_SIZE = 0x0E405000;
     static constexpr uint32_t EXPECTED_IMAGE_CHECKSUM = 0x0DEE3479;
     static constexpr size_t SITE_COUNT = 4;
-    // Isolate the observed outer vcall so its return can be measured without nested probe hooks.
-    static constexpr size_t ISOLATED_SITE_INDEX = 2;
+    // Isolate the nested owner vcall so its ABI and return can be measured without other probe hooks.
+    static constexpr size_t ISOLATED_SITE_INDEX = 1;
     static constexpr uint32_t MAX_PENDING_PRESENT_GRACE = 2;
     static constexpr size_t MAX_CAPTURED_CALLS_PER_SITE = 4;
     static constexpr size_t MAX_CAPTURED_CALLS = SITE_COUNT * MAX_CAPTURED_CALLS_PER_SITE;
