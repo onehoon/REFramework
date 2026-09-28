@@ -1788,6 +1788,10 @@ Production code should implement the minimum stable contract, not carry broad ho
 | AD-48 | A same-generation OutputHandoff MissingMarker condition is a transient callback-ordering state, not a producer/context failure. While the real post-Present marker is pending, restore native Overlay state and skip new XeSS submit/install; preserve the worker/context/control generation and reset temporal history for the next accepted frame. Never synthesize the downstream marker early. |
 | AD-49 | An exception escaping the public xessD3D12Execute path leaves external runtime and command-recording state uncertain. Preserve fail-closed quarantine and do not continue/submit the interrupted command list. Add bounded diagnostics at the exact public API boundary before considering recovery. |
 | AD-50 | The completed TargetState vtable/xref/creator probes are no longer part of normal production startup. Keep the exact-image resolver validation, but place heavy historical discovery probes behind explicit diagnostic opt-in or remove them from the normal RE4 XeSS path. |
+| AD-51 | Execute-boundary api-enter/api-return diagnostics prove the current terminal failure escapes directly from public xessD3D12Execute before REFramework records restore barriers, closes, submits, or signals the command list. Those post-call D3D12 stages are not the source of the captured terminal exception. |
+| AD-52 | At OptiScaler 44cfee4d, the final paired log line "XeSSFeatureDx12::EvaluateInternal Executing!!" is immediately before XeSSProxy::D3D12Execute. Until exception address/module evidence exists, treat the fault as inside the intercepted/native XeSS backend boundary without assigning ownership to OptiScaler, Intel XeSS, or the driver. |
+| AD-53 | For the next failure capture, use only a narrow observation mechanism around m_functions.d3d12_execute that records the native exception code/address/module/RVA and continues exception search. Do not add process-wide VEH, worker-wide SEH translation, recovery, or retry. |
+| AD-54 | CreateRenderTargetViewProbe is no longer required in the normal producer path. Its factory/format/handoff questions are already proven; remove it from normal execution or gate it behind explicit diagnostic opt-in while preserving the actual RE4 RTV resolver. |
 
 ---
 
@@ -2631,6 +2635,272 @@ Until then:
 SR producer architecture     proven
 SR sustained stability       not yet proven
 XeFG production validation   deferred
+~~~
+
+Keep PR66 Draft and unmerged.
+
+
+---
+
+## 26. PR66 exact execute-boundary checkpoint — 2026-09-28 15:17 build
+
+This checkpoint supersedes the broader exception boundary in Section 25.
+
+Paired runtime:
+
+~~~text
+REFramework:
+    re2_framework_log(20260928-062039).txt
+    stamped commit 23550b91e80c4361e733788a8610ac74c4fbfa9a
+    branch feature/re4-xess-load-state-accessor-diagnostic
+
+OptiScaler:
+    OptiScaler(2).log
+    v10.0.0-dev
+    commit 44cfee4d
+~~~
+
+Current remote PR66 head at analysis time:
+
+~~~text
+5cd612303ee9e9efe778f4cf47913fde66aa7ff9
+Handle delayed XeSS retirement and execute faults
+~~~
+
+Follow-up work order:
+
+~~~text
+5864651645
+~~~
+
+### 26.1 Delayed-marker handling is no longer the current blocker
+
+Observed delayed markers now settle without the prior context-unavailable cascade.
+
+The runtime shows:
+
+~~~text
+restored previous handoff before marker
+real post-Present marker arrives
+same control generation continues
+next Execute succeeds
+handoff resumes
+~~~
+
+No output-handoff-unavailable or producer-context-unavailable reset appears in this capture.
+
+The explicit WaitingForPostPresentMarker branch remains required for a longer delay, although this particular run settled the marker before prepare had to return that status.
+
+Production rule remains:
+
+~~~text
+never reuse before downstream proof
+never synthesize the marker
+never wait for it on CPU/GPU
+do not recreate the producer merely because the same-generation marker is late
+~~~
+
+### 26.2 Public execute failure location is now proven
+
+The added API boundary diagnostic records normal executions as:
+
+~~~text
+api-enter
+api-return result=0
+Execute result=SUCCESS
+~~~
+
+At the terminal failure:
+
+~~~text
+frame=6216
+submission=201
+slot=0
+input=853x480
+output=2560x1440
+resetHistory=false
+api-enter
+api-exception kind=unknown
+~~~
+
+with no api-return.
+
+Therefore:
+
+~~~text
+exception location:
+    inside m_functions.d3d12_execute(...)
+
+excluded after-call stages:
+    velocity restore barrier
+    output finish barrier
+    command-list close
+    ExecuteCommandLists
+    queue Signal
+~~~
+
+The bridge/output/runtime quarantine remains mandatory because the interrupted external call may have partially modified command-list or backend state.
+
+### 26.3 OptiScaler source correlation narrows the external call chain
+
+The paired OptiScaler log reaches:
+
+~~~text
+hk_xessD3D12Execute
+NVSDK_NGX_D3D12_EvaluateFeature
+XeSSFeatureDx12::EvaluateInternal
+all required resources present
+AutoExposure enabled
+Executing!!
+~~~
+
+At OptiScaler 44cfee4d, Executing!! is emitted immediately before:
+
+~~~cpp
+xessResult = XeSSProxy::D3D12Execute()(_xessContext, InCommandList, &params);
+~~~
+
+There is no normal xessD3D12Execute error-result log afterward.
+
+Current evidence therefore supports only:
+
+~~~text
+exception escaped during the intercepted/native XeSS backend call
+~~~
+
+It does not yet identify the owning binary.
+
+Do not change producer resource states, output lifetime, or worker ownership based only on this evidence.
+
+### 26.4 Failure recurrence is approximately time/count stable across quality modes
+
+Earlier capture:
+
+~~~text
+Ultra Quality
+1969x1107
+first Execute 14:59:22.858
+failure       14:59:24.915
+~2.06 seconds
+~~~
+
+Current capture:
+
+~~~text
+Ultra Performance
+853x480
+first Execute 15:20:04.148
+failure       15:20:06.266
+~2.12 seconds
+submission 201
+~~~
+
+This strongly suggests a repeatable time/submission boundary rather than a single-quality input-size failure.
+
+Treat it as evidence for diagnostics, not as a workaround condition.
+
+### 26.5 Next implementation boundary is exception ownership, not rendering behavior
+
+The next patch should add a narrow Windows/MSVC observation filter only around the external function-pointer invocation.
+
+Collect:
+
+~~~text
+exception code
+ExceptionAddress
+ContextRecord RIP
+module name/path
+module RVA
+ExceptionFlags
+NumberParameters
+~~~
+
+For access violation also collect:
+
+~~~text
+read/write/execute kind
+faulting virtual address
+~~~
+
+The observation filter must:
+
+~~~text
+copy POD only
+avoid logging/allocating inside the filter
+return EXCEPTION_CONTINUE_SEARCH
+preserve the current outer catch/quarantine path
+~~~
+
+Do not install process-wide handlers.
+
+Do not translate the exception into a recoverable result.
+
+Do not retry or recreate the backend automatically.
+
+### 26.6 Remove the remaining RTV diagnostic hook from production execution
+
+The completed TargetState diagnostics are gone from normal startup.
+
+CreateRenderTargetViewProbe remains active, but is no longer required for the production contract.
+
+Remove or opt-in gate:
+
+~~~cpp
+CreateRenderTargetViewProbe::instance().ensure(...)
+~~~
+
+and its unused normal lifecycle plumbing.
+
+Preserve:
+
+~~~text
+exact RE4 create_render_target_view resolver
+TargetState clone behavior
+OutputHandoff validation
+~~~
+
+This removes a diagnostic hook before the next native exception capture.
+
+### 26.7 Acceptance before any recovery or XeFG work
+
+The next run should attempt to pass:
+
+~~~text
+submission 201
+submission 250
+submission 300
+~~~
+
+without changing the producer architecture.
+
+If the exception recurs, the capture must identify:
+
+~~~text
+exception code
+faulting instruction
+owning module
+module RVA
+AV access kind/address when applicable
+~~~
+
+Only then decide whether the next code change belongs to:
+
+~~~text
+REFramework
+OptiScaler
+native Intel XeSS
+driver-facing integration
+~~~
+
+Current status:
+
+~~~text
+SR architecture                 proven
+delayed-marker context churn    no longer reproducing
+execute exception call boundary proven
+exception ownership             unknown
+sustained SR stability          blocked
+XeFG validation                 deferred
 ~~~
 
 Keep PR66 Draft and unmerged.
