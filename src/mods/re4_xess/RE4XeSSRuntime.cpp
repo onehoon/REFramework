@@ -23,9 +23,19 @@ struct NativeExceptionObservation {
     DWORD flags{};
     uintptr_t exception_address{};
     uintptr_t instruction_pointer{};
+    uintptr_t rax{};
+    uintptr_t rcx{};
+    uintptr_t rdx{};
+    uintptr_t r8{};
+    uintptr_t r9{};
+    uintptr_t r10{};
+    uintptr_t r11{};
+    uintptr_t rsp{};
+    uintptr_t rbp{};
     ULONG parameter_count{};
     ULONG_PTR information0{};
     ULONG_PTR information1{};
+    bool registers_valid{};
     bool valid{};
 };
 
@@ -38,6 +48,21 @@ LONG capture_native_exception(EXCEPTION_POINTERS* exception_info, NativeExceptio
         observation->instruction_pointer = exception_info->ContextRecord != nullptr
             ? static_cast<uintptr_t>(exception_info->ContextRecord->Rip)
             : 0;
+#if defined(_M_X64)
+        if (exception_info->ContextRecord != nullptr) {
+            const auto* context = exception_info->ContextRecord;
+            observation->rax = static_cast<uintptr_t>(context->Rax);
+            observation->rcx = static_cast<uintptr_t>(context->Rcx);
+            observation->rdx = static_cast<uintptr_t>(context->Rdx);
+            observation->r8 = static_cast<uintptr_t>(context->R8);
+            observation->r9 = static_cast<uintptr_t>(context->R9);
+            observation->r10 = static_cast<uintptr_t>(context->R10);
+            observation->r11 = static_cast<uintptr_t>(context->R11);
+            observation->rsp = static_cast<uintptr_t>(context->Rsp);
+            observation->rbp = static_cast<uintptr_t>(context->Rbp);
+            observation->registers_valid = true;
+        }
+#endif
         observation->parameter_count = record->NumberParameters;
         if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) {
             observation->information0 = record->ExceptionInformation[0];
@@ -135,7 +160,7 @@ void log_native_exception(
         ? static_cast<uintptr_t>(observation.information1)
         : 0;
     spdlog::error(
-        "[RE4XeSS][Execute] native-exception frame={} workerThread={} controlGeneration={} resetGeneration={} slot={} submission={} commandList=0x{:x} color=0x{:x} depth=0x{:x} convertedMV=0x{:x} originalMV=0x{:x} output=0x{:x} input={}x{} outputExtent={}x{} resetHistory={} code=0x{:08x} ExceptionAddress=0x{:x} Rip=0x{:x} module={} moduleRVA=0x{:x} ExceptionFlags=0x{:x} NumberParameters={} accessKind={} targetAddress=0x{:x}",
+        "[RE4XeSS][Execute] native-exception frame={} workerThread={} controlGeneration={} resetGeneration={} slot={} submission={} commandList=0x{:x} color=0x{:x} depth=0x{:x} convertedMV=0x{:x} originalMV=0x{:x} output=0x{:x} input={}x{} outputExtent={}x{} resetHistory={} code=0x{:08x} ExceptionAddress=0x{:x} Rip=0x{:x} module={} moduleRVA=0x{:x} ExceptionFlags=0x{:x} NumberParameters={} accessKind={} targetAddress=0x{:x} GPRValid={} RAX=0x{:x} RCX=0x{:x} RDX=0x{:x} R8=0x{:x} R9=0x{:x} R10=0x{:x} R11=0x{:x} RSP=0x{:x} RBP=0x{:x}",
         static_cast<unsigned long long>(frame_id),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(control_generation),
@@ -161,7 +186,17 @@ void log_native_exception(
         observation.flags,
         observation.parameter_count,
         access_kind,
-        faulting_address_argument);
+        faulting_address_argument,
+        observation.registers_valid,
+        observation.rax,
+        observation.rcx,
+        observation.rdx,
+        observation.r8,
+        observation.r9,
+        observation.r10,
+        observation.r11,
+        observation.rsp,
+        observation.rbp);
 }
 
 void log_owner_thread_violation_once(const std::string& error) {
