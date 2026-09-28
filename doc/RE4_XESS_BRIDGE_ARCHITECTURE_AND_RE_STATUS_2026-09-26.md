@@ -5501,3 +5501,368 @@ actual production-safe TargetState creation ABI not yet proven
 ~~~
 
 Keep PR66 Draft and unmerged.
+
+
+---
+
+## 34. PR66 14:34 runtime — RE4 TargetState creator proven
+
+Latest runtime evidence:
+
+~~~text
+file: re2_framework_log(20260928-054035).txt
+stamped commit: f99742e77f8b3df4db81bec639110183b967296e
+branch: feature/re4-xess-load-state-accessor-diagnostic
+build date/time: 2026-09-28 14:34
+~~~
+
+The current remote PR66 implementation containing the bounded creator probe is:
+
+~~~text
+27fa92f75b1b4da985749bcd3a2b729b75cf0d9f
+Add bounded RE4 TargetState creator probe
+~~~
+
+The log clearly contains that creator-probe behavior.
+
+Treat the stamped runtime hash as local-build provenance rather than assuming it exactly identifies the pushed source tree.
+
+### 34.1 0x47D2180 executes as a real engine TargetState creator
+
+The early read-only probe successfully observed real engine calls to:
+
+~~~text
+re4+0x47D2180
+~~~
+
+The wrapper behavior is now runtime-proven:
+
+~~~text
+allocation size          0xA8
+allocation result        non-null
+post-initializer object  same allocation
+post-vtable object       same allocation
+returned object          same allocation
+vtable                   exact TargetState vtable
+initial refCount         1
+descriptor               readable
+RTV entries              valid
+Texture backing          valid
+~~~
+
+Two single-RTV examples:
+
+~~~text
+id=1
+    object=0x22feeb96700
+    vtable=0x7ff6396ec148
+    refCount=1
+    numRtv=1
+    rect=3840x2160
+    rtv0 valid
+    format=29
+    dimension=4
+    targetStateLike=true
+
+id=2
+    object=0x22feeb967c0
+    vtable=0x7ff6396ec148
+    refCount=1
+    numRtv=1
+    rect=1920x1088
+    rtv0 valid
+    format=29
+    dimension=4
+    targetStateLike=true
+~~~
+
+The same wrapper also creates valid multi-RTV states:
+
+~~~text
+numRtv=6
+rect sequence includes:
+    256x256
+    128x128
+    64x64
+    32x32
+    16x16
+vtable=exact TargetState vtable
+refCount=1
+valid RTV / Texture objects
+~~~
+
+This upgrades the classification from:
+
+~~~text
+TargetState creator candidate
+~~~
+
+to:
+
+~~~text
+proven RE4 TargetState allocation/construction wrapper
+~~~
+
+for the exact validated RE4 image.
+
+### 34.2 Existing SDK ABI matches the proven wrapper
+
+The existing SDK abstraction in shared/sdk/Renderer.cpp is already:
+
+~~~cpp
+TargetState* (*)(void*, TargetState::Desc*)
+~~~
+
+and invokes the resolved function as:
+
+~~~cpp
+fn(nullptr, desc)
+~~~
+
+The exact RE4 body is compatible with this contract.
+
+Proven local dataflow:
+
+~~~asm
+MOV RDI, RDX          ; preserve incoming Desc*
+MOV ECX, 1
+MOV EDX, 0xA8
+CALL re4+0x3AB27F0   ; allocation
+
+MOV RBX, RAX
+TEST RAX, RAX
+JZ failure
+
+MOV RDX, RDI          ; original Desc*
+MOV RCX, RAX          ; new TargetState
+CALL re4+0x446E790   ; initializer
+
+LEA RAX, TargetState_vtable
+MOV [RBX], RAX
+MOV RAX, RBX
+RET
+~~~
+
+The incoming RCX is not consumed before being overwritten for the allocator call.
+
+The incoming RDX is the descriptor pointer used by the initializer.
+
+Therefore, for this exact image:
+
+~~~text
+existing SDK function-pointer type    compatible
+existing fn(nullptr, desc) shape      compatible
+0x47D2180                              production resolver candidate accepted
+~~~
+
+### 34.3 Previous live-pointer correlation requirement is superseded
+
+The creator probe was configured with:
+
+~~~text
+observationLimit=16
+frameLimit=1800
+~~~
+
+All 16 observations were consumed during early initialization.
+
+It then disarmed:
+
+~~~text
+reason=observation budget reached
+observations=16
+frames=1
+~~~
+
+Only afterward did the first live Overlay state become available.
+
+The later:
+
+~~~text
+matchedObservation=false
+structuralMatches=0
+~~~
+
+therefore does not reject 0x47D2180.
+
+More importantly, raw identity between an arbitrary earlier-created TargetState and the later live Overlay TargetState is not required to prove a generic TargetState creation wrapper.
+
+The wrapper itself has already been observed creating fresh objects with:
+
+~~~text
+exact TargetState vtable
+correct TargetState layout
+refCount=1
+valid RTVs
+valid Texture backing
+multiple descriptor shapes
+~~~
+
+Do not spend another capture merely increasing the creator observation budget to chase Overlay object identity.
+
+### 34.4 Direct caller scan result is provenance-only
+
+Static direct CALL-rel32 enumeration reports:
+
+~~~text
+targetRva=0x47D2180
+callerCount=0
+~~~
+
+while runtime calls arrive with caller return RVAs including:
+
+~~~text
+0x4197775
+0x4523F2E
+~~~
+
+This is consistent with indirect dispatch.
+
+That caller-dispatch detail is not required before using the exact validated function RVA through the already-established SDK ABI.
+
+Return to caller reconstruction only if the production resolver behaves unexpectedly.
+
+### 34.5 Important RE4 RTV-array ownership observation
+
+Every captured TargetState uses an RTV array pointer inside the allocated 0xA8 object.
+
+Examples:
+
+~~~text
+id=1
+    object = 0x22feeb96700
+    rtvs   = 0x22feeb96768
+    delta  = +0x68
+
+id=2
+    object = 0x22feeb967c0
+    rtvs   = 0x22feeb96828
+    delta  = +0x68
+
+id=3
+    object = 0x22fee9b6010
+    rtvs   = 0x22fee9b6078
+    delta  = +0x68
+~~~
+
+Thus the constructed RE4 object does not retain Desc::rtvs as its final array pointer.
+
+It materializes/points to internal RTV storage at object+0x68.
+
+This raises a likely later cleanup issue in TargetState::clone():
+
+~~~text
+temporary cloned_desc.rtvs array
+    -> passed to creator
+    -> creator builds internal object storage
+    -> current clone success path does not release temporary array
+~~~
+
+Do not change this ownership behavior in the same commit as the resolver.
+
+First prove the production resolver and OutputHandoff.
+
+Then separately verify AddRef/copy semantics and safely release the temporary caller-owned array if warranted.
+
+### 34.6 Next implementation — promote exact RE4 resolver
+
+PR66 implementation work order:
+
+~~~text
+5864220846
+~~~
+
+Modify only the RE4 path of:
+
+~~~text
+shared/sdk/Renderer.cpp::create_target_state()
+~~~
+
+For the exact RE4 image, resolve:
+
+~~~text
+creator RVA             0x47D2180
+function range          0x47D2180..0x47D21D2
+TargetState vtable RVA  0x7B1C148
+image size              0x0E405000
+PE checksum             0x0DEE3479
+~~~
+
+Validate the already-proven instruction anchors and relative CALL targets.
+
+On any mismatch:
+
+~~~text
+return nullptr
+~~~
+
+For non-RE4 games, preserve the existing generic resolver unchanged.
+
+Do not introduce a dependency from shared/sdk/Renderer.cpp to mods/re4_xess.
+
+### 34.7 Next runtime acceptance
+
+The next capture should validate production flow:
+
+~~~text
+[Renderer][RE4] Found create_target_state via validated RVA 0x47D2180
+TargetState::clone returns distinct state
+new state has one valid RTV
+OutputHandoff prepare succeeds
+OutputHandoff install succeeds
+worker submit succeeds
+hk_xessD3D12Execute first call is reached
+post-present retirement remains correct
+~~~
+
+If a later stage fails, stop at that newly exposed blocker.
+
+Do not return to broad TargetState provenance diagnostics unless the validated resolver itself fails.
+
+---
+
+## 35. Handoff state after creator proof
+
+### Proven
+
+~~~text
+TargetState vtable RVA 0x7B1C148                  proven exact-image anchor
+0x47C3E00                                        destructor/deallocation-side
+0x47D2180 allocation size                       0xA8
+0x47D2180 descriptor input                      RDX
+0x47D2180 initializer object                    RCX=new allocation
+0x47D2180 final vtable                          exact TargetState vtable
+0x47D2180 returned object                       allocation
+0x47D2180 initial refCount                      1
+0x47D2180 output resources                      valid
+0x47D2180 generic TargetState creator wrapper   proven
+existing SDK factory ABI                        compatible
+~~~
+
+### Current task
+
+~~~text
+wire exact-image RE4 create_target_state resolver
+    -> keep fail-closed validation
+    -> leave non-RE4 path unchanged
+    -> validate TargetState::clone
+    -> advance to OutputHandoff
+~~~
+
+### Deferred ownership follow-up
+
+~~~text
+RE4 constructed TargetState rtvs = object + 0x68
+temporary clone-side Desc::rtvs ownership cleanup requires separate proof
+~~~
+
+### Current production blocker
+
+~~~text
+resolver not yet wired
+    -> TargetState::clone still returns no distinct state
+    -> OutputHandoff unavailable
+    -> no XeSS Execute
+~~~
+
+Keep PR66 Draft and unmerged.
