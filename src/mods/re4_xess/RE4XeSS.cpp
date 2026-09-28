@@ -1172,6 +1172,23 @@ public:
         return probe;
     }
 
+    bool arm_provenance_early() noexcept {
+        if (!sdk::GameIdentity::get().is_re4()) {
+            return false;
+        }
+
+        const auto image = inspect_main_image();
+        if (!image.valid || image.size != EXPECTED_IMAGE_SIZE || image.checksum != EXPECTED_IMAGE_CHECKSUM) {
+            m_provenance_attempted.store(true, std::memory_order_release);
+            spdlog::warn("[RE4XeSS][TargetStateProvenance] early arm rejected: RE4 image identity mismatch size=0x{:x} checksum=0x{:x}",
+                image.size, image.checksum);
+            return false;
+        }
+
+        m_frame_id = 0;
+        return arm_provenance_hooks(image);
+    }
+
     bool arm(
         uint64_t frame_id,
         sdk::renderer::layer::Overlay* overlay,
@@ -1210,16 +1227,6 @@ public:
         m_image_end = image.base + image.size;
         m_frame_id = frame_id;
         m_arm_thread_id = GetCurrentThreadId();
-        m_overlay_state = reinterpret_cast<uintptr_t>(overlay_state);
-        m_overlay_desc = m_overlay_state + RE4_RENDER_RESOURCE_SIZE;
-        m_overlay_snapshot_valid = read_private_memory(m_overlay_state, &m_overlay_snapshot, sizeof(m_overlay_snapshot));
-        m_overlay_rtv_array = m_overlay_snapshot_valid ? m_overlay_snapshot.rtvs : 0;
-        m_overlay_rtv = 0;
-        if (m_overlay_snapshot_valid && m_overlay_snapshot.num_rtv != 0 &&
-            m_overlay_snapshot.num_rtv <= MAX_TARGET_STATE_RTVS && m_overlay_snapshot.rtvs != 0) {
-            // Read the intrusive pointer's raw value only; do not AddRef/Release it.
-            read_private_memory(m_overlay_snapshot.rtvs, &m_overlay_rtv, sizeof(m_overlay_rtv));
-        }
         m_semantic_color = reinterpret_cast<uintptr_t>(semantic_color);
         m_calls_captured.store(0, std::memory_order_release);
         m_returns_captured.store(0, std::memory_order_release);
@@ -1291,7 +1298,6 @@ public:
             MAX_CAPTURED_CALLS_PER_SITE,
             MAX_PENDING_PRESENT_GRACE);
         log_overlay_state_snapshot();
-        (void)arm_provenance_hooks(image);
         return true;
     }
 
@@ -1366,11 +1372,12 @@ public:
         (void)refresh_provenance_overlay_slot(
             overlay,
             overlay->get_main_target_state().get(),
-            m_frame_id + m_provenance_frames.load(std::memory_order_acquire));
+            m_provenance_frames.load(std::memory_order_acquire));
     }
 
     void on_post_present() noexcept {
         if (m_provenance_active.load(std::memory_order_acquire)) {
+            report_early_provenance_observations();
             poll_pending_provenance_write();
             const auto elapsed_frames = m_provenance_frames.fetch_add(1, std::memory_order_acq_rel) + 1;
             const bool capture_limit_reached =
@@ -1448,6 +1455,37 @@ private:
         uint32_t frames_waited{};
     };
 
+    struct EarlyProvenanceObservation {
+        uint64_t id{};
+        uint64_t frame_id{};
+        uint32_t writer_site_rva{};
+        uint32_t caller_return_rva{};
+        uint32_t caller_callsite_rva{};
+        DWORD thread_id{};
+        uintptr_t receiver{};
+        uintptr_t slot{};
+        uintptr_t previous_value{};
+        uintptr_t incoming_value{};
+        uintptr_t source_owner{};
+        uintptr_t source_slot{};
+        uintptr_t source_value{};
+        uintptr_t caller_return{};
+        std::array<uintptr_t, 5> registers{};
+        std::array<uintptr_t, 4> stack_arguments{};
+        int32_t receiver_ref_count{};
+        bool previous_readable{};
+        bool source_slot_readable{};
+        bool caller_return_readable{};
+        bool stack_arguments_readable{};
+        bool receiver_header_readable{};
+        bool direct_transfer_route{};
+    };
+
+    struct EarlyProvenanceEntry {
+        std::atomic<bool> ready{};
+        EarlyProvenanceObservation observation{};
+    };
+
     struct TargetStateLayoutSnapshot {
         uintptr_t vtable{};
         int32_t ref_count{};
@@ -1498,6 +1536,7 @@ private:
     static constexpr uint32_t MAX_PROVENANCE_FRAMES = 1800;
     static constexpr uint32_t MAX_PROVENANCE_PENDING_FRAMES = 4;
     static constexpr uint32_t MAX_PROVENANCE_PENDING_GRACE = 2;
+    static constexpr size_t MAX_EARLY_PROVENANCE_WRITES = 32;
     static constexpr uint32_t MAX_TARGET_STATE_RTVS = D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT;
     static constexpr size_t SITE_COUNT = 4;
     // Isolate the nested owner vcall so its ABI and return can be measured without other probe hooks.
@@ -1558,6 +1597,12 @@ private:
     std::atomic<bool> m_provenance_pending_overflow_logged{};
     std::atomic<uint64_t> m_provenance_next_id{};
     std::atomic<int> m_provenance_pending_state{};
+    std::atomic<uint32_t> m_early_provenance_count{};
+    std::atomic<uint32_t> m_early_provenance_reported_count{};
+    std::atomic<uint32_t> m_early_provenance_correlated_count{};
+    std::atomic<bool> m_early_provenance_overflow{};
+    std::atomic<bool> m_early_provenance_overflow_logged{};
+    std::array<EarlyProvenanceEntry, MAX_EARLY_PROVENANCE_WRITES> m_early_provenance_observations{};
     PendingProvenanceWrite m_pending_provenance_write{};
     std::array<safetyhook::MidHook, PROVENANCE_HOOK_COUNT> m_provenance_hooks{};
     uintptr_t m_image_base{};
@@ -1571,6 +1616,7 @@ private:
     uintptr_t m_semantic_color{};
     TargetStateLayoutSnapshot m_overlay_snapshot{};
     bool m_overlay_snapshot_valid{};
+    bool m_overlay_snapshot_attempted{};
     std::array<safetyhook::MidHook, HOOK_COUNT> m_hooks{};
     inline static thread_local std::array<PendingObservation, MAX_CAPTURED_CALLS> s_pending_observations{};
 
@@ -1699,7 +1745,7 @@ private:
             m_provenance_overlay_object.store(overlay_address, std::memory_order_release);
             m_provenance_overlay_slot.store(0, std::memory_order_release);
             if (!m_provenance_slot_invalid_logged.exchange(true, std::memory_order_acq_rel)) {
-                spdlog::warn("[RE4XeSS][TargetStateProvenance] not armed: runtime Overlay slot validation failed overlay=0x{:x} slot=0x{:x} offset=0x{:x} expectedOffset=0x{:x} slotReadable={} slotValue=0x{:x} accessorValue=0x{:x}",
+                spdlog::warn("[RE4XeSS][TargetStateProvenance] Overlay slot validation failed overlay=0x{:x} slot=0x{:x} offset=0x{:x} expectedOffset=0x{:x} slotReadable={} slotValue=0x{:x} accessorValue=0x{:x}",
                     overlay_address, slot_address,
                     slot_address >= overlay_address ? slot_address - overlay_address : 0,
                     RE4_TARGET_STATE_SLOT_OFFSET,
@@ -1710,13 +1756,29 @@ private:
             return false;
         }
 
-        const auto previous_object = m_provenance_overlay_object.exchange(overlay_address, std::memory_order_acq_rel);
-        const auto previous_slot = m_provenance_overlay_slot.exchange(slot_address, std::memory_order_acq_rel);
+        const auto previous_object = m_provenance_overlay_object.load(std::memory_order_acquire);
+        const auto previous_slot = m_provenance_overlay_slot.load(std::memory_order_acquire);
+        if (!m_overlay_snapshot_attempted) {
+            m_overlay_snapshot_attempted = true;
+            m_overlay_state = current_state;
+            m_overlay_desc = m_overlay_state + RE4_RENDER_RESOURCE_SIZE;
+            m_overlay_snapshot_valid = read_private_memory(m_overlay_state, &m_overlay_snapshot, sizeof(m_overlay_snapshot));
+            m_overlay_rtv_array = m_overlay_snapshot_valid ? m_overlay_snapshot.rtvs : 0;
+            m_overlay_rtv = 0;
+            if (m_overlay_snapshot_valid && m_overlay_snapshot.num_rtv != 0 &&
+                m_overlay_snapshot.num_rtv <= MAX_TARGET_STATE_RTVS && m_overlay_snapshot.rtvs != 0) {
+                // Read the intrusive pointer's raw value only; do not AddRef/Release it.
+                read_private_memory(m_overlay_snapshot.rtvs, &m_overlay_rtv, sizeof(m_overlay_rtv));
+            }
+        }
+        m_provenance_overlay_object.store(overlay_address, std::memory_order_release);
+        m_provenance_overlay_slot.store(slot_address, std::memory_order_release);
         if (previous_object != overlay_address || previous_slot != slot_address) {
             spdlog::info("[RE4XeSS][TargetStateProvenance] overlay-slot baseline frame={} overlay=0x{:x} slot=0x{:x} targetState=0x{:x} offset=0x{:x} derivedFromAccessor=true",
                 static_cast<unsigned long long>(frame_id), overlay_address, slot_address, current_state,
                 slot_address - overlay_address);
         }
+        report_early_provenance_observations();
         return true;
     }
 
@@ -1853,18 +1915,14 @@ private:
             return false;
         }
 
-        const auto overlay = m_provenance_overlay_object.load(std::memory_order_acquire);
-        const auto slot = m_provenance_overlay_slot.load(std::memory_order_acquire);
-        if (overlay == 0 || slot == 0 || slot - overlay != RE4_TARGET_STATE_SLOT_OFFSET) {
-            spdlog::warn("[RE4XeSS][TargetStateProvenance] not armed: no validated runtime Overlay slot overlay=0x{:x} slot=0x{:x}",
-                overlay, slot);
-            return false;
-        }
         if (!validate_provenance_writer(image)) {
-            spdlog::warn("[RE4XeSS][TargetStateProvenance] not armed: RE4 Overlay writer fingerprint/ownership validation failed functionRva=0x{:x}",
+            spdlog::warn("[RE4XeSS][TargetStateProvenance] early arm rejected: RE4 Overlay writer fingerprint/ownership validation failed functionRva=0x{:x}",
                 RE4_TARGET_STATE_ASSIGNMENT_RVA);
             return false;
         }
+
+        m_image_base = image.base;
+        m_image_end = image.base + image.size;
 
         static constexpr std::array<uint32_t, PROVENANCE_HOOK_COUNT> hook_rvas{
             0x4597C9,
@@ -1883,7 +1941,7 @@ private:
                         (void)hook.disable();
                     }
                 }
-                spdlog::warn("[RE4XeSS][TargetStateProvenance] not armed: failed to create bounded writer hook index={} siteRva=0x{:x}",
+                spdlog::warn("[RE4XeSS][TargetStateProvenance] early arm failed: could not create bounded writer hook index={} siteRva=0x{:x}",
                     index, hook_rvas[index]);
                 return false;
             }
@@ -1896,29 +1954,31 @@ private:
                         (void)hook.disable();
                     }
                 }
-                spdlog::warn("[RE4XeSS][TargetStateProvenance] not armed: writer hook span invalid index={} siteRva=0x{:x} stolen={} nextBoundaryRva=0x{:x}",
+                spdlog::warn("[RE4XeSS][TargetStateProvenance] early arm failed: writer hook span invalid index={} siteRva=0x{:x} stolen={} nextBoundaryRva=0x{:x}",
                     index, hook_rvas[index], stolen_bytes, next_site);
                 return false;
             }
         }
 
+        m_provenance_active.store(true, std::memory_order_release);
         for (size_t index = 0; index < m_provenance_hooks.size(); ++index) {
             if (!m_provenance_hooks[index].enable()) {
+                m_provenance_active.store(false, std::memory_order_release);
                 for (auto& hook : m_provenance_hooks) {
                     if (hook) {
                         (void)hook.disable();
                     }
                 }
-                spdlog::warn("[RE4XeSS][TargetStateProvenance] not armed: failed to enable bounded writer hook index={} siteRva=0x{:x}",
+                spdlog::warn("[RE4XeSS][TargetStateProvenance] early arm failed: could not enable bounded writer hook index={} siteRva=0x{:x}",
                     index, hook_rvas[index]);
                 return false;
             }
         }
 
-        m_provenance_active.store(true, std::memory_order_release);
-        spdlog::info("[RE4XeSS][TargetStateProvenance] armed writerFunctionRva=0x{:x} overlay=0x{:x} slot=0x{:x} slotOffset=0x{:x} sourceOwnerGlobalRva=0x{:x} sourceFieldOffset=0x60 addRefRva=0x39d6ed0 releaseRva=0x39df010 maxWrites={} maxFrames={} capture=matching-runtime-slot-only",
-            RE4_TARGET_STATE_ASSIGNMENT_RVA, overlay, slot, RE4_TARGET_STATE_SLOT_OFFSET,
-            RE4_TARGET_STATE_SOURCE_OWNER_RVA, MAX_PROVENANCE_WRITES, MAX_PROVENANCE_FRAMES);
+        spdlog::info("[RE4XeSS][TargetStateProvenance] early-armed writerFunctionRva=0x{:x} thread={} imageSize=0x{:x} checksum=0x{:x} sourceOwnerGlobalRva=0x{:x} sourceFieldOffset=0x60 addRefRva=0x39d6ed0 releaseRva=0x39df010 maxEarlyWrites={} maxMatchedWrites={} maxFrames={} frameBasis=post-present-count-from-early-arm capture=unbound-until-live-overlay-slot",
+            RE4_TARGET_STATE_ASSIGNMENT_RVA, GetCurrentThreadId(), image.size, image.checksum,
+            RE4_TARGET_STATE_SOURCE_OWNER_RVA, MAX_EARLY_PROVENANCE_WRITES,
+            MAX_PROVENANCE_WRITES, MAX_PROVENANCE_FRAMES);
         return true;
     }
 
@@ -1935,13 +1995,95 @@ private:
                 disable_failed = true;
             }
         }
-        spdlog::info("[RE4XeSS][TargetStateProvenance] disarmed reason={} frames={} writes={} confirmedAssignments={} pendingState={} disableFailed={}",
+        report_early_provenance_observations();
+        spdlog::info("[RE4XeSS][TargetStateProvenance] disarmed reason={} frames={} writes={} confirmedAssignments={} earlyCaptured={} earlyCorrelated={} earlyOverflow={} overlayKnown={} pendingState={} disableFailed={}",
             reason,
             m_provenance_frames.load(std::memory_order_acquire),
             m_provenance_write_count.load(std::memory_order_acquire),
             m_provenance_confirmed_count.load(std::memory_order_acquire),
+            std::min<uint32_t>(m_early_provenance_count.load(std::memory_order_acquire),
+                static_cast<uint32_t>(MAX_EARLY_PROVENANCE_WRITES)),
+            m_early_provenance_correlated_count.load(std::memory_order_acquire),
+            m_early_provenance_overflow.load(std::memory_order_acquire),
+            m_provenance_overlay_slot.load(std::memory_order_acquire) != 0,
             m_provenance_pending_state.load(std::memory_order_acquire),
             disable_failed);
+    }
+
+    void capture_unbound_provenance_write(size_t hook_index, uintptr_t receiver, const safetyhook::Context& context) noexcept {
+        auto index = m_early_provenance_count.load(std::memory_order_acquire);
+        while (index < MAX_EARLY_PROVENANCE_WRITES &&
+            !m_early_provenance_count.compare_exchange_weak(
+                index, index + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        }
+        if (index >= MAX_EARLY_PROVENANCE_WRITES) {
+            m_early_provenance_overflow.store(true, std::memory_order_release);
+            return;
+        }
+
+        static constexpr std::array<uint32_t, PROVENANCE_HOOK_COUNT> hook_rvas{
+            0x4597C9,
+            0x4597FB,
+            0x45981A,
+        };
+        EarlyProvenanceObservation observation{};
+        observation.id = m_provenance_next_id.fetch_add(1, std::memory_order_relaxed) + 1;
+        observation.frame_id = m_provenance_frames.load(std::memory_order_acquire);
+        observation.writer_site_rva = hook_rvas[hook_index];
+        observation.thread_id = GetCurrentThreadId();
+        observation.receiver = receiver;
+        observation.slot = receiver + RE4_TARGET_STATE_SLOT_OFFSET;
+        observation.incoming_value = static_cast<uintptr_t>(context.rdi);
+        observation.previous_readable = read_private_memory(
+            observation.slot, &observation.previous_value, sizeof(observation.previous_value));
+        observation.receiver_header_readable = read_private_memory(
+            receiver + sizeof(uintptr_t), &observation.receiver_ref_count, sizeof(observation.receiver_ref_count));
+
+        const bool source_owner_readable = read_memory(
+            m_image_base + RE4_TARGET_STATE_SOURCE_OWNER_RVA,
+            &observation.source_owner,
+            sizeof(observation.source_owner));
+        observation.source_slot_readable = source_owner_readable && observation.source_owner != 0 &&
+            observation.source_owner <= UINTPTR_MAX - 0x60 &&
+            read_private_memory(observation.source_owner + 0x60, &observation.source_value, sizeof(observation.source_value));
+        if (observation.source_slot_readable) {
+            observation.source_slot = observation.source_owner + 0x60;
+        }
+
+        const auto return_address_slot = static_cast<uintptr_t>(context.rsp);
+        observation.caller_return_readable = return_address_slot <= UINTPTR_MAX - 0x28 &&
+            read_memory(return_address_slot + 0x28, &observation.caller_return, sizeof(observation.caller_return));
+        if (observation.caller_return_readable &&
+            observation.caller_return >= m_image_base && observation.caller_return < m_image_end) {
+            observation.caller_return_rva = static_cast<uint32_t>(observation.caller_return - m_image_base);
+            if (observation.caller_return >= m_image_base + 5) {
+                std::array<uint8_t, 5> call_bytes{};
+                if (read_memory(observation.caller_return - 5, call_bytes.data(), call_bytes.size()) && call_bytes[0] == 0xE8) {
+                    int32_t displacement{};
+                    std::memcpy(&displacement, call_bytes.data() + 1, sizeof(displacement));
+                    if (static_cast<int64_t>(observation.caller_return - m_image_base) + displacement ==
+                        RE4_TARGET_STATE_ASSIGNMENT_RVA) {
+                        observation.caller_callsite_rva = observation.caller_return_rva - 5;
+                    }
+                }
+            }
+        }
+
+        observation.stack_arguments_readable = return_address_slot <= UINTPTR_MAX - 0x50 &&
+            read_memory(return_address_slot + 0x50,
+                observation.stack_arguments.data(), sizeof(observation.stack_arguments));
+        observation.registers = {
+            static_cast<uintptr_t>(context.rcx),
+            static_cast<uintptr_t>(context.rdx),
+            static_cast<uintptr_t>(context.rbx),
+            static_cast<uintptr_t>(context.rdi),
+            static_cast<uintptr_t>(context.rax),
+        };
+        observation.direct_transfer_route = observation.receiver_header_readable && observation.receiver_ref_count < 0;
+
+        auto& entry = m_early_provenance_observations[index];
+        entry.observation = observation;
+        entry.ready.store(true, std::memory_order_release);
     }
 
     void capture_provenance_write(size_t hook_index, const safetyhook::Context& context) noexcept {
@@ -1953,8 +2095,14 @@ private:
         const auto receiver = hook_index == 0
             ? static_cast<uintptr_t>(context.rdx)
             : static_cast<uintptr_t>(context.rbx);
-        if (overlay_slot == 0 || receiver == 0 || receiver > UINTPTR_MAX - RE4_TARGET_STATE_SLOT_OFFSET ||
-            receiver + RE4_TARGET_STATE_SLOT_OFFSET != overlay_slot) {
+        if (receiver == 0 || receiver > UINTPTR_MAX - RE4_TARGET_STATE_SLOT_OFFSET) {
+            return;
+        }
+        if (overlay_slot == 0) {
+            capture_unbound_provenance_write(hook_index, receiver, context);
+            return;
+        }
+        if (receiver + RE4_TARGET_STATE_SLOT_OFFSET != overlay_slot) {
             return;
         }
 
@@ -2024,7 +2172,7 @@ private:
             : "incoming-AddRef-then-atomic-replace-and-release-old";
         spdlog::info("[RE4XeSS][TargetStateProvenance] stage=write-attempt id={} frame={} writerSiteRva=0x{:x} writerFunctionRva=0x{:x} operation={} receiver=0x{:x} overlay=0x{:x} slot=0x{:x} previous=0x{:x} previousReadable={} incoming=0x{:x} sourceOwnerGlobalRva=0x{:x} sourceOwner=0x{:x} sourceSlot=0x{:x} sourceSlotReadable={} sourceValue=0x{:x} sourceMatchesIncoming={} receiverRefCount={} receiverHeaderReadable={} ownershipRoute={} callerReturn=0x{:x} callerReturnRva=0x{:x} callerDirectCallsiteRva=0x{:x} callerReturnReadable={} regs[rcx=0x{:x},rdx=0x{:x},rbx=0x{:x},rdi=0x{:x},rax=0x{:x}] stackArgs[0x{:x},0x{:x},0x{:x},0x{:x}] stackArgsReadable={}",
             static_cast<unsigned long long>(capture_id),
-            static_cast<unsigned long long>(m_frame_id + m_provenance_frames.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(m_provenance_frames.load(std::memory_order_acquire)),
             writer_site_rva,
             RE4_TARGET_STATE_ASSIGNMENT_RVA,
             hook_index == 0 ? "mov" : "lock-cmpxchg",
@@ -2058,7 +2206,7 @@ private:
         inspect_provenance_candidate(capture_id, incoming);
         publish_pending_provenance_write({
             .id = capture_id,
-            .frame_id = m_frame_id + m_provenance_frames.load(std::memory_order_acquire),
+            .frame_id = m_provenance_frames.load(std::memory_order_acquire),
             .slot = overlay_slot,
             .previous_value = previous,
             .incoming_value = incoming,
@@ -2130,6 +2278,91 @@ private:
             rtv0.format, rtv0.dimension, m_overlay_rtv, overlay_rtv0_valid,
             overlay_rtv0.format, overlay_rtv0.dimension, overlay_rtv_desc_match,
             texture_slot_readable, texture, texture_header_valid);
+    }
+
+    void report_early_provenance_observations() noexcept {
+        while (true) {
+            auto index = m_early_provenance_reported_count.load(std::memory_order_acquire);
+            const auto captured = std::min<uint32_t>(
+                m_early_provenance_count.load(std::memory_order_acquire),
+                static_cast<uint32_t>(MAX_EARLY_PROVENANCE_WRITES));
+            if (index >= captured) {
+                break;
+            }
+
+            auto& entry = m_early_provenance_observations[index];
+            if (!entry.ready.load(std::memory_order_acquire)) {
+                break;
+            }
+            if (!m_early_provenance_reported_count.compare_exchange_weak(
+                    index, index + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                continue;
+            }
+
+            const auto observation = entry.observation;
+            const auto overlay = m_provenance_overlay_object.load(std::memory_order_acquire);
+            const auto overlay_slot = m_provenance_overlay_slot.load(std::memory_order_acquire);
+            const bool correlation_candidate = overlay != 0 && overlay_slot != 0 &&
+                (observation.receiver == overlay || observation.slot == overlay_slot);
+            const char* ownership_route = observation.direct_transfer_route
+                ? "direct-transfer-negative-owner-refcount"
+                : "incoming-AddRef-then-atomic-replace-and-release-old";
+            spdlog::info("[RE4XeSS][TargetStateProvenance] stage=early-write id={} frame={} tid={} writerSiteRva=0x{:x} writerFunctionRva=0x{:x} operation={} receiver=0x{:x} receiverSlot=0x{:x} previous=0x{:x} previousReadable={} incoming=0x{:x} sourceOwnerGlobalRva=0x{:x} sourceOwner=0x{:x} sourceSlot=0x{:x} sourceSlotReadable={} sourceValue=0x{:x} sourceMatchesIncoming={} receiverRefCount={} receiverHeaderReadable={} ownershipRoute={} callerReturn=0x{:x} callerReturnRva=0x{:x} callerCallsiteRva=0x{:x} callerReturnReadable={} regs[rcx=0x{:x},rdx=0x{:x},rbx=0x{:x},rdi=0x{:x},rax=0x{:x}] stackArgs[0x{:x},0x{:x},0x{:x},0x{:x}] stackArgsReadable={} overlayKnown={} correlationCandidate={}",
+                static_cast<unsigned long long>(observation.id),
+                static_cast<unsigned long long>(observation.frame_id),
+                observation.thread_id,
+                observation.writer_site_rva,
+                RE4_TARGET_STATE_ASSIGNMENT_RVA,
+                observation.writer_site_rva == 0x4597C9 ? "mov" : "lock-cmpxchg",
+                observation.receiver,
+                observation.slot,
+                observation.previous_value,
+                observation.previous_readable,
+                observation.incoming_value,
+                RE4_TARGET_STATE_SOURCE_OWNER_RVA,
+                observation.source_owner,
+                observation.source_slot,
+                observation.source_slot_readable,
+                observation.source_value,
+                observation.source_slot_readable && observation.source_value == observation.incoming_value,
+                observation.receiver_ref_count,
+                observation.receiver_header_readable,
+                ownership_route,
+                observation.caller_return,
+                observation.caller_return_rva,
+                observation.caller_callsite_rva,
+                observation.caller_return_readable,
+                observation.registers[0], observation.registers[1], observation.registers[2],
+                observation.registers[3], observation.registers[4],
+                observation.stack_arguments[0], observation.stack_arguments[1],
+                observation.stack_arguments[2], observation.stack_arguments[3],
+                observation.stack_arguments_readable,
+                overlay != 0 && overlay_slot != 0,
+                correlation_candidate);
+
+            if (correlation_candidate) {
+                uintptr_t current_live_state{};
+                const bool current_live_state_readable = read_private_memory(
+                    overlay_slot, &current_live_state, sizeof(current_live_state));
+                m_early_provenance_correlated_count.fetch_add(1, std::memory_order_acq_rel);
+                spdlog::info("[RE4XeSS][TargetStateProvenance] stage=early-correlation id={} receiver=0x{:x} overlay=0x{:x} slot=0x{:x} previous=0x{:x} incoming=0x{:x} currentLiveTargetState=0x{:x} currentLiveReadable={} incomingMatchesCurrent={} sourceValue=0x{:x} sourceMatchesIncoming={} writerSiteRva=0x{:x} callerCallsiteRva=0x{:x} ownershipRoute={}",
+                    static_cast<unsigned long long>(observation.id),
+                    observation.receiver, overlay, overlay_slot,
+                    observation.previous_value, observation.incoming_value,
+                    current_live_state, current_live_state_readable,
+                    current_live_state_readable && observation.incoming_value == current_live_state,
+                    observation.source_value,
+                    observation.source_slot_readable && observation.source_value == observation.incoming_value,
+                    observation.writer_site_rva, observation.caller_callsite_rva, ownership_route);
+                inspect_provenance_candidate(observation.id, observation.incoming_value);
+            }
+        }
+
+        if (m_early_provenance_overflow.load(std::memory_order_acquire) &&
+            !m_early_provenance_overflow_logged.exchange(true, std::memory_order_acq_rel)) {
+            spdlog::warn("[RE4XeSS][TargetStateProvenance] early observation buffer full capacity={} additionalUnboundWritesDropped=true",
+                MAX_EARLY_PROVENANCE_WRITES);
+        }
     }
 
     void publish_pending_provenance_write(const PendingProvenanceWrite& pending) noexcept {
@@ -2708,6 +2941,17 @@ std::filesystem::path reframework_module_directory() {
     return module_path ? std::filesystem::path{ *module_path }.parent_path() : std::filesystem::path{};
 }
 
+bool re4_xess_diagnostics_enabled_from_config() noexcept {
+    try {
+        utility::Config config{
+            (REFramework::get_persistent_dir() / REFrameworkConfig::REFRAMEWORK_CONFIG_NAME).string()
+        };
+        return config.get<bool>(std::string{ REFrameworkConfig::DEBUG_LOG_CONFIG_NAME }).value_or(false);
+    } catch (...) {
+        return false;
+    }
+}
+
 }
 
 RE4XeSS::~RE4XeSS() {
@@ -2719,6 +2963,10 @@ RE4XeSS::~RE4XeSS() {
 std::optional<std::string> RE4XeSS::on_initialize() {
     if (!sdk::GameIdentity::get().is_re4()) {
         return std::nullopt;
+    }
+
+    if (re4_xess_diagnostics_enabled_from_config()) {
+        (void)TargetStateFactoryProbe::instance().arm_provenance_early();
     }
 
     std::string error;
