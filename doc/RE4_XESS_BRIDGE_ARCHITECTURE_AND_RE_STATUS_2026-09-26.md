@@ -4963,3 +4963,257 @@ Do not add another broad D3D12 trace.
 Do not bypass OutputHandoff by copying XeSS output directly to the swapchain.
 
 The next meaningful milestone is a proven TargetState construction path and a distinct engine-visible single-RTV handoff state.
+
+
+---
+
+## 30. PR66 latest runtime — trust gate fixed and two TargetState-vtable xrefs discovered
+
+Latest runtime evidence:
+
+~~~text
+file: re2_framework_log(20260928-045315).txt
+commit header: a72333a1a9944c156bf947e43cfab9410877867c
+branch: feature/re4-xess-load-state-accessor-diagnostic
+build date/time: 2026-09-28 13:47
+~~~
+
+Important handoff note:
+
+> The local runtime contains diagnostic changes that are not yet fully represented by the current remote source at the same stamped commit.
+
+The runtime clearly uses:
+
+~~~text
+exception-directory / RUNTIME_FUNCTION coverage
+live-anchor trust decoupled from discoveryComplete
+~~~
+
+while the remote source at the stamped commit still reflects the older executable-section scanner / stricter trust gate.
+
+Before the next diagnostic change, preserve and push the exact local implementation that produced this runtime.
+
+### 30.1 Previous trust-gate blocker is resolved
+
+Runtime now proves:
+
+~~~text
+[TargetStateVtableProbe] live-anchor
+    liveVtable=0x7ff6396ec148
+    expectedVtable=0x7ff6396ec148
+    imageIdentityValid=true
+    match=true
+    discoveryComplete=false
+    trusted=true
+~~~
+
+The bounded TargetState probe subsequently arms:
+
+~~~text
+[TargetStateProbe] armed
+    frame=5285
+    isolatedSite=1
+    siteName=RTV owner vcall+0x40 A
+~~~
+
+Therefore:
+
+~~~text
+live TargetState exact match     ✅
+live anchor trusted              ✅
+TargetStateProbe arm             ✅
+full xref scan complete          ❌ not required for trust
+~~~
+
+Do not restore the old rule:
+
+~~~text
+trusted = match && discoveryComplete
+~~~
+
+### 30.2 RUNTIME_FUNCTION discovery found two exact vtable xrefs
+
+The new scanner reports:
+
+~~~text
+coverage=exception-directory-runtime-functions
+functions=508868
+scannedFunctions=507568
+failedFunctions=1300
+scannedBytes=0x74be117
+xrefCount=2
+truncated=false
+complete=false
+~~~
+
+The two positive xrefs are:
+
+~~~text
+xref 0
+    RVA = 0x47C3E0A
+    instruction = LEA rax, [rel imageBase+0x7B1C148]
+    bytes = 48 8D 05 37 83 35 03
+
+xref 1
+    RVA = 0x47D21AF
+    instruction = LEA rax, [rel imageBase+0x7B1C148]
+    bytes = 48 8D 05 92 9F 34 03
+~~~
+
+These are exact decoded RIP-relative references to the proven TargetState vtable.
+
+complete=false means discovery is not exhaustive.
+
+It does not invalidate the two positive xrefs already found.
+
+The two RVAs are now the strongest static leads for the actual TargetState constructor/initializer/destructor/type-use path.
+
+They are not production factory RVAs yet.
+
+### 30.3 Old site-1/provider-return path is exhausted
+
+The old isolated site-1 probe ran again.
+
+The same polymorphic callees appeared, including:
+
+~~~text
+re4+0x44742F0
+re4+0x447A540
+re4+0x78F42D0
+re4+0x44AF030
+~~~
+
+The re4+0x78F42D0 return again validated as unusable:
+
+~~~text
+numRtv=1
+rect=(0,0,2560,1440)
+overlayVtableMatch=false
+rtv0=0
+rtv0Valid=false
+targetStateLike=false
+~~~
+
+This reconfirms the prior rejection.
+
+Do not spend the next runtime capture on the same site-1/provider-return probe.
+
+### 30.4 Production blocker is unchanged
+
+The latest runtime still reaches:
+
+~~~text
+create_render_target_view  ✅
+create_texture             ✅
+create_target_state        ❌ unresolved
+distinct TargetState       ❌
+OutputHandoff install      ❌
+Worker submit              0
+hk_xessD3D12Execute        0
+~~~
+
+Repeated mode changes recreate the public XeSS frontend successfully, but every first valid temporal packet still fails at TargetState cloning/handoff.
+
+The repeated:
+
+~~~text
+xessDestroyContext result -8
+~~~
+
+remains the known downstream INVALID_CONTEXT teardown symptom before first Execute, not the primary blocker.
+
+### 30.5 Next work order
+
+PR66 follow-up comment:
+
+~~~text
+5863746550
+~~~
+
+The next commit should classify only the two discovered vtable xrefs.
+
+For each xref, capture its containing RUNTIME_FUNCTION:
+
+~~~text
+xrefRva
+functionIndex
+functionBeginRva
+functionEndRva
+xrefOffsetWithinFunction
+~~~
+
+and a strictly bounded decoded instruction window around it.
+
+The immediate questions are:
+
+~~~text
+where does the LEA-loaded vtable address flow?
+is it stored to object + 0?
+which register is the candidate object?
+is there a nearby allocation/base-constructor call?
+is there a release/deallocation path?
+does the function return the object?
+are the two xrefs constructor/destructor pairs, overloads, or type-query helpers?
+~~~
+
+Do not dynamically hook both functions yet.
+
+First classify the static contexts, then select the strongest single constructor/initializer candidate for a later bounded read-only dynamic probe.
+
+### 30.6 Diagnostic logging cleanup
+
+The RUNTIME_FUNCTION scan is structurally better because decode failure in one function does not terminate the scan.
+
+However, the latest run emits approximately 1300 individual decode-stopped warnings.
+
+Keep the final counters, but rate-limit individual failure logs to a small fixed number.
+
+Do not change scan semantics merely to suppress warnings.
+
+---
+
+## 31. Handoff state after latest runtime
+
+### Frozen proven facts
+
+~~~text
+LoadAccessor valid                                      proven
+Capture 22 production load behavior                     proven
+TargetState vtable RVA 0x7B1C148                       proven for exact RE4 image
+live-anchor match/trust                                 proven
+RUNTIME_FUNCTION-based bounded scan                     operational
+TargetState vtable xref 0x47C3E0A                      proven exact reference
+TargetState vtable xref 0x47D21AF                      proven exact reference
+TargetStateProbe can arm                                proven
+~~~
+
+### Rejected / retired
+
+~~~text
+legacy generic create_target_state                     rejected
+0x44C7A27                                              rejected factory
+0x47212A6                                              polymorphic dispatch only
+0x78F42D0 return                                       rejected usable TargetState
+0x4597A0                                               retired Overlay writer
+repeating old site-1 provider probe                    exhausted
+~~~
+
+### Current task
+
+~~~text
+classify 0x47C3E0A and 0x47D21AF containing functions
+    -> identify actual vtable store/object flow
+    -> choose strongest constructor/initializer candidate
+    -> only then add one bounded dynamic probe
+~~~
+
+### Current production blocker
+
+~~~text
+actual TargetState creator/factory ABI unknown
+    -> no distinct single-RTV handoff state
+    -> OutputHandoff unavailable
+    -> no XeSS Execute
+~~~
+
+Keep PR66 Draft and unmerged.
