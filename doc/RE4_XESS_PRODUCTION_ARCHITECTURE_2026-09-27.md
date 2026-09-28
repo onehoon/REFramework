@@ -1797,6 +1797,9 @@ Production code should implement the minimum stable contract, not carry broad ho
 | AD-57 | The production runtime no longer arms the completed CreateRenderTargetViewProbe in its normal RE4 XeSS path. Preserve the actual validated RTV factory resolver and OutputHandoff while locating the fault. |
 | AD-58 | A same-Overlay third-TargetState identity encountered during OutputHandoff restore is a terminal ownership uncertainty, not permission to overwrite the observed state with the saved original. Preserve old output generation pins and downstream lifetime constraints; first capture pointer identities and marker state. |
 | AD-59 | Quality-change ownership diagnosis must precede any recovery policy. Mode selection increments the control generation but does not establish which component wrote Overlay main TargetState. Capture bounded transition/first-failure evidence and suppress duplicate terminal errors without lifting quarantine. |
+| AD-60 | A repeatable native write AV at game-directory OptiScaler dxgi.dll+0x21256f, with first-chance RAX=0 and write target=0xc, requires disassembly of that exact binary and pointer-producer provenance before any semantic fix. Registers alone do not prove the instruction addressing mode or owning component. |
+| AD-61 | Treat 128 ordinary Execute api-enter/api-return logs as the deliberate MAX_EXECUTE_API_LOGS budget, not the total submission count; terminal submission=205 and 205 paired OptiScaler XeSS intercepts are separate evidence. Keep the narrow SEH filter and fail-closed quarantine intact. |
+| AD-62 | Post-fault quality requests do not validate healthy in-flight quality transition. Verify the same-Overlay third-TargetState mode-change issue separately from the exact-binary native OptiScaler AV. |
 
 ---
 
@@ -3148,3 +3151,122 @@ Sustained SR stability / XeFG validation                deferred
 ~~~
 
 Keep PR66 Draft/Open/unmerged. No speculative Intel SDK ABI, D3D12 barrier, or direct-swapchain changes are justified by this capture.
+
+
+---
+
+## 29. Exact-image native exception regression — 16:49 paired capture
+
+The REFramework log re2_framework_log(20260928-075010).txt and
+OptiScaler(5).log (44cfee4d / 20260926_090919) reproduce the previously
+observed OptiScaler game-directory dxgi.dll write access violation at the
+**same module-relative instruction RVA 0x21256f**.
+
+Relevant PR66 follow-up comment: **5865784530**.
+Review HEAD when posted: 0be6550ddc865dafc09fa3bbb0295a5c530203ed.
+REFramework local runtime reports build 11:26 and hash
+a9bd0b59cefde15317a774602b14a67548c2145e;
+do not substitute remote HEAD for exact built sources.
+
+### 29.1 Reproduced signature
+
+~~~text
+public XeSS first entered   16:49:29.124, submission 1, frame 7300
+native exception            16:49:31.223, submission 205, frame 7505
+input/output                1969x1107 -> 2560x1440
+control/reset generation    1 / 0
+exception code              0xc0000005
+access                      WRITE 0xc
+faulting module             <RE4 game directory>\dxgi.dll (OptiScaler proxy)
+moduleRVA                   0x21256f
+RIP                         0x7ffda6a4256f
+first-chance RAX            0x0
+RDX                         0x1f6f8945890
+RCX                         0x5cf6782388b50000
+R8                          0x0
+R9                          0x35094ce0
+R10                         0xec359125e7c0067
+R11                         0x6919c17fb0
+RSP                         0x6919c18200
+RBP                         0x6919c18300
+~~~
+
+The 2.10-second interval and approximate 205 submissions are
+repeatability conditions, not evidence of a literal timer/frame trigger.
+
+**A null RAX and a write-to-0xc do not by themselves identify the
+faulting assembly instruction.** Disassemble the exact binary to
+determine its effective address operand and containing source function.
+
+The REFramework normal-call telemetry uses MAX_EXECUTE_API_LOGS=128:
+128 api-enter and 128 api-return result=0 are printed, then ordinary
+per-call logging stops. The exceptional submission is still numbered
+205. The paired OptiScaler log contains 205 hk_xessD3D12Execute and
+202 XeSSFeatureDx12::EvaluateInternal Executing!! messages.
+Do not report missing logs 129–204 as missing calls; do not report
+205 completed successful GPU evaluations.
+
+### 29.2 Separate blockers remain separate
+
+Normal Overlay identities observed earlier in the same run:
+
+~~~text
+Overlay layer        0x1f4e5250800
+handoff TargetState  0x1f4e4b453a0
+saved original       0x1f4ccc98210
+~~~
+
+Delayed-marker settlements are observed at frames 7303, 7381 and 7460.
+
+The new capture does **not** reproduce the Section 28 third-state
+restore failure or the previous log flood. However, it does not
+validate the healthy-generation Quality -> Ultra Quality transition:
+Off -> Ultra Quality is the sole mode change before the AV;
+all subsequent mode changes take place after terminal worker failure.
+
+REF observes and logs the AV through its already implemented narrow
+EXCEPTION_CONTINUE_SEARCH filter, then terminates the worker operation,
+quarantines uncertain output lifetime and rejects automatic restart.
+Post-fault snapshots report bridgeWriterUncertain=true and
+retirementRequested=true. Preserve those fail-closed invariants.
+
+### 29.3 Engineering decision gates
+
+1. **Exact OptiScaler binary identification.** Inspect/hash the
+   game-directory dxgi.dll used during this run (not the system copy).
+   Record SHA-256, PE timestamp, image base/size, and exact build match.
+2. **Instruction and pointer provenance.** Disassemble around
+   0x21256f, recover function/callers from a matching PDB/map if
+   available and capture first-chance stack/context before C++
+   unwinding. Identify who produced the pointer and whether the
+   issue originates within OptiScaler XeSS/NGX integration, a
+   driver/interception callback, or a REF-provided argument.
+3. **Smallest owner-correct patch.** Do not change REF GPU barriers,
+   TargetState ownership, public XeSS ABI, or D3D12Hook/FG lifecycle
+   merely because OptiScaler is the faulting instruction module.
+4. **Independent validation.** Reproduce/test an active healthy
+   Quality -> Ultra Quality switch for Section 28, and separately
+   verify >300 continuous successful public XeSS submissions on the
+   exact OptiScaler build after a justified native AV fix.
+
+MenuCommon::Init re-entry around 16:49:31.204 precedes the exception
+but is only a temporal observation, not a proven cause.
+
+Status:
+
+~~~text
+TargetState clone / basic handoff                   VERIFIED
+public XeSS -> OptiScaler SR                       VERIFIED up to failure
+native exception module/RVA                        PROVEN
+faulting register snapshot                         PROVEN
+instruction / source function / pointer origin     UNKNOWN
+healthy-generation quality transition              NOT TESTED IN THIS RUN
+sustained SR (>300)                                 BLOCKED
+XeFG production                                     DEFERRED
+~~~
+
+Do not add process-wide VEH, broad exception translation,
+fake XeSS success, automatic context restart, or forced Overlay state
+repair without independent ownership proof.
+
+Keep PR66 Draft / Open / unmerged.
