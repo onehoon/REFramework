@@ -7116,3 +7116,116 @@ XeFG production validation                               DEFERRED
 ~~~
 
 PR66 remains Draft / Open / unmerged.
+
+
+---
+
+## 45. Exact OptiScaler DXGI binary disassembly — internal global slot confirmed
+
+**Supersedes only the “faulting instruction / immediate pointer source UNKNOWN” wording in Sections 43–44.** The earlier 16:49 capture, pending OutputHandoff quality-switch investigation, and sustained-SR blocker remain valid.
+
+Evidence was posted to [PR66 issue comment 5865873929](https://github.com/onehoon/REFramework/pull/66#issuecomment-5865873929) following exact-binary disassembly of the game-directory OptiScaler proxy from the 16:49 paired capture.
+
+### 45.1 Pinned binary identity
+
+~~~text
+File: <RE4 game directory>\dxgi.dll
+SHA-256:
+  60E6FB52F924C1C47ED7ECE4B19B747112FA09C2492F323E558E30957196C2B8
+
+OptiScaler log:
+  v10.0.0-dev
+  commit 44cfee4d
+  build 20260926_090919
+
+PE32+ x64
+Preferred image base: 0x180000000
+SizeOfImage:          0x18AB000
+File size:            25,743,872 bytes
+Debug-directory timestamp: 2026-09-26 09:12:09Z
+~~~
+
+The local analysis did not find a matching PDB alongside the DLL. The local OptiScaler checkout also did not contain the log-reported 44cfee4d revision. **The upstream GitHub commit 44cfee4d436857742a9bf71bbe81396ec9989715 exists**, but its source alone does not prove a newly built PDB matches the captured optimized DLL. Match the PDB GUID/Age (or reproduce the crash using the *new* PDB-matched DLL) before assigning source lines to the original RVA.
+
+### 45.2 Faulting instruction and pointer provenance: proven
+
+Windows exception from the 16:49 capture:
+
+~~~text
+exception code: 0xC0000005
+faulting module RVA: 0x21256F
+first-chance RAX: 0x0
+access: WRITE
+effective address: 0xC
+~~~
+
+The exact file's .pdata places RVA 0x21256F within:
+
+~~~text
+RUNTIME_FUNCTION: [0x2124C0, 0x212949)
+~~~
+
+Disassembly of the **captured file**, not an assumed rebuilt binary:
+
+~~~asm
+; RVA 0x212568, bytes 48 8B 05 49 FC 63 01:
+mov rax, qword ptr [rip+0x163fc49] ; module global at dxgi.dll+0x18521B8
+
+; RVA 0x21256F, bytes 83 48 0C 10:
+or dword ptr [rax+0xC], 0x10
+~~~
+
+With RAX=0, the faulting operand resolves to WRITE 0xC exactly. This eliminates uncertainty over the **faulting instruction and immediate pointer source**.
+
+The pointer was loaded independently from OptiScaler's module-global slot at RVA 0x18521B8, **not directly from incoming RCX/RDX/R8**. However, this observation does **not** establish what owns or initializes that slot, or whether its source state originally came from a REF-provided object/callback.
+
+### 45.3 Static caller and slot writer evidence
+
+~~~text
+immediate direct caller:
+  CALL at dxgi.dll+0x1D1945 -> dxgi.dll+0x2124C0
+
+caller RCX source:
+  separate module-global slot dxgi.dll+0x1845FA8
+
+faulting target pointer source:
+  module-global slot dxgi.dll+0x18521B8
+
+observed static stores to the target global:
+  dxgi.dll+0x20CF06
+  dxgi.dll+0x20CF17
+  dxgi.dll+0x20D6C1
+~~~
+
+These are concrete static program relationships. They do not explain why the target slot is null at submission 205; no valid C++ symbol/ownership label has yet been assigned.
+
+Recommended next evidence:
+
+1. Match the exact captured binary to its original PDB/build map; if absent, fetch upstream source at commit 44cfee4d, build ReleaseDebug and reproduce with the **new matched binary+PDB** (do not symbolicate the old RVA using the new PDB without a match).
+2. In a first-chance debugger session, inspect the target global at +0x18521B8, its stores and the caller at +0x1D1945, and capture the pre-unwind stack and relevant object lifetime.
+3. Determine whether the slot was never initialized, cleared by a teardown/transition, or points to an external object that was invalidated. Do not label any of these alternatives as established yet.
+4. Make only the smallest owner-correct source fix once a responsible source symbol/lifecycle path is proven. Keep stock-OptiScaler public XeSS compatibility as the target.
+
+### 45.4 Scope of next REFramework work
+
+The PR66 code should **not** add a null check, bypass, recovery retry, fabricated XeSS success, D3D12 resource-state change, or output-lifetime relaxation merely to mask this exact OptiScaler-internal dereference.
+
+No REFramework source change, test DLL, code commit, or push was made by the exact-binary analysis step. PR66 remained Draft/Open; head at that checkpoint was 2ae09f78c70a18719d854de2e0ea61fe1c6f09c3.
+
+Maintain these as **two independent pending gates**:
+
+~~~text
+A. sustained public XeSS SR:
+   OptiScaler dxgi.dll+0x21256F
+   0xC0000005 WRITE 0xC
+   internal global +0x18521B8 is null
+   owner/source lifecycle still UNKNOWN
+
+B. live healthy-generation Quality -> Ultra Quality:
+   same-Overlay unexpected third TargetState
+   origin and safe retirement still UNKNOWN
+
+XeFG production validation: DEFERRED
+~~~
+
+The next meaningful proof is the C++ owner and lifecycle of the **OptiScaler-internal target global**, not another broad REF-side hook.
