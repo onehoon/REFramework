@@ -18,6 +18,152 @@ std::atomic_flag execute_api_exception_logged = ATOMIC_FLAG_INIT;
 std::atomic_flag execute_api_failure_logged = ATOMIC_FLAG_INIT;
 constexpr uint32_t MAX_EXECUTE_API_LOGS = 128;
 
+struct NativeExceptionObservation {
+    DWORD code{};
+    DWORD flags{};
+    uintptr_t exception_address{};
+    uintptr_t instruction_pointer{};
+    ULONG parameter_count{};
+    ULONG_PTR information0{};
+    ULONG_PTR information1{};
+    bool valid{};
+};
+
+LONG capture_native_exception(EXCEPTION_POINTERS* exception_info, NativeExceptionObservation* observation) noexcept {
+    if (exception_info != nullptr && exception_info->ExceptionRecord != nullptr && observation != nullptr) {
+        const auto* record = exception_info->ExceptionRecord;
+        observation->code = record->ExceptionCode;
+        observation->flags = record->ExceptionFlags;
+        observation->exception_address = reinterpret_cast<uintptr_t>(record->ExceptionAddress);
+        observation->instruction_pointer = exception_info->ContextRecord != nullptr
+            ? static_cast<uintptr_t>(exception_info->ContextRecord->Rip)
+            : 0;
+        observation->parameter_count = record->NumberParameters;
+        if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) {
+            observation->information0 = record->ExceptionInformation[0];
+            observation->information1 = record->ExceptionInformation[1];
+        }
+        observation->valid = true;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+template <typename ExecuteFunction>
+xess_result_t invoke_xess_execute(
+    ExecuteFunction function,
+    xess_context_handle_t context,
+    ID3D12GraphicsCommandList* command_list,
+    const xess_d3d12_execute_params_t* params,
+    NativeExceptionObservation* observation) {
+    xess_result_t result{};
+#if defined(_WIN32) && defined(_MSC_VER)
+    __try {
+        result = function(context, command_list, params);
+    } __except (capture_native_exception(GetExceptionInformation(), observation)) {
+        // The filter always continues search; this handler must never turn an
+        // external exception into a normal XeSS return.
+        std::terminate();
+    }
+#else
+    result = function(context, command_list, params);
+#endif
+    return result;
+}
+
+void log_native_exception(
+    const NativeExceptionObservation& observation,
+    uint64_t frame_id,
+    uint64_t control_generation,
+    uint64_t device_reset_generation,
+    uint64_t submission_sequence,
+    uint32_t bridge_slot,
+    uint32_t output_width,
+    uint32_t output_height,
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12Resource* original_velocity,
+    const xess_d3d12_execute_params_t& params) {
+    if (!observation.valid) {
+        return;
+    }
+
+    const auto faulting_address = observation.instruction_pointer != 0
+        ? observation.instruction_pointer
+        : observation.exception_address;
+    HMODULE faulting_module{};
+    std::string module_path{ "unresolved" };
+    uintptr_t module_rva{};
+    if (faulting_address != 0 && GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(faulting_address),
+            &faulting_module)) {
+        const auto module_base = reinterpret_cast<uintptr_t>(faulting_module);
+        module_rva = faulting_address >= module_base ? faulting_address - module_base : 0;
+        std::array<wchar_t, 32768> wide_path{};
+        const auto path_length = GetModuleFileNameW(
+            faulting_module,
+            wide_path.data(),
+            static_cast<DWORD>(wide_path.size()));
+        if (path_length != 0) {
+            const auto utf8_length = WideCharToMultiByte(
+                CP_UTF8,
+                0,
+                wide_path.data(),
+                static_cast<int>(path_length),
+                nullptr,
+                0,
+                nullptr,
+                nullptr);
+            if (utf8_length > 0) {
+                module_path.resize(static_cast<size_t>(utf8_length));
+                WideCharToMultiByte(
+                    CP_UTF8,
+                    0,
+                    wide_path.data(),
+                    static_cast<int>(path_length),
+                    module_path.data(),
+                    utf8_length,
+                    nullptr,
+                    nullptr);
+            }
+        }
+    }
+
+    const auto access_kind = observation.code == EXCEPTION_ACCESS_VIOLATION && observation.parameter_count >= 2
+        ? observation.information0 == 0 ? "read" : observation.information0 == 1 ? "write" : observation.information0 == 8 ? "execute" : "unknown"
+        : "n/a";
+    const auto faulting_address_argument = observation.code == EXCEPTION_ACCESS_VIOLATION && observation.parameter_count >= 2
+        ? static_cast<uintptr_t>(observation.information1)
+        : 0;
+    spdlog::error(
+        "[RE4XeSS][Execute] native-exception frame={} workerThread={} controlGeneration={} resetGeneration={} slot={} submission={} commandList=0x{:x} color=0x{:x} depth=0x{:x} convertedMV=0x{:x} originalMV=0x{:x} output=0x{:x} input={}x{} outputExtent={}x{} resetHistory={} code=0x{:08x} ExceptionAddress=0x{:x} Rip=0x{:x} module={} moduleRVA=0x{:x} ExceptionFlags=0x{:x} NumberParameters={} accessKind={} targetAddress=0x{:x}",
+        static_cast<unsigned long long>(frame_id),
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(control_generation),
+        static_cast<unsigned long long>(device_reset_generation),
+        bridge_slot,
+        static_cast<unsigned long long>(submission_sequence),
+        reinterpret_cast<uintptr_t>(command_list),
+        reinterpret_cast<uintptr_t>(params.pColorTexture),
+        reinterpret_cast<uintptr_t>(params.pDepthTexture),
+        reinterpret_cast<uintptr_t>(params.pVelocityTexture),
+        reinterpret_cast<uintptr_t>(original_velocity),
+        reinterpret_cast<uintptr_t>(params.pOutputTexture),
+        params.inputWidth,
+        params.inputHeight,
+        output_width,
+        output_height,
+        params.resetHistory != 0,
+        observation.code,
+        observation.exception_address,
+        observation.instruction_pointer,
+        module_path,
+        module_rva,
+        observation.flags,
+        observation.parameter_count,
+        access_kind,
+        faulting_address_argument);
+}
+
 void log_owner_thread_violation_once(const std::string& error) {
     if (!owner_thread_violation_logged.test_and_set(std::memory_order_relaxed)) {
         spdlog::error("[RE4XeSS][Failure] {}", error);
@@ -326,10 +472,27 @@ bool RE4XeSSRuntime::execute(
     }
 
     xess_result_t result{};
+    NativeExceptionObservation native_exception{};
     try {
-        result = m_functions.d3d12_execute(m_context, command_list, &params);
+        result = invoke_xess_execute(
+            m_functions.d3d12_execute,
+            m_context,
+            command_list,
+            &params,
+            &native_exception);
     } catch (const std::exception& exception) {
         if (!execute_api_exception_logged.test_and_set(std::memory_order_relaxed)) {
+            log_native_exception(native_exception,
+                diagnostics.frame_id,
+                diagnostics.control_generation,
+                diagnostics.device_reset_generation,
+                diagnostics.submission_sequence,
+                diagnostics.bridge_slot,
+                diagnostics.output_width,
+                diagnostics.output_height,
+                command_list,
+                diagnostics.original_velocity,
+                params);
             std::string_view what = exception.what() != nullptr ? exception.what() : "";
             if (what.size() > 512) {
                 what = what.substr(0, 512);
@@ -340,6 +503,17 @@ bool RE4XeSSRuntime::execute(
         throw;
     } catch (...) {
         if (!execute_api_exception_logged.test_and_set(std::memory_order_relaxed)) {
+            log_native_exception(native_exception,
+                diagnostics.frame_id,
+                diagnostics.control_generation,
+                diagnostics.device_reset_generation,
+                diagnostics.submission_sequence,
+                diagnostics.bridge_slot,
+                diagnostics.output_width,
+                diagnostics.output_height,
+                command_list,
+                diagnostics.original_velocity,
+                params);
             log_context(spdlog::level::err, "api-exception", "kind=unknown");
         }
         error = "xessD3D12Execute threw an unknown exception";

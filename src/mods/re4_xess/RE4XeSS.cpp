@@ -3686,7 +3686,6 @@ std::filesystem::path reframework_module_directory() {
 }
 
 RE4XeSS::~RE4XeSS() {
-    CreateRenderTargetViewProbe::instance().reset();
     m_worker.stop();
 }
 
@@ -3843,7 +3842,6 @@ void RE4XeSS::on_device_reset() {
     if (!sdk::GameIdentity::get().is_re4()) {
         return;
     }
-    CreateRenderTargetViewProbe::instance().reset();
     m_device_reset_generation.fetch_add(1, std::memory_order_acq_rel);
 }
 
@@ -4686,17 +4684,12 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
     control_request.caller_thread_id = callback_thread_id;
     control_request.external_fault = pending_worker_fault(control_generation, reset_generation);
     control_request.reframework_directory = reframework_module_directory();
-    ID3D12Device4* rtv_probe_device{};
     if (control_request.active) {
         (void)get_display_resolution(control_request.display);
-    }
-    if (requested_mode == UpscalingMode::Off) {
-        CreateRenderTargetViewProbe::instance().reset();
     }
     if (g_framework != nullptr && g_framework->get_renderer_type() == REFramework::RendererType::D3D12) {
         const auto& hook = g_framework->get_d3d12_hook();
         if (hook != nullptr) {
-            rtv_probe_device = hook->get_device();
             control_request.device = hook->get_device();
             control_request.queue = hook->get_command_queue();
         }
@@ -4929,11 +4922,6 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
     };
     RE4XeSSD3D12::OutputBinding output{};
     std::string handoff_error;
-    (void)CreateRenderTargetViewProbe::instance().ensure(
-        rtv_probe_device,
-        packet.frame_id,
-        packet.display_width,
-        packet.display_height);
     const auto handoff_prepare_result = m_output_handoff.prepare(
         layer,
         control_request.device.Get(),
