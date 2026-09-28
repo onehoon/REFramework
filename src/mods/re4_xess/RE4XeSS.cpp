@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
+#include <iomanip>
 #include <initializer_list>
 #include <limits>
 #include <optional>
@@ -23,6 +24,7 @@
 #include <safetyhook.hpp>
 #include <utility/Address.hpp>
 #include <utility/Module.hpp>
+#include <utility/Scan.hpp>
 #include <utility/VtableHook.hpp>
 
 #include "mods/REFrameworkConfig.hpp"
@@ -1173,21 +1175,22 @@ public:
         return probe;
     }
 
-    bool arm_provenance_early() noexcept {
+    bool discover_target_state_vtable_early() noexcept {
         if (!sdk::GameIdentity::get().is_re4()) {
             return false;
         }
 
         const auto image = inspect_main_image();
         if (!image.valid || image.size != EXPECTED_IMAGE_SIZE || image.checksum != EXPECTED_IMAGE_CHECKSUM) {
-            m_provenance_attempted.store(true, std::memory_order_release);
-            spdlog::warn("[RE4XeSS][TargetStateProvenance] early arm rejected: RE4 image identity mismatch size=0x{:x} checksum=0x{:x}",
+            spdlog::warn("[RE4XeSS][TargetStateVtableProbe] discovery rejected: RE4 image identity mismatch size=0x{:x} checksum=0x{:x}",
                 image.size, image.checksum);
             return false;
         }
 
-        m_frame_id = 0;
-        return arm_provenance_hooks(image);
+        m_image_base = image.base;
+        m_image_end = image.base + image.size;
+        m_expected_vtable.store(image.base + TARGET_STATE_VTABLE_RVA, std::memory_order_release);
+        return discover_vtable_xrefs(image);
     }
 
     bool arm(
@@ -1204,7 +1207,11 @@ public:
             return false;
         }
 
-        (void)refresh_provenance_overlay_slot(overlay, overlay_state, frame_id);
+        (void)refresh_live_overlay_anchor(overlay, overlay_state, frame_id);
+        if (!m_live_anchor_trusted.load(std::memory_order_acquire)) {
+            spdlog::warn("[RE4XeSS][TargetStateProbe] not armed: live TargetState vtable anchor is untrusted");
+            return false;
+        }
         if (m_attempted.exchange(true, std::memory_order_acq_rel)) {
             return false;
         }
@@ -1331,15 +1338,6 @@ public:
             }
         }
 
-        if (m_provenance_active.load(std::memory_order_acquire)) {
-            spdlog::info("[RE4XeSS][TargetStateProvenance] retained after short TargetStateProbe disarm reason={} frames={} maxFrames={} writes={} maxWrites={}",
-                reason,
-                m_provenance_frames.load(std::memory_order_acquire),
-                MAX_PROVENANCE_FRAMES,
-                m_provenance_write_count.load(std::memory_order_acquire),
-                MAX_PROVENANCE_WRITES);
-        }
-
         spdlog::info("[RE4XeSS][TargetStateProbe] disarmed reason={} captureStarted={} capturedCalls={} returnedCalls={} pendingCalls={} pendingPresentGrace={} captureBudgetReached={} disableFailed={}",
             reason,
             m_capture_started.load(std::memory_order_acquire),
@@ -1362,38 +1360,20 @@ public:
 
     void force_disarm_all(std::string_view reason) noexcept {
         disarm(reason);
-        disarm_provenance_hooks(reason);
     }
 
     void refresh_live_overlay_slot(sdk::renderer::layer::Overlay* overlay) noexcept {
-        if (!m_provenance_active.load(std::memory_order_acquire) || overlay == nullptr) {
+        if (!m_vtable_discovery_done.load(std::memory_order_acquire) || overlay == nullptr) {
             return;
         }
 
-        (void)refresh_provenance_overlay_slot(
+        (void)refresh_live_overlay_anchor(
             overlay,
             overlay->get_main_target_state().get(),
-            m_provenance_frames.load(std::memory_order_acquire));
+            0);
     }
 
     void on_post_present() noexcept {
-        if (m_provenance_active.load(std::memory_order_acquire)) {
-            report_early_provenance_observations();
-            poll_pending_provenance_write();
-            const auto elapsed_frames = m_provenance_frames.fetch_add(1, std::memory_order_acq_rel) + 1;
-            const bool capture_limit_reached =
-                m_provenance_write_count.load(std::memory_order_acquire) >= MAX_PROVENANCE_WRITES;
-            if (capture_limit_reached || elapsed_frames >= MAX_PROVENANCE_FRAMES) {
-                const auto pending_state = m_provenance_pending_state.load(std::memory_order_acquire);
-                if (pending_state == 0 ||
-                    m_provenance_pending_grace_frames.fetch_add(1, std::memory_order_acq_rel) + 1 >= MAX_PROVENANCE_PENDING_GRACE) {
-                    disarm_provenance_hooks(capture_limit_reached
-                            ? "bounded writer capture complete"
-                            : "bounded frame window expired");
-                }
-            }
-        }
-
         if (!m_active.load(std::memory_order_acquire)) {
             return;
         }
@@ -1527,9 +1507,10 @@ private:
 
     static constexpr uint32_t EXPECTED_IMAGE_SIZE = 0x0E405000;
     static constexpr uint32_t EXPECTED_IMAGE_CHECKSUM = 0x0DEE3479;
+    static constexpr uint32_t TARGET_STATE_VTABLE_RVA = 0x7B1C148;
     static constexpr uint32_t RE4_PROVIDER_CALLEE_RVA = 0x78F42D0;
     static constexpr uintptr_t RE4_RENDER_RESOURCE_SIZE = 0x18;
-    static constexpr uint32_t RE4_TARGET_STATE_ASSIGNMENT_RVA = 0x4597A0;
+    static constexpr uint32_t RETIRED_RE4_TARGET_STATE_WRITER_RVA = 0x4597A0;
     static constexpr uint32_t RE4_TARGET_STATE_SLOT_OFFSET = 0x90;
     static constexpr uint32_t RE4_TARGET_STATE_SOURCE_OWNER_RVA = 0xD6974F0;
     static constexpr size_t PROVENANCE_HOOK_COUNT = 3;
@@ -1585,6 +1566,12 @@ private:
     std::array<std::atomic<uint32_t>, SITE_COUNT> m_site_return_counts{};
     std::array<std::atomic<uint32_t>, SITE_COUNT> m_return_hook_entries{};
     std::array<std::atomic<uint32_t>, SITE_COUNT> m_unmatched_returns{};
+    std::atomic<uintptr_t> m_expected_vtable{};
+    std::atomic<bool> m_vtable_discovery_done{};
+    std::atomic<bool> m_vtable_discovery_complete{};
+    std::atomic<bool> m_live_anchor_logged{};
+    std::atomic<bool> m_live_anchor_invalid_logged{};
+    std::atomic<bool> m_live_anchor_trusted{};
     std::atomic<uintptr_t> m_provenance_overlay_object{};
     std::atomic<uintptr_t> m_provenance_overlay_slot{};
     std::atomic<bool> m_provenance_slot_invalid_logged{};
@@ -1723,6 +1710,100 @@ private:
         return false;
     }
 
+    bool discover_vtable_xrefs(const ImageInfo& image) noexcept {
+        constexpr size_t MAX_LOGGED_XREFS = 16;
+        const auto expected_vtable = m_expected_vtable.load(std::memory_order_acquire);
+        size_t xref_count{};
+        bool truncated{};
+        bool scan_complete{ true };
+        const auto section_table = image.base + image.section_table_rva;
+        const auto section_count = std::min<uint16_t>(image.nt.FileHeader.NumberOfSections, 96);
+
+        spdlog::info("[RE4XeSS][TargetStateVtableProbe] discovery-begin imageSize=0x{:x} checksum=0x{:x} vtableRva=0x{:x} expectedVtable=0x{:x}",
+            image.size, image.checksum, TARGET_STATE_VTABLE_RVA, expected_vtable);
+
+        for (uint16_t section_index = 0; section_index < section_count; ++section_index) {
+            IMAGE_SECTION_HEADER section{};
+            if (!read_memory(section_table + static_cast<uintptr_t>(section_index) * sizeof(section), &section, sizeof(section))) {
+                spdlog::warn("[RE4XeSS][TargetStateVtableProbe] section metadata unreadable index={}", section_index);
+                scan_complete = false;
+                break;
+            }
+            if ((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0 || section.VirtualAddress >= image.size) {
+                continue;
+            }
+
+            const auto section_size = std::min<size_t>(
+                std::max(section.Misc.VirtualSize, section.SizeOfRawData), image.size - section.VirtualAddress);
+            const auto* code = reinterpret_cast<const uint8_t*>(image.base + section.VirtualAddress);
+            size_t offset{};
+            while (offset < section_size) {
+                const auto remaining = std::min<size_t>(15, section_size - offset);
+                auto decoded = utility::decode_one(const_cast<uint8_t*>(code + offset), remaining);
+                if (!decoded || decoded->Length == 0 || decoded->Length > remaining) {
+                    // Do not byte-resynchronize: later offsets would no longer have proven instruction boundaries.
+                    spdlog::warn("[RE4XeSS][TargetStateVtableProbe] decode stopped sectionIndex={} sectionRva=0x{:x} offset=0x{:x}",
+                        section_index, section.VirtualAddress, offset);
+                    scan_complete = false;
+                    break;
+                }
+
+                for (uint8_t operand_index = 0; operand_index < decoded->OperandsCount; ++operand_index) {
+                    const auto& operand = decoded->Operands[operand_index];
+                    if (operand.Type != ND_OP_MEM || !operand.Info.Memory.IsRipRel || !operand.Info.Memory.HasDisp) {
+                        continue;
+                    }
+
+                    const auto instruction_address = reinterpret_cast<uintptr_t>(code + offset);
+                    const auto next_instruction = instruction_address + decoded->Length;
+                    const auto displacement = static_cast<int64_t>(operand.Info.Memory.Disp);
+                    if ((displacement < 0 && next_instruction < static_cast<uintptr_t>(-displacement)) ||
+                        (displacement >= 0 && next_instruction > UINTPTR_MAX - static_cast<uintptr_t>(displacement))) {
+                        continue;
+                    }
+                    const auto resolved = displacement < 0
+                        ? next_instruction - static_cast<uintptr_t>(-displacement)
+                        : next_instruction + static_cast<uintptr_t>(displacement);
+                    if (resolved != expected_vtable) {
+                        continue;
+                    }
+
+                    if (xref_count < MAX_LOGGED_XREFS) {
+                        std::array<char, 128> instruction_text{};
+                        const auto text_status = NdToText(&*decoded, instruction_address,
+                            static_cast<uint32_t>(instruction_text.size()), instruction_text.data());
+                        std::ostringstream bytes;
+                        for (uint8_t byte_index = 0; byte_index < decoded->Length; ++byte_index) {
+                            if (byte_index != 0) bytes << ' ';
+                            bytes << std::hex << std::setw(2) << std::setfill('0')
+                                  << static_cast<unsigned>(code[offset + byte_index]);
+                        }
+                        const bool destination_register = decoded->OperandsCount != 0 &&
+                            decoded->Operands[0].Type == ND_OP_REG;
+                        const auto destination_register_id = destination_register
+                            ? static_cast<unsigned>(decoded->Operands[0].Info.Register.Reg)
+                            : 0U;
+                        spdlog::info("[RE4XeSS][TargetStateVtableProbe] xref index={} xrefRva=0x{:x} instructionLength={} resolved=0x{:x} destinationRegisterAvailable={} destinationRegisterId={} text={} bytes={}",
+                            xref_count, section.VirtualAddress + offset, decoded->Length, resolved,
+                            destination_register, destination_register_id,
+                            text_status == ND_STATUS_SUCCESS ? instruction_text.data() : "unavailable",
+                            bytes.str());
+                    } else {
+                        truncated = true;
+                    }
+                    ++xref_count;
+                }
+                offset += decoded->Length;
+            }
+        }
+
+        m_vtable_discovery_complete.store(scan_complete, std::memory_order_release);
+        m_vtable_discovery_done.store(true, std::memory_order_release);
+        spdlog::info("[RE4XeSS][TargetStateVtableProbe] discovery-summary vtableRva=0x{:x} xrefCount={} truncated={} complete={}",
+            TARGET_STATE_VTABLE_RVA, xref_count, truncated, scan_complete);
+        return true;
+    }
+
     static bool matches_bytes(uintptr_t address, std::initializer_list<uint8_t> expected) noexcept {
         std::array<uint8_t, 32> bytes{};
         if (expected.size() > bytes.size() || !read_memory(address, bytes.data(), expected.size())) {
@@ -1731,7 +1812,7 @@ private:
         return std::equal(expected.begin(), expected.end(), bytes.begin());
     }
 
-    bool refresh_provenance_overlay_slot(
+    bool refresh_live_overlay_anchor(
         sdk::renderer::layer::Overlay* overlay,
         sdk::renderer::TargetState* overlay_state,
         uint64_t frame_id) noexcept {
@@ -1743,10 +1824,8 @@ private:
             read_private_memory(slot_address, &current_state, sizeof(current_state)) &&
             current_state == reinterpret_cast<uintptr_t>(overlay_state);
         if (!slot_valid) {
-            m_provenance_overlay_object.store(overlay_address, std::memory_order_release);
-            m_provenance_overlay_slot.store(0, std::memory_order_release);
-            if (!m_provenance_slot_invalid_logged.exchange(true, std::memory_order_acq_rel)) {
-                spdlog::warn("[RE4XeSS][TargetStateProvenance] Overlay slot validation failed overlay=0x{:x} slot=0x{:x} offset=0x{:x} expectedOffset=0x{:x} slotReadable={} slotValue=0x{:x} accessorValue=0x{:x}",
+            if (!m_live_anchor_invalid_logged.exchange(true, std::memory_order_acq_rel)) {
+                spdlog::warn("[RE4XeSS][TargetStateVtableProbe] live-anchor unavailable overlay=0x{:x} slot=0x{:x} offset=0x{:x} expectedOffset=0x{:x} slotReadable={} slotValue=0x{:x} accessorValue=0x{:x}",
                     overlay_address, slot_address,
                     slot_address >= overlay_address ? slot_address - overlay_address : 0,
                     RE4_TARGET_STATE_SLOT_OFFSET,
@@ -1757,8 +1836,6 @@ private:
             return false;
         }
 
-        const auto previous_object = m_provenance_overlay_object.load(std::memory_order_acquire);
-        const auto previous_slot = m_provenance_overlay_slot.load(std::memory_order_acquire);
         if (!m_overlay_snapshot_attempted) {
             m_overlay_snapshot_attempted = true;
             m_overlay_state = current_state;
@@ -1772,14 +1849,17 @@ private:
                 read_private_memory(m_overlay_snapshot.rtvs, &m_overlay_rtv, sizeof(m_overlay_rtv));
             }
         }
-        m_provenance_overlay_object.store(overlay_address, std::memory_order_release);
-        m_provenance_overlay_slot.store(slot_address, std::memory_order_release);
-        if (previous_object != overlay_address || previous_slot != slot_address) {
-            spdlog::info("[RE4XeSS][TargetStateProvenance] overlay-slot baseline frame={} overlay=0x{:x} slot=0x{:x} targetState=0x{:x} offset=0x{:x} derivedFromAccessor=true",
-                static_cast<unsigned long long>(frame_id), overlay_address, slot_address, current_state,
-                slot_address - overlay_address);
+        if (!m_live_anchor_logged.exchange(true, std::memory_order_acq_rel)) {
+            const auto expected_vtable = m_expected_vtable.load(std::memory_order_acquire);
+            const bool snapshot_readable = m_overlay_snapshot_valid;
+            const bool discovery_complete = m_vtable_discovery_complete.load(std::memory_order_acquire);
+            const bool match = snapshot_readable && expected_vtable != 0 && m_overlay_snapshot.vtable == expected_vtable;
+            m_live_anchor_trusted.store(match && discovery_complete, std::memory_order_release);
+            spdlog::info("[RE4XeSS][TargetStateVtableProbe] live-anchor state=0x{:x} liveVtable=0x{:x} expectedVtable=0x{:x} match={} discoveryComplete={} trusted={} frame={}",
+                current_state, snapshot_readable ? m_overlay_snapshot.vtable : 0, expected_vtable,
+                match, discovery_complete, match && discovery_complete,
+                static_cast<unsigned long long>(frame_id));
         }
-        report_early_provenance_observations();
         return true;
     }
 
@@ -1912,75 +1992,10 @@ private:
     }
 
     bool arm_provenance_hooks(const ImageInfo& image) noexcept {
-        if (m_provenance_attempted.exchange(true, std::memory_order_acq_rel)) {
-            return false;
-        }
-
-        if (!validate_provenance_writer(image)) {
-            spdlog::warn("[RE4XeSS][TargetStateProvenance] early arm rejected: RE4 Overlay writer fingerprint/ownership validation failed functionRva=0x{:x}",
-                RE4_TARGET_STATE_ASSIGNMENT_RVA);
-            return false;
-        }
-
-        m_image_base = image.base;
-        m_image_end = image.base + image.size;
-
-        static constexpr std::array<uint32_t, PROVENANCE_HOOK_COUNT> hook_rvas{
-            0x4597C9,
-            0x4597FB,
-            0x45981A,
-        };
-        for (size_t index = 0; index < hook_rvas.size(); ++index) {
-            const auto address = image.base + hook_rvas[index];
-            m_provenance_hooks[index] = safetyhook::create_mid(
-                reinterpret_cast<void*>(address),
-                provenance_hook_callback(index),
-                safetyhook::MidHook::StartDisabled);
-            if (!m_provenance_hooks[index]) {
-                for (auto& hook : m_provenance_hooks) {
-                    if (hook) {
-                        (void)hook.disable();
-                    }
-                }
-                spdlog::warn("[RE4XeSS][TargetStateProvenance] early arm failed: could not create bounded writer hook index={} siteRva=0x{:x}",
-                    index, hook_rvas[index]);
-                return false;
-            }
-
-            const auto stolen_bytes = m_provenance_hooks[index].original_bytes().size();
-            const auto next_site = index + 1 < hook_rvas.size() ? hook_rvas[index + 1] : 0x459839;
-            if (stolen_bytes == 0 || stolen_bytes > next_site - hook_rvas[index]) {
-                for (auto& hook : m_provenance_hooks) {
-                    if (hook) {
-                        (void)hook.disable();
-                    }
-                }
-                spdlog::warn("[RE4XeSS][TargetStateProvenance] early arm failed: writer hook span invalid index={} siteRva=0x{:x} stolen={} nextBoundaryRva=0x{:x}",
-                    index, hook_rvas[index], stolen_bytes, next_site);
-                return false;
-            }
-        }
-
-        m_provenance_active.store(true, std::memory_order_release);
-        for (size_t index = 0; index < m_provenance_hooks.size(); ++index) {
-            if (!m_provenance_hooks[index].enable()) {
-                m_provenance_active.store(false, std::memory_order_release);
-                for (auto& hook : m_provenance_hooks) {
-                    if (hook) {
-                        (void)hook.disable();
-                    }
-                }
-                spdlog::warn("[RE4XeSS][TargetStateProvenance] early arm failed: could not enable bounded writer hook index={} siteRva=0x{:x}",
-                    index, hook_rvas[index]);
-                return false;
-            }
-        }
-
-        spdlog::info("[RE4XeSS][TargetStateProvenance] early-armed writerFunctionRva=0x{:x} thread={} imageSize=0x{:x} checksum=0x{:x} sourceOwnerGlobalRva=0x{:x} sourceFieldOffset=0x60 addRefRva=0x39d6ed0 releaseRva=0x39df010 maxEarlyWrites={} maxMatchedWrites={} maxFrames={} frameBasis=post-present-count-from-early-arm capture=unbound-until-live-overlay-slot",
-            RE4_TARGET_STATE_ASSIGNMENT_RVA, GetCurrentThreadId(), image.size, image.checksum,
-            RE4_TARGET_STATE_SOURCE_OWNER_RVA, MAX_EARLY_PROVENANCE_WRITES,
-            MAX_PROVENANCE_WRITES, MAX_PROVENANCE_FRAMES);
-        return true;
+        (void)image;
+        spdlog::warn("[RE4XeSS][TargetStateVtableProbe] retired writer hook installation refused rva=0x{:x}",
+            RETIRED_RE4_TARGET_STATE_WRITER_RVA);
+        return false;
     }
 
     void disarm_provenance_hooks(std::string_view reason) noexcept {
@@ -2063,7 +2078,7 @@ private:
                     int32_t displacement{};
                     std::memcpy(&displacement, call_bytes.data() + 1, sizeof(displacement));
                     if (static_cast<int64_t>(observation.caller_return - m_image_base) + displacement ==
-                        RE4_TARGET_STATE_ASSIGNMENT_RVA) {
+                        RETIRED_RE4_TARGET_STATE_WRITER_RVA) {
                         observation.caller_callsite_rva = observation.caller_return_rva - 5;
                     }
                 }
@@ -2157,7 +2172,7 @@ private:
                     int32_t displacement{};
                     std::memcpy(&displacement, call_bytes.data() + 1, sizeof(displacement));
                     if (static_cast<int64_t>(caller_return - m_image_base) + displacement ==
-                        RE4_TARGET_STATE_ASSIGNMENT_RVA) {
+                        RETIRED_RE4_TARGET_STATE_WRITER_RVA) {
                         caller_callsite_rva = caller_return_rva - 5;
                     }
                 }
@@ -2175,7 +2190,7 @@ private:
             static_cast<unsigned long long>(capture_id),
             static_cast<unsigned long long>(m_provenance_frames.load(std::memory_order_acquire)),
             writer_site_rva,
-            RE4_TARGET_STATE_ASSIGNMENT_RVA,
+            RETIRED_RE4_TARGET_STATE_WRITER_RVA,
             hook_index == 0 ? "mov" : "lock-cmpxchg",
             receiver,
             m_provenance_overlay_object.load(std::memory_order_acquire),
@@ -2313,7 +2328,7 @@ private:
                 static_cast<unsigned long long>(observation.frame_id),
                 observation.thread_id,
                 observation.writer_site_rva,
-                RE4_TARGET_STATE_ASSIGNMENT_RVA,
+                RETIRED_RE4_TARGET_STATE_WRITER_RVA,
                 observation.writer_site_rva == 0x4597C9 ? "mov" : "lock-cmpxchg",
                 observation.receiver,
                 observation.slot,
@@ -2949,11 +2964,11 @@ void RE4XeSS::bootstrap_early_target_state_diagnostics() noexcept {
         return;
     }
 
-    spdlog::info("[RE4XeSS][TargetStateProvenance] bootstrap-begin point=REFramework-constructor-after-integrity tid={} before-plugin-init=true",
+    spdlog::info("[RE4XeSS][TargetStateVtableProbe] bootstrap-begin point=REFramework-constructor-after-integrity tid={} before-plugin-init=true",
         GetCurrentThreadId());
-    const bool armed = TargetStateFactoryProbe::instance().arm_provenance_early();
-    spdlog::info("[RE4XeSS][TargetStateProvenance] bootstrap-result armed={} point=REFramework-constructor-after-integrity",
-        armed);
+    const bool discovered = TargetStateFactoryProbe::instance().discover_target_state_vtable_early();
+    spdlog::info("[RE4XeSS][TargetStateVtableProbe] bootstrap-result discovered={} point=REFramework-constructor-after-integrity",
+        discovered);
 }
 
 void RE4XeSS::shutdown_early_target_state_diagnostics() noexcept {
