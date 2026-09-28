@@ -1795,6 +1795,8 @@ Production code should implement the minimum stable contract, not carry broad ho
 | AD-55 | The 16:10 capture identifies a native 0xC0000005 near-null write to address 0xC at game-directory OptiScaler dxgi.dll+0x21256f. This identifies the instruction module, not the underlying pointer origin or correct fix. Symbolize the exact OptiScaler binary before changing SR integration behavior. |
 | AD-56 | The completed narrow SEH observation retains EXCEPTION_CONTINUE_SEARCH and terminal worker/bridge/output/runtime quarantine. Debugging may obtain first-chance call stacks with a debugger or optionally copy bounded GPRs as POD in that same filter; do not add broad handlers or same-process retry. |
 | AD-57 | The production runtime no longer arms the completed CreateRenderTargetViewProbe in its normal RE4 XeSS path. Preserve the actual validated RTV factory resolver and OutputHandoff while locating the fault. |
+| AD-58 | A same-Overlay third-TargetState identity encountered during OutputHandoff restore is a terminal ownership uncertainty, not permission to overwrite the observed state with the saved original. Preserve old output generation pins and downstream lifetime constraints; first capture pointer identities and marker state. |
+| AD-59 | Quality-change ownership diagnosis must precede any recovery policy. Mode selection increments the control generation but does not establish which component wrote Overlay main TargetState. Capture bounded transition/first-failure evidence and suppress duplicate terminal errors without lifting quarantine. |
 
 ---
 
@@ -3099,3 +3101,50 @@ XeFG production validation        DEFERRED
 ~~~
 
 Keep PR66 Draft, Open, and unmerged.
+
+
+---
+
+## 28. PR66 quality-mode TargetState identity checkpoint — 2026-09-28 16:24
+
+This checkpoint changes the next investigation priority, not the previous OptiScaler native AV evidence in Section 27.
+
+Paired logs: REFramework re2_framework_log(20260928-072521).txt and OptiScaler(4).log (44cfee4d). REFramework is stamped fa05355903a1b9e9e16b5e45c5c28feb0512a96b, build 15:37. Remote PR66 HEAD at review: 425bcb7419619674a8d2fac405d155d1d89c1728. Exact stamp/source-tree identity remains unproven.
+
+### 28.1 Quality-change restoration is a new blocker
+
+The public XeSS API returned result=0 on all 118 observed submissions. Last successful frame: 7374 at 16:24:53.544 (Quality, input 1706x960, output 2560x1440).
+
+At 16:24:53.552 the mode changed Quality -> Ultra Quality; at 16:24:53.599 OutputHandoff::restore() first reported a main TargetState that was neither its installed handoff nor saved original. No additional XeSS Execute followed. The same error was emitted 2,192 times through 16:25:07.881.
+
+No native-exception or api-exception was observed in this capture. The prior OptiScaler dxgi.dll+0x21256f 0xC0000005 write-to-0xC remains independently unresolved; this run did not reach its prior ~200-submission window.
+
+### 28.2 Source ordering and safety
+
+In on_pre_overlay_layer_draw(), restore() executes before new mode-generation retirement and worker-control service. The unexpected TargetState branch is a same-layer identity mismatch; an Overlay layer generation change is already handled separately.
+
+request_mode() changes the requested mode and increments the control generation; no code evidence here identifies the writer of the third TargetState.
+
+Do not overwrite the third pointer with the saved state, clear installed bookkeeping, release old output pins, or invent post-Present completion. Preserve fail-closed quarantine until writer identity and downstream use are proven.
+
+### 28.3 Immediate PR66 task
+
+PR comment: 5865417657.
+
+Capture only the first unexpected identity with: callback phase/thread/frame, requested mode, control/device generation, installed frame, current/installed Overlay layer pointers, observed/handoff/saved/template state pointers, installed/markerPending/retirementRequested/hardQuarantined flags and existing marker values.
+
+Bracket last successful install, requested mode generation change, and first subsequent pre-Overlay restore. Avoid dereferencing an unknown pointer. Make repeated quarantine reporting idempotent while preserving failure semantics. Decide if the third state is a genuine engine replacement, stale saved baseline, or another writer only after seeing evidence.
+
+### 28.4 Production gates
+
+~~~text
+Validated RE4 TargetState creator / normal OutputHandoff  proven
+Public XeSS -> stock OptiScaler                         118 success returns
+Delayed same-generation marker settlement              observed
+Quality-change TargetState identity                     blocked
+Third pointer / writer / safe retirement                unknown
+Separate ~200-submit OptiScaler native AV               unresolved
+Sustained SR stability / XeFG validation                deferred
+~~~
+
+Keep PR66 Draft/Open/unmerged. No speculative Intel SDK ABI, D3D12 barrier, or direct-swapchain changes are justified by this capture.
