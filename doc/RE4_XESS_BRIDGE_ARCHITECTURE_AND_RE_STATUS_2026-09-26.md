@@ -5866,3 +5866,396 @@ resolver not yet wired
 ~~~
 
 Keep PR66 Draft and unmerged.
+
+
+---
+
+## 36. PR66 14:57 runtime — production XeSS/OptiScaler path reached
+
+Latest paired runtime evidence:
+
+~~~text
+REFramework:
+    file: re2_framework_log(20260928-055958).txt
+    commit: 088fdbbedff9bf59bcf56618e725fefc1a07a5da
+    branch: feature/re4-xess-load-state-accessor-diagnostic
+    build date/time: 2026-09-28 14:57
+
+OptiScaler:
+    file: OptiScaler(1).log
+    version: 10.0.0-dev
+    commit: 44cfee4d
+~~~
+
+The current remote PR66 implementation subsequently advanced to:
+
+~~~text
+1d9bb7774d9c05c33bce45842d1e8cf225638c4d
+~~~
+
+and contains the exact-image RE4 TargetState resolver exercised by this capture.
+
+### 36.1 Exact RE4 create_target_state resolver is runtime-proven
+
+The runtime reports:
+
+~~~text
+Searching for create_target_state
+[Renderer][RE4] Found create_target_state via validated RVA 0x47d2180
+~~~
+
+The first handoff immediately proceeds to:
+
+~~~text
+cloned display handoff TargetState
+worker submit
+bridge initialization
+xessD3D12Execute result=SUCCESS
+Overlay handoff install
+post-Overlay handoff confirmation
+downstream retirement marker
+~~~
+
+Concrete first accepted frame:
+
+~~~text
+frame=6423
+input=1969x1107
+output=2560x1440
+resetHistory=true
+beforeState=COMMON
+afterState=0xC0
+result=SUCCESS
+~~~
+
+The installed handoff is a display-resolution engine-visible TargetState and remains installed through the post-Overlay observation.
+
+This closes the previous TargetState production blocker.
+
+Current status:
+
+~~~text
+create_render_target_view                  proven
+create_texture                             proven
+create_target_state RVA 0x47D2180          proven production resolver
+TargetState::clone                         proven
+display-resolution cloned output           proven
+worker submit                              proven
+public xessD3D12Execute                    proven
+Overlay install                            proven
+post-Overlay survival                      proven
+downstream post-Present marker             proven
+~~~
+
+### 36.2 Stock OptiScaler public-XeSS interception is runtime-proven
+
+The paired OptiScaler log shows the REFramework producer entering the stock public XeSS interception path:
+
+~~~text
+hk_xessD3D12CreateContext
+hk_xessGetOptimalInputResolution
+    output=2560x1440
+    optimal input=1969x1107
+hk_xessD3D12Init
+hk_xessSetVelocityScale
+    x=984.5
+    y=-553.5
+hk_xessD3D12Execute
+~~~
+
+During evaluation, OptiScaler reports all required temporal inputs:
+
+~~~text
+Color exist
+MotionVectors exist
+Output exist
+Depth exist
+Executing!!
+~~~
+
+Therefore the intended high-level bridge contract is now demonstrated in a real run:
+
+~~~text
+RE4
+    -> custom REFramework public XeSS producer
+    -> stock OptiScaler libxess interception
+    -> OptiScaler upscaler feature evaluation
+    -> engine-visible display-resolution TargetState
+    -> native Overlay path
+~~~
+
+No private REF <-> OptiScaler ABI was required.
+
+### 36.3 New timing issue — next pre-Overlay can precede the previous post-Present marker
+
+The first newly exposed handoff issue is callback ordering, not TargetState creation.
+
+Frame 6426:
+
+~~~text
+14:59:23.040 Execute frame=6426 result=SUCCESS
+14:59:23.040 installed handoff
+14:59:23.040 post-Overlay observation confirms handoff
+14:59:23.049 restored handoff without its post-Present marker
+14:59:23.049 Reset reason=output-handoff-unavailable
+14:59:23.062 downstream retirement marker queued value=4
+14:59:23.062 delayed-marker settlement queued
+14:59:23.071 Reset reason=producer-context-unavailable
+~~~
+
+Frame 6429 reproduces the same ordering.
+
+Interpretation:
+
+~~~text
+next pre-Overlay callback
+    can arrive before
+post-Present callback for the previous installed handoff
+~~~
+
+The current OutputHandoff safety behavior itself is correct:
+
+~~~text
+restore original Overlay state
+do not reuse the handoff while marker is pending
+wait for the real post-Present path to signal the downstream fence
+~~~
+
+The problem is severity propagation.
+
+The same-generation MissingMarker state currently becomes owner/context unavailability and forces producer reconfiguration even though the marker arrives only milliseconds later.
+
+### 36.4 MissingMarker must become a transient skipped-frame state
+
+PR66 follow-up work order:
+
+~~~text
+5864421040
+~~~
+
+Required behavior:
+
+~~~text
+same generation + post-Present marker pending
+    -> restore original Overlay state
+    -> no new XeSS submit/install
+    -> no CPU/GPU wait
+    -> preserve worker/XeSS context
+    -> preserve control generation
+    -> invalidate temporal history only
+    -> next accepted frame uses resetHistory=true
+~~~
+
+Do not signal the retirement marker early.
+
+The marker must remain on the real post-Present path.
+
+Do not weaken the current rule that prevents reuse while the previous downstream consumer lifetime is unproven.
+
+Only change the caller's interpretation of:
+
+~~~text
+RetirementStatus::MissingMarker
+~~~
+
+from producer-unavailable/fault severity to transient frame skip.
+
+### 36.5 Sustained execution exposes a new public-XeSS exception
+
+After the path runs successfully for many frames, the worker reports:
+
+~~~text
+14:59:24.915
+[RE4XeSS][Worker] RE4XeSS worker terminated an operation after an unhandled exception
+[RE4XeSS][Failure] output handoff quarantined: Unknown exception in the RE4XeSS worker
+[RE4XeSS][Reset] reason=xess-execute-fault
+~~~
+
+The paired OptiScaler log immediately before that point reports:
+
+~~~text
+14:59:24.914708 hk_xessD3D12Execute
+14:59:24.914778 XeSSFeatureDx12::EvaluateInternal
+14:59:24.914784 Input Resolution: 1969x1107
+14:59:24.914788 Color exist
+14:59:24.914794 MotionVectors exist
+14:59:24.914799 Output exist
+14:59:24.914803 Depth exist
+14:59:24.914824 Executing!!
+~~~
+
+The temporal correlation strongly narrows the failure to:
+
+~~~text
+public xessD3D12Execute interception/evaluation
+or immediately beneath that call
+~~~
+
+It does not yet prove which OptiScaler/XeSS backend component throws.
+
+No backend-specific root cause should be claimed from this capture alone.
+
+### 36.6 Current exception handling is safe but too coarse
+
+Current worker architecture catches the exception outside the complete request:
+
+~~~text
+process_request()
+    -> process_submit()
+        -> RE4XeSSD3D12::submit()
+            -> record_and_submit()
+                -> RE4XeSSRuntime::execute()
+                    -> m_functions.d3d12_execute(...)
+~~~
+
+An unknown exception therefore reaches the outer worker catch.
+
+The outer catch safely:
+
+~~~text
+marks terminal fault
+quarantines bridge
+quarantines runtime
+quarantines output handoff
+does not attempt unsafe recovery
+~~~
+
+Keep that fail-closed behavior.
+
+The next diagnostic must move the observation boundary closer to the exact public API call.
+
+Add bounded:
+
+~~~text
+api-enter
+api-return
+api-threw-std-exception
+api-threw-unknown
+~~~
+
+metadata around:
+
+~~~cpp
+m_functions.d3d12_execute(...)
+~~~
+
+including:
+
+~~~text
+frame
+slot
+submission sequence
+worker thread
+control generation
+device-reset generation
+command list
+Color
+Depth
+converted MV
+Output
+input/output extents
+resetHistory
+~~~
+
+If the public call throws, do not continue recording/close/submit the current command list as if the API completed.
+
+Keep the generation quarantined.
+
+Do not add same-process automatic retry in this diagnostic step.
+
+### 36.7 Retire completed TargetState discovery probes from the normal path
+
+The exact production resolver no longer depends on:
+
+~~~text
+full RUNTIME_FUNCTION TargetState-vtable xref scan
+early TargetStateCreatorProbe hooks
+old provider-return probes
+~~~
+
+The latest startup still scans approximately:
+
+~~~text
+508868 RUNTIME_FUNCTION entries
+~~~
+
+and arms creator hooks despite the factory already being proven and productionized.
+
+Remove these heavy diagnostics from the normal RE4 XeSS startup path or require an explicit diagnostic/debug opt-in.
+
+Keep the exact-image resolver validation in shared/sdk/Renderer.cpp.
+
+This is cleanup/isolation, not a change to the proven factory contract.
+
+### 36.8 Clone temporary RTV ownership remains deferred
+
+The successful handoff run demonstrates that the constructed cloned TargetState and its native resource survive repeated use.
+
+Earlier evidence still shows:
+
+~~~text
+TargetState::Desc::rtvs == object + 0x68
+~~~
+
+for RE4 constructed states.
+
+The temporary clone-side Desc::rtvs allocation may therefore be releasable after construction, but do not combine that ownership change with the current marker/exception stabilization.
+
+Validate ownership separately after the live producer path is stable.
+
+---
+
+## 37. Handoff state after first end-to-end producer execution
+
+### Proven end-to-end
+
+~~~text
+semantic Color / Depth / Velocity inputs             proven
+public XeSS context/init                             proven
+validated RE4 TargetState creator                    proven
+display-resolution cloned TargetState                proven
+worker-side XeSS command recording                   proven
+stock OptiScaler hk_xessD3D12Execute                 proven
+OptiScaler sees Color/MV/Depth/Output                 proven
+XeSS Execute success                                 proven repeatedly
+engine-visible Overlay install                       proven
+post-Overlay handoff survival                        proven
+downstream retirement marker                         proven
+~~~
+
+### Current stabilization tasks
+
+~~~text
+1. treat same-generation MissingMarker as transient skip
+   without XeSS context/bridge reconfiguration
+
+2. localize the synchronous exception at/under
+   public xessD3D12Execute while preserving quarantine safety
+
+3. retire completed TargetState discovery probes
+   from normal startup
+~~~
+
+### Current production blocker
+
+~~~text
+TargetState creation is no longer the blocker.
+
+Current blocker:
+    sustained public XeSS execution eventually throws an unknown exception
+    -> worker terminal quarantine
+    -> producer stops
+~~~
+
+### Not yet ready
+
+~~~text
+long-duration SR stability                 not proven
+mode-change stability after live Execute   not proven
+XeFG validation                            not started for this production path
+clone temporary-array ownership cleanup    deferred
+~~~
+
+Do not start XeFG validation until the SR/output-handoff path survives sustained execution without terminal quarantine.
+
+Keep PR66 Draft and unmerged.
