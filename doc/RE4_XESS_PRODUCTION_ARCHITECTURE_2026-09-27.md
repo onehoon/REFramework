@@ -1775,6 +1775,8 @@ Production code should implement the minimum stable contract, not carry broad ho
 | AD-35 | Static TargetState-vtable xref scan completeness is diagnostic evidence and must not by itself veto a live anchor already validated by exact image identity, Overlay slot identity, readable layout, and exact vtable match. |
 | AD-36 | RE4 create_target_state remains fail-closed until constructor/factory ABI, descriptor semantics, return object layout, and ownership/refcount contract are runtime-proven. Rejected candidates 0x44C7A27, 0x47212A6-as-fixed-factory, 0x78F42D0-as-usable-TargetState, and 0x4597A0-as-Overlay-writer must not be productionized. |
 | AD-37 | DLSS5-Feeder externally corroborates that synthetic standard upscaler API calls can be intercepted by stock OptiScaler, but its post-process/backbuffer-copy architecture does not replace RE4's required pre-Overlay TargetState handoff. Public XeSS remains the RE4 producer contract. |
+| AD-38 | Exact decoded TargetState-vtable xrefs at RE4 RVAs 0x47C3E0A and 0x47D21AF are reverse-engineering leads only. They must be classified to a concrete constructor/initializer dataflow and runtime-proven before any production creator/factory resolver is allowed. |
+| AD-39 | Incomplete RUNTIME_FUNCTION xref coverage does not invalidate already decoded exact positive xrefs and does not veto a runtime live-anchor proven by exact image identity and vtable equality. Decoder failures are diagnostic coverage metadata and should be rate-limited in logs. |
 
 ---
 
@@ -1915,3 +1917,130 @@ low-resolution SceneView
 ~~~
 
 Public XeSS remains the standard producer contract.
+
+
+---
+
+## 22. PR66 latest TargetState xref checkpoint — 2026-09-28 13:47 build
+
+This section supersedes the diagnostic-blocker state recorded in Section 21.
+
+Latest local runtime:
+
+~~~text
+re2_framework_log(20260928-045315).txt
+commit header: a72333a1a9944c156bf947e43cfab9410877867c
+branch: feature/re4-xess-load-state-accessor-diagnostic
+~~~
+
+### 22.1 Previous live-anchor trust blocker is closed
+
+The runtime now reports:
+
+~~~text
+liveVtable=expectedVtable
+imageIdentityValid=true
+match=true
+discoveryComplete=false
+trusted=true
+~~~
+
+and the bounded TargetStateProbe arms successfully.
+
+Therefore static xref scan completeness remains separate from live-anchor trust.
+
+### 22.2 Vtable discovery now has two positive leads
+
+The RUNTIME_FUNCTION-based scan reports:
+
+~~~text
+functions=508868
+scannedFunctions=507568
+failedFunctions=1300
+xrefCount=2
+complete=false
+~~~
+
+Exact decoded references:
+
+~~~text
+0x47C3E0A:
+    LEA rax, [rel imageBase+0x7B1C148]
+
+0x47D21AF:
+    LEA rax, [rel imageBase+0x7B1C148]
+~~~
+
+The scan is not exhaustive, but these two references are positive decoded evidence.
+
+Neither RVA is a production factory by itself.
+
+### 22.3 Old dynamic provider probe is complete
+
+The existing site-1 probe again reaches re4+0x78F42D0 and reproduces:
+
+~~~text
+numRtv=1
+rtv0=null
+overlayVtableMatch=false
+targetStateLike=false
+~~~
+
+Do not continue spending captures on the same provider-return path.
+
+### 22.4 Next diagnostic boundary
+
+PR66 work-order comment:
+
+~~~text
+5863746550
+~~~
+
+Next step:
+
+~~~text
+for 0x47C3E0A and 0x47D21AF only
+    -> record containing RUNTIME_FUNCTION Begin/End
+    -> decode bounded local instruction context
+    -> trace the LEA-loaded vtable address
+    -> determine whether the site is constructor, initializer,
+       destructor, overload, or type-query helper
+    -> choose one strongest candidate
+    -> only then add a bounded read-only dynamic probe
+~~~
+
+Do not dynamically hook both candidates before static context classification.
+
+Do not call either candidate directly.
+
+### 22.5 Remote/local implementation handoff note
+
+The runtime includes the RUNTIME_FUNCTION scanner and decoupled trusted=true behavior, but the currently visible remote source at the stamped implementation commit does not fully reflect those local changes.
+
+Before continuing, preserve and push the exact local implementation that produced this runtime so the PR source and runtime evidence converge.
+
+### 22.6 Production blocker remains unchanged
+
+~~~text
+actual TargetState creator/factory ABI    unknown
+distinct single-RTV handoff TargetState   unavailable
+OutputHandoff install                     blocked
+Worker XeSS submit                        blocked before Execute
+OptiScaler xessD3D12Execute               0 calls
+~~~
+
+No architecture change is justified.
+
+Keep:
+
+~~~text
+public XeSS producer
+    -> stock OptiScaler interception
+    -> selected SR backend
+    -> RE4 engine-visible TargetState handoff
+    -> native Overlay/UI/final output
+~~~
+
+Do not direct-copy XeSS output to the swapchain.
+
+Keep PR66 Draft and unmerged.
