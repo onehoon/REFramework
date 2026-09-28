@@ -1175,20 +1175,27 @@ public:
         return probe;
     }
 
-    bool discover_target_state_vtable_early() noexcept {
+    struct DiscoveryResult {
+        bool attempted{};
+        bool complete{};
+        size_t xref_count{};
+    };
+
+    DiscoveryResult discover_target_state_vtable_early() noexcept {
         if (!sdk::GameIdentity::get().is_re4()) {
-            return false;
+            return {};
         }
 
         const auto image = inspect_main_image();
         if (!image.valid || image.size != EXPECTED_IMAGE_SIZE || image.checksum != EXPECTED_IMAGE_CHECKSUM) {
             spdlog::warn("[RE4XeSS][TargetStateVtableProbe] discovery rejected: RE4 image identity mismatch size=0x{:x} checksum=0x{:x}",
                 image.size, image.checksum);
-            return false;
+            return {};
         }
 
         m_image_base = image.base;
         m_image_end = image.base + image.size;
+        m_image_identity_valid.store(true, std::memory_order_release);
         m_expected_vtable.store(image.base + TARGET_STATE_VTABLE_RVA, std::memory_order_release);
         return discover_vtable_xrefs(image);
     }
@@ -1569,6 +1576,7 @@ private:
     std::atomic<uintptr_t> m_expected_vtable{};
     std::atomic<bool> m_vtable_discovery_done{};
     std::atomic<bool> m_vtable_discovery_complete{};
+    std::atomic<bool> m_image_identity_valid{};
     std::atomic<bool> m_live_anchor_logged{};
     std::atomic<bool> m_live_anchor_invalid_logged{};
     std::atomic<bool> m_live_anchor_trusted{};
@@ -1710,41 +1718,76 @@ private:
         return false;
     }
 
-    bool discover_vtable_xrefs(const ImageInfo& image) noexcept {
+    DiscoveryResult discover_vtable_xrefs(const ImageInfo& image) noexcept {
         constexpr size_t MAX_LOGGED_XREFS = 16;
+        constexpr size_t MAX_RUNTIME_FUNCTIONS = 1'000'000;
+        struct RuntimeFunctionRange {
+            uint32_t begin_rva{};
+            uint32_t end_rva{};
+            uint32_t unwind_info_rva{};
+        };
+        static_assert(sizeof(RuntimeFunctionRange) == 12);
+
         const auto expected_vtable = m_expected_vtable.load(std::memory_order_acquire);
         size_t xref_count{};
+        size_t function_count{};
+        size_t scanned_function_count{};
+        size_t failed_function_count{};
+        size_t scanned_bytes{};
         bool truncated{};
-        bool scan_complete{ true };
-        const auto section_table = image.base + image.section_table_rva;
-        const auto section_count = std::min<uint16_t>(image.nt.FileHeader.NumberOfSections, 96);
+        bool scan_complete = expected_vtable != 0 &&
+            image.nt.OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXCEPTION;
+        const auto exception_directory = scan_complete
+            ? image.nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION]
+            : IMAGE_DATA_DIRECTORY{};
+        if (exception_directory.VirtualAddress == 0 || exception_directory.Size < sizeof(RuntimeFunctionRange) ||
+            exception_directory.Size % sizeof(RuntimeFunctionRange) != 0 ||
+            exception_directory.VirtualAddress >= image.size ||
+            exception_directory.Size > image.size - exception_directory.VirtualAddress) {
+            scan_complete = false;
+        }
+        if (scan_complete) {
+            function_count = exception_directory.Size / sizeof(RuntimeFunctionRange);
+            if (function_count > MAX_RUNTIME_FUNCTIONS) {
+                scan_complete = false;
+                function_count = 0;
+            }
+        }
 
-        spdlog::info("[RE4XeSS][TargetStateVtableProbe] discovery-begin imageSize=0x{:x} checksum=0x{:x} vtableRva=0x{:x} expectedVtable=0x{:x}",
-            image.size, image.checksum, TARGET_STATE_VTABLE_RVA, expected_vtable);
+        spdlog::info("[RE4XeSS][TargetStateVtableProbe] discovery-begin attempted=true imageSize=0x{:x} checksum=0x{:x} vtableRva=0x{:x} expectedVtable=0x{:x} exceptionRva=0x{:x} exceptionSize=0x{:x} functionCount={}",
+            image.size, image.checksum, TARGET_STATE_VTABLE_RVA, expected_vtable,
+            exception_directory.VirtualAddress, exception_directory.Size, function_count);
 
-        for (uint16_t section_index = 0; section_index < section_count; ++section_index) {
-            IMAGE_SECTION_HEADER section{};
-            if (!read_memory(section_table + static_cast<uintptr_t>(section_index) * sizeof(section), &section, sizeof(section))) {
-                spdlog::warn("[RE4XeSS][TargetStateVtableProbe] section metadata unreadable index={}", section_index);
+        const auto table_address = image.base + exception_directory.VirtualAddress;
+        for (size_t function_index = 0; function_index < function_count; ++function_index) {
+            RuntimeFunctionRange function{};
+            if (!read_memory(table_address + function_index * sizeof(function), &function, sizeof(function))) {
+                spdlog::warn("[RE4XeSS][TargetStateVtableProbe] runtime-function entry unreadable index={}", function_index);
+                ++failed_function_count;
                 scan_complete = false;
                 break;
             }
-            if ((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0 || section.VirtualAddress >= image.size) {
+
+            if (function.begin_rva >= function.end_rva || function.end_rva > image.size ||
+                !is_executable_range(image, function.begin_rva, function.end_rva - function.begin_rva)) {
+                ++failed_function_count;
+                scan_complete = false;
                 continue;
             }
 
-            const auto section_size = std::min<size_t>(
-                std::max(section.Misc.VirtualSize, section.SizeOfRawData), image.size - section.VirtualAddress);
-            const auto* code = reinterpret_cast<const uint8_t*>(image.base + section.VirtualAddress);
+            const auto function_size = static_cast<size_t>(function.end_rva - function.begin_rva);
+            const auto* code = reinterpret_cast<const uint8_t*>(image.base + function.begin_rva);
             size_t offset{};
-            while (offset < section_size) {
-                const auto remaining = std::min<size_t>(15, section_size - offset);
+            bool function_decoded = true;
+            while (offset < function_size) {
+                const auto remaining = std::min<size_t>(15, function_size - offset);
                 auto decoded = utility::decode_one(const_cast<uint8_t*>(code + offset), remaining);
                 if (!decoded || decoded->Length == 0 || decoded->Length > remaining) {
-                    // Do not byte-resynchronize: later offsets would no longer have proven instruction boundaries.
-                    spdlog::warn("[RE4XeSS][TargetStateVtableProbe] decode stopped sectionIndex={} sectionRva=0x{:x} offset=0x{:x}",
-                        section_index, section.VirtualAddress, offset);
-                    scan_complete = false;
+                    // Keep instruction-boundary guarantees within each unwind-proven function.
+                    // A bad function does not prevent independent ranges from being inspected.
+                    spdlog::warn("[RE4XeSS][TargetStateVtableProbe] decode stopped functionIndex={} functionRva=0x{:x} offset=0x{:x}",
+                        function_index, function.begin_rva, offset);
+                    function_decoded = false;
                     break;
                 }
 
@@ -1784,7 +1827,7 @@ private:
                             ? static_cast<unsigned>(decoded->Operands[0].Info.Register.Reg)
                             : 0U;
                         spdlog::info("[RE4XeSS][TargetStateVtableProbe] xref index={} xrefRva=0x{:x} instructionLength={} resolved=0x{:x} destinationRegisterAvailable={} destinationRegisterId={} text={} bytes={}",
-                            xref_count, section.VirtualAddress + offset, decoded->Length, resolved,
+                            xref_count, function.begin_rva + offset, decoded->Length, resolved,
                             destination_register, destination_register_id,
                             text_status == ND_STATUS_SUCCESS ? instruction_text.data() : "unavailable",
                             bytes.str());
@@ -1795,13 +1838,21 @@ private:
                 }
                 offset += decoded->Length;
             }
+            scanned_bytes += offset;
+            if (function_decoded) {
+                ++scanned_function_count;
+            } else {
+                ++failed_function_count;
+                scan_complete = false;
+            }
         }
 
         m_vtable_discovery_complete.store(scan_complete, std::memory_order_release);
         m_vtable_discovery_done.store(true, std::memory_order_release);
-        spdlog::info("[RE4XeSS][TargetStateVtableProbe] discovery-summary vtableRva=0x{:x} xrefCount={} truncated={} complete={}",
-            TARGET_STATE_VTABLE_RVA, xref_count, truncated, scan_complete);
-        return true;
+        spdlog::info("[RE4XeSS][TargetStateVtableProbe] discovery-summary attempted=true coverage=exception-directory-runtime-functions vtableRva=0x{:x} xrefCount={} truncated={} functions={} scannedFunctions={} failedFunctions={} scannedBytes=0x{:x} complete={}",
+            TARGET_STATE_VTABLE_RVA, xref_count, truncated, function_count,
+            scanned_function_count, failed_function_count, scanned_bytes, scan_complete);
+        return DiscoveryResult{ true, scan_complete, xref_count };
     }
 
     static bool matches_bytes(uintptr_t address, std::initializer_list<uint8_t> expected) noexcept {
@@ -1853,11 +1904,13 @@ private:
             const auto expected_vtable = m_expected_vtable.load(std::memory_order_acquire);
             const bool snapshot_readable = m_overlay_snapshot_valid;
             const bool discovery_complete = m_vtable_discovery_complete.load(std::memory_order_acquire);
-            const bool match = snapshot_readable && expected_vtable != 0 && m_overlay_snapshot.vtable == expected_vtable;
-            m_live_anchor_trusted.store(match && discovery_complete, std::memory_order_release);
-            spdlog::info("[RE4XeSS][TargetStateVtableProbe] live-anchor state=0x{:x} liveVtable=0x{:x} expectedVtable=0x{:x} match={} discoveryComplete={} trusted={} frame={}",
+            const bool image_identity_valid = m_image_identity_valid.load(std::memory_order_acquire);
+            const bool match = image_identity_valid && snapshot_readable && expected_vtable != 0 &&
+                m_overlay_snapshot.vtable == expected_vtable;
+            m_live_anchor_trusted.store(match, std::memory_order_release);
+            spdlog::info("[RE4XeSS][TargetStateVtableProbe] live-anchor state=0x{:x} liveVtable=0x{:x} expectedVtable=0x{:x} imageIdentityValid={} match={} discoveryComplete={} trusted={} frame={}",
                 current_state, snapshot_readable ? m_overlay_snapshot.vtable : 0, expected_vtable,
-                match, discovery_complete, match && discovery_complete,
+                image_identity_valid, match, discovery_complete, match,
                 static_cast<unsigned long long>(frame_id));
         }
         return true;
@@ -2966,9 +3019,9 @@ void RE4XeSS::bootstrap_early_target_state_diagnostics() noexcept {
 
     spdlog::info("[RE4XeSS][TargetStateVtableProbe] bootstrap-begin point=REFramework-constructor-after-integrity tid={} before-plugin-init=true",
         GetCurrentThreadId());
-    const bool discovered = TargetStateFactoryProbe::instance().discover_target_state_vtable_early();
-    spdlog::info("[RE4XeSS][TargetStateVtableProbe] bootstrap-result discovered={} point=REFramework-constructor-after-integrity",
-        discovered);
+    const auto discovery = TargetStateFactoryProbe::instance().discover_target_state_vtable_early();
+    spdlog::info("[RE4XeSS][TargetStateVtableProbe] bootstrap-result attempted={} complete={} xrefCount={} point=REFramework-constructor-after-integrity",
+        discovery.attempted, discovery.complete, discovery.xref_count);
 }
 
 void RE4XeSS::shutdown_early_target_state_diagnostics() noexcept {
