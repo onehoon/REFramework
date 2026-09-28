@@ -137,6 +137,7 @@ private:
         uint32_t phase_bit) noexcept;
 
     struct ProvenanceSample {
+        std::string_view phase{};
         uint64_t sequence{};
         int64_t timestamp_us{};
         uint64_t control_generation{};
@@ -200,9 +201,11 @@ private:
     std::atomic<uint64_t> m_provenance_generation{};
     std::atomic<uint32_t> m_provenance_phase_mask{};
     std::atomic<uint32_t> m_provenance_event_budget{};
+    std::atomic<uint32_t> m_provenance_window_budget{};
     std::atomic<uintptr_t> m_provenance_last_current_state{};
+    std::atomic<uintptr_t> m_provenance_validated_layer{};
     std::atomic<bool> m_provenance_enabled{};
-    std::array<ProvenanceSample, 8> m_provenance_ring{};
+    std::array<ProvenanceSample, 16> m_provenance_ring{};
     size_t m_provenance_ring_next{};
     size_t m_provenance_ring_size{};
     uint64_t m_provenance_event_count{};

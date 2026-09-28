@@ -19,7 +19,8 @@ constexpr auto OUTPUT_READ_STATE = static_cast<D3D12_RESOURCE_STATES>(
 constexpr auto REQUIRED_OUTPUT_FLAGS = static_cast<D3D12_RESOURCE_FLAGS>(
     D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
 constexpr uint32_t MODE_TRANSITION_OBSERVATION_BUDGET = 4;
-constexpr uint32_t TRANSITION_PROVENANCE_EVENT_BUDGET = 24;
+constexpr uint32_t TRANSITION_PROVENANCE_EVENT_BUDGET = 32;
+constexpr uint32_t TRANSITION_PROVENANCE_WINDOW_BUDGET = 16;
 constexpr uintptr_t RE4_OVERLAY_MAIN_TARGET_STATE_OFFSET = 0x90;
 std::atomic<uint64_t> transition_provenance_sequence{};
 
@@ -333,6 +334,7 @@ void RE4XeSSOutputHandoff::note_mode_transition(
     m_mode_transition_observation_budget.store(MODE_TRANSITION_OBSERVATION_BUDGET, std::memory_order_release);
     m_provenance_phase_mask.store(0, std::memory_order_release);
     m_provenance_event_budget.store(TRANSITION_PROVENANCE_EVENT_BUDGET, std::memory_order_release);
+    m_provenance_window_budget.store(TRANSITION_PROVENANCE_WINDOW_BUDGET, std::memory_order_release);
     m_provenance_generation.store(control_generation, std::memory_order_release);
     {
         std::lock_guard lock{ m_provenance_mutex };
@@ -379,7 +381,12 @@ void RE4XeSSOutputHandoff::log_transition_provenance(
     }
     const auto previous_mask = m_provenance_phase_mask.fetch_or(phase_bit, std::memory_order_acq_rel);
     const bool first_phase = (previous_mask & phase_bit) == 0;
-    if (!first_phase) {
+    auto window_remaining = m_provenance_window_budget.load(std::memory_order_acquire);
+    while (window_remaining != 0 && !m_provenance_window_budget.compare_exchange_weak(
+        window_remaining, window_remaining - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    }
+    const bool window_sample = window_remaining != 0;
+    if (!first_phase && !window_sample && !current_state_known) {
         return;
     }
 
@@ -424,12 +431,16 @@ void RE4XeSSOutputHandoff::log_transition_provenance(
     uintptr_t target_state_slot{};
     uintptr_t observed_current_state{};
     bool slot_read_valid{};
-    if (current_state_known && layer_identity != 0 &&
-        layer_identity <= UINTPTR_MAX - RE4_OVERLAY_MAIN_TARGET_STATE_OFFSET) {
-        auto* const layer = reinterpret_cast<sdk::renderer::layer::Overlay*>(layer_identity);
-        const auto accessor_slot = reinterpret_cast<uintptr_t>(&layer->get_main_target_state());
-        target_state_slot = layer_identity + RE4_OVERLAY_MAIN_TARGET_STATE_OFFSET;
-        if (accessor_slot == target_state_slot) {
+    const auto sampled_layer = layer_identity != 0 ? layer_identity : installed_layer;
+    if (sampled_layer != 0 && sampled_layer <= UINTPTR_MAX - RE4_OVERLAY_MAIN_TARGET_STATE_OFFSET) {
+        target_state_slot = sampled_layer + RE4_OVERLAY_MAIN_TARGET_STATE_OFFSET;
+        if (current_state_known && layer_identity != 0) {
+            auto* const layer = reinterpret_cast<sdk::renderer::layer::Overlay*>(layer_identity);
+            if (reinterpret_cast<uintptr_t>(&layer->get_main_target_state()) == target_state_slot) {
+                m_provenance_validated_layer.store(sampled_layer, std::memory_order_release);
+            }
+        }
+        if (m_provenance_validated_layer.load(std::memory_order_acquire) == sampled_layer) {
             SIZE_T bytes_read{};
             slot_read_valid = ReadProcessMemory(
                 GetCurrentProcess(), reinterpret_cast<const void*>(target_state_slot),
@@ -446,26 +457,17 @@ void RE4XeSSOutputHandoff::log_transition_provenance(
         : 0;
     const bool identity_changed = slot_read_valid && previous_current_state != 0 &&
         previous_current_state != observed_current_state;
-    bool first_divergence = slot_read_valid && installed && observed_current_state != handoff_state &&
+    bool first_divergence = slot_read_valid && installed && sampled_layer == installed_layer &&
+        observed_current_state != handoff_state &&
         observed_current_state != saved_state;
     if (!slot_read_valid) {
         previous_current_state = m_provenance_last_current_state.load(std::memory_order_acquire);
     }
 
-    if (!identity_changed && !first_divergence && !first_phase) {
-        return;
-    }
-    auto remaining = m_provenance_event_budget.load(std::memory_order_acquire);
-    while (remaining != 0 && !m_provenance_event_budget.compare_exchange_weak(
-        remaining, remaining - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
-    }
-    if (remaining == 0) {
-        return;
-    }
-
     const auto timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     ProvenanceSample sample{
+        phase,
         transition_provenance_sequence.fetch_add(1, std::memory_order_relaxed) + 1,
         timestamp_us,
         observation.control_generation,
@@ -474,7 +476,7 @@ void RE4XeSSOutputHandoff::log_transition_provenance(
         observation.callback_thread_id,
         observation.requested_mode_token,
         installed_mode_token,
-        layer_identity,
+        sampled_layer,
         target_state_slot,
         slot_read_valid ? observed_current_state : current_state_identity,
         handoff_state,
@@ -487,11 +489,10 @@ void RE4XeSSOutputHandoff::log_transition_provenance(
         retirement_requested,
         hard_quarantined,
     };
-    std::array<ProvenanceSample, 8> preceding{};
+    std::array<ProvenanceSample, 16> preceding{};
     size_t preceding_count{};
     {
         std::lock_guard lock{ m_provenance_mutex };
-        ++m_provenance_event_count;
         if (slot_read_valid) {
             m_provenance_ring[m_provenance_ring_next] = sample;
             m_provenance_ring_next = (m_provenance_ring_next + 1) % m_provenance_ring.size();
@@ -512,6 +513,20 @@ void RE4XeSSOutputHandoff::log_transition_provenance(
             }
         }
     }
+    if (!first_phase && !window_sample && !first_divergence) {
+        return;
+    }
+    auto remaining = m_provenance_event_budget.load(std::memory_order_acquire);
+    while (remaining != 0 && !m_provenance_event_budget.compare_exchange_weak(
+        remaining, remaining - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    }
+    if (remaining == 0 && !first_divergence) {
+        return;
+    }
+    {
+        std::lock_guard lock{ m_provenance_mutex };
+        ++m_provenance_event_count;
+    }
     spdlog::info(
         "[RE4XeSS][OutputTransition] seq={} timestampUs={} phase={} tid={} frameKnown={} frame={} requestedModeToken={} controlGeneration={} deviceResetGeneration={} installedModeToken={} installedControlGeneration={} installedDeviceResetGeneration={} currentLayer=0x{:x} installedLayer=0x{:x} targetStateSlot=0x{:x} targetStateSlotOffset=0x{:x} currentKnown={} slotReadValid={} currentTargetState=0x{:x} expectedHandoffState=0x{:x} savedOriginalState=0x{:x} lastConfirmedValid={} lastConfirmedLayer=0x{:x} lastConfirmedTargetState=0x{:x} installedFrame={} installed={} markerPending={} retirementRequested={} hardQuarantined={} bridgeWriterUncertain={} downstreamFenceLastSignaled={} cachedFenceCompleted={} identityChanged={} firstDivergence={} previousCurrentTargetState=0x{:x}",
         static_cast<unsigned long long>(sample.sequence),
@@ -526,11 +541,11 @@ void RE4XeSSOutputHandoff::log_transition_provenance(
         installed_mode_token,
         static_cast<unsigned long long>(installed_control_generation),
         static_cast<unsigned long long>(installed_device_generation),
-        layer_identity,
+        sampled_layer,
         installed_layer,
         target_state_slot,
-        target_state_slot != 0 ? target_state_slot - layer_identity : 0,
-        current_state_known,
+        target_state_slot != 0 ? target_state_slot - sampled_layer : 0,
+        current_state_known || slot_read_valid,
         slot_read_valid,
         slot_read_valid ? observed_current_state : current_state_identity,
         handoff_state,
@@ -555,8 +570,8 @@ void RE4XeSSOutputHandoff::log_transition_provenance(
             static_cast<unsigned long long>(sample.sequence), observed_current_state, handoff_state, saved_state, preceding_count);
         for (size_t i = 0; i < preceding_count; ++i) {
             const auto& prior = preceding[i];
-            spdlog::info("[RE4XeSS][HandoffProvenanceSample] seq={} timestampUs={} tid={} frameKnown={} frame={} controlGeneration={} deviceResetGeneration={} mode={} overlay=0x{:x} slot=0x{:x} slotReadValid={} current=0x{:x} expected=0x{:x} saved=0x{:x} markerPending={} installed={} retirementRequested={} hardQuarantined={} identityChanged={}",
-                static_cast<unsigned long long>(prior.sequence), prior.timestamp_us, prior.thread_id,
+            spdlog::info("[RE4XeSS][HandoffProvenanceSample] seq={} timestampUs={} phase={} tid={} frameKnown={} frame={} controlGeneration={} deviceResetGeneration={} mode={} overlay=0x{:x} slot=0x{:x} slotReadValid={} current=0x{:x} expected=0x{:x} saved=0x{:x} markerPending={} installed={} retirementRequested={} hardQuarantined={} identityChanged={}",
+                static_cast<unsigned long long>(prior.sequence), prior.timestamp_us, prior.phase, prior.thread_id,
                 prior.frame_id_valid, static_cast<unsigned long long>(prior.frame_id),
                 static_cast<unsigned long long>(prior.control_generation),
                 static_cast<unsigned long long>(prior.device_reset_generation), prior.requested_mode_token,
