@@ -1179,6 +1179,33 @@ public:
         bool attempted{};
         bool complete{};
         size_t xref_count{};
+        bool creator_probe_armed{};
+    };
+
+    struct CreatorObjectSnapshot {
+        bool readable{};
+        uintptr_t object{};
+        uintptr_t vtable{};
+        int32_t ref_count{};
+        uint32_t render_frame{};
+        uintptr_t rtvs{};
+        uintptr_t dsv{};
+        uint32_t num_rtv{};
+        float rect_left{};
+        float rect_top{};
+        float rect_right{};
+        float rect_bottom{};
+        uint32_t flag{};
+        uintptr_t rtv0{};
+        bool rtv_valid{};
+        uint32_t rtv_format{};
+        uint32_t rtv_dimension{};
+        uintptr_t texture{};
+        bool texture_header_valid{};
+        uintptr_t texture_vtable{};
+        int32_t texture_ref_count{};
+        uint32_t texture_render_frame{};
+        bool target_state_like{};
     };
 
     DiscoveryResult discover_target_state_vtable_early() noexcept {
@@ -1197,7 +1224,9 @@ public:
         m_image_end = image.base + image.size;
         m_image_identity_valid.store(true, std::memory_order_release);
         m_expected_vtable.store(image.base + TARGET_STATE_VTABLE_RVA, std::memory_order_release);
-        return discover_vtable_xrefs(image);
+        auto result = discover_vtable_xrefs(image);
+        result.creator_probe_armed = arm_creator_probe_early(image);
+        return result;
     }
 
     bool arm(
@@ -1367,20 +1396,32 @@ public:
 
     void force_disarm_all(std::string_view reason) noexcept {
         disarm(reason);
+        disarm_creator_probe(reason);
     }
+
+    CreatorObjectSnapshot snapshot_creator_object(uintptr_t object) const noexcept;
 
     void refresh_live_overlay_slot(sdk::renderer::layer::Overlay* overlay) noexcept {
         if (!m_vtable_discovery_done.load(std::memory_order_acquire) || overlay == nullptr) {
             return;
         }
 
-        (void)refresh_live_overlay_anchor(
-            overlay,
-            overlay->get_main_target_state().get(),
-            0);
+        auto* state = overlay->get_main_target_state().get();
+        if (refresh_live_overlay_anchor(overlay, state, 0)) {
+            correlate_creator_observations(reinterpret_cast<uintptr_t>(state));
+        }
     }
 
     void on_post_present() noexcept {
+        if (m_creator_active.load(std::memory_order_acquire)) {
+            const auto frame_count = m_creator_frames.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (m_creator_call_count.load(std::memory_order_acquire) >= MAX_CREATOR_OBSERVATIONS ||
+                frame_count >= MAX_CREATOR_CAPTURE_FRAMES) {
+                disarm_creator_probe(m_creator_call_count.load(std::memory_order_acquire) >= MAX_CREATOR_OBSERVATIONS
+                        ? "observation budget reached"
+                        : "frame budget reached");
+            }
+        }
         if (!m_active.load(std::memory_order_acquire)) {
             return;
         }
@@ -1414,6 +1455,53 @@ private:
         uint32_t section_table_rva{};
         IMAGE_NT_HEADERS64 nt{};
         bool valid{};
+    };
+
+    struct CreatorObservation {
+        std::atomic<bool> ready{};
+        uint64_t id{};
+        DWORD thread_id{};
+        uintptr_t caller_return_rva{};
+        uintptr_t caller_callsite_rva{};
+        uintptr_t rcx{};
+        uintptr_t rdx{};
+        uintptr_t r8{};
+        uintptr_t r9{};
+        uintptr_t rdi{};
+        std::atomic<uintptr_t> allocation_result{};
+        std::atomic<uintptr_t> initialized_object{};
+        std::atomic<uintptr_t> constructed_object{};
+        std::atomic<uintptr_t> returned_object{};
+        std::atomic<uintptr_t> object_vtable{};
+        std::atomic<int32_t> object_ref_count{};
+        std::atomic<uint32_t> object_render_frame{};
+        std::atomic<uintptr_t> object_rtvs{};
+        std::atomic<uintptr_t> object_dsv{};
+        std::atomic<uint32_t> object_num_rtv{};
+        std::atomic<float> object_rect_left{};
+        std::atomic<float> object_rect_top{};
+        std::atomic<float> object_rect_right{};
+        std::atomic<float> object_rect_bottom{};
+        std::atomic<uint32_t> object_flag{};
+        std::atomic<uintptr_t> object_rtv0{};
+        std::atomic<bool> object_rtv_valid{};
+        std::atomic<uint32_t> object_rtv_format{};
+        std::atomic<uint32_t> object_rtv_dimension{};
+        std::atomic<uintptr_t> object_texture{};
+        std::atomic<bool> object_texture_header_valid{};
+        std::atomic<uintptr_t> object_texture_vtable{};
+        std::atomic<int32_t> object_texture_ref_count{};
+        std::atomic<uint32_t> object_texture_render_frame{};
+        std::atomic<bool> object_target_state_like{};
+    };
+
+    enum class CreatorHookPoint : size_t {
+        FunctionEntry,
+        AllocationReturned,
+        InitializerReturned,
+        SuccessReturn,
+        AllocationFailureReturn,
+        Count,
     };
 
     struct CallArguments {
@@ -1518,6 +1606,8 @@ private:
     static constexpr uint32_t RE4_PROVIDER_CALLEE_RVA = 0x78F42D0;
     static constexpr uintptr_t RE4_RENDER_RESOURCE_SIZE = 0x18;
     static constexpr uint32_t RETIRED_RE4_TARGET_STATE_WRITER_RVA = 0x4597A0;
+    static constexpr uint32_t RE4_TARGET_STATE_CREATOR_RVA = 0x47D2180;
+    static constexpr uint32_t RE4_TARGET_STATE_CREATOR_END_RVA = 0x47D21D2;
     static constexpr uint32_t RE4_TARGET_STATE_SLOT_OFFSET = 0x90;
     static constexpr uint32_t RE4_TARGET_STATE_SOURCE_OWNER_RVA = 0xD6974F0;
     static constexpr size_t PROVENANCE_HOOK_COUNT = 3;
@@ -1532,6 +1622,9 @@ private:
     static constexpr size_t ISOLATED_SITE_INDEX = 1;
     static constexpr uint32_t MAX_PENDING_PRESENT_GRACE = 2;
     static constexpr size_t MAX_CAPTURED_CALLS_PER_SITE = 4;
+    static constexpr size_t MAX_CREATOR_OBSERVATIONS = 16;
+    static constexpr size_t MAX_CREATOR_ACTIVE_DEPTH = 8;
+    static constexpr uint32_t MAX_CREATOR_CAPTURE_FRAMES = 1800;
     static constexpr size_t MAX_CAPTURED_CALLS = SITE_COUNT * MAX_CAPTURED_CALLS_PER_SITE;
     static constexpr size_t HOOK_COUNT = SITE_COUNT * 2;
     static constexpr std::array<uint32_t, SITE_COUNT> PRE_HOOK_RVAS{
@@ -1614,6 +1707,18 @@ private:
     bool m_overlay_snapshot_valid{};
     bool m_overlay_snapshot_attempted{};
     std::array<safetyhook::MidHook, HOOK_COUNT> m_hooks{};
+    std::atomic<bool> m_creator_attempted{};
+    std::atomic<bool> m_creator_active{};
+    std::atomic<uint32_t> m_creator_call_count{};
+    std::atomic<uint32_t> m_creator_ready_count{};
+    std::atomic<uint32_t> m_creator_frames{};
+    std::atomic<bool> m_creator_disarm_started{};
+    std::array<safetyhook::MidHook, 5> m_creator_hooks{};
+    std::array<CreatorObservation, MAX_CREATOR_OBSERVATIONS> m_creator_observations{};
+    uintptr_t m_last_creator_correlation_state{};
+    uint32_t m_last_creator_correlation_count{ UINT32_MAX };
+    static inline thread_local std::array<size_t, MAX_CREATOR_ACTIVE_DEPTH> s_creator_active_calls{};
+    static inline thread_local size_t s_creator_active_depth{};
     inline static thread_local std::array<PendingObservation, MAX_CAPTURED_CALLS> s_pending_observations{};
 
     static bool read_memory(uintptr_t address, void* destination, size_t size) noexcept {
@@ -1742,6 +1847,15 @@ private:
             unsigned destination_register_id{};
             std::array<uint32_t, CONTEXT_BEFORE_INSTRUCTIONS> preceding_rvas{};
         };
+        struct DirectCreatorCaller {
+            size_t index{};
+            size_t function_index{};
+            uint32_t function_begin_rva{};
+            uint32_t function_end_rva{};
+            uint32_t callsite_rva{};
+            uint8_t preceding_count{};
+            std::array<uint32_t, CONTEXT_BEFORE_INSTRUCTIONS> preceding_rvas{};
+        };
         static_assert(sizeof(RuntimeFunctionRange) == 12);
 
         const auto expected_vtable = m_expected_vtable.load(std::memory_order_acquire);
@@ -1753,6 +1867,11 @@ private:
         size_t decode_failure_details_logged{};
         std::array<XrefCandidate, MAX_LOGGED_XREFS> candidates{};
         size_t candidate_count{};
+        constexpr size_t MAX_LOGGED_CREATOR_CALLERS = 16;
+        std::array<DirectCreatorCaller, MAX_LOGGED_CREATOR_CALLERS> creator_callers{};
+        size_t creator_caller_count{};
+        size_t creator_call_count{};
+        bool creator_callers_truncated{};
         bool truncated{};
         bool decode_failure_details_suppressed{};
         bool scan_complete = expected_vtable != 0 &&
@@ -1866,6 +1985,33 @@ private:
                     ++xref_count;
                 }
 
+                if (decoded->Length == 5 && code[offset] == 0xE8) {
+                    int32_t displacement{};
+                    std::memcpy(&displacement, code + offset + 1, sizeof(displacement));
+                    const auto call_address = reinterpret_cast<uintptr_t>(code + offset);
+                    const auto target = static_cast<int64_t>(call_address + decoded->Length) + displacement;
+                    if (target == static_cast<int64_t>(image.base + RE4_TARGET_STATE_CREATOR_RVA)) {
+                        if (creator_call_count < MAX_LOGGED_CREATOR_CALLERS) {
+                            auto& caller = creator_callers[creator_caller_count++];
+                            caller.index = creator_call_count;
+                            caller.function_index = function_index;
+                            caller.function_begin_rva = function.begin_rva;
+                            caller.function_end_rva = function.end_rva;
+                            caller.callsite_rva = function.begin_rva + static_cast<uint32_t>(offset);
+                            caller.preceding_count = static_cast<uint8_t>(previous_instruction_count);
+                            const auto oldest = (previous_instruction_next + CONTEXT_BEFORE_INSTRUCTIONS -
+                                previous_instruction_count) % CONTEXT_BEFORE_INSTRUCTIONS;
+                            for (size_t previous_index = 0; previous_index < previous_instruction_count; ++previous_index) {
+                                caller.preceding_rvas[previous_index] = previous_instruction_rvas[
+                                    (oldest + previous_index) % CONTEXT_BEFORE_INSTRUCTIONS];
+                            }
+                        } else {
+                            creator_callers_truncated = true;
+                        }
+                        ++creator_call_count;
+                    }
+                }
+
                 previous_instruction_rvas[previous_instruction_next] =
                     function.begin_rva + static_cast<uint32_t>(offset);
                 previous_instruction_next = (previous_instruction_next + 1) % CONTEXT_BEFORE_INSTRUCTIONS;
@@ -1892,8 +2038,8 @@ private:
             scanned_function_count, failed_function_count, decode_failure_details_logged,
             decode_failure_details_suppressed, scanned_bytes, scan_complete);
 
-        const auto log_context_instruction = [&](size_t candidate_index, const char* stage, uint32_t rva,
-                                                 uint32_t function_end_rva) {
+        const auto log_context_instruction = [&](const char* kind, size_t candidate_index, const char* stage,
+                                                 uint32_t rva, uint32_t function_end_rva) {
             if (rva >= function_end_rva) {
                 return false;
             }
@@ -1901,8 +2047,8 @@ private:
             const auto address = image.base + rva;
             auto decoded = utility::decode_one(reinterpret_cast<uint8_t*>(address), remaining);
             if (!decoded || decoded->Length == 0 || decoded->Length > remaining) {
-                spdlog::warn("[RE4XeSS][TargetStateVtableProbe] context decode failed candidate={} stage={} rva=0x{:x}",
-                    candidate_index, stage, rva);
+                spdlog::warn("[RE4XeSS][TargetStateVtableProbe] context decode failed kind={} candidate={} stage={} rva=0x{:x}",
+                    kind, candidate_index, stage, rva);
                 return false;
             }
 
@@ -1915,8 +2061,8 @@ private:
                 bytes << std::hex << std::setw(2) << std::setfill('0')
                       << static_cast<unsigned>(reinterpret_cast<const uint8_t*>(address)[byte_index]);
             }
-            spdlog::info("[RE4XeSS][TargetStateVtableProbe] context candidate={} rva=0x{:x} stage={} text={} bytes={}",
-                candidate_index, rva, stage,
+            spdlog::info("[RE4XeSS][TargetStateVtableProbe] context kind={} candidate={} rva=0x{:x} stage={} text={} bytes={}",
+                kind, candidate_index, rva, stage,
                 text_status == ND_STATUS_SUCCESS ? instruction_text.data() : "unavailable", bytes.str());
             return true;
         };
@@ -1929,10 +2075,10 @@ private:
                 candidate.function_begin_rva, candidate.function_end_rva, offset,
                 candidate.destination_register_available, candidate.destination_register_id);
             for (size_t previous_index = 0; previous_index < candidate.preceding_count; ++previous_index) {
-                (void)log_context_instruction(candidate.index, "before",
+                (void)log_context_instruction("vtable-xref", candidate.index, "before",
                     candidate.preceding_rvas[previous_index], candidate.function_end_rva);
             }
-            if (!log_context_instruction(candidate.index, "at", candidate.xref_rva, candidate.function_end_rva)) {
+            if (!log_context_instruction("vtable-xref", candidate.index, "at", candidate.xref_rva, candidate.function_end_rva)) {
                 continue;
             }
 
@@ -1942,14 +2088,47 @@ private:
                 const auto remaining = std::min<size_t>(15, candidate.function_end_rva - after_rva);
                 auto decoded = utility::decode_one(reinterpret_cast<uint8_t*>(image.base + after_rva), remaining);
                 if (!decoded || decoded->Length == 0 || decoded->Length > remaining) {
-                    spdlog::warn("[RE4XeSS][TargetStateVtableProbe] context decode failed candidate={} stage=after rva=0x{:x}",
+                    spdlog::warn("[RE4XeSS][TargetStateVtableProbe] context decode failed kind=vtable-xref candidate={} stage=after rva=0x{:x}",
                         candidate.index, after_rva);
                     break;
                 }
-                (void)log_context_instruction(candidate.index, "after", after_rva, candidate.function_end_rva);
+                (void)log_context_instruction("vtable-xref", candidate.index, "after", after_rva, candidate.function_end_rva);
                 after_rva += decoded->Length;
             }
         }
+
+        for (size_t caller_index = 0; caller_index < creator_caller_count; ++caller_index) {
+            const auto& caller = creator_callers[caller_index];
+            const auto offset = caller.callsite_rva - caller.function_begin_rva;
+            spdlog::info("[RE4XeSS][TargetStateCreatorProbe] direct-caller index={} callsiteRva=0x{:x} functionIndex={} functionBeginRva=0x{:x} functionEndRva=0x{:x} offset=0x{:x} targetRva=0x{:x}",
+                caller.index, caller.callsite_rva, caller.function_index,
+                caller.function_begin_rva, caller.function_end_rva, offset,
+                RE4_TARGET_STATE_CREATOR_RVA);
+            for (size_t previous_index = 0; previous_index < caller.preceding_count; ++previous_index) {
+                (void)log_context_instruction("creator-caller", caller.index, "before",
+                    caller.preceding_rvas[previous_index], caller.function_end_rva);
+            }
+            if (!log_context_instruction("creator-caller", caller.index, "at",
+                    caller.callsite_rva, caller.function_end_rva)) {
+                continue;
+            }
+            auto after_rva = caller.callsite_rva + 5;
+            for (size_t after_index = 0; after_index < CONTEXT_AFTER_INSTRUCTIONS &&
+                after_rva < caller.function_end_rva; ++after_index) {
+                const auto remaining = std::min<size_t>(15, caller.function_end_rva - after_rva);
+                auto decoded = utility::decode_one(reinterpret_cast<uint8_t*>(image.base + after_rva), remaining);
+                if (!decoded || decoded->Length == 0 || decoded->Length > remaining) {
+                    spdlog::warn("[RE4XeSS][TargetStateVtableProbe] context decode failed kind=creator-caller candidate={} stage=after rva=0x{:x}",
+                        caller.index, after_rva);
+                    break;
+                }
+                (void)log_context_instruction("creator-caller", caller.index, "after",
+                    after_rva, caller.function_end_rva);
+                after_rva += decoded->Length;
+            }
+        }
+        spdlog::info("[RE4XeSS][TargetStateCreatorProbe] direct-caller-summary targetRva=0x{:x} callerCount={} logged={} truncated={} coverage=exception-directory-runtime-functions",
+            RE4_TARGET_STATE_CREATOR_RVA, creator_call_count, creator_caller_count, creator_callers_truncated);
 
         return DiscoveryResult{ true, scan_complete, xref_count };
     }
@@ -2025,6 +2204,352 @@ private:
         const auto target = static_cast<int64_t>(call_address + bytes.size()) + displacement;
         const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
         return base != 0 && target == static_cast<int64_t>(base + expected_target_rva);
+    }
+
+    static bool validate_creator_function_range(const ImageInfo& image) noexcept {
+        struct RuntimeFunctionRange {
+            uint32_t begin_rva{};
+            uint32_t end_rva{};
+            uint32_t unwind_info_rva{};
+        };
+        static_assert(sizeof(RuntimeFunctionRange) == 12);
+        if (image.nt.OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXCEPTION) {
+            return false;
+        }
+        const auto directory = image.nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+        if (directory.VirtualAddress == 0 || directory.Size < sizeof(RuntimeFunctionRange) ||
+            directory.Size % sizeof(RuntimeFunctionRange) != 0 || directory.VirtualAddress >= image.size ||
+            directory.Size > image.size - directory.VirtualAddress) {
+            return false;
+        }
+
+        const auto count = directory.Size / sizeof(RuntimeFunctionRange);
+        const auto table = image.base + directory.VirtualAddress;
+        for (uint32_t index = 0; index < count; ++index) {
+            RuntimeFunctionRange range{};
+            if (!read_memory(table + static_cast<uintptr_t>(index) * sizeof(range), &range, sizeof(range))) {
+                return false;
+            }
+            if (range.begin_rva == RE4_TARGET_STATE_CREATOR_RVA &&
+                range.end_rva == RE4_TARGET_STATE_CREATOR_END_RVA) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool arm_creator_probe_early(const ImageInfo& image) noexcept {
+        if (m_creator_attempted.exchange(true, std::memory_order_acq_rel)) {
+            return m_creator_active.load(std::memory_order_acquire);
+        }
+
+        const bool bytes_valid = image.valid && image.size == EXPECTED_IMAGE_SIZE &&
+            image.checksum == EXPECTED_IMAGE_CHECKSUM &&
+            validate_creator_function_range(image) &&
+            is_executable_range(image, RE4_TARGET_STATE_CREATOR_RVA,
+                RE4_TARGET_STATE_CREATOR_END_RVA - RE4_TARGET_STATE_CREATOR_RVA) &&
+            matches_bytes(image.base + 0x47D2180, {
+                0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20,
+                0x48, 0x8B, 0xFA, 0xB9, 0x01, 0x00, 0x00, 0x00 }) &&
+            matches_bytes(image.base + 0x47D2192, { 0xBA, 0xA8, 0x00, 0x00, 0x00 }) &&
+            relative_call_targets(image.base + 0x47D2197, 0x3AB27F0) &&
+            matches_bytes(image.base + 0x47D219C, { 0x48, 0x8B, 0xD8, 0x48, 0x85, 0xC0 }) &&
+            relative_call_targets(image.base + 0x47D21AA, 0x446E790) &&
+            matches_bytes(image.base + 0x47D21AF, { 0x48, 0x8D, 0x05, 0x92, 0x9F, 0x34, 0x03 }) &&
+            matches_bytes(image.base + 0x47D21B6, { 0x48, 0x89, 0x03 }) &&
+            matches_bytes(image.base + 0x47D21B9, { 0x48, 0x8B, 0xC3 }) &&
+            matches_bytes(image.base + 0x47D21BC, { 0x48, 0x8B, 0x5C, 0x24, 0x30, 0x48, 0x83, 0xC4, 0x20, 0x5F, 0xC3 }) &&
+            matches_bytes(image.base + 0x47D21C7, { 0x48, 0x8B, 0x5C, 0x24, 0x30, 0x48, 0x83, 0xC4, 0x20, 0x5F, 0xC3 });
+        if (!bytes_valid) {
+            spdlog::warn("[RE4XeSS][TargetStateCreatorProbe] not armed: RE4 image/function/byte validation failed imageSize=0x{:x} checksum=0x{:x} functionBeginRva=0x{:x} functionEndRva=0x{:x}",
+                image.size, image.checksum, RE4_TARGET_STATE_CREATOR_RVA, RE4_TARGET_STATE_CREATOR_END_RVA);
+            return false;
+        }
+
+        constexpr std::array<uint32_t, static_cast<size_t>(CreatorHookPoint::Count)> hook_rvas{
+            0x47D2180, 0x47D219C, 0x47D21AF, 0x47D21BC, 0x47D21C7 };
+        for (size_t index = 0; index < hook_rvas.size(); ++index) {
+            m_creator_hooks[index] = safetyhook::create_mid(
+                reinterpret_cast<void*>(image.base + hook_rvas[index]),
+                creator_hook_callback(index), safetyhook::MidHook::StartDisabled);
+            if (!m_creator_hooks[index]) {
+                disarm_creator_probe("could not create all creator hooks");
+                return false;
+            }
+            const auto actual_span = m_creator_hooks[index].original_bytes().size();
+            const auto next_rva = index + 1 < hook_rvas.size()
+                ? hook_rvas[index + 1]
+                : RE4_TARGET_STATE_CREATOR_END_RVA;
+            if (actual_span == 0 || actual_span > next_rva - hook_rvas[index]) {
+                spdlog::warn("[RE4XeSS][TargetStateCreatorProbe] not armed: hook span overlaps next site index={} rva=0x{:x} actualSpan={} maxSpan={}",
+                    index, hook_rvas[index], actual_span, next_rva - hook_rvas[index]);
+                disarm_creator_probe("creator hook span overlap");
+                return false;
+            }
+            spdlog::info("[RE4XeSS][TargetStateCreatorProbe] hook-span validated point={} rva=0x{:x} actual={} nextRva=0x{:x}",
+                index, hook_rvas[index], actual_span, next_rva);
+        }
+
+        m_creator_call_count.store(0, std::memory_order_release);
+        m_creator_ready_count.store(0, std::memory_order_release);
+        m_creator_frames.store(0, std::memory_order_release);
+        m_creator_disarm_started.store(false, std::memory_order_release);
+        for (size_t index = 0; index < m_creator_hooks.size(); ++index) {
+            if (!m_creator_hooks[index].enable()) {
+                disarm_creator_probe("could not enable all creator hooks");
+                return false;
+            }
+        }
+        m_creator_active.store(true, std::memory_order_release);
+
+        spdlog::info("[RE4XeSS][TargetStateCreatorProbe] armed creatorRva=0x{:x} functionBeginRva=0x{:x} functionEndRva=0x{:x} imageSize=0x{:x} checksum=0x{:x} points=entry,post-allocation,post-initializer,post-vtable-store-return,allocation-failure-return observationLimit={} frameLimit={} readOnly=true",
+            RE4_TARGET_STATE_CREATOR_RVA, RE4_TARGET_STATE_CREATOR_RVA, RE4_TARGET_STATE_CREATOR_END_RVA,
+            image.size, image.checksum, MAX_CREATOR_OBSERVATIONS, MAX_CREATOR_CAPTURE_FRAMES);
+        return true;
+    }
+
+    static safetyhook::MidHookFn creator_hook_callback(size_t index) noexcept {
+        switch (static_cast<CreatorHookPoint>(index)) {
+        case CreatorHookPoint::FunctionEntry: return &creator_entry_callback;
+        case CreatorHookPoint::AllocationReturned: return &creator_allocation_callback;
+        case CreatorHookPoint::InitializerReturned: return &creator_initializer_callback;
+        case CreatorHookPoint::SuccessReturn: return &creator_success_return_callback;
+        case CreatorHookPoint::AllocationFailureReturn: return &creator_failure_return_callback;
+        default: return nullptr;
+        }
+    }
+
+    static void creator_entry_callback(safetyhook::Context& context) noexcept {
+        instance().capture_creator_entry(context);
+    }
+
+    static void creator_allocation_callback(safetyhook::Context& context) noexcept {
+        instance().capture_creator_phase(CreatorHookPoint::AllocationReturned, context);
+    }
+
+    static void creator_initializer_callback(safetyhook::Context& context) noexcept {
+        instance().capture_creator_phase(CreatorHookPoint::InitializerReturned, context);
+    }
+
+    static void creator_success_return_callback(safetyhook::Context& context) noexcept {
+        instance().capture_creator_phase(CreatorHookPoint::SuccessReturn, context);
+    }
+
+    static void creator_failure_return_callback(safetyhook::Context& context) noexcept {
+        instance().capture_creator_phase(CreatorHookPoint::AllocationFailureReturn, context);
+    }
+
+    void capture_creator_entry(const safetyhook::Context& context) noexcept {
+        if (!m_creator_active.load(std::memory_order_acquire)) {
+            return;
+        }
+        if (s_creator_active_depth >= MAX_CREATOR_ACTIVE_DEPTH) {
+            return;
+        }
+
+        auto index = m_creator_call_count.load(std::memory_order_acquire);
+        while (index < MAX_CREATOR_OBSERVATIONS &&
+            !m_creator_call_count.compare_exchange_weak(index, index + 1,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+        }
+        if (index >= MAX_CREATOR_OBSERVATIONS) {
+            return;
+        }
+
+        auto& observation = m_creator_observations[index];
+        uintptr_t caller_return{};
+        (void)read_memory(static_cast<uintptr_t>(context.rsp), &caller_return, sizeof(caller_return));
+        uintptr_t caller_callsite{};
+        if (caller_return >= m_image_base + 5 &&
+            relative_call_targets(caller_return - 5, RE4_TARGET_STATE_CREATOR_RVA)) {
+            caller_callsite = caller_return - 5 - m_image_base;
+        }
+        observation.id = index + 1;
+        observation.thread_id = GetCurrentThreadId();
+        observation.caller_return_rva = caller_return >= m_image_base && caller_return < m_image_end
+            ? caller_return - m_image_base
+            : 0;
+        observation.caller_callsite_rva = caller_callsite;
+        observation.rcx = static_cast<uintptr_t>(context.rcx);
+        observation.rdx = static_cast<uintptr_t>(context.rdx);
+        observation.r8 = static_cast<uintptr_t>(context.r8);
+        observation.r9 = static_cast<uintptr_t>(context.r9);
+        observation.rdi = static_cast<uintptr_t>(context.rdi);
+        observation.ready.store(true, std::memory_order_release);
+        m_creator_ready_count.fetch_add(1, std::memory_order_acq_rel);
+        s_creator_active_calls[s_creator_active_depth++] = index;
+        spdlog::info("[RE4XeSS][TargetStateCreatorProbe] stage=entry id={} tid={} callerReturnRva=0x{:x} callerCallsiteRva=0x{:x} regs[rcx=0x{:x},rdx=0x{:x},r8=0x{:x},r9=0x{:x},rdi=0x{:x},rsp=0x{:x}]",
+            observation.id, observation.thread_id, observation.caller_return_rva,
+            observation.caller_callsite_rva, observation.rcx, observation.rdx,
+            observation.r8, observation.r9, observation.rdi, static_cast<uintptr_t>(context.rsp));
+    }
+
+    void capture_creator_phase(CreatorHookPoint point, const safetyhook::Context& context) noexcept {
+        if (!m_creator_active.load(std::memory_order_acquire) || s_creator_active_depth == 0) {
+            return;
+        }
+        const auto index = s_creator_active_calls[s_creator_active_depth - 1];
+        if (index >= MAX_CREATOR_OBSERVATIONS) {
+            return;
+        }
+        auto& observation = m_creator_observations[index];
+        const auto thread_id = GetCurrentThreadId();
+        if (!observation.ready.load(std::memory_order_acquire) || observation.thread_id != thread_id) {
+            return;
+        }
+
+        if (point == CreatorHookPoint::AllocationReturned) {
+            const auto allocation = static_cast<uintptr_t>(context.rax);
+            observation.allocation_result.store(allocation, std::memory_order_release);
+            spdlog::info("[RE4XeSS][TargetStateCreatorProbe] stage=post-allocation id={} tid={} allocationResult=0x{:x} expectedSize=0xa8 rbXBeforeMove=0x{:x}",
+                observation.id, thread_id, allocation, static_cast<uintptr_t>(context.rbx));
+            return;
+        }
+        if (point == CreatorHookPoint::InitializerReturned) {
+            const auto object = static_cast<uintptr_t>(context.rbx);
+            observation.initialized_object.store(object, std::memory_order_release);
+            spdlog::info("[RE4XeSS][TargetStateCreatorProbe] stage=post-initializer id={} tid={} object=0x{:x} rax=0x{:x} rdi=0x{:x} rcx=0x{:x} rdx=0x{:x}",
+                observation.id, thread_id, object, static_cast<uintptr_t>(context.rax),
+                static_cast<uintptr_t>(context.rdi), static_cast<uintptr_t>(context.rcx),
+                static_cast<uintptr_t>(context.rdx));
+            return;
+        }
+
+        if (point == CreatorHookPoint::SuccessReturn) {
+            const auto object = static_cast<uintptr_t>(context.rbx);
+            const auto returned = static_cast<uintptr_t>(context.rax);
+            observation.constructed_object.store(object, std::memory_order_release);
+            observation.returned_object.store(returned, std::memory_order_release);
+            const auto snapshot = snapshot_creator_object(object);
+            observation.object_vtable.store(snapshot.vtable, std::memory_order_release);
+            observation.object_ref_count.store(snapshot.ref_count, std::memory_order_release);
+            observation.object_render_frame.store(snapshot.render_frame, std::memory_order_release);
+            observation.object_rtvs.store(snapshot.rtvs, std::memory_order_release);
+            observation.object_dsv.store(snapshot.dsv, std::memory_order_release);
+            observation.object_num_rtv.store(snapshot.num_rtv, std::memory_order_release);
+            observation.object_rect_left.store(snapshot.rect_left, std::memory_order_release);
+            observation.object_rect_top.store(snapshot.rect_top, std::memory_order_release);
+            observation.object_rect_right.store(snapshot.rect_right, std::memory_order_release);
+            observation.object_rect_bottom.store(snapshot.rect_bottom, std::memory_order_release);
+            observation.object_flag.store(snapshot.flag, std::memory_order_release);
+            observation.object_rtv0.store(snapshot.rtv0, std::memory_order_release);
+            observation.object_rtv_valid.store(snapshot.rtv_valid, std::memory_order_release);
+            observation.object_rtv_format.store(snapshot.rtv_format, std::memory_order_release);
+            observation.object_rtv_dimension.store(snapshot.rtv_dimension, std::memory_order_release);
+            observation.object_texture.store(snapshot.texture, std::memory_order_release);
+            observation.object_texture_header_valid.store(snapshot.texture_header_valid, std::memory_order_release);
+            observation.object_texture_vtable.store(snapshot.texture_vtable, std::memory_order_release);
+            observation.object_texture_ref_count.store(snapshot.texture_ref_count, std::memory_order_release);
+            observation.object_texture_render_frame.store(snapshot.texture_render_frame, std::memory_order_release);
+            observation.object_target_state_like.store(snapshot.target_state_like, std::memory_order_release);
+            spdlog::info("[RE4XeSS][TargetStateCreatorProbe] stage=post-vtable-store-return id={} tid={} candidateObject=0x{:x} returnedObject=0x{:x} objectSnapshotReadable={} vtable=0x{:x} refCount={} renderFrame={} rtvs=0x{:x} dsv=0x{:x} numRtv={} rect=({:.3f},{:.3f},{:.3f},{:.3f}) flag={} rtv0=0x{:x} rtvValid={} rtvFormat={} rtvDimension={} texture=0x{:x} textureHeaderValid={} textureVtable=0x{:x} textureRefCount={} textureRenderFrame={} targetStateLike={}",
+                observation.id, thread_id, object, returned, snapshot.readable, snapshot.vtable,
+                snapshot.ref_count, snapshot.render_frame, snapshot.rtvs, snapshot.dsv,
+                snapshot.num_rtv, snapshot.rect_left, snapshot.rect_top,
+                snapshot.rect_right, snapshot.rect_bottom, snapshot.flag, snapshot.rtv0,
+                snapshot.rtv_valid, snapshot.rtv_format, snapshot.rtv_dimension,
+                snapshot.texture, snapshot.texture_header_valid, snapshot.texture_vtable,
+                snapshot.texture_ref_count, snapshot.texture_render_frame, snapshot.target_state_like);
+        } else if (point == CreatorHookPoint::AllocationFailureReturn) {
+            const auto returned = static_cast<uintptr_t>(context.rax);
+            observation.returned_object.store(returned, std::memory_order_release);
+            spdlog::info("[RE4XeSS][TargetStateCreatorProbe] stage=allocation-failure-return id={} tid={} allocationResult=0x{:x} returnedObject=0x{:x}",
+                observation.id, thread_id,
+                observation.allocation_result.load(std::memory_order_acquire), returned);
+        }
+
+        if (s_creator_active_calls[s_creator_active_depth - 1] == index) {
+            --s_creator_active_depth;
+        }
+    }
+
+    void disarm_creator_probe(std::string_view reason) noexcept {
+        m_creator_active.store(false, std::memory_order_release);
+        if (m_creator_disarm_started.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        bool disable_failed{};
+        for (auto& hook : m_creator_hooks) {
+            if (hook && !hook.disable()) {
+                disable_failed = true;
+            }
+        }
+        spdlog::info("[RE4XeSS][TargetStateCreatorProbe] disarmed reason={} observations={} frames={} disableFailed={}",
+            reason, m_creator_ready_count.load(std::memory_order_acquire),
+            m_creator_frames.load(std::memory_order_acquire), disable_failed);
+    }
+
+    void correlate_creator_observations(uintptr_t live_overlay_state) noexcept {
+        if (live_overlay_state == 0) {
+            return;
+        }
+        const auto ready_count = m_creator_ready_count.load(std::memory_order_acquire);
+        if (live_overlay_state == m_last_creator_correlation_state &&
+            ready_count == m_last_creator_correlation_count) {
+            return;
+        }
+        m_last_creator_correlation_state = live_overlay_state;
+        m_last_creator_correlation_count = ready_count;
+        const auto live = snapshot_creator_object(live_overlay_state);
+        bool matched{};
+        uint64_t matched_call_id{};
+        uintptr_t matched_caller_rva{};
+        uint32_t structural_matches{};
+        uint64_t first_structural_call_id{};
+        uintptr_t first_structural_caller_rva{};
+        for (size_t index = 0; index < MAX_CREATOR_OBSERVATIONS; ++index) {
+            const auto& observation = m_creator_observations[index];
+            if (!observation.ready.load(std::memory_order_acquire)) {
+                continue;
+            }
+            const auto constructed = observation.constructed_object.load(std::memory_order_acquire);
+            const auto returned = observation.returned_object.load(std::memory_order_acquire);
+            if (constructed == live_overlay_state || returned == live_overlay_state) {
+                matched = true;
+                matched_call_id = observation.id;
+                matched_caller_rva = observation.caller_callsite_rva != 0
+                    ? observation.caller_callsite_rva
+                    : observation.caller_return_rva;
+                break;
+            }
+
+            if (constructed == 0 ||
+                !observation.object_target_state_like.load(std::memory_order_acquire)) {
+                continue;
+            }
+            const bool vtable_match = live.readable &&
+                observation.object_vtable.load(std::memory_order_acquire) == live.vtable && live.vtable != 0;
+            const bool count_match = observation.object_num_rtv.load(std::memory_order_acquire) == live.num_rtv;
+            const auto candidate_rtv = observation.object_rtv0.load(std::memory_order_acquire);
+            const bool rtv_match = candidate_rtv == 0 || live.rtv0 == 0 || candidate_rtv == live.rtv0;
+            const auto rect_left = observation.object_rect_left.load(std::memory_order_acquire);
+            const auto rect_top = observation.object_rect_top.load(std::memory_order_acquire);
+            const auto rect_right = observation.object_rect_right.load(std::memory_order_acquire);
+            const auto rect_bottom = observation.object_rect_bottom.load(std::memory_order_acquire);
+            const bool rect_match = live.readable && std::abs(rect_left - live.rect_left) <= 0.01f &&
+                std::abs(rect_top - live.rect_top) <= 0.01f &&
+                std::abs(rect_right - live.rect_right) <= 0.01f &&
+                std::abs(rect_bottom - live.rect_bottom) <= 0.01f;
+            if (vtable_match && count_match && rtv_match && rect_match) {
+                if (structural_matches == 0) {
+                    first_structural_call_id = observation.id;
+                    first_structural_caller_rva = observation.caller_callsite_rva != 0
+                        ? observation.caller_callsite_rva
+                        : observation.caller_return_rva;
+                }
+                ++structural_matches;
+            }
+        }
+
+        if (!matched && structural_matches != 0) {
+            matched_call_id = first_structural_call_id;
+            matched_caller_rva = first_structural_caller_rva;
+        }
+        spdlog::info("[RE4XeSS][TargetStateCreatorProbe] live-correlation liveOverlayState=0x{:x} matchedObservation={} matchedCallId={} creatorRva=0x{:x} callerRva=0x{:x} structuralMatches={} liveSnapshotReadable={} liveVtable=0x{:x} liveRefCount={} liveNumRtv={} liveRtv0=0x{:x} liveRect=({:.3f},{:.3f},{:.3f},{:.3f}) observations={}",
+            live_overlay_state, matched, matched_call_id, RE4_TARGET_STATE_CREATOR_RVA,
+            matched_caller_rva, structural_matches, live.readable, live.vtable,
+            live.ref_count, live.num_rtv, live.rtv0, live.rect_left, live.rect_top,
+            live.rect_right, live.rect_bottom, ready_count);
     }
 
     static bool validate_provenance_writer(const ImageInfo& image) noexcept {
@@ -3089,6 +3614,55 @@ private:
     }
 };
 
+TargetStateFactoryProbe::CreatorObjectSnapshot TargetStateFactoryProbe::snapshot_creator_object(
+    uintptr_t object) const noexcept {
+    CreatorObjectSnapshot result{};
+    result.object = object;
+    if (object == 0) {
+        return result;
+    }
+
+    TargetStateLayoutSnapshot state{};
+    if (!read_private_memory(object, &state, sizeof(state)) || !has_re4_vtable(state.vtable)) {
+        return result;
+    }
+    result.readable = true;
+    result.vtable = state.vtable;
+    result.ref_count = state.ref_count;
+    result.render_frame = state.render_frame;
+    result.rtvs = state.rtvs;
+    result.dsv = state.dsv;
+    result.num_rtv = state.num_rtv;
+    result.rect_left = state.rect_left;
+    result.rect_top = state.rect_top;
+    result.rect_right = state.rect_right;
+    result.rect_bottom = state.rect_bottom;
+    result.flag = state.flag;
+
+    if (state.rtvs != 0 && state.num_rtv != 0 && state.num_rtv <= MAX_TARGET_STATE_RTVS) {
+        if (read_private_memory(state.rtvs, &result.rtv0, sizeof(result.rtv0)) && result.rtv0 != 0) {
+            RenderTargetViewSnapshot rtv{};
+            result.rtv_valid = inspect_rtv(result.rtv0, rtv);
+            if (result.rtv_valid) {
+                result.rtv_format = rtv.format;
+                result.rtv_dimension = rtv.dimension;
+                if (read_rtv_texture_pointer(result.rtv0, result.texture)) {
+                    RenderResourceHeaderSnapshot texture_header{};
+                    result.texture_header_valid = inspect_render_resource_header(result.texture, texture_header);
+                    if (result.texture_header_valid) {
+                        result.texture_vtable = texture_header.vtable;
+                        result.texture_ref_count = texture_header.ref_count;
+                        result.texture_render_frame = texture_header.render_frame;
+                    }
+                }
+            }
+        }
+    }
+    result.target_state_like = state.vtable == m_expected_vtable.load(std::memory_order_acquire) &&
+        state.num_rtv == 1 && plausible_rect(state) && result.rtv_valid;
+    return result;
+}
+
 bool is_valid_texture_extent(ID3D12Resource* resource, uint32_t width, uint32_t height) {
     if (resource == nullptr) {
         return false;
@@ -3119,8 +3693,8 @@ void RE4XeSS::bootstrap_early_target_state_diagnostics() noexcept {
     spdlog::info("[RE4XeSS][TargetStateVtableProbe] bootstrap-begin point=REFramework-constructor-after-integrity tid={} before-plugin-init=true",
         GetCurrentThreadId());
     const auto discovery = TargetStateFactoryProbe::instance().discover_target_state_vtable_early();
-    spdlog::info("[RE4XeSS][TargetStateVtableProbe] bootstrap-result attempted={} complete={} xrefCount={} point=REFramework-constructor-after-integrity",
-        discovery.attempted, discovery.complete, discovery.xref_count);
+    spdlog::info("[RE4XeSS][TargetStateVtableProbe] bootstrap-result attempted={} complete={} xrefCount={} creatorProbeArmed={} point=REFramework-constructor-after-integrity",
+        discovery.attempted, discovery.complete, discovery.xref_count, discovery.creator_probe_armed);
 }
 
 void RE4XeSS::shutdown_early_target_state_diagnostics() noexcept {
@@ -4383,8 +4957,6 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         packet.frame_id,
         packet.display_width,
         packet.display_height);
-    auto& target_state_probe = TargetStateFactoryProbe::instance();
-    (void)target_state_probe.arm(packet.frame_id, layer, color_state, color);
     const bool handoff_prepared = m_output_handoff.prepare(
         layer,
         control_request.device.Get(),
@@ -4399,7 +4971,6 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         control_result.snapshot.bridge_device_removed,
         output,
         handoff_error);
-    target_state_probe.on_prepare_return(handoff_prepared);
     if (!handoff_prepared) {
         const auto handoff_state = m_output_handoff.snapshot();
         const bool retirement_pending =
