@@ -1215,14 +1215,32 @@ public:
         }
         m_semantic_color = reinterpret_cast<uintptr_t>(semantic_color);
         m_calls_captured.store(0, std::memory_order_release);
+        m_returns_captured.store(0, std::memory_order_release);
         m_next_call_id.store(0, std::memory_order_release);
+        m_capture_started.store(false, std::memory_order_release);
         m_capture_stopped.store(false, std::memory_order_release);
+        for (size_t index = 0; index < SITE_COUNT; ++index) {
+            m_site_call_counts[index].store(0, std::memory_order_release);
+            m_site_return_counts[index].store(0, std::memory_order_release);
+        }
 
         for (size_t index = 0; index < HOOK_COUNT; ++index) {
             const auto address = reinterpret_cast<void*>(image.base + hook_rva(index));
             m_hooks[index] = safetyhook::create_mid(address, hook_callback(index), safetyhook::MidHook::StartDisabled);
             if (!m_hooks[index]) {
                 disarm("could not create all callsite hooks");
+                return false;
+            }
+        }
+
+        // The pre-hooks must stop before each original CALL so its address and return address stay unchanged.
+        for (size_t index = 0; index < SITE_COUNT; ++index) {
+            const auto expected_span = CALLSITE_RVAS[index] - PRE_HOOK_RVAS[index];
+            const auto actual_span = m_hooks[index].original_bytes().size();
+            if (actual_span != expected_span) {
+                spdlog::warn("[RE4XeSS][TargetStateProbe] not armed: pre-hook span would move callsite index={} expected={} actual={}",
+                    index, expected_span, actual_span);
+                disarm("pre-hook span overlaps callsite");
                 return false;
             }
         }
@@ -1236,7 +1254,7 @@ public:
 
         m_active.store(true, std::memory_order_release);
 
-        spdlog::info("[RE4XeSS][TargetStateProbe] armed frame={} thread={} imageSize=0x{:x} checksum=0x{:x} overlayState=0x{:x} desc=0x{:x} rtvArray=0x{:x} rtv0=0x{:x} color=0x{:x} sites={} captureLimit={}",
+        spdlog::info("[RE4XeSS][TargetStateProbe] armed frame={} thread={} imageSize=0x{:x} checksum=0x{:x} overlayState=0x{:x} desc=0x{:x} rtvArray=0x{:x} rtv0=0x{:x} color=0x{:x} sites={} captureLimit={} perSiteLimit={} captureStarts=after-prepare disarm=next-post-present",
             static_cast<unsigned long long>(m_frame_id),
             m_arm_thread_id,
             image.size,
@@ -1247,9 +1265,26 @@ public:
             m_overlay_rtv,
             m_semantic_color,
             CALLSITE_RVAS.size(),
-            MAX_CAPTURED_CALLS);
+            MAX_CAPTURED_CALLS,
+            MAX_CAPTURED_CALLS_PER_SITE);
         log_overlay_state_snapshot(overlay_state);
         return true;
+    }
+
+    void on_prepare_return(bool prepared) noexcept {
+        if (!m_active.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        bool expected = false;
+        if (!m_capture_started.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return;
+        }
+        spdlog::info("[RE4XeSS][TargetStateProbe] capture window started frame={} prepare={} thread={} boundary=next-post-present",
+            static_cast<unsigned long long>(m_frame_id),
+            prepared,
+            GetCurrentThreadId());
     }
 
     void disarm(std::string_view reason) noexcept {
@@ -1265,10 +1300,28 @@ public:
             }
         }
 
-        spdlog::info("[RE4XeSS][TargetStateProbe] disarmed reason={} capturedCalls={} disableFailed={}",
+        spdlog::info("[RE4XeSS][TargetStateProbe] disarmed reason={} captureStarted={} capturedCalls={} returnedCalls={} captureBudgetReached={} disableFailed={}",
             reason,
+            m_capture_started.load(std::memory_order_acquire),
             m_calls_captured.load(std::memory_order_acquire),
+            m_returns_captured.load(std::memory_order_acquire),
+            m_capture_stopped.load(std::memory_order_acquire),
             disable_failed);
+        for (size_t index = 0; index < SITE_COUNT; ++index) {
+            spdlog::info("[RE4XeSS][TargetStateProbe] site-summary site={} callsiteRva=0x{:x} pre={} post={}",
+                SITE_NAMES[index],
+                CALLSITE_RVAS[index],
+                m_site_call_counts[index].load(std::memory_order_acquire),
+                m_site_return_counts[index].load(std::memory_order_acquire));
+        }
+    }
+
+    void on_post_present() noexcept {
+        if (m_active.load(std::memory_order_acquire)) {
+            disarm(m_capture_stopped.load(std::memory_order_acquire)
+                    ? "capture budget reached; hooks removed at post-present boundary"
+                    : "post-present frame boundary");
+        }
     }
 
 private:
@@ -1281,7 +1334,7 @@ private:
         bool valid{};
     };
 
-    struct PendingCall {
+    struct CallArguments {
         uintptr_t rcx{};
         uintptr_t rdx{};
         uintptr_t r8{};
@@ -1289,11 +1342,27 @@ private:
         uint8_t valid_mask{};
     };
 
+    struct PendingObservation {
+        bool active{};
+        size_t site{};
+        uintptr_t stack_pointer{};
+        uint64_t id{};
+        CallArguments arguments{};
+        uintptr_t callee{};
+    };
+
     static constexpr uint32_t EXPECTED_IMAGE_SIZE = 0x0E405000;
     static constexpr uint32_t EXPECTED_IMAGE_CHECKSUM = 0x0DEE3479;
-    static constexpr size_t MAX_CAPTURED_CALLS = 16;
     static constexpr size_t SITE_COUNT = 4;
-    static constexpr size_t HOOK_COUNT = SITE_COUNT;
+    static constexpr size_t MAX_CAPTURED_CALLS_PER_SITE = 4;
+    static constexpr size_t MAX_CAPTURED_CALLS = SITE_COUNT * MAX_CAPTURED_CALLS_PER_SITE;
+    static constexpr size_t HOOK_COUNT = SITE_COUNT * 2;
+    static constexpr std::array<uint32_t, SITE_COUNT> PRE_HOOK_RVAS{
+        0x447AF53,
+        0x47212A0,
+        0x44C7A21,
+        0x47D0FC5,
+    };
     static constexpr std::array<uint32_t, SITE_COUNT> CALLSITE_RVAS{
         0x447AF5A,
         0x47212A6,
@@ -1306,7 +1375,6 @@ private:
         0x44C7A2A,
         0x47D0FD5,
     };
-    static constexpr std::array<uint32_t, HOOK_COUNT> HOOK_RVAS = RETURN_RVAS;
     static constexpr std::array<const char*, SITE_COUNT> SITE_NAMES{
         "render-target-view factory call",
         "RTV owner vcall+0x40 A",
@@ -1317,9 +1385,13 @@ private:
     std::atomic<bool> m_attempted{};
     std::atomic<bool> m_active{};
     std::atomic<bool> m_disarm_started{};
+    std::atomic<bool> m_capture_started{};
     std::atomic<bool> m_capture_stopped{};
     std::atomic<uint32_t> m_calls_captured{};
+    std::atomic<uint32_t> m_returns_captured{};
     std::atomic<uint64_t> m_next_call_id{};
+    std::array<std::atomic<uint32_t>, SITE_COUNT> m_site_call_counts{};
+    std::array<std::atomic<uint32_t>, SITE_COUNT> m_site_return_counts{};
     uintptr_t m_image_base{};
     uintptr_t m_image_end{};
     uint64_t m_frame_id{};
@@ -1330,6 +1402,7 @@ private:
     uintptr_t m_overlay_rtv{};
     uintptr_t m_semantic_color{};
     std::array<safetyhook::MidHook, HOOK_COUNT> m_hooks{};
+    inline static thread_local std::array<PendingObservation, MAX_CAPTURED_CALLS> s_pending_observations{};
 
     static bool read_memory(uintptr_t address, void* destination, size_t size) noexcept {
         if (address == 0 || destination == nullptr || size == 0 || address > UINTPTR_MAX - size) {
@@ -1414,6 +1487,7 @@ private:
         switch (index) {
         case 0: {
             if (!is_executable_range(image, 0x447AF50, 11) ||
+                !is_executable_range(image, PRE_HOOK_RVAS[index], 7) ||
                 !is_executable_range(image, CALLSITE_RVAS[index], 5) ||
                 !is_executable_range(image, RETURN_RVAS[index], 4) ||
                 !matches_bytes(image.base + 0x447AF50, {
@@ -1430,12 +1504,14 @@ private:
         }
         case 1:
             return is_executable_range(image, 0x47212A0, 9) &&
+                is_executable_range(image, PRE_HOOK_RVAS[index], 6) &&
                 is_executable_range(image, RETURN_RVAS[index], 4) &&
                 matches_bytes(image.base + 0x47212A0, {
                        0x48, 0x8B, 0x07, 0x48, 0x8B, 0xCF, 0xFF, 0x50, 0x40 }) &&
                 matches_bytes(image.base + RETURN_RVAS[index], { 0x48, 0x8B, 0x5F, 0x48 });
         case 2:
             return is_executable_range(image, 0x44C7A21, 9) &&
+                is_executable_range(image, PRE_HOOK_RVAS[index], 6) &&
                 is_executable_range(image, RETURN_RVAS[index], 12) &&
                 matches_bytes(image.base + 0x44C7A21, {
                        0x49, 0x8B, 0x06, 0x49, 0x8B, 0xCE, 0xFF, 0x50, 0x40 }) &&
@@ -1443,6 +1519,7 @@ private:
                     0x48, 0xC7, 0x84, 0x24, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
         case 3:
             return is_executable_range(image, 0x47D0FBE, 23) &&
+                is_executable_range(image, PRE_HOOK_RVAS[index], 10) &&
                 is_executable_range(image, CALLSITE_RVAS[index], 6) &&
                 is_executable_range(image, RETURN_RVAS[index], 5) &&
                 matches_bytes(image.base + 0x47D0FBE, {
@@ -1455,7 +1532,16 @@ private:
     }
 
     static uint32_t hook_rva(size_t hook_index) noexcept {
-        return hook_index < HOOK_RVAS.size() ? HOOK_RVAS[hook_index] : 0;
+        if (hook_index < SITE_COUNT) {
+            return PRE_HOOK_RVAS[hook_index];
+        }
+        const auto site = hook_index - SITE_COUNT;
+        return site < RETURN_RVAS.size() ? RETURN_RVAS[site] : 0;
+    }
+
+    template <size_t Site>
+    static void before_call(safetyhook::Context& context) {
+        instance().capture_before(Site, context);
     }
 
     template <size_t Site>
@@ -1465,6 +1551,10 @@ private:
 
     static safetyhook::MidHookFn hook_callback(size_t hook_index) noexcept {
         static constexpr std::array<safetyhook::MidHookFn, HOOK_COUNT> callbacks{
+            &before_call<0>,
+            &before_call<1>,
+            &before_call<2>,
+            &before_call<3>,
             &after_call<0>,
             &after_call<1>,
             &after_call<2>,
@@ -1488,7 +1578,7 @@ private:
             slot_offset = 0x40;
         } else if (site == 3) {
             const auto vtable = read_pointer(static_cast<uintptr_t>(context.r14));
-            if (vtable > UINTPTR_MAX - 0xC06C08) {
+            if (vtable == 0 || vtable > UINTPTR_MAX - 0xC06C08) {
                 return 0;
             }
             receiver = read_pointer(vtable + 0xC06C08);
@@ -1505,13 +1595,36 @@ private:
         return read_memory(vtable + slot_offset, &target, sizeof(target)) ? target : 0;
     }
 
-    uint64_t note_capture() noexcept {
-        const auto index = m_calls_captured.fetch_add(1, std::memory_order_acq_rel);
-        if (index >= MAX_CAPTURED_CALLS) {
-            m_capture_stopped.store(true, std::memory_order_release);
-            return 0;
+    bool reserve_call(size_t site, uint64_t& id) noexcept {
+        if (site >= SITE_COUNT) {
+            return false;
         }
-        return m_next_call_id.fetch_add(1, std::memory_order_relaxed) + 1;
+
+        auto site_count = m_site_call_counts[site].load(std::memory_order_acquire);
+        while (site_count < MAX_CAPTURED_CALLS_PER_SITE) {
+            if (m_site_call_counts[site].compare_exchange_weak(
+                    site_count, site_count + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                const auto total_count = m_calls_captured.fetch_add(1, std::memory_order_acq_rel);
+                if (total_count >= MAX_CAPTURED_CALLS) {
+                    m_calls_captured.fetch_sub(1, std::memory_order_acq_rel);
+                    m_site_call_counts[site].fetch_sub(1, std::memory_order_acq_rel);
+                    m_capture_stopped.store(true, std::memory_order_release);
+                    return false;
+                }
+                id = m_next_call_id.fetch_add(1, std::memory_order_relaxed) + 1;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static PendingObservation* find_pending_observation(size_t site, uintptr_t stack_pointer) noexcept {
+        for (auto& pending : s_pending_observations) {
+            if (pending.active && pending.site == site && pending.stack_pointer == stack_pointer) {
+                return &pending;
+            }
+        }
+        return nullptr;
     }
 
     static bool read_stack_window(uintptr_t rsp, std::array<uintptr_t, 4>& values) noexcept {
@@ -1521,13 +1634,18 @@ private:
         return read_memory(rsp + 0x20, values.data(), sizeof(values));
     }
 
-    PendingCall reconstruct_arguments(size_t site, const safetyhook::Context& context) const noexcept {
-        PendingCall args{};
+    CallArguments reconstruct_arguments(size_t site, const safetyhook::Context& context) const noexcept {
+        CallArguments args{};
         if (site == 0) {
             args.rcx = static_cast<uintptr_t>(context.r12);
             args.rdx = static_cast<uintptr_t>(context.rbx);
-            args.r8 = static_cast<uintptr_t>(context.rbp) + 0x6D0;
-            args.valid_mask = 0x07;
+            const auto rbp = static_cast<uintptr_t>(context.rbp);
+            if (rbp != 0 && rbp <= UINTPTR_MAX - 0x6D0) {
+                args.r8 = rbp + 0x6D0;
+                args.valid_mask = 0x07;
+            } else {
+                args.valid_mask = 0x03;
+            }
             return args;
         }
         if (site == 1) {
@@ -1553,7 +1671,7 @@ private:
             args.rcx = read_pointer(vtable + 0xC06C08);
             if (args.rcx != 0) args.valid_mask |= 0x01;
         }
-        if (rsi <= UINTPTR_MAX - 0xB8) {
+        if (rsi != 0 && rsi <= UINTPTR_MAX - 0xB8) {
             const auto desc_owner = read_pointer(rsi + 0xB8);
             if (desc_owner != 0 && desc_owner <= UINTPTR_MAX - 0x18) {
                 args.rdx = read_pointer(desc_owner + 0x18);
@@ -1641,54 +1759,120 @@ private:
             m_semantic_color);
     }
 
-    void capture_after(size_t site, const safetyhook::Context& context) noexcept {
-        if (!m_active.load(std::memory_order_acquire) || m_capture_stopped.load(std::memory_order_acquire)) {
+    void log_observation(
+        std::string_view stage,
+        uint64_t id,
+        size_t site,
+        const safetyhook::Context& context,
+        const CallArguments& args,
+        uintptr_t callee) const {
+        std::array<uintptr_t, 4> stack{};
+        const auto has_stack = read_stack_window(static_cast<uintptr_t>(context.rsp), stack);
+        const auto rax = static_cast<uintptr_t>(context.rax);
+        const auto tid = GetCurrentThreadId();
+        spdlog::info("[RE4XeSS][TargetStateProbe] stage={} id={} armFrame={} site={} callsiteRva=0x{:x} returnRva=0x{:x} callee={} tid={} armThread={} rsp=0x{:x} regs[rax=0x{:x},rcx=0x{:x},rdx=0x{:x},r8=0x{:x},r9=0x{:x},rdi=0x{:x},rsi=0x{:x},r12=0x{:x},r14=0x{:x},r15=0x{:x},rbp=0x{:x}] abiMask=0x{:x} abiArgs[rcx=0x{:x},rdx=0x{:x},r8=0x{:x},r9=0x{:x}] stack20=[0x{:x},0x{:x},0x{:x},0x{:x}] stackValid={} identity[abiRCX:{};abiRDX:{};abiR8:{};abiR9:{};rax:{}] words[abiRCX={};abiRDX={};abiR8={};abiR9={};rax={}]",
+            stage,
+            static_cast<unsigned long long>(id),
+            static_cast<unsigned long long>(m_frame_id),
+            SITE_NAMES[site],
+            CALLSITE_RVAS[site],
+            RETURN_RVAS[site],
+            format_rva(callee),
+            tid,
+            m_arm_thread_id,
+            static_cast<uintptr_t>(context.rsp),
+            rax,
+            static_cast<uintptr_t>(context.rcx),
+            static_cast<uintptr_t>(context.rdx),
+            static_cast<uintptr_t>(context.r8),
+            static_cast<uintptr_t>(context.r9),
+            static_cast<uintptr_t>(context.rdi),
+            static_cast<uintptr_t>(context.rsi),
+            static_cast<uintptr_t>(context.r12),
+            static_cast<uintptr_t>(context.r14),
+            static_cast<uintptr_t>(context.r15),
+            static_cast<uintptr_t>(context.rbp),
+            args.valid_mask,
+            args.rcx,
+            args.rdx,
+            args.r8,
+            args.r9,
+            stack[0],
+            stack[1],
+            stack[2],
+            stack[3],
+            has_stack,
+            identity_matches(args.rcx),
+            identity_matches(args.rdx),
+            identity_matches(args.r8),
+            identity_matches(args.r9),
+            identity_matches(rax),
+            describe_private_words(args.rcx),
+            describe_private_words(args.rdx),
+            describe_private_words(args.r8),
+            describe_private_words(args.r9),
+            describe_private_words(rax));
+    }
+
+    void capture_before(size_t site, const safetyhook::Context& context) noexcept {
+        if (!m_active.load(std::memory_order_acquire) || !m_capture_started.load(std::memory_order_acquire) ||
+            m_capture_stopped.load(std::memory_order_acquire) || site >= SITE_COUNT) {
             return;
         }
 
         try {
-            if (GetCurrentThreadId() != m_arm_thread_id || site >= SITE_COUNT) {
-                return;
-            }
-            const auto id = note_capture();
-            if (id == 0) {
+            auto pending = std::find_if(s_pending_observations.begin(), s_pending_observations.end(),
+                [](const PendingObservation& observation) { return !observation.active; });
+            if (pending == s_pending_observations.end()) {
+                m_capture_stopped.store(true, std::memory_order_release);
+                spdlog::warn("[RE4XeSS][TargetStateProbe] capture stopped: per-thread pending-call table full tid={} site={} rsp=0x{:x}",
+                    GetCurrentThreadId(), SITE_NAMES[site], static_cast<uintptr_t>(context.rsp));
                 return;
             }
 
-            const auto args = reconstruct_arguments(site, context);
+            uint64_t id{};
+            if (!reserve_call(site, id)) {
+                return;
+            }
+
+            const auto arguments = reconstruct_arguments(site, context);
             const auto callee = resolve_callee(site, context);
-            std::array<uintptr_t, 4> stack{};
-            const auto has_stack = read_stack_window(context.rsp, stack);
-            const auto returned = static_cast<uintptr_t>(context.rax);
-            spdlog::info("[RE4XeSS][TargetStateProbe] stage=return id={} frame={} site={} callsiteRva=0x{:x} returnRva=0x{:x} callee={} tid={} attemptThread={} argMask=0x{:x} rcx=0x{:x} rdx=0x{:x} r8=0x{:x} r9=0x{:x} stack20=[0x{:x},0x{:x},0x{:x},0x{:x}] stackValid={} identity[rcx:{};rdx:{};r8:{};r9:{};result:{}] words[rcx={};rdx={};r8={};r9={};result={} ]",
-                static_cast<unsigned long long>(id),
-                static_cast<unsigned long long>(m_frame_id),
-                SITE_NAMES[site],
-                CALLSITE_RVAS[site],
-                RETURN_RVAS[site],
-                format_rva(callee),
-                GetCurrentThreadId(),
-                m_arm_thread_id,
-                args.valid_mask,
-                args.rcx,
-                args.rdx,
-                args.r8,
-                args.r9,
-                stack[0],
-                stack[1],
-                stack[2],
-                stack[3],
-                has_stack,
-                identity_matches(args.rcx),
-                identity_matches(args.rdx),
-                identity_matches(args.r8),
-                identity_matches(args.r9),
-                identity_matches(returned),
-                describe_private_words(args.rcx),
-                describe_private_words(args.rdx),
-                describe_private_words(args.r8),
-                describe_private_words(args.r9),
-                describe_private_words(returned));
+            *pending = PendingObservation{
+                .active = true,
+                .site = site,
+                .stack_pointer = static_cast<uintptr_t>(context.rsp),
+                .id = id,
+                .arguments = arguments,
+                .callee = callee,
+            };
+            log_observation("pre", id, site, context, arguments, callee);
+
+            if (m_calls_captured.load(std::memory_order_acquire) >= MAX_CAPTURED_CALLS) {
+                m_capture_stopped.store(true, std::memory_order_release);
+            }
+        } catch (...) {
+            // Probe failures must not affect the original engine call.
+        }
+    }
+
+    void capture_after(size_t site, const safetyhook::Context& context) noexcept {
+        if (!m_active.load(std::memory_order_acquire) || !m_capture_started.load(std::memory_order_acquire) ||
+            site >= SITE_COUNT) {
+            return;
+        }
+
+        try {
+            const auto stack_pointer = static_cast<uintptr_t>(context.rsp);
+            auto pending = find_pending_observation(site, stack_pointer);
+            if (pending == nullptr) {
+                return;
+            }
+
+            const auto observation = *pending;
+            pending->active = false;
+            log_observation("post", observation.id, site, context, observation.arguments, observation.callee);
+            m_site_return_counts[site].fetch_add(1, std::memory_order_acq_rel);
+            m_returns_captured.fetch_add(1, std::memory_order_acq_rel);
         } catch (...) {
             // Probe failures must not affect the original engine call.
         }
@@ -1697,16 +1881,6 @@ private:
     static uintptr_t read_pointer(uintptr_t address) noexcept {
         uintptr_t value{};
         return read_memory(address, &value, sizeof(value)) ? value : 0;
-    }
-};
-
-struct TargetStateFactoryProbeWindow {
-    bool armed{};
-
-    ~TargetStateFactoryProbeWindow() {
-        if (armed) {
-            TargetStateFactoryProbe::instance().disarm("OutputHandoff::prepare returned");
-        }
     }
 };
 
@@ -1733,6 +1907,7 @@ std::filesystem::path reframework_module_directory() {
 }
 
 RE4XeSS::~RE4XeSS() {
+    TargetStateFactoryProbe::instance().disarm("RE4XeSS destroyed");
     CreateRenderTargetViewProbe::instance().reset();
     m_worker.stop();
 }
@@ -1879,6 +2054,7 @@ void RE4XeSS::on_post_present() {
         g_framework->get_renderer_type() != REFramework::RendererType::D3D12) {
         return;
     }
+    TargetStateFactoryProbe::instance().on_post_present();
     const auto& hook = g_framework->get_d3d12_hook();
     if (hook == nullptr) {
         return;
@@ -1890,6 +2066,7 @@ void RE4XeSS::on_device_reset() {
     if (!sdk::GameIdentity::get().is_re4()) {
         return;
     }
+    TargetStateFactoryProbe::instance().disarm("device reset");
     CreateRenderTargetViewProbe::instance().reset();
     m_device_reset_generation.fetch_add(1, std::memory_order_acq_rel);
 }
@@ -2981,26 +3158,23 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         packet.frame_id,
         packet.display_width,
         packet.display_height);
-    bool handoff_prepared{};
-    {
-        TargetStateFactoryProbeWindow probe_window{
-            TargetStateFactoryProbe::instance().arm(packet.frame_id, color_state, color),
-        };
-        handoff_prepared = m_output_handoff.prepare(
-            layer,
-            control_request.device.Get(),
-            control_request.queue.Get(),
-            color,
-            render_width,
-            render_height,
-            packet.display_width,
-            packet.display_height,
-            control_generation,
-            control_result.snapshot.bridge_idle,
-            control_result.snapshot.bridge_device_removed,
-            output,
-            handoff_error);
-    }
+    auto& target_state_probe = TargetStateFactoryProbe::instance();
+    (void)target_state_probe.arm(packet.frame_id, color_state, color);
+    const bool handoff_prepared = m_output_handoff.prepare(
+        layer,
+        control_request.device.Get(),
+        control_request.queue.Get(),
+        color,
+        render_width,
+        render_height,
+        packet.display_width,
+        packet.display_height,
+        control_generation,
+        control_result.snapshot.bridge_idle,
+        control_result.snapshot.bridge_device_removed,
+        output,
+        handoff_error);
+    target_state_probe.on_prepare_return(handoff_prepared);
     if (!handoff_prepared) {
         const auto handoff_state = m_output_handoff.snapshot();
         const bool retirement_pending =
