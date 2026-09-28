@@ -6901,3 +6901,42 @@ validate a justified change with >300 successful XeSS submissions
 ~~~
 
 Keep PR66 Draft, Open, and unmerged.
+
+
+---
+
+## 42. PR66 quality-transition OutputHandoff checkpoint — 2026-09-28 16:24
+
+This supersedes the immediate next-task ordering in Section 41, **not** its historical OptiScaler native AV evidence.
+
+Paired capture: REFramework re2_framework_log(20260928-072521).txt (reported build 15:37 / stamped fa05355903a1b9e9e16b5e45c5c28feb0512a96b) and OptiScaler(4).log (44cfee4d). Current PR66 code at review: 425bcb7419619674a8d2fac405d155d1d89c1728. The logged source stamp does not reliably identify all local changes.
+
+Evidence:
+
+~~~text
+16:24:53.544  last successful public XeSS API return, frame 7374, submission 118
+16:24:53.552  requested mode Quality -> Ultra Quality, control generation change
+16:24:53.599  OutputHandoff restore quarantines: unexpected Overlay TargetState
+16:24:53.632  mode-change reset follows
+~~~
+
+118 api-enter and 118 api-return result=0; no native-exception or api-exception. The same OutputHandoff quarantine line then repeats 2,192 times until 16:25:07.881. OptiScaler stops receiving new XeSS Execute requests at the last accepted frame. Earlier delayed post-Present markers still settle.
+
+Source predicate: RE4XeSSOutputHandoff::restore() sees the same Overlay layer but a main TargetState that is neither the installed handoff nor its saved original. The actual third pointer and owner were not logged. request_mode() changes mode/control generation but does not itself assign Overlay main state. Restore precedes retirement/control dispatch, so this failure prevents ordinary mode-change service.
+
+PR66 work-order comment **5865417657**: add first-failure pointer/Overlay identity, saved/handoff/template state, installed frame, control/device generation and marker-retirement state; bracket the mode request and next pre-Overlay restore with bounded telemetry; suppress repeat logging while keeping quarantine intact. Do not replace the unknown third state, clear installed bookkeeping, release retained output, or synthesize downstream lifetime completion.
+
+This is a separate **quality-change OutputHandoff ownership blocker**, observed at 118 successful submits before the independently unresolved approximately 200-submission OptiScaler dxgi.dll+0x21256f native write AV.
+
+### Current handoff
+
+~~~text
+TargetState creator/clone and public XeSS interception     proven
+Quality -> Ultra Quality transition                        blocked on third TargetState
+Mode-change failure spam                                   2,192 repeats
+Third pointer/write ownership                              unknown
+OptiScaler native AV                                       not encountered in this run; still unresolved
+XeFG validation                                            deferred
+~~~
+
+Next: classify the third pointer from one bounded capture while preserving fail-closed ownership. After quality-transition stability, separately retest sustained >300-submission SR and investigate the exact OptiScaler binary AV. Keep PR66 Draft/Open/unmerged.
