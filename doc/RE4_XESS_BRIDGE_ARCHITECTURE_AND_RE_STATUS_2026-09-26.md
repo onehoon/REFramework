@@ -7228,4 +7228,35 @@ B. live healthy-generation Quality -> Ultra Quality:
 XeFG production validation: DEFERRED
 ~~~
 
-The next meaningful proof is the C++ owner and lifecycle of the **OptiScaler-internal target global**, not another broad REF-side hook.
+
+---
+
+## 46. PR66 paired 00/01 transition instrumentation — 2026-09-28
+
+Follow-up source: [PR66 comment 5866997374](https://github.com/onehoon/REFramework/pull/66#issuecomment-5866997374), paired RE4 captures `ETS2ATS/RE4/ref opti/00` and `01`. Logged build stamps (`REF a9bd0b59`, OptiScaler fork `d7f64081`, `20260928_175724`) are runtime metadata, not verified binary hashes.
+
+`00` remained stable in Balanced: the capture reports 2,656 OptiScaler evaluations and 128 initial successful REF public XeSS Execute returns, with no OutputHandoff mismatch/quarantine/native Execute AV. In `01`, Balanced -> Ultra Quality Plus was requested at 18:03:21.206; the next pre-Overlay restore at 18:03:21.257 observed an unexpected third TargetState on the same Overlay and latched hard quarantine. The last confirmed post-Overlay handoff was frame 8795; the reported cached retirement completion was zero while the last signal was 750. These observations do not identify who wrote the third pointer.
+
+Static audit at PR66 source head `239565e91eb9cd217a290606eede202870356e1b` found the Overlay getter returns a reference to its intrusive TargetState slot (`shared/sdk/Renderer.hpp:468-470`). The two direct REF writes in RE4 XeSS are limited to `RE4XeSSOutputHandoff::restore()` and `install()`; remaining getter uses in the feature path inspect/observe the state. `request_mode()` does not write it. This does not establish whether RE Engine or another module performs the third write. The new bounded transition event includes the exact slot address/offset; a debugger data-write breakpoint and call stack are still required if callback-boundary events do not expose the writer.
+
+PR66 now adds only bounded evidence collection: monotonic transition event sequence/timestamp and mode/device/frame/thread/identity/ownership flags; first-mismatch cached versus actual nonblocking fence completion; and cumulative XeSS success checkpoints at 256, 512, 1024, 2048 and subsequent powers of two, preserving the detailed first 128 calls and bounded per-generation transition detail. It never waits on the GPU or changes handoff ownership, quarantine, markers, or resource pins.
+
+~~~text
+Balanced steady-state (>300 REF XeSS success returns)       NOT YET VALIDATED
+Balanced -> Ultra Quality Plus writer attribution           UNKNOWN
+TargetState owner-correct fix                                NOT APPLIED (evidence insufficient)
+Quarantine safety                                            PRESERVED
+Off/On and Load Save after transition                        NOT YET VALIDATED
+PR66                                                        Draft / Open / unmerged
+~~~
+
+The local test bundle `artifacts/pr66-output-transition-239565e9/` was built RelWithDebInfo/x64 from base HEAD `239565e91eb9cd217a290606eede202870356e1b` plus uncommitted instrumentation:
+
+~~~text
+dinput8.dll SHA-256  489D8C82F112150919CC4C37BA09B35C09A742F1B40E0BAE27D26A547716C959
+dinput8.pdb SHA-256  F4B6F0EAA1B6D340B6D20107522905D7FD1598767CB81A28AD5C079CDC525FBA
+PDB GUID / Age      {8FC16AE4-E113-459E-A432-DB6E89E9B617} / 2
+Symbol check        PASS (private symbols, line records, globals, type info)
+~~~
+
+The REF embedded stamp identifies only its base commit; use the DLL hash and matching PDB identity as the exact build identity. Next evidence must capture the first TargetState write if callback provenance remains ambiguous. Do not infer success from OptiScaler `Upscaling done` counts, write back/adopt the third object, clear quarantine, synthesize a post-Present marker, or release retained resources early. Keep the OptiScaler native AV investigation independent. The >300-success run, mode transition, Off/On and Load Save sequences are still unvalidated.

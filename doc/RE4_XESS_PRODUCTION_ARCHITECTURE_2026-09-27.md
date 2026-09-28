@@ -3340,3 +3340,55 @@ XeFG production validation                         DEFERRED
 ~~~
 
 PR66 stays Draft/Open/unmerged.
+
+
+---
+
+## 31. PR66 paired 00/01 OutputHandoff transition follow-up — 2026-09-28
+
+Source: [PR66 comment 5866997374](https://github.com/onehoon/REFramework/pull/66#issuecomment-5866997374), paired captures `ETS2ATS/RE4/ref opti/00` and `01`. The logged REFramework stamp `a9bd0b59` and OptiScaler fork stamp `d7f64081` / build `20260928_175724` are runtime metadata, not byte-for-byte proof of the PR head.
+
+### Evidence and unresolved writer
+
+- `00` (steady Balanced): OptiScaler reports 2,656 `Upscaling done: true` evaluations; REF's first 128 public XeSS Execute returns are successful. No mismatch, hard quarantine, or native Execute AV was logged. Delayed-marker settlement and continued handoff were observed.
+- `01` (Balanced -> Ultra Quality Plus): 747 OptiScaler successful evaluations and 128 initial REF `result=0` Execute returns. The request at 18:03:21.206 (`controlGeneration=2`) is followed at 18:03:21.257 by the first pre-Overlay observation of a third TargetState and terminal quarantine. The same Overlay identity had a confirmed handoff state at frame 8795 immediately before the transition. Fence counters in this capture are `lastSignaled=750`, cached `lastCompleted=0`.
+- The evidence establishes a same-layer pointer change between observations, but not the writer, ownership, lifetime, or causality. It does not prove that the quality request wrote the pointer.
+
+Static REF audit at PR66 head `239565e91eb9cd217a290606eede202870356e1b`:
+
+~~~text
+shared/sdk/Renderer.hpp:468-470
+  get_main_target_state() returns an intrusive_ptr<TargetState>& into the Overlay object
+
+REF assignments to that returned slot:
+  RE4XeSSOutputHandoff::restore()  -> saved original state
+  RE4XeSSOutputHandoff::install()  -> handoff state
+
+Other RE4XeSS get_main_target_state() uses are reads/identity observations.
+request_mode() changes requested mode and generation; it does not assign the slot.
+~~~
+
+This source audit rules out another direct REF assignment in the searched RE4 XeSS paths; it does not identify an engine/other-module writer. The slot address and object identities are now included in bounded transition telemetry so the next mismatch capture can set a debugger data-write breakpoint on the exact storage. No ownership-correct repair can be selected until that writer or a concrete invariant violation is proven.
+
+### PR66 safety-preserving instrumentation
+
+- Adds a monotonic sequence and steady-clock timestamp to bounded `[RE4XeSS][OutputTransition]` events at mode request, pre-Overlay entry, restore result, install entry/completion, post-Overlay observation, and post-Present marker attempt/success. Phase-first events plus observed identity changes share a 24-event budget per requested control generation. Logs include frame validity, thread, mode/control/device generations, Overlay/slot/TargetState identities, last-confirmed state, and retirement/quarantine flags. Third TargetStates are treated as opaque addresses and are not dereferenced.
+- The first mismatch now reports cached retirement completion separately from a one-shot, nonblocking `ID3D12Fence::GetCompletedValue()` observation. `UINT64_MAX` is explicitly not counted as completion. This diagnostic does not wait, mutate cached completion, release pins, or relax quarantine.
+- The first 128 detailed XeSS Execute pairs remain. Successful calls additionally emit cumulative checkpoints at powers of two from 256 onward, with success/failure totals and generations. Up to eight detail pairs per control generation are retained around transitions; returned failures and caught exceptions are no longer suppressed after the first occurrence.
+- No TargetState writeback/adoption, quarantine clearing, marker synthesis, lifetime relaxation, or unrelated OptiScaler/D3D12/XeFG change is included.
+
+### Status and validation gate
+
+The writer remains **unproven** and quality switching remains **blocked/fail-closed**. This update is bounded instrumentation only. Local x64 Release and `RelWithDebInfo` builds and source checks validate compilation, not RE4 runtime behavior. The test bundle is `artifacts/pr66-output-transition-239565e9/`:
+
+~~~text
+Build configuration  RelWithDebInfo / x64
+PE machine           0x8664
+REF embedded stamp   239565e91eb9cd217a290606eede202870356e1b (base HEAD; local source diff is uncommitted)
+dinput8.dll SHA-256  489D8C82F112150919CC4C37BA09B35C09A742F1B40E0BAE27D26A547716C959
+dinput8.pdb SHA-256  F4B6F0EAA1B6D340B6D20107522905D7FD1598767CB81A28AD5C079CDC525FBA
+PDB GUID / Age      {8FC16AE4-E113-459E-A432-DB6E89E9B617} / 2
+Symbol match        symchk PASS; private symbols, lines, globals, and type info present
+~~~
+
+The requested fresh-process run (>300 successful public XeSS returns, Balanced -> Ultra Quality Plus, later quality changes, Off/On, Load Save, delayed marker settlement) and debugger first-write stack remain pending. Keep PR66 Draft/Open/unmerged until runtime evidence supports an owner-correct fix.

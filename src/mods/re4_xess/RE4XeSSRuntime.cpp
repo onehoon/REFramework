@@ -14,9 +14,13 @@ namespace {
 
 std::atomic_flag owner_thread_violation_logged = ATOMIC_FLAG_INIT;
 std::atomic<uint32_t> execute_api_log_count{};
-std::atomic_flag execute_api_exception_logged = ATOMIC_FLAG_INIT;
-std::atomic_flag execute_api_failure_logged = ATOMIC_FLAG_INIT;
+std::atomic<uint64_t> execute_api_success_count{};
+std::atomic<uint64_t> execute_api_failure_count{};
 constexpr uint32_t MAX_EXECUTE_API_LOGS = 128;
+
+bool is_execute_success_checkpoint(uint64_t count) noexcept {
+    return count >= 256 && (count & (count - 1)) == 0;
+}
 
 struct NativeExceptionObservation {
     DWORD code{};
@@ -477,10 +481,19 @@ bool RE4XeSSRuntime::execute(
     const auto log_index = debug_log
         ? execute_api_log_count.fetch_add(1, std::memory_order_relaxed)
         : MAX_EXECUTE_API_LOGS;
-    const bool log_api_call = log_index < MAX_EXECUTE_API_LOGS;
+    if (diagnostics.control_generation != m_execute_detail_control_generation) {
+        m_execute_detail_control_generation = diagnostics.control_generation;
+        m_execute_transition_detail_count = 0;
+    }
+    const bool log_transition_detail = debug_log && diagnostics.control_generation != 0 &&
+        m_execute_transition_detail_count < 8;
+    if (log_transition_detail) {
+        ++m_execute_transition_detail_count;
+    }
+    const bool log_api_call = log_index < MAX_EXECUTE_API_LOGS || log_transition_detail;
     const auto log_context = [&](spdlog::level::level_enum level, std::string_view stage, std::string_view detail) {
         spdlog::log(level,
-            "[RE4XeSS][Execute] {} frame={} workerThread={} controlGeneration={} resetGeneration={} slot={} submission={} commandList=0x{:x} color=0x{:x} depth=0x{:x} convertedMV=0x{:x} originalMV=0x{:x} output=0x{:x} input={}x{} outputExtent={}x{} resetHistory={} detail={}",
+            "[RE4XeSS][Execute] {} frame={} workerThread={} controlGeneration={} resetGeneration={} slot={} submission={} commandList=0x{:x} color=0x{:x} depth=0x{:x} convertedMV=0x{:x} originalMV=0x{:x} output=0x{:x} input={}x{} outputExtent={}x{} resetHistory={} cumulativeSuccess={} cumulativeFailure={} detail={}",
             stage,
             static_cast<unsigned long long>(diagnostics.frame_id),
             GetCurrentThreadId(),
@@ -499,6 +512,8 @@ bool RE4XeSSRuntime::execute(
             diagnostics.output_width,
             diagnostics.output_height,
             params.resetHistory != 0,
+            static_cast<unsigned long long>(execute_api_success_count.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(execute_api_failure_count.load(std::memory_order_relaxed)),
             detail);
     };
 
@@ -516,50 +531,64 @@ bool RE4XeSSRuntime::execute(
             &params,
             &native_exception);
     } catch (const std::exception& exception) {
-        if (!execute_api_exception_logged.test_and_set(std::memory_order_relaxed)) {
-            log_native_exception(native_exception,
-                diagnostics.frame_id,
-                diagnostics.control_generation,
-                diagnostics.device_reset_generation,
-                diagnostics.submission_sequence,
-                diagnostics.bridge_slot,
-                diagnostics.output_width,
-                diagnostics.output_height,
-                command_list,
-                diagnostics.original_velocity,
-                params);
-            std::string_view what = exception.what() != nullptr ? exception.what() : "";
-            if (what.size() > 512) {
-                what = what.substr(0, 512);
-            }
-            log_context(spdlog::level::err, "api-exception", std::string{ "kind=std::exception what=" } + std::string{ what });
+        execute_api_failure_count.fetch_add(1, std::memory_order_relaxed);
+        log_native_exception(native_exception,
+            diagnostics.frame_id,
+            diagnostics.control_generation,
+            diagnostics.device_reset_generation,
+            diagnostics.submission_sequence,
+            diagnostics.bridge_slot,
+            diagnostics.output_width,
+            diagnostics.output_height,
+            command_list,
+            diagnostics.original_velocity,
+            params);
+        std::string_view what = exception.what() != nullptr ? exception.what() : "";
+        if (what.size() > 512) {
+            what = what.substr(0, 512);
         }
+        log_context(spdlog::level::err, "api-exception", std::string{ "kind=std::exception what=" } + std::string{ what });
         error = "xessD3D12Execute threw std::exception";
         throw;
     } catch (...) {
-        if (!execute_api_exception_logged.test_and_set(std::memory_order_relaxed)) {
-            log_native_exception(native_exception,
-                diagnostics.frame_id,
-                diagnostics.control_generation,
-                diagnostics.device_reset_generation,
-                diagnostics.submission_sequence,
-                diagnostics.bridge_slot,
-                diagnostics.output_width,
-                diagnostics.output_height,
-                command_list,
-                diagnostics.original_velocity,
-                params);
-            log_context(spdlog::level::err, "api-exception", "kind=unknown");
-        }
+        execute_api_failure_count.fetch_add(1, std::memory_order_relaxed);
+        log_native_exception(native_exception,
+            diagnostics.frame_id,
+            diagnostics.control_generation,
+            diagnostics.device_reset_generation,
+            diagnostics.submission_sequence,
+            diagnostics.bridge_slot,
+            diagnostics.output_width,
+            diagnostics.output_height,
+            command_list,
+            diagnostics.original_velocity,
+            params);
+        log_context(spdlog::level::err, "api-exception", "kind=unknown");
         error = "xessD3D12Execute threw an unknown exception";
         throw;
     }
 
-    const bool log_api_failure = result != XESS_RESULT_SUCCESS &&
-        !execute_api_failure_logged.test_and_set(std::memory_order_relaxed);
+    const auto success_count = result == XESS_RESULT_SUCCESS
+        ? execute_api_success_count.fetch_add(1, std::memory_order_relaxed) + 1
+        : execute_api_success_count.load(std::memory_order_relaxed);
+    const auto failure_count = result != XESS_RESULT_SUCCESS
+        ? execute_api_failure_count.fetch_add(1, std::memory_order_relaxed) + 1
+        : execute_api_failure_count.load(std::memory_order_relaxed);
+    const bool log_api_failure = result != XESS_RESULT_SUCCESS;
     if (log_api_call || log_api_failure) {
         log_context(result == XESS_RESULT_SUCCESS ? spdlog::level::info : spdlog::level::err, "api-return",
             std::string{ "result=" } + std::to_string(static_cast<int32_t>(result)));
+    }
+    if (debug_log && result == XESS_RESULT_SUCCESS && is_execute_success_checkpoint(success_count)) {
+        spdlog::info(
+            "[RE4XeSS][ExecuteCheckpoint] cumulativeSuccess={} cumulativeFailure={} frame={} submission={} controlGeneration={} resetGeneration={} workerThread={}",
+            static_cast<unsigned long long>(success_count),
+            static_cast<unsigned long long>(failure_count),
+            static_cast<unsigned long long>(diagnostics.frame_id),
+            static_cast<unsigned long long>(diagnostics.submission_sequence),
+            static_cast<unsigned long long>(diagnostics.control_generation),
+            static_cast<unsigned long long>(diagnostics.device_reset_generation),
+            GetCurrentThreadId());
     }
     if (result != XESS_RESULT_SUCCESS) {
         error = result_message("xessD3D12Execute", result);

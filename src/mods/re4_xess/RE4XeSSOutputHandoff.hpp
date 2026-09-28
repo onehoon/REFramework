@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <atomic>
+#include <array>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -58,7 +59,16 @@ public:
         const ObservationContext& observation,
         std::string& error);
     void request_retirement(std::string_view reason);
-    void note_mode_transition(uint64_t control_generation) noexcept;
+    void note_mode_transition(
+        uint64_t control_generation,
+        int32_t requested_mode_token,
+        uint64_t device_reset_generation) noexcept;
+    void configure_transition_provenance(
+        bool enabled,
+        std::string_view reason,
+        uintptr_t image_base,
+        uint32_t image_size,
+        uint32_t image_checksum) noexcept;
     RetirementStatus poll_retirement(bool bridge_writer_idle, bool bridge_device_removed);
     PrepareResult prepare(
         sdk::renderer::layer::Overlay* layer,
@@ -118,6 +128,36 @@ private:
     void preserve_quarantined_generation() noexcept;
     bool confirmed_device_removal(bool bridge_device_removed) const noexcept;
     bool consume_mode_transition_observation(const ObservationContext& observation) noexcept;
+    void log_transition_provenance(
+        std::string_view phase,
+        const ObservationContext& observation,
+        uintptr_t layer_identity,
+        uintptr_t current_state_identity,
+        bool current_state_known,
+        uint32_t phase_bit) noexcept;
+
+    struct ProvenanceSample {
+        uint64_t sequence{};
+        int64_t timestamp_us{};
+        uint64_t control_generation{};
+        uint64_t device_reset_generation{};
+        uint64_t frame_id{};
+        uint32_t thread_id{};
+        int32_t requested_mode_token{};
+        int32_t installed_mode_token{};
+        uintptr_t overlay{};
+        uintptr_t slot{};
+        uintptr_t current_state{};
+        uintptr_t expected_state{};
+        uintptr_t saved_state{};
+        bool frame_id_valid{};
+        bool slot_read_valid{};
+        bool identity_changed{};
+        bool marker_pending{};
+        bool installed{};
+        bool retirement_requested{};
+        bool hard_quarantined{};
+    };
 
     sdk::intrusive_ptr<sdk::renderer::TargetState> m_handoff_state{};
     sdk::intrusive_ptr<sdk::renderer::TargetState> m_saved_original_state{};
@@ -157,6 +197,18 @@ private:
     std::atomic<bool> m_identity_mismatch_latched{};
     std::atomic<uint64_t> m_mode_transition_generation{};
     std::atomic<uint32_t> m_mode_transition_observation_budget{};
+    std::atomic<uint64_t> m_provenance_generation{};
+    std::atomic<uint32_t> m_provenance_phase_mask{};
+    std::atomic<uint32_t> m_provenance_event_budget{};
+    std::atomic<uintptr_t> m_provenance_last_current_state{};
+    std::atomic<bool> m_provenance_enabled{};
+    std::array<ProvenanceSample, 8> m_provenance_ring{};
+    size_t m_provenance_ring_next{};
+    size_t m_provenance_ring_size{};
+    uint64_t m_provenance_event_count{};
+    uint64_t m_provenance_divergence_count{};
+    uint64_t m_provenance_invalid_slot_count{};
+    std::mutex m_provenance_mutex{};
     std::atomic<bool> m_has_generation_snapshot{};
     std::atomic<bool> m_installed_snapshot{};
     RetirementStatus m_retirement_status{ RetirementStatus::NoGeneration };

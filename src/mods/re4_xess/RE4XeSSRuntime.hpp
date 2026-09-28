@@ -124,6 +124,8 @@ private:
     std::filesystem::path m_selected_path{};
     std::optional<xess_version_t> m_runtime_version{};
     std::atomic<DWORD> m_owner_thread_id{};
+    uint64_t m_execute_detail_control_generation{};
+    uint32_t m_execute_transition_detail_count{};
     bool m_sr_initialized{};
     bool m_quarantined{};
 };

@@ -36,6 +36,7 @@ namespace {
 using UpscalingMode = RE4XeSS::UpscalingMode;
 
 constexpr std::string_view UPSCALING_MODE_CONFIG_KEY{ "RE4XeSS_UpscalingMode" };
+constexpr std::string_view HANDOFF_PROVENANCE_CONFIG_KEY{ "RE4XeSS_HandoffProvenance" };
 constexpr char INHIBIT_BIT_BACKING_FIELD_NAME[]{ "<InhibitBit>k__BackingField" };
 
 constexpr std::array<const char*, 8> UPSCALING_MODE_LABELS{
@@ -1181,6 +1182,25 @@ public:
         size_t xref_count{};
         bool creator_probe_armed{};
     };
+
+    struct ImageIdentity {
+        uintptr_t base{};
+        uint32_t size{};
+        uint32_t checksum{};
+        bool valid{};
+        bool expected_re4_build{};
+    };
+
+    ImageIdentity image_identity() const noexcept {
+        const auto image = inspect_main_image();
+        return {
+            image.base,
+            image.size,
+            image.checksum,
+            image.valid,
+            image.valid && image.size == EXPECTED_IMAGE_SIZE && image.checksum == EXPECTED_IMAGE_CHECKSUM,
+        };
+    }
 
     struct CreatorObjectSnapshot {
         bool readable{};
@@ -3843,6 +3863,7 @@ void RE4XeSS::on_post_present() {
         GetCurrentThreadId(),
         false,
     };
+
     m_output_handoff.on_post_present(hook->get_device(), hook->get_command_queue(), observation);
 }
 
@@ -3857,6 +3878,22 @@ void RE4XeSS::on_config_load(const utility::Config& cfg) {
     if (!sdk::GameIdentity::get().is_re4()) {
         return;
     }
+
+    m_handoff_provenance_opt_in = cfg.get<bool>(std::string{ HANDOFF_PROVENANCE_CONFIG_KEY }).value_or(false);
+    const auto debug_log = REFrameworkConfig::get() != nullptr &&
+        REFrameworkConfig::get()->is_debug_log_enabled();
+    const bool d3d12_renderer = g_framework != nullptr &&
+        g_framework->get_renderer_type() == REFramework::RendererType::D3D12;
+    const auto image = TargetStateFactoryProbe::instance().image_identity();
+    const bool provenance_enabled = m_handoff_provenance_opt_in && debug_log && d3d12_renderer &&
+        image.expected_re4_build;
+    const auto provenance_reason = !m_handoff_provenance_opt_in ? "opt-in-disabled" :
+        !debug_log ? "debug-log-disabled" :
+        !d3d12_renderer ? "renderer-not-d3d12" :
+        !image.valid ? "main-image-identity-unreadable" :
+        !image.expected_re4_build ? "unsupported-re4-image" : "enabled";
+    m_output_handoff.configure_transition_provenance(
+        provenance_enabled, provenance_reason, image.base, image.size, image.checksum);
 
     const auto persisted_mode = cfg.get<std::string>(std::string{ UPSCALING_MODE_CONFIG_KEY });
     if (!persisted_mode) {
@@ -3883,6 +3920,7 @@ void RE4XeSS::on_config_save(utility::Config& cfg) {
     cfg.set<std::string>(
         std::string{ UPSCALING_MODE_CONFIG_KEY },
         std::string{ mode_to_config_token(m_requested_mode.load(std::memory_order_acquire)) });
+    cfg.set<bool>(std::string{ HANDOFF_PROVENANCE_CONFIG_KEY }, m_handoff_provenance_opt_in);
 }
 
 void RE4XeSS::request_mode(UpscalingMode mode) {
@@ -3894,7 +3932,10 @@ void RE4XeSS::request_mode(UpscalingMode mode) {
     m_requested_mode.store(mode, std::memory_order_release);
     const auto control_generation = m_control_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
     const auto request_thread_id = GetCurrentThreadId();
-    m_output_handoff.note_mode_transition(control_generation);
+    m_output_handoff.note_mode_transition(
+        control_generation,
+        static_cast<int32_t>(mode),
+        m_device_reset_generation.load(std::memory_order_acquire));
     spdlog::info("[RE4XeSS][Config] mode changed: {} -> {} controlGeneration={} requestThread={}",
         mode_to_display_label(old_mode),
         mode_to_display_label(mode),
