@@ -1191,24 +1191,61 @@ The RE4 producer does not detect whether libxess.dll is Intel's runtime or OptiS
 
 That is intentional.
 
-### Load-state accessor runtime gate
+### Current PR66 runtime gate — TargetState OutputHandoff
 
-The PR4-Log capture after PR65 proves the producer path reaches stock OptiScaler through public XeSS calls, but no frame reaches `xessD3D12Execute`.
+The production LoadAccessor blocker is resolved.
 
-Observed:
+Runtime now proves the exact TDB71 access path:
 
 ~~~text
-OptiScaler GetVersion/CreateContext/Init/SetVelocityScale > 0
-RE4XeSS Worker submit                              = 0
-OptiScaler xessD3D12Execute                        = 0
-PR4 OutputHandoff                                  = 0
+chainsaw.SceneLoadZoneManager
+    get_Instance
+    _Pause
+    System.Boolean storage width = 1
+
+chainsaw.GameSituationManager
+    get_Instance
+    <InhibitBit>k__BackingField
+    System.UInt64 storage width = 8
 ~~~
 
-At the same time production logged `load-state-observation-unavailable` continuously.
+The Capture 22 load-window semantics remain frozen and are now observed in production behavior: startup during Pause does not invent a baseline, Pause release alone does not resume history, and the current normal InhibitBit value is re-adopted dynamically after stable post-pause observations. The observed 0xB9 value must never be hardcoded.
 
-The Capture 22 Load Save state-machine semantics remain frozen. The current task is only to prove why the production accessor cannot obtain a valid `SceneLoadZoneManager._Pause` + `GameSituationManager.InhibitBit` snapshot.
+The current blocker has moved to RE4XeSSOutputHandoff:
 
-Do not bypass this gate, hardcode `InhibitBit`, or replace the proven semantic load window with camera heuristics.
+~~~text
+first valid temporal packet                 proven
+public XeSS runtime discovery/init           proven
+stock OptiScaler XeSS frontend interception  proven through init
+create_render_target_view                    proven
+create_texture                               proven
+live Overlay TargetState layout              proven
+live Overlay TargetState slot +0x90          proven
+live TargetState vtable                       proven for exact RE4 image
+create_target_state                          unresolved
+distinct single-RTV handoff TargetState      unavailable
+xessD3D12Execute                             not reached
+~~~
+
+For the exact validated RE4 1.5.9.0 image, the live Overlay TargetState vtable is anchored at RVA 0x7B1C148. Current PR66 static xref discovery is diagnostic only and is not allowed to become a production factory resolver without runtime ABI/ownership proof.
+
+The latest diagnostic run proves the live vtable exactly matches imageBase + 0x7B1C148, but the full executable-section decoder stops early and reports discoveryComplete=false. The current implementation incorrectly combines static scan completeness with live-anchor trust, preventing the bounded TargetState probe from arming.
+
+The immediate diagnostic correction is:
+
+~~~text
+live-anchor trust:
+    exact RE4 image identity
+    + validated Overlay slot
+    + readable live TargetState
+    + exact live vtable match
+
+static xref scan completeness:
+    separate diagnostic evidence
+    not a prerequisite for the bounded read-only probe
+~~~
+
+Production create_target_state remains fail-closed until an actual constructor/factory ABI and ownership contract are proven.
 
 The public call stream remains the same and is serialized on the single dedicated RE4XeSS worker thread:
 
@@ -1733,6 +1770,11 @@ Production code should implement the minimum stable contract, not carry broad ho
 | AD-30 | RE4XeSSOutputHandoff is owned by the semantic pre-Overlay coordinator, not a fixed callback thread ID. Install on callback thread A and restore on callback thread B is valid when coordinator serialization and Overlay/generation invariants hold. |
 | AD-31 | The true pre-Overlay coordinator is non-reentrant. Concurrent callback overlap fails closed without a second worker dispatch or callback-side temporal/handoff mutation, and marks the active pass stale before install/history commit. |
 | AD-32 | Worker control/submit results are tagged with control/device-reset generations. Callback-side install/history commit requires a post-return generation recheck; stale-after-submit work is retired by writer lifetime rules without becoming visible. |
+| AD-33 | RE4 LoadAccessor uses SceneLoadZoneManager._Pause plus GameSituationManager.<InhibitBit>k__BackingField with managed primitive storage widths; the normal InhibitBit value is learned dynamically and must never be hardcoded. |
+| AD-34 | For the exact validated RE4 1.5.9.0 image, the live Overlay TargetState vtable RVA 0x7B1C148 is a diagnostic type anchor only; it is not itself a production creator/factory ABI. |
+| AD-35 | Static TargetState-vtable xref scan completeness is diagnostic evidence and must not by itself veto a live anchor already validated by exact image identity, Overlay slot identity, readable layout, and exact vtable match. |
+| AD-36 | RE4 create_target_state remains fail-closed until constructor/factory ABI, descriptor semantics, return object layout, and ownership/refcount contract are runtime-proven. Rejected candidates 0x44C7A27, 0x47212A6-as-fixed-factory, 0x78F42D0-as-usable-TargetState, and 0x4597A0-as-Overlay-writer must not be productionized. |
+| AD-37 | DLSS5-Feeder externally corroborates that synthetic standard upscaler API calls can be intercepted by stock OptiScaler, but its post-process/backbuffer-copy architecture does not replace RE4's required pre-Overlay TargetState handoff. Public XeSS remains the RE4 producer contract. |
 
 ---
 
@@ -1754,3 +1796,122 @@ If implementation behavior contradicts the research evidence:
 2. do not silently weaken RE4-only isolation or bypass the public XeSS contract;
 3. add the smallest targeted diagnostic necessary;
 4. update both the evidence record and this architecture document before changing a frozen architectural decision.
+
+
+---
+
+## 21. PR66 TargetState handoff checkpoint — 2026-09-28
+
+This checkpoint is the current production handoff state and should be read together with the full evidence record in RE4_XESS_BRIDGE_ARCHITECTURE_AND_RE_STATUS_2026-09-26.md.
+
+### Proven and frozen
+
+~~~text
+LoadAccessor                               ✅
+Capture 22 load semantics                 ✅
+first valid resetHistory packet           ✅
+dedicated XeSS worker/runtime ownership   ✅
+public XeSS -> stock OptiScaler init      ✅
+RTV factory                               ✅
+create_texture                             ✅
+live Overlay TargetState layout           ✅
+Overlay main TargetState slot +0x90       ✅
+live TargetState vtable RVA 0x7B1C148     ✅ exact validated RE4 image only
+~~~
+
+### Rejected/retired diagnostics
+
+~~~text
+legacy generic create_target_state path   rejected for RE4
+0x44C7A27                                 rejected as TargetState factory
+0x47212A6                                 polymorphic vcall site, not fixed factory
+0x78F42D0 return                          rejected as usable live TargetState
+0x4597A0                                  retired as Overlay TargetState writer
+~~~
+
+### Current production blocker
+
+~~~text
+actual TargetState creator/factory ABI    unknown
+distinct single-RTV handoff state         unavailable
+OutputHandoff install                     blocked
+Worker XeSS submit                        blocked before submit
+OptiScaler xessD3D12Execute               0 calls
+~~~
+
+### Current diagnostic blocker
+
+Latest runtime proves:
+
+~~~text
+expected TargetState vtable = live TargetState vtable
+match = true
+~~~
+
+but current static xref discovery stops on undecodable executable ranges:
+
+~~~text
+xrefCount = 0
+complete = false
+~~~
+
+and the current code incorrectly derives:
+
+~~~text
+trusted = match && discoveryComplete
+~~~
+
+so the bounded TargetState probe does not arm.
+
+PR66 follow-up comment 5863592995 defines the next correction:
+
+~~~text
+decouple live-anchor trust from full static-xref scan completeness
+repair xref discovery independently
+keep all production handoff paths fail-closed
+~~~
+
+The xref scanner should prefer per-RUNTIME_FUNCTION decode or candidate-driven exact RIP-relative validation. Do not blind-resynchronize bytes merely to force full coverage.
+
+### Next acceptance
+
+The next runtime capture must first show:
+
+~~~text
+[TargetStateVtableProbe] live-anchor ... match=true ... trusted=true
+[TargetStateProbe] armed ...
+~~~
+
+Then continue only the smallest diagnostic needed to identify the actual TargetState allocation/constructor path.
+
+Do not:
+
+- merge PR66 yet;
+- bypass the handoff with a direct swapchain copy;
+- start XeFG validation;
+- reintroduce retired writer/factory candidates;
+- convert a static xref directly into a production call;
+- weaken RE4-only image/callsite validation.
+
+### XeSS teardown note
+
+The current xessDestroyContext result -8 is XESS_RESULT_ERROR_INVALID_CONTEXT. In the current stock OptiScaler path this is expected before the first Execute/CreateDLSSContext creates its internal context entry. Because the current capture never reaches xessD3D12Execute, this is a downstream teardown symptom, not the primary blocker.
+
+### DLSS5-Feeder comparison
+
+DLSS5-Feeder demonstrates that a synthetic public upscaler producer can feed stock OptiScaler successfully. It does so at a post-process/ReShade-style boundary and can copy the result to the finished backbuffer, so it does not need an RE Engine TargetState.
+
+That does not alter this architecture.
+
+RE4 still requires:
+
+~~~text
+low-resolution SceneView
+    -> pre-Overlay semantic temporal inputs
+    -> public XeSS
+    -> display-resolution output
+    -> engine-visible TargetState
+    -> native Overlay/UI/final-output path
+~~~
+
+Public XeSS remains the standard producer contract.
