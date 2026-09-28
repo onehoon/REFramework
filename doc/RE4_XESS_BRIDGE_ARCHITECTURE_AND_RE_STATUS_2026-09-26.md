@@ -6259,3 +6259,360 @@ clone temporary-array ownership cleanup    deferred
 Do not start XeFG validation until the SR/output-handoff path survives sustained execution without terminal quarantine.
 
 Keep PR66 Draft and unmerged.
+
+
+---
+
+## 38. PR66 15:17 runtime — public XeSS exception boundary proven
+
+Latest paired capture:
+
+~~~text
+REFramework:
+    file: re2_framework_log(20260928-062039).txt
+    stamped commit: 23550b91e80c4361e733788a8610ac74c4fbfa9a
+    branch: feature/re4-xess-load-state-accessor-diagnostic
+    build time: 2026-09-28 15:17
+
+OptiScaler:
+    file: OptiScaler(2).log
+    version: 10.0.0-dev
+    commit: 44cfee4d
+~~~
+
+Current remote PR66 head at analysis time:
+
+~~~text
+5cd612303ee9e9efe778f4cf47913fde66aa7ff9
+Handle delayed XeSS retirement and execute faults
+~~~
+
+PR66 follow-up work order:
+
+~~~text
+5864651645
+~~~
+
+### 38.1 Previous delayed-marker context churn is no longer reproduced
+
+The run repeatedly reaches:
+
+~~~text
+restored handoff without its post-Present marker
+queued delayed-marker settlement
+same control generation continues
+next XeSS submit succeeds
+resumed handoff after marker settlement
+~~~
+
+Example:
+
+~~~text
+frame 6040:
+    marker missing at restore
+    delayed marker value=25 settles
+
+frame 6041:
+    controlGeneration=1
+    resetGeneration=0
+    same output generation
+    api-return result=0
+    Execute result=SUCCESS
+    handoff resumes
+~~~
+
+The capture contains no:
+
+~~~text
+output-handoff-unavailable
+producer-context-unavailable
+~~~
+
+reset cascade.
+
+This is the intended operational result.
+
+The explicit WaitingForPostPresentMarker branch is still retained as the fail-safe for a longer scheduling delay.
+
+In this capture, marker settlement occurred between restore and prepare, so that explicit wait branch was not itself exercised.
+
+Do not make further lifecycle changes from this capture.
+
+### 38.2 Execute-boundary diagnostics now prove the exception is inside the public call
+
+The first producer submission:
+
+~~~text
+frame=6016
+slot=0
+submission=1
+input=853x480
+output=2560x1440
+resetHistory=true
+api-enter
+api-return result=0
+Execute result=SUCCESS
+~~~
+
+The run continues successfully through repeated submissions.
+
+The terminal failure is:
+
+~~~text
+frame=6216
+slot=0
+submission=201
+workerThread=18040
+controlGeneration=1
+resetGeneration=0
+commandList=0x1b2109107b0
+color=0x1b1724915a0
+depth=0x1b172493250
+convertedMV=0x1b21090fd10
+originalMV=0x1b172496220
+output=0x1b16bb21650
+input=853x480
+outputExtent=2560x1440
+resetHistory=false
+api-exception kind=unknown
+~~~
+
+Critically:
+
+~~~text
+api-enter exists
+api-return does not exist
+api-exception follows immediately
+~~~
+
+Therefore the exception escapes directly from:
+
+~~~cpp
+m_functions.d3d12_execute(m_context, command_list, &params)
+~~~
+
+and is not caused by REFramework work after the call.
+
+The following stages are excluded for this failure:
+
+~~~text
+restore-velocity ResourceBarrier
+output-finish ResourceBarrier
+GraphicsCommandList::Close
+ExecuteCommandLists
+CommandQueue::Signal
+~~~
+
+### 38.3 Paired OptiScaler log narrows the failure to its native XeSS backend call
+
+At the same failure timestamp, OptiScaler reports:
+
+~~~text
+15:20:06.266202 hk_xessD3D12Execute
+15:20:06.266234 NVSDK_NGX_D3D12_EvaluateFeature
+15:20:06.266272 XeSSFeatureDx12::EvaluateInternal
+15:20:06.266278 Input Resolution: 853x480
+15:20:06.266283 Color exist
+15:20:06.266290 MotionVectors exist
+15:20:06.266295 Output exist
+15:20:06.266299 Depth exist
+15:20:06.266304 AutoExposure enabled
+15:20:06.266321 Executing!!
+~~~
+
+No normal OptiScaler XeSS error-result log follows.
+
+At OptiScaler commit 44cfee4d, this log occurs immediately before:
+
+~~~cpp
+xessResult = XeSSProxy::D3D12Execute()(_xessContext, InCommandList, &params);
+~~~
+
+Therefore the current strongest boundary is:
+
+~~~text
+REFramework public xessD3D12Execute call
+    -> OptiScaler hk_xessD3D12Execute
+        -> NVSDK_NGX_D3D12_EvaluateFeature
+            -> XeSSFeatureDx12::EvaluateInternal
+                -> XeSSProxy::D3D12Execute
+                    -> exception escapes before normal return
+~~~
+
+This still does not identify which binary owns the faulting instruction.
+
+Possible owners remain:
+
+~~~text
+OptiScaler glue
+native Intel XeSS
+graphics driver
+another dependency reached by native XeSS
+~~~
+
+Do not assign root cause until the exception address/module is captured.
+
+### 38.4 Cross-run timing suggests a repeatable ~2-second / ~200-submit failure
+
+Previous capture:
+
+~~~text
+mode: Ultra Quality
+input: 1969x1107
+first successful Execute: 14:59:22.858
+unknown exception:        14:59:24.915
+elapsed:                  ~2.06 s
+~~~
+
+Current capture:
+
+~~~text
+mode: Ultra Performance
+input: 853x480
+first Execute api-enter:  15:20:04.148
+unknown exception:        15:20:06.266
+elapsed:                  ~2.12 s
+failing submission:       201
+~~~
+
+This is a strong reproducibility clue.
+
+It lowers the likelihood that the failure is specific to one XeSS quality mode or one input resolution.
+
+Do not add a frame-count or time-based workaround.
+
+### 38.5 Next diagnostic target — native exception identity
+
+The current kind=unknown classification is no longer sufficient.
+
+The next PR66 diagnostic must capture, without swallowing or translating the exception:
+
+~~~text
+exception code
+ExceptionAddress
+ContextRecord RIP
+faulting module
+module RVA
+ExceptionFlags
+NumberParameters
+~~~
+
+For access violation:
+
+~~~text
+ExceptionInformation[0] = read/write/execute
+ExceptionInformation[1] = target virtual address
+~~~
+
+Implementation boundary:
+
+~~~text
+m_functions.d3d12_execute(...)
+~~~
+
+Use a narrow Windows/MSVC-only observation filter.
+
+Requirements:
+
+~~~text
+no process-wide VEH
+no worker-wide _set_se_translator
+no recovery
+no retry
+no logging/allocation from inside the filter
+copy POD only
+return EXCEPTION_CONTINUE_SEARCH
+log captured information from the existing catch path
+~~~
+
+The existing outer worker quarantine remains the final safety net.
+
+### 38.6 Remaining CreateRenderTargetViewProbe should leave normal production execution
+
+The TargetState/xref/creator diagnostics are absent from this capture and are no longer normal-path dependencies.
+
+However, CreateRenderTargetViewProbe still arms and produces captures.
+
+Its production questions are already closed:
+
+~~~text
+RE4 RTV factory             proven
+R11G11B10_FLOAT RTV         proven
+TargetState clone           proven
+display handoff output      proven
+repeated live use           proven
+~~~
+
+The normal pre-Overlay call to:
+
+~~~cpp
+CreateRenderTargetViewProbe::instance().ensure(...)
+~~~
+
+is diagnostic-only and its result is ignored.
+
+Remove it from the normal path or require an explicit diagnostic opt-in.
+
+Do not modify the actual create_render_target_view resolver.
+
+### 38.7 Current safety behavior remains correct
+
+If the public call throws:
+
+~~~text
+do not continue command recording
+do not close the interrupted list
+do not submit it
+do not signal its fence
+quarantine bridge
+quarantine XeSS runtime
+quarantine output handoff
+do not wait
+do not retry same context
+~~~
+
+Current PR66 behavior already follows this policy.
+
+---
+
+## 39. Handoff state after exact execute-boundary localization
+
+### Proven
+
+~~~text
+TargetState factory/resolver                         proven
+TargetState clone / OutputHandoff                    proven
+stock OptiScaler public-XeSS interception            proven
+repeated public XeSS success                         proven
+same-generation delayed marker recovery              operationally proven
+exception occurs inside public xessD3D12Execute      proven
+OptiScaler reaches native XeSS backend call          proven
+post-call REFramework D3D12 stages not at fault      proven for terminal exception
+~~~
+
+### Current single diagnostic objective
+
+~~~text
+capture native exception code + faulting address/module/RVA
+~~~
+
+### Current production blocker
+
+~~~text
+sustained public XeSS execution
+    -> approximately 2.1 seconds / approximately 200 submits
+    -> exception escapes native backend path
+    -> terminal quarantine
+~~~
+
+### Deferred
+
+~~~text
+automatic recovery after exception       deferred
+clone temporary RTV-array cleanup        deferred
+XeFG production validation               deferred
+~~~
+
+Do not begin XeFG validation until sustained SR survives beyond the reproducible failure window.
+
+Keep PR66 Draft and unmerged.
