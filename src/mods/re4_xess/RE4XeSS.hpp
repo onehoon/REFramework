@@ -28,6 +28,9 @@ public:
 
     ~RE4XeSS() override;
 
+    static void bootstrap_early_target_state_diagnostics() noexcept;
+    static void shutdown_early_target_state_diagnostics() noexcept;
+
     std::string_view get_name() const override {
         return "RE4XeSS";
     }

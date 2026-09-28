@@ -27,6 +27,7 @@
 
 #include "mods/REFrameworkConfig.hpp"
 #include "REFramework.hpp"
+#include "compatibility/xefg/XeFGCompatibility.hpp"
 
 namespace {
 
@@ -2941,17 +2942,22 @@ std::filesystem::path reframework_module_directory() {
     return module_path ? std::filesystem::path{ *module_path }.parent_path() : std::filesystem::path{};
 }
 
-bool re4_xess_diagnostics_enabled_from_config() noexcept {
-    try {
-        utility::Config config{
-            (REFramework::get_persistent_dir() / REFrameworkConfig::REFRAMEWORK_CONFIG_NAME).string()
-        };
-        return config.get<bool>(std::string{ REFrameworkConfig::DEBUG_LOG_CONFIG_NAME }).value_or(false);
-    } catch (...) {
-        return false;
-    }
 }
 
+void RE4XeSS::bootstrap_early_target_state_diagnostics() noexcept {
+    if (!sdk::GameIdentity::get().is_re4() || !XeFGCompatibility::is_debug_log_enabled()) {
+        return;
+    }
+
+    spdlog::info("[RE4XeSS][TargetStateProvenance] bootstrap-begin point=REFramework-constructor-after-integrity tid={} before-plugin-init=true",
+        GetCurrentThreadId());
+    const bool armed = TargetStateFactoryProbe::instance().arm_provenance_early();
+    spdlog::info("[RE4XeSS][TargetStateProvenance] bootstrap-result armed={} point=REFramework-constructor-after-integrity",
+        armed);
+}
+
+void RE4XeSS::shutdown_early_target_state_diagnostics() noexcept {
+    TargetStateFactoryProbe::instance().force_disarm_all("REFramework shutting down");
 }
 
 RE4XeSS::~RE4XeSS() {
@@ -2963,10 +2969,6 @@ RE4XeSS::~RE4XeSS() {
 std::optional<std::string> RE4XeSS::on_initialize() {
     if (!sdk::GameIdentity::get().is_re4()) {
         return std::nullopt;
-    }
-
-    if (re4_xess_diagnostics_enabled_from_config()) {
-        (void)TargetStateFactoryProbe::instance().arm_provenance_early();
     }
 
     std::string error;
