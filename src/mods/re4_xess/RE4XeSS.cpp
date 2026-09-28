@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <initializer_list>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -17,6 +18,7 @@
 #include <sdk/RETypeDB.hpp>
 #include <sdk/SceneManager.hpp>
 #include <spdlog/spdlog.h>
+#include <safetyhook.hpp>
 #include <utility/Address.hpp>
 #include <utility/Module.hpp>
 #include <utility/VtableHook.hpp>
@@ -1159,6 +1161,553 @@ private:
     static inline std::atomic<uint32_t> s_call_count{};
     static inline std::atomic<uint32_t> s_capture_count{};
     static inline std::atomic<bool> s_limit_logged{};
+};
+
+class TargetStateFactoryProbe final {
+public:
+    static TargetStateFactoryProbe& instance() {
+        static TargetStateFactoryProbe probe{};
+        return probe;
+    }
+
+    bool arm(
+        uint64_t frame_id,
+        sdk::renderer::TargetState* overlay_state,
+        ID3D12Resource* semantic_color) {
+        if (!sdk::GameIdentity::get().is_re4() || overlay_state == nullptr || semantic_color == nullptr) {
+            return false;
+        }
+
+        const auto config = REFrameworkConfig::get();
+        if (config == nullptr || !config->is_debug_log_enabled()) {
+            return false;
+        }
+        if (m_attempted.exchange(true, std::memory_order_acq_rel)) {
+            return false;
+        }
+
+        const auto image = inspect_main_image();
+        if (!image.valid || image.size != EXPECTED_IMAGE_SIZE || image.checksum != EXPECTED_IMAGE_CHECKSUM) {
+            spdlog::warn("[RE4XeSS][TargetStateProbe] not armed: RE4 1.5.9.0 image identity mismatch size=0x{:x} checksum=0x{:x}",
+                image.size, image.checksum);
+            return false;
+        }
+
+        for (size_t index = 0; index < CALLSITE_RVAS.size(); ++index) {
+            if (!validate_callsite(image, index)) {
+                spdlog::warn("[RE4XeSS][TargetStateProbe] not armed: callsite validation failed index={} callsiteRva=0x{:x}",
+                    index, CALLSITE_RVAS[index]);
+                return false;
+            }
+        }
+
+        m_image_base = image.base;
+        m_image_end = image.base + image.size;
+        m_frame_id = frame_id;
+        m_arm_thread_id = GetCurrentThreadId();
+        m_overlay_state = reinterpret_cast<uintptr_t>(overlay_state);
+        m_overlay_desc = overlay_state->get_desc_base();
+        m_overlay_rtv_array = reinterpret_cast<uintptr_t>(overlay_state->get_rtvs_ptr());
+        m_overlay_rtv = 0;
+        if (overlay_state->get_rtv_count() != 0 && overlay_state->get_rtvs_ptr() != nullptr) {
+            // Read the intrusive pointer's raw value only; do not AddRef/Release it.
+            m_overlay_rtv = reinterpret_cast<uintptr_t>(overlay_state->get_rtvs_ptr()[0].get());
+        }
+        m_semantic_color = reinterpret_cast<uintptr_t>(semantic_color);
+        m_calls_captured.store(0, std::memory_order_release);
+        m_next_call_id.store(0, std::memory_order_release);
+        m_capture_stopped.store(false, std::memory_order_release);
+
+        for (size_t index = 0; index < HOOK_COUNT; ++index) {
+            const auto address = reinterpret_cast<void*>(image.base + hook_rva(index));
+            m_hooks[index] = safetyhook::create_mid(address, hook_callback(index), safetyhook::MidHook::StartDisabled);
+            if (!m_hooks[index]) {
+                disarm("could not create all callsite hooks");
+                return false;
+            }
+        }
+
+        for (size_t index = 0; index < HOOK_COUNT; ++index) {
+            if (!m_hooks[index].enable()) {
+                disarm("could not enable all callsite hooks");
+                return false;
+            }
+        }
+
+        m_active.store(true, std::memory_order_release);
+
+        spdlog::info("[RE4XeSS][TargetStateProbe] armed frame={} thread={} imageSize=0x{:x} checksum=0x{:x} overlayState=0x{:x} desc=0x{:x} rtvArray=0x{:x} rtv0=0x{:x} color=0x{:x} sites={} captureLimit={}",
+            static_cast<unsigned long long>(m_frame_id),
+            m_arm_thread_id,
+            image.size,
+            image.checksum,
+            m_overlay_state,
+            m_overlay_desc,
+            m_overlay_rtv_array,
+            m_overlay_rtv,
+            m_semantic_color,
+            CALLSITE_RVAS.size(),
+            MAX_CAPTURED_CALLS);
+        log_overlay_state_snapshot(overlay_state);
+        return true;
+    }
+
+    void disarm(std::string_view reason) noexcept {
+        m_active.store(false, std::memory_order_release);
+        if (m_disarm_started.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+
+        bool disable_failed{};
+        for (auto& hook : m_hooks) {
+            if (hook && !hook.disable()) {
+                disable_failed = true;
+            }
+        }
+
+        spdlog::info("[RE4XeSS][TargetStateProbe] disarmed reason={} capturedCalls={} disableFailed={}",
+            reason,
+            m_calls_captured.load(std::memory_order_acquire),
+            disable_failed);
+    }
+
+private:
+    struct ImageInfo {
+        uintptr_t base{};
+        uint32_t size{};
+        uint32_t checksum{};
+        uint32_t section_table_rva{};
+        IMAGE_NT_HEADERS64 nt{};
+        bool valid{};
+    };
+
+    struct PendingCall {
+        uintptr_t rcx{};
+        uintptr_t rdx{};
+        uintptr_t r8{};
+        uintptr_t r9{};
+        uint8_t valid_mask{};
+    };
+
+    static constexpr uint32_t EXPECTED_IMAGE_SIZE = 0x0E405000;
+    static constexpr uint32_t EXPECTED_IMAGE_CHECKSUM = 0x0DEE3479;
+    static constexpr size_t MAX_CAPTURED_CALLS = 16;
+    static constexpr size_t SITE_COUNT = 4;
+    static constexpr size_t HOOK_COUNT = SITE_COUNT;
+    static constexpr std::array<uint32_t, SITE_COUNT> CALLSITE_RVAS{
+        0x447AF5A,
+        0x47212A6,
+        0x44C7A27,
+        0x47D0FCF,
+    };
+    static constexpr std::array<uint32_t, SITE_COUNT> RETURN_RVAS{
+        0x447AF5F,
+        0x47212A9,
+        0x44C7A2A,
+        0x47D0FD5,
+    };
+    static constexpr std::array<uint32_t, HOOK_COUNT> HOOK_RVAS = RETURN_RVAS;
+    static constexpr std::array<const char*, SITE_COUNT> SITE_NAMES{
+        "render-target-view factory call",
+        "RTV owner vcall+0x40 A",
+        "RTV owner vcall+0x40 B",
+        "render-resource vcall+0xA0",
+    };
+
+    std::atomic<bool> m_attempted{};
+    std::atomic<bool> m_active{};
+    std::atomic<bool> m_disarm_started{};
+    std::atomic<bool> m_capture_stopped{};
+    std::atomic<uint32_t> m_calls_captured{};
+    std::atomic<uint64_t> m_next_call_id{};
+    uintptr_t m_image_base{};
+    uintptr_t m_image_end{};
+    uint64_t m_frame_id{};
+    DWORD m_arm_thread_id{};
+    uintptr_t m_overlay_state{};
+    uintptr_t m_overlay_desc{};
+    uintptr_t m_overlay_rtv_array{};
+    uintptr_t m_overlay_rtv{};
+    uintptr_t m_semantic_color{};
+    std::array<safetyhook::MidHook, HOOK_COUNT> m_hooks{};
+
+    static bool read_memory(uintptr_t address, void* destination, size_t size) noexcept {
+        if (address == 0 || destination == nullptr || size == 0 || address > UINTPTR_MAX - size) {
+            return false;
+        }
+        SIZE_T bytes_read{};
+        return ReadProcessMemory(
+                   GetCurrentProcess(),
+                   reinterpret_cast<const void*>(address),
+                   destination,
+                   size,
+                   &bytes_read) != FALSE &&
+            bytes_read == size;
+    }
+
+    static ImageInfo inspect_main_image() noexcept {
+        ImageInfo result{};
+        result.base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        IMAGE_DOS_HEADER dos{};
+        if (result.base == 0 || !read_memory(result.base, &dos, sizeof(dos)) ||
+            dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0 || dos.e_lfanew > 0x100000) {
+            return result;
+        }
+
+        const auto nt_address = result.base + static_cast<uintptr_t>(dos.e_lfanew);
+        if (!read_memory(nt_address, &result.nt, sizeof(result.nt)) ||
+            result.nt.Signature != IMAGE_NT_SIGNATURE ||
+            result.nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+            result.nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+            return result;
+        }
+
+        result.size = result.nt.OptionalHeader.SizeOfImage;
+        result.checksum = result.nt.OptionalHeader.CheckSum;
+        result.section_table_rva = static_cast<uint32_t>(dos.e_lfanew +
+            offsetof(IMAGE_NT_HEADERS64, OptionalHeader) + result.nt.FileHeader.SizeOfOptionalHeader);
+        result.valid = result.size != 0 && result.base <= UINTPTR_MAX - result.size;
+        return result;
+    }
+
+    static bool is_executable_range(const ImageInfo& image, uint32_t rva, size_t size) noexcept {
+        if (!image.valid || size == 0 || rva >= image.size || size > image.size - rva) {
+            return false;
+        }
+
+        const auto section_table = image.base + image.section_table_rva;
+        const auto section_count = std::min<uint16_t>(image.nt.FileHeader.NumberOfSections, 96);
+        for (uint16_t index = 0; index < section_count; ++index) {
+            IMAGE_SECTION_HEADER section{};
+            if (!read_memory(
+                    section_table + static_cast<uintptr_t>(index) * sizeof(section),
+                    &section,
+                    sizeof(section))) {
+                return false;
+            }
+            if ((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) {
+                continue;
+            }
+            const auto section_size = std::max(section.Misc.VirtualSize, section.SizeOfRawData);
+            const auto section_begin = section.VirtualAddress;
+            const auto section_end = static_cast<uint64_t>(section_begin) + section_size;
+            if (rva >= section_begin && static_cast<uint64_t>(rva) + size <= section_end) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static bool matches_bytes(uintptr_t address, std::initializer_list<uint8_t> expected) noexcept {
+        std::array<uint8_t, 32> bytes{};
+        if (expected.size() > bytes.size() || !read_memory(address, bytes.data(), expected.size())) {
+            return false;
+        }
+        return std::equal(expected.begin(), expected.end(), bytes.begin());
+    }
+
+    static bool validate_callsite(const ImageInfo& image, size_t index) noexcept {
+        if (index >= SITE_COUNT) {
+            return false;
+        }
+
+        switch (index) {
+        case 0: {
+            if (!is_executable_range(image, 0x447AF50, 11) ||
+                !is_executable_range(image, CALLSITE_RVAS[index], 5) ||
+                !is_executable_range(image, RETURN_RVAS[index], 4) ||
+                !matches_bytes(image.base + 0x447AF50, {
+                    0x49, 0x8B, 0xCC, 0x44, 0x89, 0xAD, 0xD0, 0x06, 0x00, 0x00, 0xE8 })) {
+                return false;
+            }
+            int32_t displacement{};
+            if (!read_memory(image.base + CALLSITE_RVAS[index] + 1, &displacement, sizeof(displacement))) {
+                return false;
+            }
+            const auto target = static_cast<int64_t>(CALLSITE_RVAS[index]) + 5 + displacement;
+            return target == 0x4470470 && is_executable_range(image, static_cast<uint32_t>(target), 1) &&
+                matches_bytes(image.base + RETURN_RVAS[index], { 0x0F, 0xB7, 0x4B, 0x10 });
+        }
+        case 1:
+            return is_executable_range(image, 0x47212A0, 9) &&
+                is_executable_range(image, RETURN_RVAS[index], 4) &&
+                matches_bytes(image.base + 0x47212A0, {
+                       0x48, 0x8B, 0x07, 0x48, 0x8B, 0xCF, 0xFF, 0x50, 0x40 }) &&
+                matches_bytes(image.base + RETURN_RVAS[index], { 0x48, 0x8B, 0x5F, 0x48 });
+        case 2:
+            return is_executable_range(image, 0x44C7A21, 9) &&
+                is_executable_range(image, RETURN_RVAS[index], 12) &&
+                matches_bytes(image.base + 0x44C7A21, {
+                       0x49, 0x8B, 0x06, 0x49, 0x8B, 0xCE, 0xFF, 0x50, 0x40 }) &&
+                matches_bytes(image.base + RETURN_RVAS[index], {
+                    0x48, 0xC7, 0x84, 0x24, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
+        case 3:
+            return is_executable_range(image, 0x47D0FBE, 23) &&
+                is_executable_range(image, CALLSITE_RVAS[index], 6) &&
+                is_executable_range(image, RETURN_RVAS[index], 5) &&
+                matches_bytes(image.base + 0x47D0FBE, {
+                       0x48, 0x8B, 0x88, 0x08, 0x6C, 0xC0, 0x00, 0x4D, 0x8B, 0xCF,
+                       0x48, 0x8B, 0x52, 0x18, 0x48, 0x8B, 0x01, 0xFF, 0x90, 0xA0, 0x00, 0x00, 0x00 }) &&
+                matches_bytes(image.base + RETURN_RVAS[index], { 0xBA, 0xC0, 0x00, 0x00, 0x00 });
+        default:
+            return false;
+        }
+    }
+
+    static uint32_t hook_rva(size_t hook_index) noexcept {
+        return hook_index < HOOK_RVAS.size() ? HOOK_RVAS[hook_index] : 0;
+    }
+
+    template <size_t Site>
+    static void after_call(safetyhook::Context& context) {
+        instance().capture_after(Site, context);
+    }
+
+    static safetyhook::MidHookFn hook_callback(size_t hook_index) noexcept {
+        static constexpr std::array<safetyhook::MidHookFn, HOOK_COUNT> callbacks{
+            &after_call<0>,
+            &after_call<1>,
+            &after_call<2>,
+            &after_call<3>,
+        };
+        return hook_index < callbacks.size() ? callbacks[hook_index] : nullptr;
+    }
+
+    uintptr_t resolve_callee(size_t site, const safetyhook::Context& context) const noexcept {
+        if (site == 0) {
+            return m_image_base + 0x4470470;
+        }
+
+        uintptr_t receiver{};
+        uintptr_t slot_offset{};
+        if (site == 1) {
+            receiver = static_cast<uintptr_t>(context.rdi);
+            slot_offset = 0x40;
+        } else if (site == 2) {
+            receiver = static_cast<uintptr_t>(context.r14);
+            slot_offset = 0x40;
+        } else if (site == 3) {
+            const auto vtable = read_pointer(static_cast<uintptr_t>(context.r14));
+            if (vtable > UINTPTR_MAX - 0xC06C08) {
+                return 0;
+            }
+            receiver = read_pointer(vtable + 0xC06C08);
+            slot_offset = 0xA0;
+        } else {
+            return 0;
+        }
+
+        const auto vtable = read_pointer(receiver);
+        if (vtable == 0 || vtable > UINTPTR_MAX - slot_offset) {
+            return 0;
+        }
+        uintptr_t target{};
+        return read_memory(vtable + slot_offset, &target, sizeof(target)) ? target : 0;
+    }
+
+    uint64_t note_capture() noexcept {
+        const auto index = m_calls_captured.fetch_add(1, std::memory_order_acq_rel);
+        if (index >= MAX_CAPTURED_CALLS) {
+            m_capture_stopped.store(true, std::memory_order_release);
+            return 0;
+        }
+        return m_next_call_id.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+
+    static bool read_stack_window(uintptr_t rsp, std::array<uintptr_t, 4>& values) noexcept {
+        if (rsp == 0 || rsp > UINTPTR_MAX - 0x40) {
+            return false;
+        }
+        return read_memory(rsp + 0x20, values.data(), sizeof(values));
+    }
+
+    PendingCall reconstruct_arguments(size_t site, const safetyhook::Context& context) const noexcept {
+        PendingCall args{};
+        if (site == 0) {
+            args.rcx = static_cast<uintptr_t>(context.r12);
+            args.rdx = static_cast<uintptr_t>(context.rbx);
+            args.r8 = static_cast<uintptr_t>(context.rbp) + 0x6D0;
+            args.valid_mask = 0x07;
+            return args;
+        }
+        if (site == 1) {
+            args.rcx = static_cast<uintptr_t>(context.rdi);
+            args.valid_mask = 0x01;
+            return args;
+        }
+        if (site == 2) {
+            args.rcx = static_cast<uintptr_t>(context.r14);
+            args.valid_mask = 0x01;
+            return args;
+        }
+        if (site != 3) {
+            return args;
+        }
+
+        const auto r14 = static_cast<uintptr_t>(context.r14);
+        const auto rsi = static_cast<uintptr_t>(context.rsi);
+        const auto rbp = static_cast<uintptr_t>(context.rbp);
+        const auto r15 = static_cast<uintptr_t>(context.r15);
+        const auto vtable = read_pointer(r14);
+        if (vtable != 0 && vtable <= UINTPTR_MAX - 0xC06C08) {
+            args.rcx = read_pointer(vtable + 0xC06C08);
+            if (args.rcx != 0) args.valid_mask |= 0x01;
+        }
+        if (rsi <= UINTPTR_MAX - 0xB8) {
+            const auto desc_owner = read_pointer(rsi + 0xB8);
+            if (desc_owner != 0 && desc_owner <= UINTPTR_MAX - 0x18) {
+                args.rdx = read_pointer(desc_owner + 0x18);
+                if (args.rdx != 0) args.valid_mask |= 0x02;
+            }
+        }
+        if (rbp >= 0x30) {
+            args.r8 = rbp - 0x30;
+            args.valid_mask |= 0x04;
+        }
+        args.r9 = r15;
+        args.valid_mask |= 0x08;
+        return args;
+    }
+
+    std::string format_rva(uintptr_t address) const {
+        std::ostringstream text;
+        text << std::hex;
+        if (address >= m_image_base && address < m_image_end) {
+            text << "re4+0x" << (address - m_image_base);
+        } else {
+            text << "0x" << address;
+        }
+        return text.str();
+    }
+
+    std::string describe_private_words(uintptr_t address) const {
+        if (address == 0 || (address & (alignof(uintptr_t) - 1)) != 0) {
+            return "not-pointer";
+        }
+
+        MEMORY_BASIC_INFORMATION memory{};
+        if (VirtualQuery(reinterpret_cast<const void*>(address), &memory, sizeof(memory)) != sizeof(memory) ||
+            memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE ||
+            (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+            return "not-private-readable";
+        }
+
+        std::array<uintptr_t, 3> words{};
+        if (!read_memory(address, words.data(), sizeof(words))) {
+            return "private-read-failed";
+        }
+
+        const auto identity_mask = [this](uintptr_t value) {
+            return (value == m_overlay_state ? 0x01 : 0) |
+                (value == m_overlay_desc ? 0x02 : 0) |
+                (value == m_overlay_rtv_array ? 0x04 : 0) |
+                (value == m_overlay_rtv ? 0x08 : 0) |
+                (value == m_semantic_color ? 0x10 : 0);
+        };
+
+        std::ostringstream text;
+        text << std::hex << "[0x" << words[0] << "/m0x" << identity_mask(words[0])
+             << ",0x" << words[1] << "/m0x" << identity_mask(words[1])
+             << ",0x" << words[2] << "/m0x" << identity_mask(words[2]) << ']';
+        return text.str();
+    }
+
+    std::string identity_matches(uintptr_t value) const {
+        std::ostringstream text;
+        text << "state=" << (value == m_overlay_state)
+             << ",desc=" << (value == m_overlay_desc)
+             << ",rtvArray=" << (value == m_overlay_rtv_array)
+             << ",rtv0=" << (value == m_overlay_rtv)
+             << ",color=" << (value == m_semantic_color);
+        return text.str();
+    }
+
+    void log_overlay_state_snapshot(sdk::renderer::TargetState* state) const {
+        if (state == nullptr) {
+            return;
+        }
+        const auto& desc = state->get_desc();
+        spdlog::info("[RE4XeSS][TargetStateProbe] overlaySnapshot state=0x{:x} desc=0x{:x} rtvArray=0x{:x} count={} rtv0=0x{:x} rect=({:.1f},{:.1f},{:.1f},{:.1f}) flag=0x{:x} color=0x{:x}",
+            m_overlay_state,
+            m_overlay_desc,
+            m_overlay_rtv_array,
+            state->get_rtv_count(),
+            m_overlay_rtv,
+            desc.rect.left,
+            desc.rect.top,
+            desc.rect.right,
+            desc.rect.bottom,
+            desc.flag,
+            m_semantic_color);
+    }
+
+    void capture_after(size_t site, const safetyhook::Context& context) noexcept {
+        if (!m_active.load(std::memory_order_acquire) || m_capture_stopped.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        try {
+            if (GetCurrentThreadId() != m_arm_thread_id || site >= SITE_COUNT) {
+                return;
+            }
+            const auto id = note_capture();
+            if (id == 0) {
+                return;
+            }
+
+            const auto args = reconstruct_arguments(site, context);
+            const auto callee = resolve_callee(site, context);
+            std::array<uintptr_t, 4> stack{};
+            const auto has_stack = read_stack_window(context.rsp, stack);
+            const auto returned = static_cast<uintptr_t>(context.rax);
+            spdlog::info("[RE4XeSS][TargetStateProbe] stage=return id={} frame={} site={} callsiteRva=0x{:x} returnRva=0x{:x} callee={} tid={} attemptThread={} argMask=0x{:x} rcx=0x{:x} rdx=0x{:x} r8=0x{:x} r9=0x{:x} stack20=[0x{:x},0x{:x},0x{:x},0x{:x}] stackValid={} identity[rcx:{};rdx:{};r8:{};r9:{};result:{}] words[rcx={};rdx={};r8={};r9={};result={} ]",
+                static_cast<unsigned long long>(id),
+                static_cast<unsigned long long>(m_frame_id),
+                SITE_NAMES[site],
+                CALLSITE_RVAS[site],
+                RETURN_RVAS[site],
+                format_rva(callee),
+                GetCurrentThreadId(),
+                m_arm_thread_id,
+                args.valid_mask,
+                args.rcx,
+                args.rdx,
+                args.r8,
+                args.r9,
+                stack[0],
+                stack[1],
+                stack[2],
+                stack[3],
+                has_stack,
+                identity_matches(args.rcx),
+                identity_matches(args.rdx),
+                identity_matches(args.r8),
+                identity_matches(args.r9),
+                identity_matches(returned),
+                describe_private_words(args.rcx),
+                describe_private_words(args.rdx),
+                describe_private_words(args.r8),
+                describe_private_words(args.r9),
+                describe_private_words(returned));
+        } catch (...) {
+            // Probe failures must not affect the original engine call.
+        }
+    }
+
+    static uintptr_t read_pointer(uintptr_t address) noexcept {
+        uintptr_t value{};
+        return read_memory(address, &value, sizeof(value)) ? value : 0;
+    }
+};
+
+struct TargetStateFactoryProbeWindow {
+    bool armed{};
+
+    ~TargetStateFactoryProbeWindow() {
+        if (armed) {
+            TargetStateFactoryProbe::instance().disarm("OutputHandoff::prepare returned");
+        }
+    }
 };
 
 bool is_valid_texture_extent(ID3D12Resource* resource, uint32_t width, uint32_t height) {
@@ -2432,7 +2981,12 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         packet.frame_id,
         packet.display_width,
         packet.display_height);
-    if (!m_output_handoff.prepare(
+    bool handoff_prepared{};
+    {
+        TargetStateFactoryProbeWindow probe_window{
+            TargetStateFactoryProbe::instance().arm(packet.frame_id, color_state, color),
+        };
+        handoff_prepared = m_output_handoff.prepare(
             layer,
             control_request.device.Get(),
             control_request.queue.Get(),
@@ -2445,7 +2999,9 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
             control_result.snapshot.bridge_idle,
             control_result.snapshot.bridge_device_removed,
             output,
-            handoff_error)) {
+            handoff_error);
+    }
+    if (!handoff_prepared) {
         const auto handoff_state = m_output_handoff.snapshot();
         const bool retirement_pending =
             handoff_state.retirement == RE4XeSSOutputHandoff::RetirementStatus::WriterPending ||
