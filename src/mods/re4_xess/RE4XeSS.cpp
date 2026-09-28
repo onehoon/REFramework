@@ -1216,15 +1216,22 @@ public:
         m_semantic_color = reinterpret_cast<uintptr_t>(semantic_color);
         m_calls_captured.store(0, std::memory_order_release);
         m_returns_captured.store(0, std::memory_order_release);
+        m_pending_call_count.store(0, std::memory_order_release);
+        m_present_grace_count.store(0, std::memory_order_release);
         m_next_call_id.store(0, std::memory_order_release);
         m_capture_started.store(false, std::memory_order_release);
         m_capture_stopped.store(false, std::memory_order_release);
         for (size_t index = 0; index < SITE_COUNT; ++index) {
             m_site_call_counts[index].store(0, std::memory_order_release);
             m_site_return_counts[index].store(0, std::memory_order_release);
+            m_return_hook_entries[index].store(0, std::memory_order_release);
+            m_unmatched_returns[index].store(0, std::memory_order_release);
         }
 
         for (size_t index = 0; index < HOOK_COUNT; ++index) {
+            if (!selected_hook(index)) {
+                continue;
+            }
             const auto address = reinterpret_cast<void*>(image.base + hook_rva(index));
             m_hooks[index] = safetyhook::create_mid(address, hook_callback(index), safetyhook::MidHook::StartDisabled);
             if (!m_hooks[index]) {
@@ -1235,6 +1242,9 @@ public:
 
         // The pre-hooks must stop before each original CALL so its address and return address stay unchanged.
         for (size_t index = 0; index < SITE_COUNT; ++index) {
+            if (!selected_site(index)) {
+                continue;
+            }
             const auto expected_span = CALLSITE_RVAS[index] - PRE_HOOK_RVAS[index];
             const auto actual_span = m_hooks[index].original_bytes().size();
             if (actual_span == 0 || actual_span > expected_span) {
@@ -1248,7 +1258,7 @@ public:
         }
 
         for (size_t index = 0; index < HOOK_COUNT; ++index) {
-            if (!m_hooks[index].enable()) {
+            if (m_hooks[index] && !m_hooks[index].enable()) {
                 disarm("could not enable all callsite hooks");
                 return false;
             }
@@ -1256,7 +1266,7 @@ public:
 
         m_active.store(true, std::memory_order_release);
 
-        spdlog::info("[RE4XeSS][TargetStateProbe] armed frame={} thread={} imageSize=0x{:x} checksum=0x{:x} overlayState=0x{:x} desc=0x{:x} rtvArray=0x{:x} rtv0=0x{:x} color=0x{:x} sites={} captureLimit={} perSiteLimit={} captureStarts=after-prepare disarm=next-post-present",
+        spdlog::info("[RE4XeSS][TargetStateProbe] armed frame={} thread={} imageSize=0x{:x} checksum=0x{:x} overlayState=0x{:x} desc=0x{:x} rtvArray=0x{:x} rtv0=0x{:x} color=0x{:x} validatedSites={} activePairs={} isolatedSite={} siteName={} captureLimit={} perSiteLimit={} pendingPresentGrace={} captureStarts=after-prepare",
             static_cast<unsigned long long>(m_frame_id),
             m_arm_thread_id,
             image.size,
@@ -1267,8 +1277,12 @@ public:
             m_overlay_rtv,
             m_semantic_color,
             CALLSITE_RVAS.size(),
+            selected_site(ISOLATED_SITE_INDEX) ? 1 : SITE_COUNT,
+            ISOLATED_SITE_INDEX < SITE_COUNT ? static_cast<int>(ISOLATED_SITE_INDEX) : -1,
+            ISOLATED_SITE_INDEX < SITE_COUNT ? SITE_NAMES[ISOLATED_SITE_INDEX] : "all",
             MAX_CAPTURED_CALLS,
-            MAX_CAPTURED_CALLS_PER_SITE);
+            MAX_CAPTURED_CALLS_PER_SITE,
+            MAX_PENDING_PRESENT_GRACE);
         log_overlay_state_snapshot(overlay_state);
         return true;
     }
@@ -1302,28 +1316,50 @@ public:
             }
         }
 
-        spdlog::info("[RE4XeSS][TargetStateProbe] disarmed reason={} captureStarted={} capturedCalls={} returnedCalls={} captureBudgetReached={} disableFailed={}",
+        spdlog::info("[RE4XeSS][TargetStateProbe] disarmed reason={} captureStarted={} capturedCalls={} returnedCalls={} pendingCalls={} pendingPresentGrace={} captureBudgetReached={} disableFailed={}",
             reason,
             m_capture_started.load(std::memory_order_acquire),
             m_calls_captured.load(std::memory_order_acquire),
             m_returns_captured.load(std::memory_order_acquire),
+            m_pending_call_count.load(std::memory_order_acquire),
+            m_present_grace_count.load(std::memory_order_acquire),
             m_capture_stopped.load(std::memory_order_acquire),
             disable_failed);
         for (size_t index = 0; index < SITE_COUNT; ++index) {
-            spdlog::info("[RE4XeSS][TargetStateProbe] site-summary site={} callsiteRva=0x{:x} pre={} post={}",
+            spdlog::info("[RE4XeSS][TargetStateProbe] site-summary site={} callsiteRva=0x{:x} pre={} post={} postHookEntries={} unmatchedPost={}",
                 SITE_NAMES[index],
                 CALLSITE_RVAS[index],
                 m_site_call_counts[index].load(std::memory_order_acquire),
-                m_site_return_counts[index].load(std::memory_order_acquire));
+                m_site_return_counts[index].load(std::memory_order_acquire),
+                m_return_hook_entries[index].load(std::memory_order_acquire),
+                m_unmatched_returns[index].load(std::memory_order_acquire));
         }
     }
 
     void on_post_present() noexcept {
-        if (m_active.load(std::memory_order_acquire)) {
+        if (!m_active.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        const auto pending_calls = m_pending_call_count.load(std::memory_order_acquire);
+        if (pending_calls == 0) {
             disarm(m_capture_stopped.load(std::memory_order_acquire)
                     ? "capture budget reached; hooks removed at post-present boundary"
-                    : "post-present frame boundary");
+                    : "post-present frame boundary with no pending calls");
+            return;
         }
+
+        const auto grace_count = m_present_grace_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+        if (grace_count >= MAX_PENDING_PRESENT_GRACE) {
+            disarm(m_capture_stopped.load(std::memory_order_acquire)
+                    ? "capture budget reached; pending-call post-present grace exhausted"
+                    : "pending-call post-present grace exhausted");
+            return;
+        }
+
+        spdlog::info("[RE4XeSS][TargetStateProbe] retaining hooks across post-present boundary pendingCalls={} grace={}/{} captureBudgetReached={}",
+            pending_calls, grace_count, MAX_PENDING_PRESENT_GRACE,
+            m_capture_stopped.load(std::memory_order_acquire));
     }
 
 private:
@@ -1356,6 +1392,9 @@ private:
     static constexpr uint32_t EXPECTED_IMAGE_SIZE = 0x0E405000;
     static constexpr uint32_t EXPECTED_IMAGE_CHECKSUM = 0x0DEE3479;
     static constexpr size_t SITE_COUNT = 4;
+    // Isolate the observed outer vcall so its return can be measured without nested probe hooks.
+    static constexpr size_t ISOLATED_SITE_INDEX = 2;
+    static constexpr uint32_t MAX_PENDING_PRESENT_GRACE = 2;
     static constexpr size_t MAX_CAPTURED_CALLS_PER_SITE = 4;
     static constexpr size_t MAX_CAPTURED_CALLS = SITE_COUNT * MAX_CAPTURED_CALLS_PER_SITE;
     static constexpr size_t HOOK_COUNT = SITE_COUNT * 2;
@@ -1391,9 +1430,13 @@ private:
     std::atomic<bool> m_capture_stopped{};
     std::atomic<uint32_t> m_calls_captured{};
     std::atomic<uint32_t> m_returns_captured{};
+    std::atomic<uint32_t> m_pending_call_count{};
+    std::atomic<uint32_t> m_present_grace_count{};
     std::atomic<uint64_t> m_next_call_id{};
     std::array<std::atomic<uint32_t>, SITE_COUNT> m_site_call_counts{};
     std::array<std::atomic<uint32_t>, SITE_COUNT> m_site_return_counts{};
+    std::array<std::atomic<uint32_t>, SITE_COUNT> m_return_hook_entries{};
+    std::array<std::atomic<uint32_t>, SITE_COUNT> m_unmatched_returns{};
     uintptr_t m_image_base{};
     uintptr_t m_image_end{};
     uint64_t m_frame_id{};
@@ -1565,6 +1608,15 @@ private:
             &after_call<3>,
         };
         return hook_index < callbacks.size() ? callbacks[hook_index] : nullptr;
+    }
+
+    static constexpr bool selected_site(size_t site) noexcept {
+        return ISOLATED_SITE_INDEX >= SITE_COUNT || site == ISOLATED_SITE_INDEX;
+    }
+
+    static constexpr bool selected_hook(size_t hook_index) noexcept {
+        const auto site = hook_index < SITE_COUNT ? hook_index : hook_index - SITE_COUNT;
+        return site < SITE_COUNT && selected_site(site);
     }
 
     uintptr_t resolve_callee(size_t site, const safetyhook::Context& context) const noexcept {
@@ -1849,6 +1901,7 @@ private:
                 .arguments = arguments,
                 .callee = callee,
             };
+            m_pending_call_count.fetch_add(1, std::memory_order_acq_rel);
             log_observation("pre", id, site, context, arguments, callee);
 
             if (m_calls_captured.load(std::memory_order_acquire) >= MAX_CAPTURED_CALLS) {
@@ -1866,17 +1919,38 @@ private:
         }
 
         try {
+            m_return_hook_entries[site].fetch_add(1, std::memory_order_acq_rel);
             const auto stack_pointer = static_cast<uintptr_t>(context.rsp);
             auto pending = find_pending_observation(site, stack_pointer);
             if (pending == nullptr) {
+                const auto unmatched = m_unmatched_returns[site].fetch_add(1, std::memory_order_acq_rel);
+                if (unmatched < MAX_CAPTURED_CALLS_PER_SITE) {
+                    uint32_t same_thread_pending{};
+                    uintptr_t expected_rsp{};
+                    uint64_t expected_id{};
+                    for (const auto& candidate : s_pending_observations) {
+                        if (candidate.active && candidate.site == site) {
+                            if (same_thread_pending == 0) {
+                                expected_rsp = candidate.stack_pointer;
+                                expected_id = candidate.id;
+                            }
+                            ++same_thread_pending;
+                        }
+                    }
+                    spdlog::warn("[RE4XeSS][TargetStateProbe] post-hook unmatched site={} callsiteRva=0x{:x} tid={} rsp=0x{:x} sameThreadPending={} expectedId={} expectedRsp=0x{:x} pendingCalls={}",
+                        SITE_NAMES[site], CALLSITE_RVAS[site], GetCurrentThreadId(), stack_pointer,
+                        same_thread_pending, expected_id, expected_rsp,
+                        m_pending_call_count.load(std::memory_order_acquire));
+                }
                 return;
             }
 
             const auto observation = *pending;
             pending->active = false;
-            log_observation("post", observation.id, site, context, observation.arguments, observation.callee);
+            m_pending_call_count.fetch_sub(1, std::memory_order_acq_rel);
             m_site_return_counts[site].fetch_add(1, std::memory_order_acq_rel);
             m_returns_captured.fetch_add(1, std::memory_order_acq_rel);
+            log_observation("post", observation.id, site, context, observation.arguments, observation.callee);
         } catch (...) {
             // Probe failures must not affect the original engine call.
         }
