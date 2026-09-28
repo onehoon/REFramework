@@ -6940,3 +6940,179 @@ XeFG validation                                            deferred
 ~~~
 
 Next: classify the third pointer from one bounded capture while preserving fail-closed ownership. After quality-transition stability, separately retest sustained >300-submission SR and investigate the exact OptiScaler binary AV. Keep PR66 Draft/Open/unmerged.
+
+
+---
+
+## 43. 16:49 capture — repeated OptiScaler dxgi native AV with first-chance GPRs
+
+This checkpoint follows Section 42. The previous 16:24 quality-transition identity
+failure and this native OptiScaler-proxy AV are independent unresolved tracks.
+The new capture reaches the native AV *before* attempting a live in-flight
+quality-mode change, so it cannot validate the Section 42 fix.
+
+### 43.1 Exact paired inputs
+
+~~~text
+REFramework: re2_framework_log(20260928-075010).txt
+  log stamp:  a9bd0b59cefde15317a774602b14a67548c2145e
+  branch:     feature/re4-xess-load-state-accessor-diagnostic
+  build time: 2026-09-28 11:26
+OptiScaler: OptiScaler(5).log
+  v10.0.0-dev 44cfee4d, built 20260926_090919
+  proxy mode: game-directory dxgi.dll
+PR66 remote HEAD when reviewed:
+  0be6550ddc865dafc09fa3bbb0295a5c530203ed
+PR66 follow-up comment:
+  5865784530
+~~~
+
+Do not equate the logged local hash stamp to the current remote PR66 tree.
+
+### 43.2 Native fault at submission 205, same module/RVA as earlier
+
+~~~text
+first public Execute call     16:49:29.124  frame=7300  submission=1
+last reported native fault    16:49:31.223  frame=7505  submission=205
+workerThread                  16860
+controlGeneration             1
+resetGeneration               0
+slot                          4
+input                         1969x1107
+output                        2560x1440
+resetHistory                  false
+
+ExceptionCode                 0xC0000005
+ExceptionAddress / RIP        0x7ffda6a4256f
+module                        <game directory>\dxgi.dll (OptiScaler proxy)
+moduleRVA                     0x21256f
+accessKind                    write
+targetAddress                 0xc
+GPRValid                      true
+
+RAX                           0x0
+RCX                           0x5cf6782388b50000
+RDX                           0x1f6f8945890
+R8                            0x0
+R9                            0x35094ce0
+R10                           0xec359125e7c0067
+R11                           0x6919c17fb0
+RSP                           0x6919c18200
+RBP                           0x6919c18300
+~~~
+
+The exact OptiScaler proxy module RVA, exception code and near-null
+write target match the prior Section 40 native exception attribution.
+This is a reproducible instruction-location signature.
+
+RAX=0 is *additional context*, not proof of the instruction operand
+or object provenance. Only disassembly of the exact captured dxgi.dll
+can establish whether the failing store is [rax+0xc], another register,
+or an indirect calculation.
+
+First Execute to fault is approximately 2.10 seconds. Similar timing
+across captures is not proof of a 200-submit gate, timer or periodic
+cleanup path.
+
+### 43.3 The 128-line normal Execute budget is not the submit count
+
+~~~text
+REFramework logged api-enter                        128
+REFramework logged api-return result=0              128
+REFramework last normal verbose submission          128
+REFramework terminal exceptional submission         205
+OptiScaler hk_xessD3D12Execute                      205
+OptiScaler XeSSFeatureDx12::EvaluateInternal
+  Executing!!                                       202
+~~~
+
+The source has MAX_EXECUTE_API_LOGS=128; it intentionally omits later
+ordinary api-enter/api-return entries. The terminal submission=205
+is therefore consistent with the OptiScaler 205 intercepts. Do not
+misread the absent 129–204 verbose entries as failed calls, and do
+not claim 205 confirmed successful backend executions.
+
+OptiScaler last Execute/Executing trace is at 16:49:31.221, directly
+before REFramework records the native exception at 16:49:31.223.
+No successful public XeSS result is logged for submission 205.
+
+### 43.4 Other working paths and fail-closed behavior
+
+The observed early installed Overlay identities agree:
+
+~~~text
+Overlay layer             0x1f4e5250800
+installed handoff state   0x1f4e4b453a0
+saved original state      0x1f4ccc98210
+~~~
+
+Delayed downstream-marker settlements occurred for restored frames
+7303, 7381, and 7460 (values 4, 81 and 160, respectively).
+
+This capture shows no Section 42 unexpected third-TargetState error,
+but **does not exercise healthy-generation Quality -> Ultra Quality**:
+it begins Off -> Ultra Quality and later changes quality only *after*
+the native worker exception.
+
+Following the AV:
+
+~~~text
+16:49:31.223 api-exception kind=unknown
+16:49:31.224 worker exception termination
+16:49:31.224 output handoff quarantined once
+16:49:31.233 producer-faulted reset
+16:49:33.876 Ultra Quality -> Balanced, controlGeneration=2
+16:49:35.643 Balanced -> Ultra Quality Plus, controlGeneration=3
+16:49:36.960 Ultra Quality Plus -> Performance, controlGeneration=4
+~~~
+
+Subsequent marker snapshots keep the output generation retained with
+retirementRequested=true and bridgeWriterUncertain=true; the worker
+is not automatically restarted. Avoid claiming the old output has
+retired based solely on markerPending=false or installed=false.
+
+### 43.5 Required next proof and minimal engineering gate
+
+PR66 comment 5865784530 requires:
+
+1. Identify/hash the **actual game-directory** OptiScaler dxgi.dll
+   for the 44cfee4d / 20260926_090919 build.
+2. Disassemble the exact faulting instruction around RVA 0x21256f,
+   with matching symbols or build map when available.
+3. Capture a first-chance stack if available, and trace the producing
+   pointer through OptiScaler, XeSS->NGX translation and incoming
+   REF resource/callback ownership. Do not assign fault causality
+   from module identity alone.
+4. Only then apply the smallest justified patch in the actual
+   owner, if any. The supported contract remains stock OptiScaler.
+5. Separately verify a live healthy-generation Quality ->
+   Ultra Quality mode change for the Section 42 third-state case,
+   then sustained >300-submission XeSS SR for this native AV.
+
+The OptiScaler log also records MenuCommon::Init re-entry around
+16:49:31.204, before the failure; this is **temporal correlation
+only**, not proven causation.
+
+Preserve the current narrow EXCEPTION_CONTINUE_SEARCH observer,
+quarantined GPU-resource lifetimes, public XeSS frontend, no
+direct swapchain output, and unchanged XeFG/D3D12Hook integration.
+Do not add unproven GPU barriers or retries.
+
+---
+
+## 44. Handoff after the 16:49 capture
+
+~~~text
+Engine TargetState creator and normal Overlay handoff    PROVEN
+Public XeSS -> stock OptiScaler                          PROVEN through prior returns
+Last logged normal public Execute                        128
+Last known attempted public Execute                      205 (native AV)
+GPRs of exact faulting context                           CAPTURED
+Exact OptiScaler game-directory fault RVA                0x21256f
+Underlying pointer producer / faulting instruction       NOT YET IDENTIFIED
+Section 42 healthy mode-change identity regression       NOT TESTED HERE
+Sustained XeSS SR beyond ~200 submissions                BLOCKED
+XeFG production validation                               DEFERRED
+~~~
+
+PR66 remains Draft / Open / unmerged.
