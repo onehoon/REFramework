@@ -1313,7 +1313,6 @@ public:
 
     void disarm(std::string_view reason) noexcept {
         m_active.store(false, std::memory_order_release);
-        disarm_provenance_hooks(reason);
         if (m_disarm_started.exchange(true, std::memory_order_acq_rel)) {
             return;
         }
@@ -1323,6 +1322,15 @@ public:
             if (hook && !hook.disable()) {
                 disable_failed = true;
             }
+        }
+
+        if (m_provenance_active.load(std::memory_order_acquire)) {
+            spdlog::info("[RE4XeSS][TargetStateProvenance] retained after short TargetStateProbe disarm reason={} frames={} maxFrames={} writes={} maxWrites={}",
+                reason,
+                m_provenance_frames.load(std::memory_order_acquire),
+                MAX_PROVENANCE_FRAMES,
+                m_provenance_write_count.load(std::memory_order_acquire),
+                MAX_PROVENANCE_WRITES);
         }
 
         spdlog::info("[RE4XeSS][TargetStateProbe] disarmed reason={} captureStarted={} capturedCalls={} returnedCalls={} pendingCalls={} pendingPresentGrace={} captureBudgetReached={} disableFailed={}",
@@ -1343,6 +1351,22 @@ public:
                 m_return_hook_entries[index].load(std::memory_order_acquire),
                 m_unmatched_returns[index].load(std::memory_order_acquire));
         }
+    }
+
+    void force_disarm_all(std::string_view reason) noexcept {
+        disarm(reason);
+        disarm_provenance_hooks(reason);
+    }
+
+    void refresh_live_overlay_slot(sdk::renderer::layer::Overlay* overlay) noexcept {
+        if (!m_provenance_active.load(std::memory_order_acquire) || overlay == nullptr) {
+            return;
+        }
+
+        (void)refresh_provenance_overlay_slot(
+            overlay,
+            overlay->get_main_target_state().get(),
+            m_frame_id + m_provenance_frames.load(std::memory_order_acquire));
     }
 
     void on_post_present() noexcept {
@@ -1667,7 +1691,7 @@ private:
         const auto overlay_address = reinterpret_cast<uintptr_t>(overlay);
         const auto slot_address = reinterpret_cast<uintptr_t>(&overlay->get_main_target_state());
         uintptr_t current_state{};
-        const bool slot_valid = overlay_address != 0 && slot_address >= overlay_address &&
+        const bool slot_valid = overlay_state != nullptr && overlay_address != 0 && slot_address >= overlay_address &&
             slot_address - overlay_address == RE4_TARGET_STATE_SLOT_OFFSET &&
             read_private_memory(slot_address, &current_state, sizeof(current_state)) &&
             current_state == reinterpret_cast<uintptr_t>(overlay_state);
@@ -2687,7 +2711,7 @@ std::filesystem::path reframework_module_directory() {
 }
 
 RE4XeSS::~RE4XeSS() {
-    TargetStateFactoryProbe::instance().disarm("RE4XeSS destroyed");
+    TargetStateFactoryProbe::instance().force_disarm_all("RE4XeSS destroyed");
     CreateRenderTargetViewProbe::instance().reset();
     m_worker.stop();
 }
@@ -2846,7 +2870,7 @@ void RE4XeSS::on_device_reset() {
     if (!sdk::GameIdentity::get().is_re4()) {
         return;
     }
-    TargetStateFactoryProbe::instance().disarm("device reset");
+    TargetStateFactoryProbe::instance().force_disarm_all("device reset");
     CreateRenderTargetViewProbe::instance().reset();
     m_device_reset_generation.fetch_add(1, std::memory_order_acq_rel);
 }
@@ -3655,6 +3679,10 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
     if (log_migration) {
         spdlog::info("[RE4XeSS][Coordinator] callback thread migration {} -> {}; workerThread={} (informational)",
             previous_thread_id, callback_thread_id, m_worker.thread_id());
+    }
+
+    if (sdk::GameIdentity::get().is_re4()) {
+        TargetStateFactoryProbe::instance().refresh_live_overlay_slot(layer);
     }
 
     const auto requested_mode = m_requested_mode.load(std::memory_order_acquire);
