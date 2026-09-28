@@ -1777,6 +1777,9 @@ Production code should implement the minimum stable contract, not carry broad ho
 | AD-37 | DLSS5-Feeder externally corroborates that synthetic standard upscaler API calls can be intercepted by stock OptiScaler, but its post-process/backbuffer-copy architecture does not replace RE4's required pre-Overlay TargetState handoff. Public XeSS remains the RE4 producer contract. |
 | AD-38 | Exact decoded TargetState-vtable xrefs at RE4 RVAs 0x47C3E0A and 0x47D21AF are reverse-engineering leads only. They must be classified to a concrete constructor/initializer dataflow and runtime-proven before any production creator/factory resolver is allowed. |
 | AD-39 | Incomplete RUNTIME_FUNCTION xref coverage does not invalidate already decoded exact positive xrefs and does not veto a runtime live-anchor proven by exact image identity and vtable equality. Decoder failures are diagnostic coverage metadata and should be rate-limited in logs. |
+| AD-40 | RE4 RVA 0x47C3E00 is destructor/deallocation-side evidence for the exact validated image and must not be used as a TargetState creator/factory path. |
+| AD-41 | RE4 RVA 0x47D2180 is the strongest current TargetState creator candidate because it allocates 0xA8 bytes, invokes an initializer-like routine, installs the exact live TargetState vtable, and returns the object. It remains diagnostic-only until ABI, ownership, and live-object identity are runtime-proven. |
+| AD-42 | The next creator proof is an early read-only observation of real engine calls to 0x47D2180 plus raw-pointer correlation against the later live Overlay main TargetState. No diagnostic probe may invoke the candidate function itself or retain engine objects through AddRef/Release. |
 
 ---
 
@@ -2042,5 +2045,152 @@ public XeSS producer
 ~~~
 
 Do not direct-copy XeSS output to the swapchain.
+
+Keep PR66 Draft and unmerged.
+
+
+---
+
+## 23. PR66 TargetState creator checkpoint — 2026-09-28 14:05 build
+
+This checkpoint supersedes the unresolved two-xref classification state in Section 22.
+
+Latest runtime:
+
+~~~text
+re2_framework_log(20260928-050834).txt
+commit header: 42c3b66fd5163c331ecb1247e42b25cfc13e9d40
+branch: feature/re4-xess-load-state-accessor-diagnostic
+~~~
+
+Current remote source contains the bounded context diagnostic in:
+
+~~~text
+06a50b2572a19ba0f4ff977babd2a786273a8bfe
+Log bounded TargetState vtable xref context
+~~~
+
+### 23.1 Scanner and trust-gate diagnostics are no longer blockers
+
+The scanner now:
+
+~~~text
+uses exception-directory RUNTIME_FUNCTION ranges
+retains the two exact positive vtable xrefs
+rate-limits individual decode failures to 12
+reports complete=false separately from positive xrefs
+~~~
+
+The live Overlay anchor remains:
+
+~~~text
+imageIdentityValid=true
+liveVtable == expectedVtable
+match=true
+trusted=true
+~~~
+
+No further work is required on this trust gate unless new runtime evidence contradicts it.
+
+### 23.2 0x47C3E00 is not a creator path
+
+The 0x47C3E00 function:
+
+~~~text
+writes the TargetState vtable onto an existing RCX object
+preserves EDX as flag bits
+performs destructor-side work
+conditionally performs a deallocation-like call
+returns the existing object pointer
+~~~
+
+Treat it as deleting-destructor / ownership-side evidence only.
+
+Do not use it for create_target_state.
+
+### 23.3 0x47D2180 is the sole current creator candidate
+
+The 0x47D2180 function:
+
+~~~text
+requests 0xA8 bytes
+receives a new object pointer
+invokes re4+0x446E790 on that object
+writes the exact TargetState vtable to [RBX]
+returns the same object in RAX
+~~~
+
+This is the strongest candidate yet for the engine TargetState allocation/construction path.
+
+However, production integration still requires proof of:
+
+~~~text
+real engine caller(s)
+input argument semantics
+constructed object layout
+initial refcount / ownership transfer
+relationship to the live Overlay TargetState instance
+safe descriptor/RTV population contract
+~~~
+
+Therefore:
+
+~~~text
+0x47D2180 = diagnostic creator candidate
+0x47D2180 != production create_target_state yet
+~~~
+
+### 23.4 Next implementation boundary
+
+PR66 comment:
+
+~~~text
+5863904529
+~~~
+
+Add one early, bounded, read-only creator probe for 0x47D2180 only.
+
+Arm before plugin/renderer initialization at the existing post-integrity bootstrap point.
+
+Observe real engine calls and retain only plain diagnostic values.
+
+Do not AddRef, Release, call, modify, or retain engine objects.
+
+The strongest acceptance condition is:
+
+~~~text
+createdObjectFrom0x47D2180 == laterLiveOverlayMainTargetState
+~~~
+
+Also collect exact direct callers of 0x47D2180 from the already-bounded RUNTIME_FUNCTION decode so argument setup can be reconstructed.
+
+The old 0x47212A6 provider-return diagnostic should be disabled for the next capture because it is exhausted.
+
+### 23.5 Production architecture is unchanged
+
+The desired path remains:
+
+~~~text
+RE4 low-resolution scene
+    -> true pre-Overlay semantic inputs
+    -> public XeSS D3D12 producer
+    -> stock OptiScaler interception
+    -> display-resolution SR output
+    -> engine-visible TargetState handoff
+    -> native RE4 Overlay/UI/final presentation
+~~~
+
+Current blocker:
+
+~~~text
+production-safe TargetState creator ABI   not yet proven
+distinct handoff TargetState              unavailable
+OutputHandoff                             blocked
+XeSS Execute                              not reached
+~~~
+
+Do not bypass the handoff with a swapchain copy.
+
+Do not start XeFG validation.
 
 Keep PR66 Draft and unmerged.
