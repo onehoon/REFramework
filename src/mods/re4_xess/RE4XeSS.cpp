@@ -1720,11 +1720,27 @@ private:
 
     DiscoveryResult discover_vtable_xrefs(const ImageInfo& image) noexcept {
         constexpr size_t MAX_LOGGED_XREFS = 16;
+        constexpr size_t MAX_LOGGED_DECODE_FAILURES = 12;
+        constexpr size_t CONTEXT_BEFORE_INSTRUCTIONS = 8;
+        constexpr size_t CONTEXT_AFTER_INSTRUCTIONS = 12;
         constexpr size_t MAX_RUNTIME_FUNCTIONS = 1'000'000;
         struct RuntimeFunctionRange {
             uint32_t begin_rva{};
             uint32_t end_rva{};
             uint32_t unwind_info_rva{};
+        };
+        struct XrefCandidate {
+            size_t index{};
+            size_t function_index{};
+            uint32_t function_begin_rva{};
+            uint32_t function_end_rva{};
+            uint32_t xref_rva{};
+            uintptr_t resolved_address{};
+            uint8_t instruction_length{};
+            uint8_t preceding_count{};
+            bool destination_register_available{};
+            unsigned destination_register_id{};
+            std::array<uint32_t, CONTEXT_BEFORE_INSTRUCTIONS> preceding_rvas{};
         };
         static_assert(sizeof(RuntimeFunctionRange) == 12);
 
@@ -1734,7 +1750,11 @@ private:
         size_t scanned_function_count{};
         size_t failed_function_count{};
         size_t scanned_bytes{};
+        size_t decode_failure_details_logged{};
+        std::array<XrefCandidate, MAX_LOGGED_XREFS> candidates{};
+        size_t candidate_count{};
         bool truncated{};
+        bool decode_failure_details_suppressed{};
         bool scan_complete = expected_vtable != 0 &&
             image.nt.OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXCEPTION;
         const auto exception_directory = scan_complete
@@ -1778,6 +1798,9 @@ private:
             const auto function_size = static_cast<size_t>(function.end_rva - function.begin_rva);
             const auto* code = reinterpret_cast<const uint8_t*>(image.base + function.begin_rva);
             size_t offset{};
+            std::array<uint32_t, CONTEXT_BEFORE_INSTRUCTIONS> previous_instruction_rvas{};
+            size_t previous_instruction_count{};
+            size_t previous_instruction_next{};
             bool function_decoded = true;
             while (offset < function_size) {
                 const auto remaining = std::min<size_t>(15, function_size - offset);
@@ -1785,8 +1808,13 @@ private:
                 if (!decoded || decoded->Length == 0 || decoded->Length > remaining) {
                     // Keep instruction-boundary guarantees within each unwind-proven function.
                     // A bad function does not prevent independent ranges from being inspected.
-                    spdlog::warn("[RE4XeSS][TargetStateVtableProbe] decode stopped functionIndex={} functionRva=0x{:x} offset=0x{:x}",
-                        function_index, function.begin_rva, offset);
+                    if (decode_failure_details_logged < MAX_LOGGED_DECODE_FAILURES) {
+                        spdlog::warn("[RE4XeSS][TargetStateVtableProbe] decode stopped functionIndex={} functionRva=0x{:x} functionEndRva=0x{:x} offset=0x{:x}",
+                            function_index, function.begin_rva, function.end_rva, offset);
+                        ++decode_failure_details_logged;
+                    } else {
+                        decode_failure_details_suppressed = true;
+                    }
                     function_decoded = false;
                     break;
                 }
@@ -1812,30 +1840,36 @@ private:
                     }
 
                     if (xref_count < MAX_LOGGED_XREFS) {
-                        std::array<char, 128> instruction_text{};
-                        const auto text_status = NdToText(&*decoded, instruction_address,
-                            static_cast<uint32_t>(instruction_text.size()), instruction_text.data());
-                        std::ostringstream bytes;
-                        for (uint8_t byte_index = 0; byte_index < decoded->Length; ++byte_index) {
-                            if (byte_index != 0) bytes << ' ';
-                            bytes << std::hex << std::setw(2) << std::setfill('0')
-                                  << static_cast<unsigned>(code[offset + byte_index]);
-                        }
-                        const bool destination_register = decoded->OperandsCount != 0 &&
+                        auto& candidate = candidates[candidate_count++];
+                        candidate.index = xref_count;
+                        candidate.function_index = function_index;
+                        candidate.function_begin_rva = function.begin_rva;
+                        candidate.function_end_rva = function.end_rva;
+                        candidate.xref_rva = function.begin_rva + static_cast<uint32_t>(offset);
+                        candidate.resolved_address = resolved;
+                        candidate.instruction_length = decoded->Length;
+                        candidate.preceding_count = static_cast<uint8_t>(previous_instruction_count);
+                        candidate.destination_register_available = decoded->OperandsCount != 0 &&
                             decoded->Operands[0].Type == ND_OP_REG;
-                        const auto destination_register_id = destination_register
+                        candidate.destination_register_id = candidate.destination_register_available
                             ? static_cast<unsigned>(decoded->Operands[0].Info.Register.Reg)
                             : 0U;
-                        spdlog::info("[RE4XeSS][TargetStateVtableProbe] xref index={} xrefRva=0x{:x} instructionLength={} resolved=0x{:x} destinationRegisterAvailable={} destinationRegisterId={} text={} bytes={}",
-                            xref_count, function.begin_rva + offset, decoded->Length, resolved,
-                            destination_register, destination_register_id,
-                            text_status == ND_STATUS_SUCCESS ? instruction_text.data() : "unavailable",
-                            bytes.str());
+                        const auto oldest = (previous_instruction_next + CONTEXT_BEFORE_INSTRUCTIONS -
+                            previous_instruction_count) % CONTEXT_BEFORE_INSTRUCTIONS;
+                        for (size_t previous_index = 0; previous_index < previous_instruction_count; ++previous_index) {
+                            candidate.preceding_rvas[previous_index] = previous_instruction_rvas[
+                                (oldest + previous_index) % CONTEXT_BEFORE_INSTRUCTIONS];
+                        }
                     } else {
                         truncated = true;
                     }
                     ++xref_count;
                 }
+
+                previous_instruction_rvas[previous_instruction_next] =
+                    function.begin_rva + static_cast<uint32_t>(offset);
+                previous_instruction_next = (previous_instruction_next + 1) % CONTEXT_BEFORE_INSTRUCTIONS;
+                previous_instruction_count = std::min(previous_instruction_count + 1, CONTEXT_BEFORE_INSTRUCTIONS);
                 offset += decoded->Length;
             }
             scanned_bytes += offset;
@@ -1849,9 +1883,74 @@ private:
 
         m_vtable_discovery_complete.store(scan_complete, std::memory_order_release);
         m_vtable_discovery_done.store(true, std::memory_order_release);
-        spdlog::info("[RE4XeSS][TargetStateVtableProbe] discovery-summary attempted=true coverage=exception-directory-runtime-functions vtableRva=0x{:x} xrefCount={} truncated={} functions={} scannedFunctions={} failedFunctions={} scannedBytes=0x{:x} complete={}",
+        if (decode_failure_details_suppressed) {
+            spdlog::warn("[RE4XeSS][TargetStateVtableProbe] further decode failure details suppressed after {} entries",
+                MAX_LOGGED_DECODE_FAILURES);
+        }
+        spdlog::info("[RE4XeSS][TargetStateVtableProbe] discovery-summary attempted=true coverage=exception-directory-runtime-functions vtableRva=0x{:x} xrefCount={} truncated={} functions={} scannedFunctions={} failedFunctions={} decodeFailureDetailsLogged={} decodeFailureDetailsSuppressed={} scannedBytes=0x{:x} complete={}",
             TARGET_STATE_VTABLE_RVA, xref_count, truncated, function_count,
-            scanned_function_count, failed_function_count, scanned_bytes, scan_complete);
+            scanned_function_count, failed_function_count, decode_failure_details_logged,
+            decode_failure_details_suppressed, scanned_bytes, scan_complete);
+
+        const auto log_context_instruction = [&](size_t candidate_index, const char* stage, uint32_t rva,
+                                                 uint32_t function_end_rva) {
+            if (rva >= function_end_rva) {
+                return false;
+            }
+            const auto remaining = std::min<size_t>(15, function_end_rva - rva);
+            const auto address = image.base + rva;
+            auto decoded = utility::decode_one(reinterpret_cast<uint8_t*>(address), remaining);
+            if (!decoded || decoded->Length == 0 || decoded->Length > remaining) {
+                spdlog::warn("[RE4XeSS][TargetStateVtableProbe] context decode failed candidate={} stage={} rva=0x{:x}",
+                    candidate_index, stage, rva);
+                return false;
+            }
+
+            std::array<char, 128> instruction_text{};
+            const auto text_status = NdToText(&*decoded, address,
+                static_cast<uint32_t>(instruction_text.size()), instruction_text.data());
+            std::ostringstream bytes;
+            for (uint8_t byte_index = 0; byte_index < decoded->Length; ++byte_index) {
+                if (byte_index != 0) bytes << ' ';
+                bytes << std::hex << std::setw(2) << std::setfill('0')
+                      << static_cast<unsigned>(reinterpret_cast<const uint8_t*>(address)[byte_index]);
+            }
+            spdlog::info("[RE4XeSS][TargetStateVtableProbe] context candidate={} rva=0x{:x} stage={} text={} bytes={}",
+                candidate_index, rva, stage,
+                text_status == ND_STATUS_SUCCESS ? instruction_text.data() : "unavailable", bytes.str());
+            return true;
+        };
+
+        for (size_t candidate_index = 0; candidate_index < candidate_count; ++candidate_index) {
+            const auto& candidate = candidates[candidate_index];
+            const auto offset = candidate.xref_rva - candidate.function_begin_rva;
+            spdlog::info("[RE4XeSS][TargetStateVtableProbe] candidate index={} xrefRva=0x{:x} instructionLength={} resolved=0x{:x} functionIndex={} functionBeginRva=0x{:x} functionEndRva=0x{:x} offset=0x{:x} classification=unknown destinationRegisterAvailable={} destinationRegisterId={}",
+                candidate.index, candidate.xref_rva, candidate.instruction_length, candidate.resolved_address, candidate.function_index,
+                candidate.function_begin_rva, candidate.function_end_rva, offset,
+                candidate.destination_register_available, candidate.destination_register_id);
+            for (size_t previous_index = 0; previous_index < candidate.preceding_count; ++previous_index) {
+                (void)log_context_instruction(candidate.index, "before",
+                    candidate.preceding_rvas[previous_index], candidate.function_end_rva);
+            }
+            if (!log_context_instruction(candidate.index, "at", candidate.xref_rva, candidate.function_end_rva)) {
+                continue;
+            }
+
+            auto after_rva = candidate.xref_rva + candidate.instruction_length;
+            for (size_t after_index = 0; after_index < CONTEXT_AFTER_INSTRUCTIONS &&
+                after_rva < candidate.function_end_rva; ++after_index) {
+                const auto remaining = std::min<size_t>(15, candidate.function_end_rva - after_rva);
+                auto decoded = utility::decode_one(reinterpret_cast<uint8_t*>(image.base + after_rva), remaining);
+                if (!decoded || decoded->Length == 0 || decoded->Length > remaining) {
+                    spdlog::warn("[RE4XeSS][TargetStateVtableProbe] context decode failed candidate={} stage=after rva=0x{:x}",
+                        candidate.index, after_rva);
+                    break;
+                }
+                (void)log_context_instruction(candidate.index, "after", after_rva, candidate.function_end_rva);
+                after_rva += decoded->Length;
+            }
+        }
+
         return DiscoveryResult{ true, scan_complete, xref_count };
     }
 
