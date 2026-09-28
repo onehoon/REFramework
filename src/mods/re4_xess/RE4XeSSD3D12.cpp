@@ -172,6 +172,8 @@ RE4XeSSD3D12::SubmitResult RE4XeSSD3D12::submit(
     const RE4XeSSFrame& frame,
     RE4XeSSRuntime& runtime,
     const OutputBinding& output,
+    uint64_t control_generation,
+    uint64_t device_reset_generation,
     std::string& error) {
     error.clear();
     if (!m_initialized || m_quarantined || m_device_removed) {
@@ -213,7 +215,15 @@ RE4XeSSD3D12::SubmitResult RE4XeSSD3D12::submit(
     slot.output_pin = output.resource;
     write_slot_descriptors(slot, frame.velocity);
 
-    if (!record_and_submit(slot, frame, runtime, output, selected_slot, error)) {
+    if (!record_and_submit(
+            slot,
+            frame,
+            runtime,
+            output,
+            selected_slot,
+            control_generation,
+            device_reset_generation,
+            error)) {
         if (m_quarantined) {
             return SubmitResult::Faulted;
         }
@@ -715,6 +725,8 @@ bool RE4XeSSD3D12::record_and_submit(
     RE4XeSSRuntime& runtime,
     const OutputBinding& output,
     uint32_t slot_index,
+    uint64_t control_generation,
+    uint64_t device_reset_generation,
     std::string& error) {
     auto result = slot.allocator->Reset();
     if (FAILED(result)) {
@@ -788,7 +800,17 @@ bool RE4XeSSD3D12::record_and_submit(
     params.pDescriptorHeap = nullptr;
     params.descriptorHeapOffset = 0;
 
-    if (!runtime.execute(slot.list.Get(), params, error)) {
+    RE4XeSSRuntime::ExecuteDiagnostics execute_diagnostics{};
+    execute_diagnostics.frame_id = frame.frame_id;
+    execute_diagnostics.control_generation = control_generation;
+    execute_diagnostics.device_reset_generation = device_reset_generation;
+    execute_diagnostics.submission_sequence = m_submission_count + 1;
+    execute_diagnostics.bridge_slot = slot_index;
+    execute_diagnostics.output_width = frame.display_width;
+    execute_diagnostics.output_height = frame.display_height;
+    execute_diagnostics.original_velocity = frame.velocity;
+
+    if (!runtime.execute(slot.list.Get(), params, execute_diagnostics, error)) {
         slot.list->Close();
         return false;
     }

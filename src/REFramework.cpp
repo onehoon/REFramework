@@ -663,12 +663,6 @@ REFramework::REFramework(HMODULE reframework_module)
         suspender.resume();
     }
 
-    // Arm only the bounded RE4 TargetState provenance diagnostic after the
-    // integrity bootstrap and before plugin, VM, or renderer initialization.
-    if (gi.is_re4() && XeFGCompatibility::is_debug_log_enabled()) {
-        RE4XeSS::bootstrap_early_target_state_diagnostics();
-    }
-
     // Load the plugins early right after executable unpacking
     PluginLoader::get()->early_init();
 
@@ -926,8 +920,6 @@ REFramework::~REFramework() {
     }
 
     m_d3d_monitor_thread.reset();
-
-    RE4XeSS::shutdown_early_target_state_diagnostics();
 
     const bool ui_layout_save_pending = std::exchange(m_ui_layout_save_pending, false);
     m_wants_save_imgui_config = false;

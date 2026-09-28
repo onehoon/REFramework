@@ -3685,24 +3685,7 @@ std::filesystem::path reframework_module_directory() {
 
 }
 
-void RE4XeSS::bootstrap_early_target_state_diagnostics() noexcept {
-    if (!sdk::GameIdentity::get().is_re4() || !XeFGCompatibility::is_debug_log_enabled()) {
-        return;
-    }
-
-    spdlog::info("[RE4XeSS][TargetStateVtableProbe] bootstrap-begin point=REFramework-constructor-after-integrity tid={} before-plugin-init=true",
-        GetCurrentThreadId());
-    const auto discovery = TargetStateFactoryProbe::instance().discover_target_state_vtable_early();
-    spdlog::info("[RE4XeSS][TargetStateVtableProbe] bootstrap-result attempted={} complete={} xrefCount={} creatorProbeArmed={} point=REFramework-constructor-after-integrity",
-        discovery.attempted, discovery.complete, discovery.xref_count, discovery.creator_probe_armed);
-}
-
-void RE4XeSS::shutdown_early_target_state_diagnostics() noexcept {
-    TargetStateFactoryProbe::instance().force_disarm_all("REFramework shutting down");
-}
-
 RE4XeSS::~RE4XeSS() {
-    TargetStateFactoryProbe::instance().force_disarm_all("RE4XeSS destroyed");
     CreateRenderTargetViewProbe::instance().reset();
     m_worker.stop();
 }
@@ -3849,7 +3832,6 @@ void RE4XeSS::on_post_present() {
         g_framework->get_renderer_type() != REFramework::RendererType::D3D12) {
         return;
     }
-    TargetStateFactoryProbe::instance().on_post_present();
     const auto& hook = g_framework->get_d3d12_hook();
     if (hook == nullptr) {
         return;
@@ -3861,7 +3843,6 @@ void RE4XeSS::on_device_reset() {
     if (!sdk::GameIdentity::get().is_re4()) {
         return;
     }
-    TargetStateFactoryProbe::instance().force_disarm_all("device reset");
     CreateRenderTargetViewProbe::instance().reset();
     m_device_reset_generation.fetch_add(1, std::memory_order_acq_rel);
 }
@@ -4672,10 +4653,6 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
             previous_thread_id, callback_thread_id, m_worker.thread_id());
     }
 
-    if (sdk::GameIdentity::get().is_re4()) {
-        TargetStateFactoryProbe::instance().refresh_live_overlay_slot(layer);
-    }
-
     const auto requested_mode = m_requested_mode.load(std::memory_order_acquire);
     const auto control_generation = m_control_generation.load(std::memory_order_acquire);
     const auto reset_generation = m_device_reset_generation.load(std::memory_order_acquire);
@@ -4957,7 +4934,7 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         packet.frame_id,
         packet.display_width,
         packet.display_height);
-    const bool handoff_prepared = m_output_handoff.prepare(
+    const auto handoff_prepare_result = m_output_handoff.prepare(
         layer,
         control_request.device.Get(),
         control_request.queue.Get(),
@@ -4971,7 +4948,13 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         control_result.snapshot.bridge_device_removed,
         output,
         handoff_error);
-    if (!handoff_prepared) {
+    if (handoff_prepare_result != RE4XeSSOutputHandoff::PrepareResult::Ready) {
+        if (handoff_prepare_result == RE4XeSSOutputHandoff::PrepareResult::WaitingForPostPresentMarker) {
+            invalidate_history("output-handoff-marker-pending");
+            clear_frame_state();
+            return true;
+        }
+
         const auto handoff_state = m_output_handoff.snapshot();
         const bool retirement_pending =
             handoff_state.retirement == RE4XeSSOutputHandoff::RetirementStatus::WriterPending ||

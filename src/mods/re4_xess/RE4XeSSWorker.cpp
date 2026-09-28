@@ -647,7 +647,13 @@ RE4XeSSWorker::SubmitResult RE4XeSSWorker::process_submit(SubmitRequest request)
     }
 
     std::string submit_error;
-    const auto submit_result = m_bridge->submit(request.frame, *m_runtime, request.output, submit_error);
+    const auto submit_result = m_bridge->submit(
+        request.frame,
+        *m_runtime,
+        request.output,
+        request.control_generation,
+        request.device_reset_generation,
+        submit_error);
     if (submit_result == RE4XeSSD3D12::SubmitResult::Submitted) {
         return make_submit_result(request, SubmitResult::Status::Submitted);
     }

@@ -65,6 +65,8 @@ public:
         const RE4XeSSFrame& frame,
         RE4XeSSRuntime& runtime,
         const OutputBinding& output,
+        uint64_t control_generation,
+        uint64_t device_reset_generation,
         std::string& error);
 
     PollResult poll();
@@ -108,6 +110,8 @@ private:
         RE4XeSSRuntime& runtime,
         const OutputBinding& output,
         uint32_t slot_index,
+        uint64_t control_generation,
+        uint64_t device_reset_generation,
         std::string& error);
     void set_name(ID3D12Object* object, const wchar_t* name) const noexcept;
     void quarantine_objects() noexcept;

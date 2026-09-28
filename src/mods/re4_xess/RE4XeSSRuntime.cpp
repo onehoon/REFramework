@@ -2,7 +2,10 @@
 
 #include <atomic>
 #include <cmath>
+#include <exception>
 #include <spdlog/spdlog.h>
+
+#include "mods/REFrameworkConfig.hpp"
 
 #include <system_error>
 #include <utility>
@@ -10,6 +13,10 @@
 namespace {
 
 std::atomic_flag owner_thread_violation_logged = ATOMIC_FLAG_INIT;
+std::atomic<uint32_t> execute_api_log_count{};
+std::atomic_flag execute_api_exception_logged = ATOMIC_FLAG_INIT;
+std::atomic_flag execute_api_failure_logged = ATOMIC_FLAG_INIT;
+constexpr uint32_t MAX_EXECUTE_API_LOGS = 128;
 
 void log_owner_thread_violation_once(const std::string& error) {
     if (!owner_thread_violation_logged.test_and_set(std::memory_order_relaxed)) {
@@ -268,6 +275,7 @@ bool RE4XeSSRuntime::initialize_sr(const InitSignature& signature, std::string& 
 bool RE4XeSSRuntime::execute(
     ID3D12GraphicsCommandList* command_list,
     const xess_d3d12_execute_params_t& params,
+    const ExecuteDiagnostics& diagnostics,
     std::string& error) {
     error.clear();
 
@@ -283,7 +291,67 @@ bool RE4XeSSRuntime::execute(
         return false;
     }
 
-    const auto result = m_functions.d3d12_execute(m_context, command_list, &params);
+    const bool debug_log = REFrameworkConfig::get() != nullptr &&
+        REFrameworkConfig::get()->is_debug_log_enabled();
+    const auto log_index = debug_log
+        ? execute_api_log_count.fetch_add(1, std::memory_order_relaxed)
+        : MAX_EXECUTE_API_LOGS;
+    const bool log_api_call = log_index < MAX_EXECUTE_API_LOGS;
+    const auto log_context = [&](spdlog::level::level_enum level, std::string_view stage, std::string_view detail) {
+        spdlog::log(level,
+            "[RE4XeSS][Execute] {} frame={} workerThread={} controlGeneration={} resetGeneration={} slot={} submission={} commandList=0x{:x} color=0x{:x} depth=0x{:x} convertedMV=0x{:x} originalMV=0x{:x} output=0x{:x} input={}x{} outputExtent={}x{} resetHistory={} detail={}",
+            stage,
+            static_cast<unsigned long long>(diagnostics.frame_id),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(diagnostics.control_generation),
+            static_cast<unsigned long long>(diagnostics.device_reset_generation),
+            diagnostics.bridge_slot,
+            static_cast<unsigned long long>(diagnostics.submission_sequence),
+            reinterpret_cast<uintptr_t>(command_list),
+            reinterpret_cast<uintptr_t>(params.pColorTexture),
+            reinterpret_cast<uintptr_t>(params.pDepthTexture),
+            reinterpret_cast<uintptr_t>(params.pVelocityTexture),
+            reinterpret_cast<uintptr_t>(diagnostics.original_velocity),
+            reinterpret_cast<uintptr_t>(params.pOutputTexture),
+            params.inputWidth,
+            params.inputHeight,
+            diagnostics.output_width,
+            diagnostics.output_height,
+            params.resetHistory != 0,
+            detail);
+    };
+
+    if (log_api_call) {
+        log_context(spdlog::level::info, "api-enter", "calling public xessD3D12Execute");
+    }
+
+    xess_result_t result{};
+    try {
+        result = m_functions.d3d12_execute(m_context, command_list, &params);
+    } catch (const std::exception& exception) {
+        if (!execute_api_exception_logged.test_and_set(std::memory_order_relaxed)) {
+            std::string_view what = exception.what() != nullptr ? exception.what() : "";
+            if (what.size() > 512) {
+                what = what.substr(0, 512);
+            }
+            log_context(spdlog::level::err, "api-exception", std::string{ "kind=std::exception what=" } + std::string{ what });
+        }
+        error = "xessD3D12Execute threw std::exception";
+        throw;
+    } catch (...) {
+        if (!execute_api_exception_logged.test_and_set(std::memory_order_relaxed)) {
+            log_context(spdlog::level::err, "api-exception", "kind=unknown");
+        }
+        error = "xessD3D12Execute threw an unknown exception";
+        throw;
+    }
+
+    const bool log_api_failure = result != XESS_RESULT_SUCCESS &&
+        !execute_api_failure_logged.test_and_set(std::memory_order_relaxed);
+    if (log_api_call || log_api_failure) {
+        log_context(result == XESS_RESULT_SUCCESS ? spdlog::level::info : spdlog::level::err, "api-return",
+            std::string{ "result=" } + std::to_string(static_cast<int32_t>(result)));
+    }
     if (result != XESS_RESULT_SUCCESS) {
         error = result_message("xessD3D12Execute", result);
         m_failure_reason = error;

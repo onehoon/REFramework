@@ -25,6 +25,12 @@ public:
         DeviceRemoved,
     };
 
+    enum class PrepareResult : uint8_t {
+        Ready,
+        WaitingForPostPresentMarker,
+        Failed,
+    };
+
     struct Snapshot {
         bool has_generation{};
         bool installed{};
@@ -41,7 +47,7 @@ public:
     bool restore(sdk::renderer::layer::Overlay* layer, std::string& error);
     void request_retirement(std::string_view reason);
     RetirementStatus poll_retirement(bool bridge_writer_idle, bool bridge_device_removed);
-    bool prepare(
+    PrepareResult prepare(
         sdk::renderer::layer::Overlay* layer,
         ID3D12Device* device,
         ID3D12CommandQueue* queue,

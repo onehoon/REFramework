@@ -280,7 +280,7 @@ RE4XeSSOutputHandoff::RetirementStatus RE4XeSSOutputHandoff::poll_retirement(
     return status;
 }
 
-bool RE4XeSSOutputHandoff::prepare(
+RE4XeSSOutputHandoff::PrepareResult RE4XeSSOutputHandoff::prepare(
     sdk::renderer::layer::Overlay* layer,
     ID3D12Device* device,
     ID3D12CommandQueue* queue,
@@ -298,13 +298,13 @@ bool RE4XeSSOutputHandoff::prepare(
     error.clear();
     if (layer == nullptr || device == nullptr || queue == nullptr || semantic_color == nullptr) {
         error = "The RE4 XeSS handoff is missing Overlay, device, DIRECT queue, or semantic Color";
-        return false;
+        return PrepareResult::Failed;
     }
 
     auto* current_template = layer->get_main_target_state().get();
     if (current_template == nullptr) {
         error = "Overlay main TargetState is unavailable for XeSS output handoff";
-        return false;
+        return PrepareResult::Failed;
     }
     const auto color_description = semantic_color->GetDesc();
     Signature requested_signature{
@@ -341,10 +341,10 @@ bool RE4XeSSOutputHandoff::prepare(
     if (m_handoff_state != nullptr && m_signature == requested_signature && waiting_for_marker) {
         error = "Previous RE4 XeSS handoff frame is waiting for its downstream post-Present retirement marker";
         if (log_marker_block) {
-            spdlog::warn("[RE4XeSS][Output] refusing handoff reuse while frame={} awaits post-Present settlement; no new XeSS output submit/install",
+            spdlog::info("[RE4XeSS][Output] transiently skipping producer frame while same-generation frame={} awaits post-Present settlement; no new XeSS output submit/install",
                 static_cast<unsigned long long>(waiting_marker_frame));
         }
-        return false;
+        return PrepareResult::WaitingForPostPresentMarker;
     }
     if (m_handoff_state != nullptr && m_signature == requested_signature && existing_generation_usable) {
         output.resource = m_resource_pin.Get();
@@ -352,9 +352,9 @@ bool RE4XeSSOutputHandoff::prepare(
         output.after_state = OUTPUT_READ_STATE;
         if (output.resource == nullptr) {
             error = "The active RE4 XeSS output handoff lost its native resource pin";
-            return false;
+            return PrepareResult::Failed;
         }
-        return true;
+        return PrepareResult::Ready;
     }
 
     if (m_handoff_state != nullptr) {
@@ -367,7 +367,7 @@ bool RE4XeSSOutputHandoff::prepare(
             if (!state.failure_reason.empty()) {
                 error += "; " + state.failure_reason;
             }
-            return false;
+            return PrepareResult::Failed;
         }
     }
 
@@ -381,7 +381,7 @@ bool RE4XeSSOutputHandoff::prepare(
             display_width,
             display_height,
             error)) {
-        return false;
+        return PrepareResult::Failed;
     }
 
     Microsoft::WRL::ComPtr<ID3D12Fence> fence;
@@ -391,7 +391,7 @@ bool RE4XeSSOutputHandoff::prepare(
             std::to_string(static_cast<uint32_t>(fence_result));
         m_handoff_state.reset();
         m_resource_pin.Reset();
-        return false;
+        return PrepareResult::Failed;
     }
     m_resource_pin->SetName(L"RE4XeSS Handoff Output");
 
@@ -439,7 +439,7 @@ bool RE4XeSSOutputHandoff::prepare(
     output.resource = m_resource_pin.Get();
     output.before_state = m_expected_state;
     output.after_state = OUTPUT_READ_STATE;
-    return true;
+    return PrepareResult::Ready;
 }
 
 bool RE4XeSSOutputHandoff::validate_and_clone(
