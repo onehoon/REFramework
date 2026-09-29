@@ -10,6 +10,7 @@
 
 #include "Mod.hpp"
 #include "RE4XeSSFrame.hpp"
+#include "RE4XeSSLifetimeTrace.hpp"
 #include "RE4XeSSOutputHandoff.hpp"
 #include "RE4XeSSWorker.hpp"
 
@@ -130,6 +131,11 @@ private:
     std::atomic<DWORD> m_last_pre_overlay_thread_id{};
     std::atomic<uint32_t> m_pre_overlay_migration_log_count{};
     std::atomic<uint32_t> m_pre_overlay_coordinator_log_count{};
+    std::atomic<uint64_t> m_scene_lifetime_ordinal{};
+    std::atomic<uint64_t> m_pre_overlay_lifetime_ordinal{};
+    std::atomic<uint64_t> m_post_overlay_lifetime_ordinal{};
+    std::atomic<uint64_t> m_lifetime_skip_count{};
+    std::atomic<uint64_t> m_lifetime_submit_count{};
 
     bool m_temporal_ready{};
     bool m_temporal_signature_valid{};

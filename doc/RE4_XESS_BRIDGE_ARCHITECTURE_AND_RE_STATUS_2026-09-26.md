@@ -7260,3 +7260,25 @@ Symbol check        PASS (private symbols, line records, globals, type info)
 ~~~
 
 The REF embedded stamp identifies only its base commit; use the DLL hash and matching PDB identity as the exact build identity. Next evidence must capture the first TargetState write if callback provenance remains ambiguous. Do not infer success from OptiScaler `Upscaling done` counts, write back/adopt the third object, clear quarantine, synthesize a post-Present marker, or release retained resources early. Keep the OptiScaler native AV investigation independent. The >300-success run, mode transition, Off/On and Load Save sequences are still unvalidated.
+
+## 47. PR66 Phase A lifetime trace — source status, runtime gate pending
+
+PR66 follow-up work order: [comment 5884381727](https://github.com/onehoon/REFramework/pull/66#issuecomment-5884381727). This change implements bounded, read-only Phase A tracing only. It is enabled only for RE4 + D3D12 while REFramework Debug Log is enabled. The trace keeps a fixed 4,096-event ring, emits at most 32 compact dumps, checkpoints every 512 Present callbacks or 1,024 successful submits, and includes anomaly-triggered skip dumps.
+
+Captured identities originate at their owning boundaries and are carried forward: Scene/pre-Overlay/post-Overlay ordinals and overlap epoch; trace, submit, bridge-slot, writer-fence, output-generation and monotonic install IDs; Overlay/TargetState/output identities; Present/Present1 ordinal, swapchain/source, caller/return TIDs, active queue identity/type, original-call timing/result and callback suppression; and downstream marker Signal value plus cached and actual nonblocking fence values. `UINT64_MAX` is recorded as invalid completion/device-removal evidence, never as completion. Successful XeSS submit accounting separates API return, command-list submission, Signal success, and writer-fence completion. `PostOverlayObservation`, Present callback adjacency, timestamps, and a successful Signal explicitly remain **not GPU-reader proof**.
+
+### Gate A status
+
+~~~text
+Source instrumentation/build: implemented; x64 Release build succeeded from base `3291ca246b8eb96f7475183293daea64479269b5` plus this Phase-A source diff; PE machine `0x8664`; `dinput8.dll` SHA-256 `AF5F6977CBEE2B19E22CC7ABB5351C62DAECDAA112149745FA364B61F8F8622C`.
+CTest: no tests are registered in this build tree.
+Matching PDB: not produced by this Release build; the adjacent PDB is older and must not be used to symbolize this DLL.
+Runtime capture with the new trace: pending user RE4 + OptiScaler test.
+Actual RE4 downstream consumer command submissions identified: NOT YET PROVEN.
+Installed output -> consumer submissions -> eligible Present/queue -> its marker: NOT YET PROVEN.
+OutputHandoff reuse policy / quarantine / marker semantics / history invalidation: unchanged.
+Output TargetState ring: NOT IMPLEMENTED; blocked until Gate A passes.
+PR66: Draft / Open / unmerged.
+~~~
+
+The trace deliberately does not install a process-wide `ExecuteCommandLists` hook. Current callback-boundary observations cannot identify which engine command submission actually reads a given output; adding such a hook without a narrower validated RE4 boundary would exceed the evidence and scope. Use the new runtime trace to establish callback/Present/fence order first. If the consumer-to-Present relation remains ambiguous, investigate a bounded RE4-specific read-only submission boundary on this PR; do not infer FIFO use from timestamps and do not change output reuse rules until that relation and queue ordering are proven.

@@ -11,6 +11,7 @@
 #include <wrl/client.h>
 
 #include "RE4XeSSD3D12.hpp"
+#include "RE4XeSSLifetimeTrace.hpp"
 #include <sdk/Renderer.hpp>
 
 class RE4XeSSOutputHandoff final {
@@ -37,6 +38,20 @@ public:
         bool installed{};
         RetirementStatus retirement{ RetirementStatus::NoGeneration };
         std::string failure_reason{};
+        uint64_t output_generation{};
+        uint64_t install_id{};
+        uint64_t installed_trace_id{};
+        uint64_t installed_frame{};
+        uint64_t installed_present_ordinal{};
+        uint64_t installed_control_generation{};
+        uint64_t installed_device_reset_generation{};
+        uint64_t last_signaled_fence_value{};
+        uint64_t last_completed_fence_value{};
+        int32_t installed_mode_token{};
+        uintptr_t output_resource{};
+        uintptr_t target_state{};
+        uintptr_t overlay{};
+        bool marker_pending{};
     };
 
     struct ObservationContext {
@@ -46,6 +61,18 @@ public:
         uint64_t frame_id{};
         uint32_t callback_thread_id{};
         bool frame_id_valid{};
+        uint64_t trace_id{};
+        uint64_t callback_ordinal{};
+        uint64_t present_ordinal{};
+        uint64_t submit_ordinal{};
+        uint64_t writer_fence_value{};
+        uintptr_t swapchain{};
+        uintptr_t device{};
+        uintptr_t queue{};
+        uint32_t bridge_slot{};
+        bool present_ordinal_valid{};
+        int32_t command_queue_type{ -1 };
+        bool command_queue_type_valid{};
     };
 
     struct EngineWriterWitness {
@@ -127,6 +154,7 @@ public:
         ID3D12Device* active_device,
         ID3D12CommandQueue* active_queue,
         const ObservationContext& observation) noexcept;
+    void observe_fence_completion() noexcept;
     void observe_overlay(
         sdk::renderer::layer::Overlay* layer,
         const ObservationContext& observation,
@@ -213,6 +241,28 @@ private:
     uint64_t m_last_signaled_retirement_value{};
     uint64_t m_last_completed_retirement_value{};
     uint64_t m_installed_frame{};
+    uint64_t m_next_output_generation{};
+    uint64_t m_output_generation_id{};
+    uint64_t m_next_install_id{};
+    uint64_t m_installed_install_id{};
+    uint64_t m_installed_trace_id{};
+    uint64_t m_installed_present_ordinal{};
+    uint64_t m_installed_submit_ordinal{};
+    uint64_t m_installed_writer_fence_value{};
+    uint32_t m_installed_bridge_slot{};
+    uint64_t m_trace_last_observed_completed_value{};
+    struct TraceMarker {
+        uint64_t trace_id{};
+        uint64_t install_id{};
+        uint64_t frame_id{};
+        uint64_t present_ordinal{};
+        uint64_t output_generation{};
+        uint64_t fence_value{};
+        uintptr_t output_resource{};
+        uint32_t thread_id{};
+    };
+    std::array<TraceMarker, 128> m_trace_markers{};
+    size_t m_trace_marker_count{};
     uint64_t m_installed_device_reset_generation{};
     int32_t m_installed_mode_token{};
     uintptr_t m_last_confirmed_post_overlay_layer{};

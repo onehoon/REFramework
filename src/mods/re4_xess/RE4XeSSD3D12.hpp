@@ -8,6 +8,7 @@
 #include <wrl/client.h>
 
 #include "RE4XeSSFrame.hpp"
+#include "RE4XeSSLifetimeTrace.hpp"
 
 class RE4XeSSRuntime;
 
@@ -32,6 +33,15 @@ public:
             static_cast<D3D12_RESOURCE_STATES>(
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
         };
+    };
+
+    struct SubmissionInfo {
+        uint64_t submission_ordinal{};
+        uint64_t writer_fence_value{};
+        uint32_t slot{};
+        bool execute_api_succeeded{};
+        bool command_lists_submitted{};
+        bool writer_signal_succeeded{};
     };
 
     enum class SubmitResult : uint8_t {
@@ -67,6 +77,7 @@ public:
         const OutputBinding& output,
         uint64_t control_generation,
         uint64_t device_reset_generation,
+        SubmissionInfo& submission_info,
         std::string& error);
 
     PollResult poll();
@@ -94,6 +105,10 @@ private:
         Microsoft::WRL::ComPtr<ID3D12Resource> original_velocity_pin;
         Microsoft::WRL::ComPtr<ID3D12Resource> output_pin;
         uint64_t last_fence_value{};
+        uint64_t trace_id{};
+        uint64_t frame_id{};
+        uint64_t submission_ordinal{};
+        bool reset_history{};
     };
 
     bool create_common_objects(std::string& error);
@@ -112,6 +127,7 @@ private:
         uint32_t slot_index,
         uint64_t control_generation,
         uint64_t device_reset_generation,
+        SubmissionInfo& submission_info,
         std::string& error);
     void set_name(ID3D12Object* object, const wchar_t* name) const noexcept;
     void quarantine_objects() noexcept;

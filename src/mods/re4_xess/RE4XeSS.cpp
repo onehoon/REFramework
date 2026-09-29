@@ -52,6 +52,122 @@ constexpr std::array<const char*, 8> UPSCALING_MODE_LABELS{
     "Ultra Performance",
 };
 
+const char* lifetime_trace_kind_name(RE4XeSSLifetimeTrace::Kind kind) noexcept {
+    using Kind = RE4XeSSLifetimeTrace::Kind;
+    switch (kind) {
+    case Kind::SceneFrame: return "scene-frame";
+    case Kind::PreOverlay: return "pre-overlay";
+    case Kind::Submit: return "submit";
+    case Kind::OutputInstall: return "output-install";
+    case Kind::OutputRestore: return "output-restore";
+    case Kind::PostOverlayObservation: return "post-overlay-observation";
+    case Kind::Present: return "present";
+    case Kind::PostPresentCallback: return "post-present-callback";
+    case Kind::Marker: return "marker";
+    case Kind::WriterFenceComplete: return "writer-fence-complete";
+    case Kind::DownstreamFenceComplete: return "downstream-fence-complete";
+    case Kind::Skip: return "skip";
+    case Kind::Count: break;
+    }
+    return "unknown";
+}
+
+void dump_re4_xess_lifetime_trace(std::string_view reason, size_t event_count) {
+    auto& trace = RE4XeSSLifetimeTrace::instance();
+    if (!trace.enabled()) {
+        return;
+    }
+
+    static std::atomic<uint32_t> dump_count{};
+    const auto dump_index = dump_count.fetch_add(1, std::memory_order_relaxed);
+    if (dump_index >= 32) {
+        return;
+    }
+
+    const auto summary = trace.summary();
+    const auto events = trace.recent(event_count);
+    spdlog::info("[RE4XeSS][LifetimeTrace] checkpoint reason={} dump={} retained={} overwritten={} installsUnmarked={} installsUnmarkedHighWater={} markersGPUIncomplete={} mappingAmbiguities={} submitSuccessResetHistory={} submitSuccessContinuous={} frameSkips={} markerPendingSkips={} bridgeBusySkips={} temporalGateSkips={} unmatchedMarkers={} unmatchedCompletions={} evictedInstallRecords={} allEvents={}",
+        reason,
+        dump_index + 1,
+        events.size(),
+        summary.overwritten_events,
+        summary.installed_unmarked,
+        summary.installed_unmarked_high_water,
+        summary.marked_gpu_incomplete,
+        summary.mapping_ambiguities,
+        summary.successful_reset_history_submits,
+        summary.successful_continuous_submits,
+        summary.skipped_submits,
+        summary.marker_pending_skips,
+        summary.bridge_busy_skips,
+        summary.temporal_gate_skips,
+        summary.unmatched_markers,
+        summary.unmatched_completions,
+        summary.evicted_install_records,
+        summary.total_events);
+
+    for (const auto& event : events) {
+        spdlog::info("[RE4XeSS][LifetimeTrace] seq={} us={} kind={} trace={} install={} frame={} frameValid={} sceneOrd={} callbackOrd={} overlapEpoch={} submit={} present={} relatedPresent={} outputGen={} controlGen={} deviceGen={} bridgeSlot={} writerFence={} downstreamFence={} cachedCompleted={} cachedValid={} actualCompleted={} actualValid={} writerTxn={} writerInvocation={} writerSeq={} clearSeq={}->{} replacementSeq={}->{} writerRva=0x{:x} presentTimes={}::{}/{} output=0x{:x} targetState=0x{:x} overlay=0x{:x} swapchain=0x{:x} device=0x{:x} queue=0x{:x} queueType={} queueTypeValid={} tid={} presentTids={}->{} presentSource={} present1={} presentReturned={} callbacksSuppressed={} originalSkipped={} result=0x{:08x} apiOk={} queueSubmitted={} markerQueued={} resetHistory={} mappingAmbiguous={} reason={}",
+            static_cast<unsigned long long>(event.sequence),
+            static_cast<unsigned long long>(event.timestamp_us),
+            lifetime_trace_kind_name(event.kind),
+            static_cast<unsigned long long>(event.trace_id),
+            static_cast<unsigned long long>(event.install_id),
+            static_cast<unsigned long long>(event.frame_id),
+            event.frame_valid,
+            static_cast<unsigned long long>(event.scene_ordinal),
+            static_cast<unsigned long long>(event.callback_ordinal),
+            static_cast<unsigned long long>(event.overlap_epoch),
+            static_cast<unsigned long long>(event.submit_ordinal),
+            static_cast<unsigned long long>(event.present_ordinal),
+            static_cast<unsigned long long>(event.related_present_ordinal),
+            static_cast<unsigned long long>(event.output_generation),
+            static_cast<unsigned long long>(event.control_generation),
+            static_cast<unsigned long long>(event.device_reset_generation),
+            event.bridge_slot,
+            static_cast<unsigned long long>(event.writer_fence_value),
+            static_cast<unsigned long long>(event.downstream_fence_value),
+            static_cast<unsigned long long>(event.cached_completed_value),
+            event.cached_completed_value_valid,
+            static_cast<unsigned long long>(event.actual_completed_value),
+            event.actual_completed_value_valid,
+            event.writer_transaction_confirmed,
+            static_cast<unsigned long long>(event.writer_invocation_id),
+            static_cast<unsigned long long>(event.writer_sequence),
+            static_cast<unsigned long long>(event.writer_clear_pre_sequence),
+            static_cast<unsigned long long>(event.writer_clear_post_sequence),
+            static_cast<unsigned long long>(event.writer_replacement_pre_sequence),
+            static_cast<unsigned long long>(event.writer_replacement_post_sequence),
+            event.writer_method_rva,
+            static_cast<unsigned long long>(event.present_entry_time_us),
+            static_cast<unsigned long long>(event.original_present_enter_time_us),
+            static_cast<unsigned long long>(event.original_present_return_time_us),
+            event.output_resource,
+            event.target_state,
+            event.overlay,
+            event.swapchain,
+            event.device,
+            event.queue,
+            event.command_queue_type,
+            event.command_queue_type_valid,
+            event.thread_id,
+            event.present_entry_thread_id,
+            event.present_return_thread_id,
+            event.present_source,
+            event.present1,
+            event.present_returned,
+            event.present_callbacks_suppressed,
+            event.original_present_skipped,
+            static_cast<uint32_t>(event.result),
+            event.api_succeeded,
+            event.queue_submitted,
+            event.marker_queued,
+            event.reset_history,
+            event.mapping_ambiguous,
+            event.reason.data());
+    }
+}
+
 std::optional<UpscalingMode> mode_from_config_token(std::string_view token) {
     if (token == "off") return UpscalingMode::Off;
     if (token == "native_aa") return UpscalingMode::NativeAA;
@@ -4450,6 +4566,15 @@ std::optional<std::string> RE4XeSS::on_initialize_d3d_thread() {
         return std::nullopt;
     }
 
+    const bool debug_log = REFrameworkConfig::get() != nullptr &&
+        REFrameworkConfig::get()->is_debug_log_enabled();
+    if (g_framework != nullptr &&
+        g_framework->get_renderer_type() == REFramework::RendererType::D3D12) {
+        const auto& hook = g_framework->get_d3d12_hook();
+        if (hook != nullptr) {
+            hook->set_present_diagnostics_enabled(debug_log);
+        }
+    }
     return std::nullopt;
 }
 
@@ -4577,6 +4702,61 @@ void RE4XeSS::on_post_present() {
     if (hook == nullptr) {
         return;
     }
+    auto& lifetime_trace = RE4XeSSLifetimeTrace::instance();
+    const auto debug_log = REFrameworkConfig::get() != nullptr &&
+        REFrameworkConfig::get()->is_debug_log_enabled();
+    lifetime_trace.configure(debug_log && sdk::GameIdentity::get().is_re4());
+    hook->set_present_diagnostics_enabled(lifetime_trace.enabled());
+    const auto present = hook->get_present_diagnostics_snapshot();
+    const auto handoff = m_output_handoff.snapshot();
+    const bool present_valid = present.active && present.returned && present.result_valid &&
+        present.return_thread_id == GetCurrentThreadId();
+    RE4XeSSLifetimeTrace::Event present_event{};
+    present_event.kind = RE4XeSSLifetimeTrace::Kind::PostPresentCallback;
+    present_event.trace_id = handoff.marker_pending ? handoff.installed_trace_id : 0;
+    present_event.frame_id = handoff.marker_pending ? handoff.installed_frame : 0;
+    present_event.frame_valid = handoff.marker_pending && handoff.installed_trace_id != 0;
+    present_event.present_ordinal = present.ordinal;
+    present_event.callback_ordinal = present.post_present_callback_ordinal;
+    present_event.install_id = handoff.install_id;
+    present_event.related_present_ordinal = handoff.marker_pending ? handoff.installed_present_ordinal : 0;
+    present_event.output_generation = handoff.output_generation;
+    present_event.control_generation = handoff.installed_control_generation;
+    present_event.device_reset_generation = handoff.installed_device_reset_generation;
+    present_event.downstream_fence_value = handoff.last_signaled_fence_value;
+    present_event.output_resource = handoff.output_resource;
+    present_event.target_state = handoff.target_state;
+    present_event.overlay = handoff.overlay;
+    present_event.swapchain = present.swapchain;
+    present_event.device = present.device;
+    present_event.queue = present.command_queue;
+    present_event.command_queue_type = present.command_queue_type;
+    present_event.command_queue_type_valid = present.command_queue_type_valid;
+    present_event.thread_id = GetCurrentThreadId();
+    present_event.present_entry_thread_id = present.entry_thread_id;
+    present_event.present_return_thread_id = present.return_thread_id;
+    present_event.present_source = static_cast<int32_t>(present.source);
+    present_event.result = present.result_valid ? static_cast<int32_t>(present.result) : E_PENDING;
+    present_event.present_valid = present_valid;
+    present_event.present_returned = present.returned;
+    present_event.present1 = present.present1;
+    present_event.present_callbacks_suppressed = present.render_callbacks_suppressed;
+    present_event.original_present_skipped = present.original_call_skipped;
+    present_event.mapping_ambiguous = handoff.marker_pending;
+    present_event.present_entry_time_us = present.entry_time_us;
+    present_event.original_present_enter_time_us = present.original_call_enter_time_us;
+    present_event.original_present_return_time_us = present.original_call_return_time_us;
+    present_event.original_present_skipped = present.original_call_skipped;
+    RE4XeSSLifetimeTrace::set_reason(present_event,
+        !present.active ? "callback-present-context-inactive" :
+        !present.returned ? "callback-before-present-return" :
+        present.render_callbacks_suppressed ? "unexpected-suppressed-post-callback" :
+        "post-present-callback-entered");
+    lifetime_trace.record(present_event);
+    if (lifetime_trace.enabled() && present.ordinal != 0 && present.ordinal % 512 == 0) {
+        dump_re4_xess_lifetime_trace("present-window-checkpoint", 96);
+    }
+
     const RE4XeSSOutputHandoff::ObservationContext observation{
         static_cast<int32_t>(m_requested_mode.load(std::memory_order_acquire)),
         m_control_generation.load(std::memory_order_acquire),
@@ -4584,6 +4764,18 @@ void RE4XeSS::on_post_present() {
         0,
         GetCurrentThreadId(),
         false,
+        0,
+        0,
+        present_valid ? present.ordinal : 0,
+        0,
+        0,
+        present.swapchain,
+        present.device,
+        present.command_queue,
+        0,
+        present_valid,
+        present.command_queue_type,
+        present.command_queue_type_valid,
     };
 
     m_output_handoff.on_post_present(hook->get_device(), hook->get_command_queue(), observation);
@@ -4606,6 +4798,14 @@ void RE4XeSS::on_config_load(const utility::Config& cfg) {
         REFrameworkConfig::get()->is_debug_log_enabled();
     const bool d3d12_renderer = g_framework != nullptr &&
         g_framework->get_renderer_type() == REFramework::RendererType::D3D12;
+    auto& lifetime_trace = RE4XeSSLifetimeTrace::instance();
+    lifetime_trace.configure(debug_log && d3d12_renderer);
+    if (d3d12_renderer) {
+        const auto& hook = g_framework->get_d3d12_hook();
+        if (hook != nullptr) {
+            hook->set_present_diagnostics_enabled(lifetime_trace.enabled());
+        }
+    }
     const auto image = TargetStateFactoryProbe::instance().image_identity();
     const bool provenance_enabled = m_handoff_provenance_opt_in && debug_log && d3d12_renderer &&
         image.expected_re4_build;
@@ -5392,16 +5592,116 @@ void RE4XeSS::on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* re
     m_cached_jitter_x = jitter_x;
     m_cached_jitter_y = jitter_y;
     m_cached_vertical_fov = vertical_fov;
+
+    auto& lifetime_trace = RE4XeSSLifetimeTrace::instance();
+    if (lifetime_trace.enabled()) {
+        RE4XeSSLifetimeTrace::Event trace_event{};
+        trace_event.kind = RE4XeSSLifetimeTrace::Kind::SceneFrame;
+        trace_event.frame_id = frame_id;
+        trace_event.frame_valid = true;
+        trace_event.scene_ordinal = m_scene_lifetime_ordinal.fetch_add(1, std::memory_order_relaxed) + 1;
+        trace_event.control_generation = m_control_generation.load(std::memory_order_acquire);
+        trace_event.device_reset_generation = m_device_reset_generation.load(std::memory_order_acquire);
+        trace_event.thread_id = GetCurrentThreadId();
+        RE4XeSSLifetimeTrace::set_reason(trace_event, "primary-scene-cached");
+        lifetime_trace.record(trace_event);
+    }
 }
 
 bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* render_context) {
     (void)render_context;
     const auto callback_thread_id = GetCurrentThreadId();
     const auto debug_log = REFrameworkConfig::get()->is_debug_log_enabled();
-    const auto overlap_epoch = m_pre_overlay_overlap_epoch.load(std::memory_order_acquire);
+    auto overlap_epoch = m_pre_overlay_overlap_epoch.load(std::memory_order_acquire);
+    auto& lifetime_trace = RE4XeSSLifetimeTrace::instance();
+    const bool d3d12_renderer = g_framework != nullptr &&
+        g_framework->get_renderer_type() == REFramework::RendererType::D3D12;
+    lifetime_trace.configure(debug_log && sdk::GameIdentity::get().is_re4() && d3d12_renderer);
+    if (g_framework != nullptr &&
+        g_framework->get_renderer_type() == REFramework::RendererType::D3D12) {
+        const auto& hook = g_framework->get_d3d12_hook();
+        if (hook != nullptr) {
+            hook->set_present_diagnostics_enabled(lifetime_trace.enabled());
+        }
+    }
+    const bool trace_enabled = lifetime_trace.enabled();
+    const auto trace_id = trace_enabled ? lifetime_trace.next_trace_id() : 0;
+    const auto callback_ordinal = trace_enabled
+        ? m_pre_overlay_lifetime_ordinal.fetch_add(1, std::memory_order_relaxed) + 1
+        : 0;
+    uint64_t trace_frame_id{};
+    bool trace_frame_valid{};
+    D3D12Hook::PresentDiagnosticsSnapshot present_diagnostics{};
+    const auto capture_present_diagnostics = [&] {
+        present_diagnostics = {};
+        if (g_framework == nullptr || g_framework->get_renderer_type() != REFramework::RendererType::D3D12) {
+            return;
+        }
+        const auto& hook = g_framework->get_d3d12_hook();
+        if (hook != nullptr) {
+            present_diagnostics = hook->get_present_diagnostics_snapshot();
+        }
+    };
+    capture_present_diagnostics();
+    const auto present_is_current = [&] {
+        return present_diagnostics.active &&
+            present_diagnostics.ordinal != 0 &&
+            present_diagnostics.entry_thread_id == callback_thread_id;
+    };
+    const auto record_lifetime_event = [&](
+        RE4XeSSLifetimeTrace::Kind kind,
+        std::string_view reason,
+        uint64_t event_trace_id = 0) {
+        if (!trace_enabled) {
+            return uint64_t{};
+        }
+        RE4XeSSLifetimeTrace::Event event{};
+        event.kind = kind;
+        event.trace_id = event_trace_id != 0 ? event_trace_id : trace_id;
+        event.frame_id = trace_frame_id;
+        event.frame_valid = trace_frame_valid;
+        event.callback_ordinal = callback_ordinal;
+        event.overlap_epoch = overlap_epoch;
+        event.present_ordinal = present_is_current() ? present_diagnostics.ordinal : 0;
+        event.control_generation = m_control_generation.load(std::memory_order_acquire);
+        event.device_reset_generation = m_device_reset_generation.load(std::memory_order_acquire);
+        event.swapchain = present_diagnostics.swapchain;
+        event.device = present_diagnostics.device;
+        event.queue = present_diagnostics.command_queue;
+        event.command_queue_type = present_diagnostics.command_queue_type;
+        event.command_queue_type_valid = present_diagnostics.command_queue_type_valid;
+        event.thread_id = callback_thread_id;
+        event.present_entry_thread_id = present_diagnostics.entry_thread_id;
+        event.present_return_thread_id = present_diagnostics.return_thread_id;
+        event.present_source = static_cast<int32_t>(present_diagnostics.source);
+        event.present1 = present_diagnostics.present1;
+        event.present_returned = present_diagnostics.returned;
+        event.present_callbacks_suppressed = present_diagnostics.render_callbacks_suppressed;
+        event.original_present_skipped = present_diagnostics.original_call_skipped;
+        event.result = present_diagnostics.result_valid
+            ? static_cast<int32_t>(present_diagnostics.result)
+            : E_PENDING;
+        event.present_valid = present_is_current();
+        event.mapping_ambiguous = !present_is_current();
+        RE4XeSSLifetimeTrace::set_reason(event, reason);
+        return lifetime_trace.record(event);
+    };
+    const auto trace_skip = [&](std::string_view reason) {
+        if (!trace_enabled) {
+            return;
+        }
+        (void)record_lifetime_event(RE4XeSSLifetimeTrace::Kind::Skip, reason);
+        const auto skip_count = m_lifetime_skip_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (skip_count <= 8 || skip_count % 512 == 0) {
+            dump_re4_xess_lifetime_trace(reason, 96);
+        }
+    };
+
     if (m_pre_overlay_in_progress.test_and_set(std::memory_order_acquire)) {
         m_pre_overlay_overlap_epoch.fetch_add(1, std::memory_order_acq_rel);
+        overlap_epoch = m_pre_overlay_overlap_epoch.load(std::memory_order_acquire);
         const auto overlap_count = m_pre_overlay_overlap_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        trace_skip("overlapping-pre-overlay-rejected");
         if (debug_log && overlap_count <= 8) {
             spdlog::warn("[RE4XeSS][Coordinator] overlapping pre-Overlay callback rejected thread={} count={}",
                 callback_thread_id, static_cast<unsigned long long>(overlap_count));
@@ -5423,12 +5723,17 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         callback_thread_id,
         overlap_epoch,
     };
+    trace_frame_valid = m_cached_scene_frame.has_value();
+    trace_frame_id = m_cached_scene_frame.value_or(0);
+    (void)record_lifetime_event(RE4XeSSLifetimeTrace::Kind::PreOverlay, "callback-enter");
+    m_output_handoff.observe_fence_completion();
     TargetStateFactoryProbe::instance().observe_overlay_writer(layer);
     const auto engine_writer_witness =
         TargetStateFactoryProbe::instance().latest_confirmed_overlay_writer_witness();
     if (m_output_handoff.identity_mismatch_latched()) {
         const auto producer = get_producer_snapshot();
         (void)m_output_handoff.poll_retirement(producer.bridge_idle, producer.bridge_device_removed);
+        trace_skip("output-handoff-identity-mismatch-latched");
         return true;
     }
     if (log_coordinator) {
@@ -5453,6 +5758,18 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         cached_scene_frame.value_or(0),
         callback_thread_id,
         cached_scene_frame.has_value(),
+        trace_id,
+        callback_ordinal,
+        present_is_current() ? present_diagnostics.ordinal : 0,
+        0,
+        0,
+        present_diagnostics.swapchain,
+        present_diagnostics.device,
+        present_diagnostics.command_queue,
+        0,
+        present_is_current(),
+        present_diagnostics.command_queue_type,
+        present_diagnostics.command_queue_type_valid,
     };
 
     std::string restore_error;
@@ -5463,6 +5780,7 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
             handoff.retirement == RE4XeSSOutputHandoff::RetirementStatus::Quarantined);
         invalidate_history("output-handoff-restore-failed");
         clear_frame_state();
+        trace_skip("output-handoff-restore-failed");
         return true;
     }
 
@@ -5555,6 +5873,7 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         }
         invalidate_history("pre-overlay-control-stale");
         clear_frame_state();
+        trace_skip("pre-overlay-control-stale");
         return true;
     }
 
@@ -5572,6 +5891,7 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         set_owner_unavailable(reason, control_result.snapshot.draining, true);
         invalidate_history("worker-control-fault");
         clear_frame_state();
+        trace_skip("worker-control-fault");
         return true;
     }
 
@@ -5594,6 +5914,7 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         set_owner_unavailable(reason, false, true);
         invalidate_history("worker-configuration-mismatch");
         clear_frame_state();
+        trace_skip("worker-configuration-mismatch");
         return true;
     }
     if (!worker_ready) {
@@ -5604,6 +5925,7 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
                 control_result.snapshot.bridge_device_removed);
         }
         clear_frame_state();
+        trace_skip("worker-not-ready");
         return true;
     }
 
@@ -5613,21 +5935,25 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
             control_result.snapshot.bridge_idle,
             control_result.snapshot.bridge_device_removed);
         clear_frame_state();
+        trace_skip("temporal-mode-inactive");
         return true;
     }
     if (!m_load_observation_valid) {
         invalidate_history("load-state-observation-unavailable");
         clear_frame_state();
+        trace_skip("load-state-observation-unavailable");
         return true;
     }
     if (m_inhibit_departure_pending || m_load_transition_active || m_startup_mid_load) {
         invalidate_history("load-history-invalid");
         clear_frame_state();
+        trace_skip("load-history-invalid");
         return true;
     }
     if (layer == nullptr) {
         invalidate_history("pre-overlay-layer-unavailable");
         clear_frame_state();
+        trace_skip("pre-overlay-layer-unavailable");
         return true;
     }
 
@@ -5637,12 +5963,14 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         *m_cached_scene_frame != static_cast<uint64_t>(*frame)) {
         invalidate_history("pre-overlay-primary-scene-frame-missing");
         clear_frame_state();
+        trace_skip("pre-overlay-primary-scene-frame-missing");
         return true;
     }
 
     if (!m_camera_metadata_valid || !m_camera_frame || *m_camera_frame != *m_cached_scene_frame) {
         invalidate_history("pre-overlay-temporal-gate-invalid");
         clear_frame_state();
+        trace_skip("pre-overlay-temporal-gate-invalid");
         return true;
     }
 
@@ -5655,6 +5983,7 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         color != scene->get_post_main_target_d3d12() || color != scene->get_hdr_target_d3d12()) {
         invalidate_history("temporal-resource-identity-invariant-failed");
         clear_frame_state();
+        trace_skip("temporal-resource-identity-invariant-failed");
         return true;
     }
 
@@ -5665,6 +5994,7 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         !is_valid_texture_extent(velocity, render_width, render_height)) {
         invalidate_history("temporal-resource-extent-invariant-failed");
         clear_frame_state();
+        trace_skip("temporal-resource-extent-invariant-failed");
         return true;
     }
     if (color->GetDesc().Format != DXGI_FORMAT_R11G11B10_FLOAT) {
@@ -5673,6 +6003,7 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         set_owner_unavailable(reason, false, true);
         invalidate_history("unsupported-color-format");
         clear_frame_state();
+        trace_skip("unsupported-color-format");
         return true;
     }
 
@@ -5704,6 +6035,7 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
     packet.vertical_fov = m_cached_vertical_fov;
     packet.reset_history = m_first_valid_frame_reset_pending || m_history_invalid;
     packet.frame_id = *m_cached_scene_frame;
+    packet.lifetime_trace_id = trace_id;
 
     if (packet.reset_history && debug_log) {
         spdlog::info("[RE4XeSS][Frame] first valid resetHistory packet: frame={} input={}x{} display={}x{}",
@@ -5741,6 +6073,7 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         if (handoff_prepare_result == RE4XeSSOutputHandoff::PrepareResult::WaitingForPostPresentMarker) {
             invalidate_history("output-handoff-marker-pending");
             clear_frame_state();
+            trace_skip("output-handoff-marker-pending");
             return true;
         }
 
@@ -5759,6 +6092,7 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         }
         invalidate_history("output-handoff-unavailable");
         clear_frame_state();
+        trace_skip(handoff_error.empty() ? "output-handoff-unavailable" : std::string_view{ handoff_error });
         return true;
     }
     m_output_handoff_control_generation = control_generation;
@@ -5779,6 +6113,57 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
 
     const auto submit_result = m_worker.submit_sync(std::move(submit_request));
     publish_worker_snapshot(submit_result.snapshot);
+    const auto handoff_after_submit = m_output_handoff.snapshot();
+    RE4XeSSLifetimeTrace::Event submit_event{};
+    submit_event.kind = RE4XeSSLifetimeTrace::Kind::Submit;
+    submit_event.trace_id = trace_id;
+    submit_event.frame_id = packet.frame_id;
+    submit_event.frame_valid = true;
+    submit_event.callback_ordinal = callback_ordinal;
+    submit_event.submit_ordinal = submit_result.submit_ordinal;
+    submit_event.present_ordinal = present_is_current() ? present_diagnostics.ordinal : 0;
+    submit_event.output_generation = handoff_after_submit.output_generation;
+    submit_event.control_generation = submit_result.control_generation;
+    submit_event.device_reset_generation = submit_result.device_reset_generation;
+    submit_event.bridge_slot = submit_result.bridge_slot;
+    submit_event.writer_fence_value = submit_result.writer_fence_value;
+    submit_event.output_resource = reinterpret_cast<uintptr_t>(output.resource);
+    submit_event.target_state = handoff_after_submit.target_state;
+    submit_event.overlay = reinterpret_cast<uintptr_t>(layer);
+    submit_event.swapchain = present_diagnostics.swapchain;
+    submit_event.device = reinterpret_cast<uintptr_t>(control_request.device.Get());
+    submit_event.queue = reinterpret_cast<uintptr_t>(control_request.queue.Get());
+    submit_event.command_queue_type = control_request.queue != nullptr
+        ? static_cast<int32_t>(control_request.queue->GetDesc().Type) : -1;
+    submit_event.command_queue_type_valid = control_request.queue != nullptr;
+    submit_event.thread_id = callback_thread_id;
+    submit_event.bridge_slot = submit_result.bridge_slot;
+    submit_event.result = static_cast<int32_t>(submit_result.status);
+    submit_event.frame_valid = true;
+    submit_event.present_valid = present_is_current();
+    submit_event.reset_history = packet.reset_history;
+    submit_event.api_succeeded = submit_result.execute_api_succeeded;
+    submit_event.queue_submitted = submit_result.queue_submitted;
+    submit_event.writer_signal_succeeded = submit_result.writer_signal_succeeded;
+    submit_event.successful_submission = submit_result.status == RE4XeSSWorker::SubmitResult::Status::Submitted &&
+        submit_result.execute_api_succeeded && submit_result.queue_submitted && submit_result.writer_signal_succeeded;
+    const char* submit_reason = "dispatch-failed";
+    switch (submit_result.status) {
+    case RE4XeSSWorker::SubmitResult::Status::Submitted: submit_reason = "submitted"; break;
+    case RE4XeSSWorker::SubmitResult::Status::Busy: submit_reason = "busy"; break;
+    case RE4XeSSWorker::SubmitResult::Status::Faulted: submit_reason = "faulted"; break;
+    case RE4XeSSWorker::SubmitResult::Status::NotReady: submit_reason = "not-ready"; break;
+    case RE4XeSSWorker::SubmitResult::Status::Stale: submit_reason = "stale"; break;
+    case RE4XeSSWorker::SubmitResult::Status::DispatchFailed: submit_reason = "dispatch-failed"; break;
+    }
+    RE4XeSSLifetimeTrace::set_reason(submit_event, submit_reason);
+    lifetime_trace.record(submit_event);
+    if (submit_event.successful_submission) {
+        const auto submitted = m_lifetime_submit_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (submitted % 1024 == 0) {
+            dump_re4_xess_lifetime_trace("submit-checkpoint", 96);
+        }
+    }
     if (submit_result.status == RE4XeSSWorker::SubmitResult::Status::Submitted) {
         m_output_handoff.note_submission_succeeded();
 
@@ -5796,6 +6181,7 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
                 submit_result.bridge_device_removed);
             invalidate_history("xess-submit-stale-after-submit");
             clear_frame_state();
+            trace_skip("xess-submit-stale-after-submit");
             return true;
         }
 
@@ -5807,12 +6193,26 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
             packet.frame_id,
             callback_thread_id,
             true,
+            trace_id,
+            callback_ordinal,
+            present_is_current() ? present_diagnostics.ordinal : 0,
+            submit_result.submit_ordinal,
+            submit_result.writer_fence_value,
+            present_diagnostics.swapchain,
+            reinterpret_cast<uintptr_t>(control_request.device.Get()),
+            reinterpret_cast<uintptr_t>(control_request.queue.Get()),
+            submit_result.bridge_slot,
+            present_is_current(),
+            control_request.queue != nullptr
+                ? static_cast<int32_t>(control_request.queue->GetDesc().Type) : -1,
+            control_request.queue != nullptr,
         };
         if (!m_output_handoff.install(layer, install_observation, install_error)) {
             m_output_handoff.request_retirement("XeSS output was submitted but Overlay installation failed");
             set_owner_unavailable(install_error, true, true);
             invalidate_history("output-handoff-install-failed");
             clear_frame_state();
+            trace_skip("output-handoff-install-failed");
             return true;
         }
 
@@ -5841,12 +6241,16 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         m_first_valid_frame_reset_pending = false;
         m_history_invalid = false;
         m_last_reset_reason.clear();
+        (void)record_lifetime_event(RE4XeSSLifetimeTrace::Kind::PreOverlay, "submit-and-install-complete");
     } else if (submit_result.status == RE4XeSSWorker::SubmitResult::Status::Busy ||
         submit_result.status == RE4XeSSWorker::SubmitResult::Status::Stale ||
         submit_result.status == RE4XeSSWorker::SubmitResult::Status::NotReady) {
         invalidate_history(submit_result.status == RE4XeSSWorker::SubmitResult::Status::Busy
                 ? "xess-command-ring-busy"
-                : "xess-submit-stale");
+            : "xess-submit-stale");
+        trace_skip(submit_result.status == RE4XeSSWorker::SubmitResult::Status::Busy
+            ? "xess-command-ring-busy"
+            : "xess-submit-stale-or-not-ready");
         if (submit_result.status == RE4XeSSWorker::SubmitResult::Status::Busy && debug_log) {
             static uint32_t busy_warning_count{};
             if (busy_warning_count < 8) {
@@ -5877,6 +6281,7 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         mark_execution_fault(reason);
         set_owner_unavailable(reason, submit_result.snapshot.draining, true);
         invalidate_history("xess-execute-fault");
+        trace_skip("xess-execute-fault");
     }
 
     clear_frame_state();
@@ -5890,16 +6295,108 @@ void RE4XeSS::on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* 
     if (m_output_handoff.identity_mismatch_latched()) {
         return;
     }
+    const auto callback_thread_id = GetCurrentThreadId();
+    const auto trace_enabled = RE4XeSSLifetimeTrace::instance().enabled();
+    D3D12Hook::PresentDiagnosticsSnapshot present{};
+    if (trace_enabled && g_framework != nullptr &&
+        g_framework->get_renderer_type() == REFramework::RendererType::D3D12) {
+        const auto& hook = g_framework->get_d3d12_hook();
+        if (hook != nullptr) {
+            present = hook->get_present_diagnostics_snapshot();
+        }
+    }
+    const auto present_valid = present.active && present.ordinal != 0 &&
+        present.entry_thread_id == callback_thread_id;
+    const auto callback_ordinal = trace_enabled
+        ? m_post_overlay_lifetime_ordinal.fetch_add(1, std::memory_order_relaxed) + 1
+        : 0;
     const RE4XeSSOutputHandoff::ObservationContext observation{
         static_cast<int32_t>(m_requested_mode.load(std::memory_order_acquire)),
         m_control_generation.load(std::memory_order_acquire),
         m_device_reset_generation.load(std::memory_order_acquire),
         0,
-        GetCurrentThreadId(),
+        callback_thread_id,
         false,
+        0,
+        callback_ordinal,
+        present_valid ? present.ordinal : 0,
+        0,
+        0,
+        present.swapchain,
+        present.device,
+        present.command_queue,
+        0,
+        present_valid,
     };
+    const auto before_observation = trace_enabled ? m_output_handoff.snapshot()
+        : RE4XeSSOutputHandoff::Snapshot{};
+    const auto writer_witness = TargetStateFactoryProbe::instance().latest_confirmed_overlay_writer_witness();
     m_output_handoff.observe_overlay(
         layer,
         observation,
-        TargetStateFactoryProbe::instance().latest_confirmed_overlay_writer_witness());
+        writer_witness);
+    if (trace_enabled) {
+        const auto after_observation = m_output_handoff.snapshot();
+        RE4XeSSLifetimeTrace::Event event{};
+        event.kind = RE4XeSSLifetimeTrace::Kind::PostOverlayObservation;
+        event.trace_id = before_observation.installed_trace_id;
+        event.install_id = before_observation.install_id;
+        event.frame_id = before_observation.installed_frame;
+        event.frame_valid = before_observation.installed_trace_id != 0;
+        event.callback_ordinal = callback_ordinal;
+        event.present_ordinal = present_valid ? present.ordinal : 0;
+        event.related_present_ordinal = before_observation.installed_present_ordinal;
+        event.output_generation = before_observation.output_generation;
+        event.control_generation = before_observation.installed_control_generation;
+        event.device_reset_generation = before_observation.installed_device_reset_generation;
+        event.writer_sequence = writer_witness.sequence;
+        event.writer_invocation_id = writer_witness.invocation_id;
+        event.writer_clear_pre_sequence = writer_witness.clear_pre_sequence;
+        event.writer_clear_post_sequence = writer_witness.clear_post_sequence;
+        event.writer_replacement_pre_sequence = writer_witness.replacement_pre_sequence;
+        event.writer_replacement_post_sequence = writer_witness.replacement_post_sequence;
+        event.writer_method_rva = writer_witness.method_rva;
+        event.writer_transaction_confirmed = writer_witness.same_invocation &&
+            writer_witness.clear_write_confirmed &&
+            writer_witness.replacement_write_confirmed &&
+            writer_witness.re4_image_identity_verified;
+        event.downstream_fence_value = before_observation.last_signaled_fence_value;
+        event.output_resource = before_observation.output_resource;
+        event.target_state = reinterpret_cast<uintptr_t>(layer->get_main_target_state().get());
+        event.overlay = reinterpret_cast<uintptr_t>(layer);
+        event.swapchain = present.swapchain;
+        event.device = present.device;
+        event.queue = present.command_queue;
+        event.command_queue_type = present.command_queue_type;
+        event.command_queue_type_valid = present.command_queue_type_valid;
+        event.thread_id = callback_thread_id;
+        event.present_entry_thread_id = present.entry_thread_id;
+        event.present_return_thread_id = present.return_thread_id;
+        event.present_source = static_cast<int32_t>(present.source);
+        event.result = present.result_valid ? static_cast<int32_t>(present.result) : E_PENDING;
+        event.present_valid = present_valid;
+        event.present_returned = present.returned;
+        event.present1 = present.present1;
+        event.present_callbacks_suppressed = present.render_callbacks_suppressed;
+        event.original_present_skipped = present.original_call_skipped;
+        event.mapping_ambiguous = before_observation.installed;
+        const bool state_matches_handoff = before_observation.installed &&
+            event.target_state == before_observation.target_state;
+        RE4XeSSLifetimeTrace::set_reason(event,
+            !before_observation.installed ? "overlay-observed-no-installed-output" :
+            !state_matches_handoff ? "overlay-target-differs-from-handoff-not-reader-proof" :
+            !present_valid ? "handoff-target-observed-present-context-unknown-not-reader-proof" :
+            "handoff-target-observed-not-gpu-reader-proof");
+        RE4XeSSLifetimeTrace::instance().record(event);
+        if (before_observation.installed != after_observation.installed ||
+            before_observation.target_state != after_observation.target_state ||
+            before_observation.marker_pending != after_observation.marker_pending) {
+            RE4XeSSLifetimeTrace::Event changed = event;
+            changed.output_generation = after_observation.output_generation;
+            changed.target_state = after_observation.target_state;
+            changed.downstream_fence_value = after_observation.last_signaled_fence_value;
+            RE4XeSSLifetimeTrace::set_reason(changed, "overlay-observation-state-changed");
+            RE4XeSSLifetimeTrace::instance().record(changed);
+        }
+    }
 }

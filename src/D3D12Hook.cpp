@@ -6,8 +6,11 @@
 #include <optional>
 #include <array>
 #include <string>
+#include <cstring>
 #include <windows.h>
 #include <wrl/client.h>
+
+#include "mods/re4_xess/RE4XeSSLifetimeTrace.hpp"
 
 #include <spdlog/spdlog.h>
 #include <utility/Thread.hpp>
@@ -1506,6 +1509,16 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
 
     const auto present_entry_time = std::chrono::steady_clock::now();
     const auto present_call = d3d12->m_present_entry_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool capture_present_diagnostics =
+        d3d12->m_present_diagnostics_enabled.load(std::memory_order_acquire);
+    const bool present_queue_type_valid = capture_present_diagnostics && d3d12->m_command_queue != nullptr;
+    const auto present_queue_type = present_queue_type_valid
+        ? static_cast<int32_t>(d3d12->m_command_queue->GetDesc().Type) : -1;
+    const auto steady_time_us = [](std::chrono::steady_clock::time_point time) {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            time.time_since_epoch()).count());
+    };
+    const auto present_entry_time_us = capture_present_diagnostics ? steady_time_us(present_entry_time) : 0;
     d3d12->m_last_present_entry_ticks.store(
         present_entry_time.time_since_epoch().count(), std::memory_order_release);
 
@@ -1633,8 +1646,36 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
             spdlog::info("Attempting to call real present function");
 
             ++g_present_depth;
+            const auto original_enter_time = capture_present_diagnostics
+                ? steady_time_us(std::chrono::steady_clock::now()) : 0;
             const auto result = present_fn(swap_chain, sync_interval, flags, r9);
+            const auto original_return_time = capture_present_diagnostics
+                ? steady_time_us(std::chrono::steady_clock::now()) : 0;
             --g_present_depth;
+            if (capture_present_diagnostics) {
+                RE4XeSSLifetimeTrace::Event event{};
+                event.kind = RE4XeSSLifetimeTrace::Kind::Present;
+                event.present_ordinal = present_call;
+                event.present_entry_time_us = present_entry_time_us;
+                event.original_present_enter_time_us = original_enter_time;
+                event.original_present_return_time_us = original_return_time;
+                event.swapchain = reinterpret_cast<uintptr_t>(swap_chain);
+                event.device = reinterpret_cast<uintptr_t>(d3d12->m_device);
+                event.queue = reinterpret_cast<uintptr_t>(d3d12->m_command_queue);
+                event.command_queue_type = present_queue_type;
+                event.command_queue_type_valid = present_queue_type_valid;
+                event.thread_id = GetCurrentThreadId();
+                event.present_entry_thread_id = event.thread_id;
+                event.present_return_thread_id = event.thread_id;
+                event.present_source = static_cast<int32_t>(d3d12->m_swapchain_source);
+                event.result = static_cast<int32_t>(result);
+                event.present_valid = true;
+                event.present_returned = true;
+                event.present_callbacks_suppressed = true;
+                event.mapping_ambiguous = true;
+                RE4XeSSLifetimeTrace::set_reason(event, "nested-present-recursion-suppressed");
+                RE4XeSSLifetimeTrace::instance().record(event);
+            }
 
             if (result != S_OK) {
                 spdlog::error("Present failed: {:x}", result);
@@ -1647,6 +1688,25 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
         return S_OK;
     }
 
+    if (capture_present_diagnostics) {
+        std::lock_guard diagnostics_lock{ d3d12->m_present_diagnostics_mutex };
+        d3d12->m_present_diagnostics = PresentDiagnosticsSnapshot{
+            .ordinal = present_call,
+            .swapchain = reinterpret_cast<uintptr_t>(swap_chain),
+            .device = reinterpret_cast<uintptr_t>(d3d12->m_device),
+            .command_queue = reinterpret_cast<uintptr_t>(d3d12->m_command_queue),
+            .entry_thread_id = GetCurrentThreadId(),
+            .entry_time_us = present_entry_time_us,
+            .command_queue_type = present_queue_type,
+            .source = d3d12->m_swapchain_source,
+            .active = true,
+            .present1 = false,
+            .render_callbacks_suppressed = false,
+            .original_call_skipped = d3d12->m_ignore_next_present,
+            .command_queue_type_valid = present_queue_type_valid,
+        };
+    }
+
     if (d3d12->m_on_present) {
         d3d12->m_on_present(*d3d12);
     }
@@ -1654,9 +1714,24 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
     ++g_present_depth;
 
     auto result = S_OK;
+    uint64_t original_call_enter_time_us{};
+    uint64_t original_call_return_time_us{};
+    bool original_call_invoked{};
     
     if (!d3d12->m_ignore_next_present) {
+        original_call_invoked = true;
+        if (capture_present_diagnostics) {
+            original_call_enter_time_us = steady_time_us(std::chrono::steady_clock::now());
+            std::lock_guard diagnostics_lock{ d3d12->m_present_diagnostics_mutex };
+            d3d12->m_present_diagnostics.original_call_enter_time_us = original_call_enter_time_us;
+            d3d12->m_present_diagnostics.original_call_invoked = true;
+        }
         result = present_fn(swap_chain, sync_interval, flags, r9);
+        if (capture_present_diagnostics) {
+            original_call_return_time_us = steady_time_us(std::chrono::steady_clock::now());
+            std::lock_guard diagnostics_lock{ d3d12->m_present_diagnostics_mutex };
+            d3d12->m_present_diagnostics.original_call_return_time_us = original_call_return_time_us;
+        }
 
         if (result != S_OK) {
             spdlog::error("Present failed: {:x}", result);
@@ -1667,8 +1742,54 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
 
     --g_present_depth;
 
+    const auto post_present_callback_ordinal = capture_present_diagnostics && d3d12->m_on_post_present
+        ? d3d12->m_post_present_callback_count.fetch_add(1, std::memory_order_relaxed) + 1
+        : 0;
+    if (capture_present_diagnostics) {
+        std::lock_guard diagnostics_lock{ d3d12->m_present_diagnostics_mutex };
+        d3d12->m_present_diagnostics.return_thread_id = GetCurrentThreadId();
+        d3d12->m_present_diagnostics.original_call_enter_time_us = original_call_enter_time_us;
+        d3d12->m_present_diagnostics.original_call_return_time_us = original_call_return_time_us;
+        d3d12->m_present_diagnostics.original_call_invoked = original_call_invoked;
+        d3d12->m_present_diagnostics.post_present_callback_ordinal = post_present_callback_ordinal;
+        d3d12->m_present_diagnostics.result = result;
+        d3d12->m_present_diagnostics.result_valid = true;
+        d3d12->m_present_diagnostics.returned = true;
+
+        RE4XeSSLifetimeTrace::Event event{};
+        event.kind = RE4XeSSLifetimeTrace::Kind::Present;
+        event.present_ordinal = present_call;
+        event.callback_ordinal = post_present_callback_ordinal;
+        event.present_entry_time_us = present_entry_time_us;
+        event.original_present_enter_time_us = original_call_enter_time_us;
+        event.original_present_return_time_us = original_call_return_time_us;
+        event.swapchain = reinterpret_cast<uintptr_t>(swap_chain);
+        event.device = reinterpret_cast<uintptr_t>(d3d12->m_device);
+        event.queue = reinterpret_cast<uintptr_t>(d3d12->m_command_queue);
+        event.command_queue_type = present_queue_type;
+        event.command_queue_type_valid = present_queue_type_valid;
+        event.thread_id = GetCurrentThreadId();
+        event.present_entry_thread_id = d3d12->m_present_diagnostics.entry_thread_id;
+        event.present_return_thread_id = d3d12->m_present_diagnostics.return_thread_id;
+        event.present_source = static_cast<int32_t>(d3d12->m_swapchain_source);
+        event.result = static_cast<int32_t>(result);
+        event.present_valid = true;
+        event.present_returned = true;
+        event.original_present_skipped = !original_call_invoked;
+        RE4XeSSLifetimeTrace::set_reason(event,
+            !original_call_invoked ? "present-returned-original-call-skipped" :
+            !post_present_callback_ordinal ? "present-returned-post-callback-unavailable" :
+            "present-returned-post-callback-pending");
+        RE4XeSSLifetimeTrace::instance().record(event);
+    }
+
     if (d3d12->m_on_post_present) {
         d3d12->m_on_post_present(*d3d12);
+    }
+
+    if (capture_present_diagnostics) {
+        std::lock_guard diagnostics_lock{ d3d12->m_present_diagnostics_mutex };
+        d3d12->m_present_diagnostics.active = false;
     }
 
     d3d12->m_inside_present = false;
@@ -1699,6 +1820,16 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
     swap_chain->GetHwnd(&swapchain_wnd);
     const auto present_entry_time = std::chrono::steady_clock::now();
     const auto present_call = d3d12->m_present_entry_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool capture_present_diagnostics =
+        d3d12->m_present_diagnostics_enabled.load(std::memory_order_acquire);
+    const bool present_queue_type_valid = capture_present_diagnostics && d3d12->m_command_queue != nullptr;
+    const auto present_queue_type = present_queue_type_valid
+        ? static_cast<int32_t>(d3d12->m_command_queue->GetDesc().Type) : -1;
+    const auto steady_time_us = [](std::chrono::steady_clock::time_point time) {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            time.time_since_epoch()).count());
+    };
+    const auto present_entry_time_us = capture_present_diagnostics ? steady_time_us(present_entry_time) : 0;
     d3d12->m_last_present_entry_ticks.store(
         present_entry_time.time_since_epoch().count(), std::memory_order_release);
 
@@ -1748,8 +1879,37 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
 
     if (g_present_depth > 0) {
         ++g_present_depth;
+        const auto original_enter_time = capture_present_diagnostics
+            ? steady_time_us(std::chrono::steady_clock::now()) : 0;
         const auto result = original_call();
+        const auto original_return_time = capture_present_diagnostics
+            ? steady_time_us(std::chrono::steady_clock::now()) : 0;
         --g_present_depth;
+        if (capture_present_diagnostics) {
+            RE4XeSSLifetimeTrace::Event event{};
+            event.kind = RE4XeSSLifetimeTrace::Kind::Present;
+            event.present_ordinal = present_call;
+            event.present_entry_time_us = present_entry_time_us;
+            event.original_present_enter_time_us = original_enter_time;
+            event.original_present_return_time_us = original_return_time;
+            event.swapchain = reinterpret_cast<uintptr_t>(swap_chain);
+            event.device = reinterpret_cast<uintptr_t>(d3d12->m_device);
+            event.queue = reinterpret_cast<uintptr_t>(d3d12->m_command_queue);
+            event.command_queue_type = present_queue_type;
+            event.command_queue_type_valid = present_queue_type_valid;
+            event.thread_id = GetCurrentThreadId();
+            event.present_entry_thread_id = event.thread_id;
+            event.present_return_thread_id = event.thread_id;
+            event.present_source = static_cast<int32_t>(d3d12->m_swapchain_source);
+            event.result = static_cast<int32_t>(result);
+            event.present_valid = true;
+            event.present_returned = true;
+            event.present1 = kind != nullptr && std::strcmp(kind, "Present1") == 0;
+            event.present_callbacks_suppressed = true;
+            event.mapping_ambiguous = true;
+            RE4XeSSLifetimeTrace::set_reason(event, "nested-present-recursion-suppressed");
+            RE4XeSSLifetimeTrace::instance().record(event);
+        }
         if (g_framework != nullptr && d3d12->is_xefg_source()) {
             g_framework->note_present_activity();
         }
@@ -1782,6 +1942,25 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
         }
     }
 
+    if (capture_present_diagnostics) {
+        std::lock_guard diagnostics_lock{ d3d12->m_present_diagnostics_mutex };
+        d3d12->m_present_diagnostics = PresentDiagnosticsSnapshot{
+            .ordinal = present_call,
+            .swapchain = reinterpret_cast<uintptr_t>(swap_chain),
+            .device = reinterpret_cast<uintptr_t>(d3d12->m_device),
+            .command_queue = reinterpret_cast<uintptr_t>(d3d12->m_command_queue),
+            .entry_thread_id = GetCurrentThreadId(),
+            .entry_time_us = present_entry_time_us,
+            .command_queue_type = present_queue_type,
+            .source = d3d12->m_swapchain_source,
+            .active = true,
+            .present1 = kind != nullptr && std::strcmp(kind, "Present1") == 0,
+            .render_callbacks_suppressed = xefg_present.suppress_render_callbacks,
+            .original_call_skipped = d3d12->m_ignore_next_present,
+            .command_queue_type_valid = present_queue_type_valid,
+        };
+    }
+
     if (!xefg_present.suppress_render_callbacks && d3d12->m_on_present) {
         if (post_resize.capture_renderer_snapshots && g_framework != nullptr) {
             g_framework->log_d3d12_resize_snapshot("present_pre_render_callback", xefg_present.resize_event_id);
@@ -1800,8 +1979,23 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
 
     ++g_present_depth;
     HRESULT result = S_OK;
+    uint64_t original_call_enter_time_us{};
+    uint64_t original_call_return_time_us{};
+    bool original_call_invoked{};
     if (!d3d12->m_ignore_next_present) {
+        original_call_invoked = true;
+        if (capture_present_diagnostics) {
+            original_call_enter_time_us = steady_time_us(std::chrono::steady_clock::now());
+            std::lock_guard diagnostics_lock{ d3d12->m_present_diagnostics_mutex };
+            d3d12->m_present_diagnostics.original_call_enter_time_us = original_call_enter_time_us;
+            d3d12->m_present_diagnostics.original_call_invoked = true;
+        }
         result = original_call();
+        if (capture_present_diagnostics) {
+            original_call_return_time_us = steady_time_us(std::chrono::steady_clock::now());
+            std::lock_guard diagnostics_lock{ d3d12->m_present_diagnostics_mutex };
+            d3d12->m_present_diagnostics.original_call_return_time_us = original_call_return_time_us;
+        }
         if (result != S_OK) {
             spdlog::error("{} failed: {:x}", kind, result);
         }
@@ -1809,6 +2003,52 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
         d3d12->m_ignore_next_present = false;
     }
     --g_present_depth;
+
+    const bool post_present_callback_available =
+        !xefg_present.suppress_render_callbacks && static_cast<bool>(d3d12->m_on_post_present);
+    const auto post_present_callback_ordinal = capture_present_diagnostics && post_present_callback_available
+        ? d3d12->m_post_present_callback_count.fetch_add(1, std::memory_order_relaxed) + 1
+        : 0;
+    if (capture_present_diagnostics) {
+        std::lock_guard diagnostics_lock{ d3d12->m_present_diagnostics_mutex };
+        d3d12->m_present_diagnostics.return_thread_id = GetCurrentThreadId();
+        d3d12->m_present_diagnostics.original_call_enter_time_us = original_call_enter_time_us;
+        d3d12->m_present_diagnostics.original_call_return_time_us = original_call_return_time_us;
+        d3d12->m_present_diagnostics.original_call_invoked = original_call_invoked;
+        d3d12->m_present_diagnostics.post_present_callback_ordinal = post_present_callback_ordinal;
+        d3d12->m_present_diagnostics.result = result;
+        d3d12->m_present_diagnostics.result_valid = true;
+        d3d12->m_present_diagnostics.returned = true;
+
+        RE4XeSSLifetimeTrace::Event event{};
+        event.kind = RE4XeSSLifetimeTrace::Kind::Present;
+        event.present_ordinal = present_call;
+        event.callback_ordinal = post_present_callback_ordinal;
+        event.present_entry_time_us = present_entry_time_us;
+        event.original_present_enter_time_us = original_call_enter_time_us;
+        event.original_present_return_time_us = original_call_return_time_us;
+        event.swapchain = reinterpret_cast<uintptr_t>(swap_chain);
+        event.device = reinterpret_cast<uintptr_t>(d3d12->m_device);
+        event.queue = reinterpret_cast<uintptr_t>(d3d12->m_command_queue);
+        event.command_queue_type = present_queue_type;
+        event.command_queue_type_valid = present_queue_type_valid;
+        event.thread_id = GetCurrentThreadId();
+        event.present_entry_thread_id = d3d12->m_present_diagnostics.entry_thread_id;
+        event.present_return_thread_id = d3d12->m_present_diagnostics.return_thread_id;
+        event.present_source = static_cast<int32_t>(d3d12->m_swapchain_source);
+        event.result = static_cast<int32_t>(result);
+        event.present_valid = true;
+        event.present_returned = true;
+        event.present1 = kind != nullptr && std::strcmp(kind, "Present1") == 0;
+        event.present_callbacks_suppressed = xefg_present.suppress_render_callbacks;
+        event.original_present_skipped = !original_call_invoked;
+        RE4XeSSLifetimeTrace::set_reason(event,
+            xefg_present.suppress_render_callbacks ? "present-returned-callback-suppressed" :
+            !post_present_callback_available ? "present-returned-post-callback-unavailable" :
+            !original_call_invoked ? "present-returned-original-call-skipped" :
+            "present-returned-post-callback-pending");
+        RE4XeSSLifetimeTrace::instance().record(event);
+    }
 
     if (d3d12->m_swapchain_source == SwapchainSource::XeFGInternal && result == DXGI_ERROR_DEVICE_REMOVED) {
         const auto device_removed_reason = d3d12->m_device != nullptr ? d3d12->m_device->GetDeviceRemovedReason() : E_FAIL;
@@ -1824,6 +2064,10 @@ HRESULT D3D12Hook::present_common(IDXGISwapChain3* swap_chain, const char* kind,
         d3d12->m_on_post_present(*d3d12);
     }
 
+    if (capture_present_diagnostics) {
+        std::lock_guard diagnostics_lock{ d3d12->m_present_diagnostics_mutex };
+        d3d12->m_present_diagnostics.active = false;
+    }
     d3d12->m_inside_present = false;
     return result;
 }

@@ -45,6 +45,7 @@ public:
     };
 
     struct ExecuteDiagnostics {
+        uint64_t trace_id{};
         uint64_t frame_id{};
         uint64_t control_generation{};
         uint64_t device_reset_generation{};

@@ -174,7 +174,9 @@ RE4XeSSD3D12::SubmitResult RE4XeSSD3D12::submit(
     const OutputBinding& output,
     uint64_t control_generation,
     uint64_t device_reset_generation,
+    SubmissionInfo& submission_info,
     std::string& error) {
+    submission_info = {};
     error.clear();
     if (!m_initialized || m_quarantined || m_device_removed) {
         error = m_failure_reason.empty() ? "The RE4 XeSS D3D12 bridge is not ready" : m_failure_reason;
@@ -213,6 +215,10 @@ RE4XeSSD3D12::SubmitResult RE4XeSSD3D12::submit(
     slot.depth_pin = frame.depth;
     slot.original_velocity_pin = frame.velocity;
     slot.output_pin = output.resource;
+    slot.trace_id = frame.lifetime_trace_id;
+    slot.frame_id = frame.frame_id;
+    slot.reset_history = frame.reset_history;
+    submission_info.slot = selected_slot;
     write_slot_descriptors(slot, frame.velocity);
 
     if (!record_and_submit(
@@ -223,6 +229,7 @@ RE4XeSSD3D12::SubmitResult RE4XeSSD3D12::submit(
             selected_slot,
             control_generation,
             device_reset_generation,
+            submission_info,
             error)) {
         if (m_quarantined) {
             return SubmitResult::Faulted;
@@ -231,10 +238,15 @@ RE4XeSSD3D12::SubmitResult RE4XeSSD3D12::submit(
         slot.depth_pin.Reset();
         slot.original_velocity_pin.Reset();
         slot.output_pin.Reset();
+        slot.trace_id = 0;
+        slot.frame_id = 0;
+        slot.reset_history = false;
         m_failure_reason = error;
         return SubmitResult::Faulted;
     }
 
+    slot.submission_ordinal = submission_info.submission_ordinal;
+    slot.last_fence_value = submission_info.writer_fence_value;
     m_next_slot = (selected_slot + 1) % SLOT_COUNT;
     return SubmitResult::Submitted;
 }
@@ -249,6 +261,32 @@ RE4XeSSD3D12::PollResult RE4XeSSD3D12::poll() {
 
     const auto completed = m_fence->GetCompletedValue();
     if (completed == std::numeric_limits<uint64_t>::max()) {
+        if (RE4XeSSLifetimeTrace::instance().enabled()) {
+            for (size_t slot_index = 0; slot_index < m_slots.size(); ++slot_index) {
+                const auto& slot = m_slots[slot_index];
+                if (slot.last_fence_value == 0) {
+                    continue;
+                }
+                RE4XeSSLifetimeTrace::Event event{};
+                event.kind = RE4XeSSLifetimeTrace::Kind::WriterFenceComplete;
+                event.trace_id = slot.trace_id;
+                event.frame_id = slot.frame_id;
+                event.frame_valid = true;
+                event.submit_ordinal = slot.submission_ordinal;
+                event.bridge_slot = static_cast<uint32_t>(slot_index);
+                event.writer_fence_value = slot.last_fence_value;
+                event.actual_completed_value = completed;
+                event.actual_completed_value_valid = false;
+                event.output_resource = reinterpret_cast<uintptr_t>(slot.output_pin.Get());
+                event.device = reinterpret_cast<uintptr_t>(m_device.Get());
+                event.queue = reinterpret_cast<uintptr_t>(m_queue.Get());
+                event.command_queue_type = static_cast<int32_t>(m_queue->GetDesc().Type);
+                event.command_queue_type_valid = true;
+                event.thread_id = GetCurrentThreadId();
+                RE4XeSSLifetimeTrace::set_reason(event, "writer-fence-uint64-max-device-removed-not-completion");
+                RE4XeSSLifetimeTrace::instance().record(event);
+            }
+        }
         m_device_removed = true;
         const auto reason = m_device != nullptr ? m_device->GetDeviceRemovedReason() : E_FAIL;
         m_failure_reason = hresult_message("D3D12 device removed", reason);
@@ -261,11 +299,40 @@ RE4XeSSD3D12::PollResult RE4XeSSD3D12::poll() {
         }
         if (m_quarantine_fence_value != 0 && completed >= m_quarantine_fence_value) {
             for (auto& slot : m_slots) {
+                if (slot.last_fence_value != 0 && slot.last_fence_value <= completed) {
+                    if (RE4XeSSLifetimeTrace::instance().enabled()) {
+                        RE4XeSSLifetimeTrace::Event event{};
+                        event.kind = RE4XeSSLifetimeTrace::Kind::WriterFenceComplete;
+                        event.trace_id = slot.trace_id;
+                        event.frame_id = slot.frame_id;
+                        event.frame_valid = true;
+                        event.submit_ordinal = slot.submission_ordinal;
+                        event.bridge_slot = static_cast<uint32_t>(&slot - m_slots.data());
+                        event.writer_fence_value = slot.last_fence_value;
+                        event.actual_completed_value = completed;
+                        event.actual_completed_value_valid = true;
+                        event.output_resource = reinterpret_cast<uintptr_t>(slot.output_pin.Get());
+                        event.device = reinterpret_cast<uintptr_t>(m_device.Get());
+                        event.queue = reinterpret_cast<uintptr_t>(m_queue.Get());
+                        event.command_queue_type = static_cast<int32_t>(m_queue->GetDesc().Type);
+                        event.command_queue_type_valid = true;
+                        event.api_succeeded = true;
+                        event.queue_submitted = true;
+                        event.writer_signal_succeeded = true;
+                        event.reset_history = slot.reset_history;
+                        event.thread_id = GetCurrentThreadId();
+                        RE4XeSSLifetimeTrace::instance().record(event);
+                    }
+                }
                 slot.color_pin.Reset();
                 slot.depth_pin.Reset();
                 slot.original_velocity_pin.Reset();
                 slot.output_pin.Reset();
                 slot.last_fence_value = 0;
+                slot.trace_id = 0;
+                slot.frame_id = 0;
+                slot.submission_ordinal = 0;
+                slot.reset_history = false;
             }
             m_quarantined = false;
             m_probe_quarantine_completion = false;
@@ -306,11 +373,38 @@ RE4XeSSD3D12::PollResult RE4XeSSD3D12::poll() {
     bool in_flight{};
     for (auto& slot : m_slots) {
         if (slot.last_fence_value != 0 && completed >= slot.last_fence_value) {
+            if (RE4XeSSLifetimeTrace::instance().enabled()) {
+                RE4XeSSLifetimeTrace::Event event{};
+                event.kind = RE4XeSSLifetimeTrace::Kind::WriterFenceComplete;
+                event.trace_id = slot.trace_id;
+                event.frame_id = slot.frame_id;
+                event.frame_valid = true;
+                event.submit_ordinal = slot.submission_ordinal;
+                event.bridge_slot = static_cast<uint32_t>(&slot - m_slots.data());
+                event.writer_fence_value = slot.last_fence_value;
+                event.actual_completed_value = completed;
+                event.actual_completed_value_valid = true;
+                event.output_resource = reinterpret_cast<uintptr_t>(slot.output_pin.Get());
+                event.device = reinterpret_cast<uintptr_t>(m_device.Get());
+                event.queue = reinterpret_cast<uintptr_t>(m_queue.Get());
+                event.command_queue_type = static_cast<int32_t>(m_queue->GetDesc().Type);
+                event.command_queue_type_valid = true;
+                event.api_succeeded = true;
+                event.queue_submitted = true;
+                event.writer_signal_succeeded = true;
+                event.reset_history = slot.reset_history;
+                event.thread_id = GetCurrentThreadId();
+                RE4XeSSLifetimeTrace::instance().record(event);
+            }
             slot.color_pin.Reset();
             slot.depth_pin.Reset();
             slot.original_velocity_pin.Reset();
             slot.output_pin.Reset();
             slot.last_fence_value = 0;
+            slot.trace_id = 0;
+            slot.frame_id = 0;
+            slot.submission_ordinal = 0;
+            slot.reset_history = false;
         } else if (slot.last_fence_value != 0) {
             in_flight = true;
         }
@@ -727,6 +821,7 @@ bool RE4XeSSD3D12::record_and_submit(
     uint32_t slot_index,
     uint64_t control_generation,
     uint64_t device_reset_generation,
+    SubmissionInfo& submission_info,
     std::string& error) {
     auto result = slot.allocator->Reset();
     if (FAILED(result)) {
@@ -802,6 +897,7 @@ bool RE4XeSSD3D12::record_and_submit(
 
     RE4XeSSRuntime::ExecuteDiagnostics execute_diagnostics{};
     execute_diagnostics.frame_id = frame.frame_id;
+    execute_diagnostics.trace_id = frame.lifetime_trace_id;
     execute_diagnostics.control_generation = control_generation;
     execute_diagnostics.device_reset_generation = device_reset_generation;
     execute_diagnostics.submission_sequence = m_submission_count + 1;
@@ -814,6 +910,7 @@ bool RE4XeSSD3D12::record_and_submit(
         slot.list->Close();
         return false;
     }
+    submission_info.execute_api_succeeded = true;
 
     D3D12_RESOURCE_BARRIER restore_velocity{};
     transition_barrier(
@@ -844,7 +941,10 @@ bool RE4XeSSD3D12::record_and_submit(
 
     ID3D12CommandList* lists[]{ slot.list.Get() };
     m_queue->ExecuteCommandLists(1, lists);
+    submission_info.command_lists_submitted = true;
     const auto fence_value = m_next_fence_value++;
+    submission_info.submission_ordinal = m_submission_count + 1;
+    submission_info.writer_fence_value = fence_value;
     result = m_queue->Signal(m_fence.Get(), fence_value);
     if (FAILED(result)) {
         m_quarantined = true;
@@ -861,6 +961,7 @@ bool RE4XeSSD3D12::record_and_submit(
         spdlog::error("[RE4XeSS][Failure] post-submit signal failure; generation quarantined: {}", error);
         return false;
     }
+    submission_info.writer_signal_succeeded = true;
 
     slot.last_fence_value = fence_value;
     m_last_submitted_fence_value = fence_value;

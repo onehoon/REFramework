@@ -101,6 +101,13 @@ public:
         bool bridge_idle{};
         bool bridge_quarantined{};
         bool bridge_device_removed{};
+        uint64_t trace_id{};
+        uint64_t submit_ordinal{};
+        uint64_t writer_fence_value{};
+        uint32_t bridge_slot{};
+        bool execute_api_succeeded{};
+        bool queue_submitted{};
+        bool writer_signal_succeeded{};
         Snapshot snapshot{};
         std::string failure_reason{};
     };

@@ -243,6 +243,12 @@ bool RE4XeSSOutputHandoff::restore(
         uint64_t accepted_installed_generation{};
         bool accepted_marker_pending{};
         uint64_t accepted_signaled_fence_value{};
+        uint64_t accepted_trace_id{};
+        uint64_t accepted_install_id{};
+        uint64_t accepted_frame{};
+        uint64_t accepted_install_present{};
+        uint64_t accepted_output_generation{};
+        uintptr_t accepted_output{};
         {
             std::lock_guard lock{ m_retirement_mutex };
             engine_replacement_accepted = is_verified_engine_replacement_locked(
@@ -267,6 +273,12 @@ bool RE4XeSSOutputHandoff::restore(
                 m_failure_reason = "Verified RE4 mode-transition writer replaced Overlay main TargetState; preserving the engine value and retiring the displaced output generation";
                 accepted_marker_pending = m_marker_pending;
                 accepted_signaled_fence_value = m_last_signaled_retirement_value;
+                accepted_trace_id = m_installed_trace_id;
+                accepted_install_id = m_installed_install_id;
+                accepted_frame = m_installed_frame;
+                accepted_install_present = m_installed_present_ordinal;
+                accepted_output_generation = m_output_generation_id;
+                accepted_output = reinterpret_cast<uintptr_t>(m_resource_pin.Get());
             }
         }
         if (engine_replacement_accepted) {
@@ -298,6 +310,38 @@ bool RE4XeSSOutputHandoff::restore(
                 writer_witness.incoming_state,
                 accepted_marker_pending,
                 static_cast<unsigned long long>(accepted_signaled_fence_value));
+            RE4XeSSLifetimeTrace::Event trace_event{};
+            trace_event.kind = RE4XeSSLifetimeTrace::Kind::OutputRestore;
+            trace_event.trace_id = accepted_trace_id;
+            trace_event.install_id = accepted_install_id;
+            trace_event.frame_id = accepted_frame;
+            trace_event.frame_valid = true;
+            trace_event.callback_ordinal = observation.callback_ordinal;
+            trace_event.present_ordinal = observation.present_ordinal;
+            trace_event.related_present_ordinal = accepted_install_present;
+            trace_event.output_generation = accepted_output_generation;
+            trace_event.control_generation = observation.control_generation;
+            trace_event.device_reset_generation = observation.device_reset_generation;
+            trace_event.writer_sequence = writer_witness.sequence;
+            trace_event.writer_invocation_id = writer_witness.invocation_id;
+            trace_event.writer_clear_pre_sequence = writer_witness.clear_pre_sequence;
+            trace_event.writer_clear_post_sequence = writer_witness.clear_post_sequence;
+            trace_event.writer_replacement_pre_sequence = writer_witness.replacement_pre_sequence;
+            trace_event.writer_replacement_post_sequence = writer_witness.replacement_post_sequence;
+            trace_event.writer_method_rva = writer_witness.method_rva;
+            trace_event.writer_transaction_confirmed = true;
+            trace_event.downstream_fence_value = accepted_signaled_fence_value;
+            trace_event.output_resource = accepted_output;
+            trace_event.target_state = reinterpret_cast<uintptr_t>(observed_target_state);
+            trace_event.overlay = reinterpret_cast<uintptr_t>(layer);
+            trace_event.swapchain = observation.swapchain;
+            trace_event.device = observation.device;
+            trace_event.queue = observation.queue;
+            trace_event.thread_id = observation.callback_thread_id;
+            trace_event.present_valid = observation.present_ordinal_valid;
+            trace_event.mapping_ambiguous = true;
+            RE4XeSSLifetimeTrace::set_reason(trace_event, "verified-engine-replacement");
+            RE4XeSSLifetimeTrace::instance().record(trace_event);
             log_transition_provenance(
                 "engine-target-replacement-accepted", observation,
                 reinterpret_cast<uintptr_t>(layer),
@@ -329,6 +373,11 @@ bool RE4XeSSOutputHandoff::restore(
         bool same_layer_as_last_confirmed{};
         uint64_t actual_fence_value{};
         bool actual_fence_read{};
+        uint64_t mismatch_trace_id{};
+        uint64_t mismatch_install_id{};
+        uint64_t mismatch_install_present{};
+        uint64_t mismatch_output_generation{};
+        uintptr_t mismatch_output{};
         {
             std::lock_guard lock{ m_retirement_mutex };
             if (!m_identity_mismatch_latched.exchange(true, std::memory_order_acq_rel)) {
@@ -344,6 +393,11 @@ bool RE4XeSSOutputHandoff::restore(
             saved_state_identity = reinterpret_cast<uintptr_t>(m_saved_original_state.get());
             template_state_identity = m_signature.template_state;
             installed_frame = m_installed_frame;
+            mismatch_trace_id = m_installed_trace_id;
+            mismatch_install_id = m_installed_install_id;
+            mismatch_install_present = m_installed_present_ordinal;
+            mismatch_output_generation = m_output_generation_id;
+            mismatch_output = reinterpret_cast<uintptr_t>(m_resource_pin.Get());
             last_confirmed_overlay_layer = m_last_confirmed_post_overlay_layer;
             last_confirmed_overlay_state = m_last_confirmed_post_overlay_state;
             last_confirmed_overlay_frame = m_last_confirmed_post_overlay_frame;
@@ -405,6 +459,45 @@ bool RE4XeSSOutputHandoff::restore(
                 !actual_fence_read ? "unavailable" :
                     actual_fence_value == std::numeric_limits<uint64_t>::max() ? "device-removed-or-invalid" :
                     actual_fence_value >= signaled_fence_value ? "completed-through-last-signal" : "not-yet-complete");
+            RE4XeSSLifetimeTrace::Event trace_event{};
+            trace_event.kind = RE4XeSSLifetimeTrace::Kind::OutputRestore;
+            trace_event.trace_id = mismatch_trace_id;
+            trace_event.install_id = mismatch_install_id;
+            trace_event.frame_id = installed_frame;
+            trace_event.frame_valid = mismatch_trace_id != 0;
+            trace_event.callback_ordinal = observation.callback_ordinal;
+            trace_event.present_ordinal = observation.present_ordinal;
+            trace_event.related_present_ordinal = mismatch_install_present;
+            trace_event.output_generation = mismatch_output_generation;
+            trace_event.control_generation = observation.control_generation;
+            trace_event.device_reset_generation = observation.device_reset_generation;
+            trace_event.writer_sequence = writer_witness.sequence;
+            trace_event.writer_invocation_id = writer_witness.invocation_id;
+            trace_event.writer_clear_pre_sequence = writer_witness.clear_pre_sequence;
+            trace_event.writer_clear_post_sequence = writer_witness.clear_post_sequence;
+            trace_event.writer_replacement_pre_sequence = writer_witness.replacement_pre_sequence;
+            trace_event.writer_replacement_post_sequence = writer_witness.replacement_post_sequence;
+            trace_event.writer_method_rva = writer_witness.method_rva;
+            trace_event.writer_transaction_confirmed =
+                writer_witness.same_invocation &&
+                writer_witness.clear_write_confirmed &&
+                writer_witness.replacement_write_confirmed &&
+                writer_witness.re4_image_identity_verified;
+            trace_event.downstream_fence_value = signaled_fence_value;
+            trace_event.actual_completed_value = actual_fence_value;
+            trace_event.actual_completed_value_valid =
+                actual_fence_read && actual_fence_value != std::numeric_limits<uint64_t>::max();
+            trace_event.output_resource = mismatch_output;
+            trace_event.target_state = reinterpret_cast<uintptr_t>(observed_target_state);
+            trace_event.overlay = reinterpret_cast<uintptr_t>(layer);
+            trace_event.swapchain = observation.swapchain;
+            trace_event.device = observation.device;
+            trace_event.queue = observation.queue;
+            trace_event.thread_id = observation.callback_thread_id;
+            trace_event.present_valid = observation.present_ordinal_valid;
+            trace_event.mapping_ambiguous = true;
+            RE4XeSSLifetimeTrace::set_reason(trace_event, "unverified-engine-replacement-quarantined");
+            RE4XeSSLifetimeTrace::instance().record(trace_event);
             log_transition_provenance(
                 "pre-overlay-restore-rejected", observation,
                 reinterpret_cast<uintptr_t>(layer), reinterpret_cast<uintptr_t>(observed_target_state), true, 1u << 3);
@@ -448,11 +541,29 @@ bool RE4XeSSOutputHandoff::restore(
 
     bool log_missing_marker{};
     uint64_t missing_marker_frame{};
+    uint64_t restored_trace_id{};
+    uint64_t restored_install_id{};
+    uint64_t restored_frame{};
+    uint64_t restored_install_present{};
+    uint64_t restored_output_generation{};
+    uint64_t restored_fence_value{};
+    uintptr_t restored_output{};
+    uintptr_t restored_state{};
+    bool restored_marker_pending{};
     {
         std::lock_guard lock{ m_retirement_mutex };
         m_installed = false;
         m_installed_snapshot.store(false, std::memory_order_release);
         m_installed_overlay = nullptr;
+        restored_trace_id = m_installed_trace_id;
+        restored_install_id = m_installed_install_id;
+        restored_frame = m_installed_frame;
+        restored_install_present = m_installed_present_ordinal;
+        restored_output_generation = m_output_generation_id;
+        restored_fence_value = m_last_signaled_retirement_value;
+        restored_output = reinterpret_cast<uintptr_t>(m_resource_pin.Get());
+        restored_state = reinterpret_cast<uintptr_t>(m_saved_original_state.get());
+        restored_marker_pending = m_marker_pending;
         if (m_marker_pending) {
             m_missing_marker = true;
             m_retirement_status = RetirementStatus::MissingMarker;
@@ -484,6 +595,33 @@ bool RE4XeSSOutputHandoff::restore(
     if (log_restore) {
         spdlog::info("[RE4XeSS][Output] restored original Overlay main state before frame resource collection; frame={}",
             static_cast<unsigned long long>(m_installed_frame));
+    }
+    if (RE4XeSSLifetimeTrace::instance().enabled()) {
+        RE4XeSSLifetimeTrace::Event restore_event{};
+        restore_event.kind = RE4XeSSLifetimeTrace::Kind::OutputRestore;
+        restore_event.trace_id = restored_trace_id;
+        restore_event.install_id = restored_install_id;
+        restore_event.frame_id = restored_frame;
+        restore_event.frame_valid = true;
+        restore_event.callback_ordinal = observation.callback_ordinal;
+        restore_event.present_ordinal = observation.present_ordinal;
+        restore_event.related_present_ordinal = restored_install_present;
+        restore_event.output_generation = restored_output_generation;
+        restore_event.control_generation = observation.control_generation;
+        restore_event.device_reset_generation = observation.device_reset_generation;
+        restore_event.downstream_fence_value = restored_fence_value;
+        restore_event.output_resource = restored_output;
+        restore_event.target_state = restored_state;
+        restore_event.overlay = reinterpret_cast<uintptr_t>(layer);
+        restore_event.swapchain = observation.swapchain;
+        restore_event.device = observation.device;
+        restore_event.queue = observation.queue;
+        restore_event.thread_id = observation.callback_thread_id;
+        restore_event.present_valid = observation.present_ordinal_valid;
+        restore_event.mapping_ambiguous = true;
+        RE4XeSSLifetimeTrace::set_reason(restore_event,
+            restored_marker_pending ? "restore-marker-pending" : "restore-original");
+        RE4XeSSLifetimeTrace::instance().record(restore_event);
     }
     log_transition_provenance(
         "after-restore", observation,
@@ -1032,11 +1170,20 @@ RE4XeSSOutputHandoff::PrepareResult RE4XeSSOutputHandoff::prepare(
     m_resource_pin->SetName(L"RE4XeSS Handoff Output");
 
     m_signature = requested_signature;
+    m_output_generation_id = ++m_next_output_generation;
     m_expected_state = D3D12_RESOURCE_STATE_COMMON;
     m_next_retirement_value = 1;
     m_last_signaled_retirement_value = 0;
     m_last_completed_retirement_value = 0;
     m_installed_frame = 0;
+    m_installed_install_id = 0;
+    m_installed_trace_id = 0;
+    m_installed_present_ordinal = 0;
+    m_installed_submit_ordinal = 0;
+    m_installed_writer_fence_value = 0;
+    m_installed_bridge_slot = 0;
+    m_trace_last_observed_completed_value = 0;
+    m_trace_marker_count = 0;
     m_installed_device_reset_generation = 0;
     m_installed_mode_token = 0;
     m_last_confirmed_post_overlay_layer = 0;
@@ -1208,6 +1355,12 @@ bool RE4XeSSOutputHandoff::install(
     m_installed_overlay = layer;
     m_installed = true;
     m_installed_frame = observation.frame_id;
+    m_installed_install_id = ++m_next_install_id;
+    m_installed_trace_id = observation.trace_id;
+    m_installed_present_ordinal = observation.present_ordinal_valid ? observation.present_ordinal : 0;
+    m_installed_submit_ordinal = observation.submit_ordinal;
+    m_installed_writer_fence_value = observation.writer_fence_value;
+    m_installed_bridge_slot = observation.bridge_slot;
     m_installed_mode_token = observation.requested_mode_token;
     m_installed_device_reset_generation = observation.device_reset_generation;
     m_downstream_use_seen = true;
@@ -1217,6 +1370,43 @@ bool RE4XeSSOutputHandoff::install(
     m_retirement_status = RetirementStatus::Active;
     m_failure_reason.clear();
     const auto installed_state_identity = reinterpret_cast<uintptr_t>(m_handoff_state.get());
+    const auto output_identity = reinterpret_cast<uintptr_t>(m_resource_pin.Get());
+    const auto output_generation = m_output_generation_id;
+    const auto install_id = m_installed_install_id;
+    const auto install_present_ordinal = m_installed_present_ordinal;
+
+    if (RE4XeSSLifetimeTrace::instance().enabled()) {
+        RE4XeSSLifetimeTrace::Event trace_event{};
+        trace_event.kind = RE4XeSSLifetimeTrace::Kind::OutputInstall;
+        trace_event.trace_id = observation.trace_id;
+        trace_event.install_id = install_id;
+        trace_event.frame_id = observation.frame_id;
+        trace_event.frame_valid = observation.frame_id_valid;
+        trace_event.callback_ordinal = observation.callback_ordinal;
+        trace_event.submit_ordinal = observation.submit_ordinal;
+        trace_event.present_ordinal = install_present_ordinal;
+        trace_event.output_generation = output_generation;
+        trace_event.control_generation = observation.control_generation;
+        trace_event.device_reset_generation = observation.device_reset_generation;
+        trace_event.writer_fence_value = observation.writer_fence_value;
+        trace_event.output_resource = output_identity;
+        trace_event.target_state = installed_state_identity;
+        trace_event.overlay = reinterpret_cast<uintptr_t>(layer);
+        trace_event.swapchain = observation.swapchain;
+        trace_event.device = observation.device;
+        trace_event.queue = observation.queue;
+        trace_event.command_queue_type = observation.command_queue_type;
+        trace_event.command_queue_type_valid = observation.command_queue_type_valid;
+        trace_event.thread_id = observation.callback_thread_id;
+        trace_event.bridge_slot = observation.bridge_slot;
+        trace_event.api_succeeded = true;
+        trace_event.queue_submitted = true;
+        trace_event.writer_signal_succeeded = true;
+        trace_event.mapping_ambiguous = true;
+        RE4XeSSLifetimeTrace::set_reason(trace_event,
+            observation.present_ordinal_valid ? "installed-present-context-only" : "install-present-unknown");
+        RE4XeSSLifetimeTrace::instance().record(trace_event);
+    }
     lock.unlock();
     bool log_install{};
     {
@@ -1340,6 +1530,51 @@ void RE4XeSSOutputHandoff::on_post_present(
         log_marker_return();
         return;
     }
+    const auto marker_trace_id = m_installed_trace_id;
+    const auto marker_install_id = m_installed_install_id;
+    const auto marker_frame = m_installed_frame;
+    const auto marker_output_generation = m_output_generation_id;
+    const auto marker_install_present = m_installed_present_ordinal;
+    const auto marker_output_identity = reinterpret_cast<uintptr_t>(m_resource_pin.Get());
+    const auto marker_target_state = reinterpret_cast<uintptr_t>(m_handoff_state.get());
+    const auto marker_queue_identity = reinterpret_cast<uintptr_t>(m_queue.Get());
+    const auto marker_device_identity = reinterpret_cast<uintptr_t>(m_device.Get());
+    bool trace_marker_buffer_full{};
+    const auto record_marker = [&](HRESULT result, bool queued, uint64_t fence_value, std::string_view reason) {
+        if (!RE4XeSSLifetimeTrace::instance().enabled()) {
+            return;
+        }
+        RE4XeSSLifetimeTrace::Event event{};
+        event.kind = RE4XeSSLifetimeTrace::Kind::Marker;
+        event.trace_id = marker_trace_id;
+        event.install_id = marker_install_id;
+        event.frame_id = marker_frame;
+        event.frame_valid = true;
+        event.present_ordinal = observation.present_ordinal;
+        event.related_present_ordinal = marker_install_present;
+        event.output_generation = marker_output_generation;
+        event.control_generation = observation.control_generation;
+        event.device_reset_generation = observation.device_reset_generation;
+        event.downstream_fence_value = fence_value;
+        event.output_resource = marker_output_identity;
+        event.target_state = marker_target_state;
+        event.swapchain = observation.swapchain;
+        event.device = marker_device_identity;
+        event.queue = marker_queue_identity;
+        event.command_queue_type = m_queue != nullptr
+            ? static_cast<int32_t>(m_queue->GetDesc().Type) : -1;
+        event.command_queue_type_valid = m_queue != nullptr;
+        event.cached_completed_value = m_last_completed_retirement_value;
+        event.cached_completed_value_valid = true;
+        event.thread_id = observation.callback_thread_id;
+        event.result = result;
+        event.present_valid = observation.present_ordinal_valid;
+        event.marker_queued = queued;
+        // A Present callback ordinal is not proof that a command list read this output.
+        event.mapping_ambiguous = true;
+        RE4XeSSLifetimeTrace::set_reason(event, reason);
+        RE4XeSSLifetimeTrace::instance().record(event);
+    };
     if (active_device != m_device.Get() || active_queue != m_queue.Get()) {
         m_hard_quarantined = true;
         m_retirement_requested = true;
@@ -1347,6 +1582,7 @@ void RE4XeSSOutputHandoff::on_post_present(
         m_failure_reason = "post-Present active device/queue does not match the handoff generation";
         const auto failure = m_failure_reason;
         lock.unlock();
+        record_marker(E_INVALIDARG, false, 0, "marker-device-or-queue-mismatch");
         spdlog::error("[RE4XeSS][Failure] downstream retirement marker rejected: {}", failure);
         log_marker_return();
         return;
@@ -1358,6 +1594,7 @@ void RE4XeSSOutputHandoff::on_post_present(
         m_failure_reason = "Downstream retirement fence value space is exhausted";
         const auto failure = m_failure_reason;
         lock.unlock();
+        record_marker(E_FAIL, false, 0, "marker-fence-value-exhausted");
         spdlog::error("[RE4XeSS][Failure] downstream retirement marker rejected: {}", failure);
         log_marker_return();
         return;
@@ -1374,6 +1611,7 @@ void RE4XeSSOutputHandoff::on_post_present(
             std::to_string(static_cast<uint32_t>(result));
         const auto failure = m_failure_reason;
         lock.unlock();
+        record_marker(result, false, value, "marker-signal-failed");
         spdlog::error("[RE4XeSS][Failure] {}", failure);
         log_marker_return();
         return;
@@ -1386,6 +1624,22 @@ void RE4XeSSOutputHandoff::on_post_present(
     if (settled_missing_marker) {
         m_marker_recovery_pending = true;
     }
+    if (RE4XeSSLifetimeTrace::instance().enabled()) {
+        if (m_trace_marker_count < m_trace_markers.size()) {
+            m_trace_markers[m_trace_marker_count++] = TraceMarker{
+                marker_trace_id,
+                marker_install_id,
+                marker_frame,
+                observation.present_ordinal_valid ? observation.present_ordinal : 0,
+                marker_output_generation,
+                value,
+                marker_output_identity,
+                observation.callback_thread_id,
+            };
+        } else {
+            trace_marker_buffer_full = true;
+        }
+    }
     m_retirement_status = m_retirement_requested ? RetirementStatus::Draining : RetirementStatus::Active;
     const bool log_marker = m_retirement_log_count < 32;
     if (log_marker) {
@@ -1397,6 +1651,11 @@ void RE4XeSSOutputHandoff::on_post_present(
     if (log_marker_settlement) {
         ++m_delayed_marker_log_count;
     }
+    record_marker(S_OK, true, value,
+            trace_marker_buffer_full ? "marker-queued-trace-buffer-full" :
+            !observation.present_ordinal_valid ? "marker-queued-present-unknown" :
+            marker_install_present == observation.present_ordinal ? "marker-queued-same-present-ordinal" :
+            "marker-queued-different-present-ordinal");
     lock.unlock();
     if (log_marker) {
         spdlog::info("[RE4XeSS][Output] downstream retirement marker queued value={} frame={} queue=0x{:x}",
@@ -1413,6 +1672,77 @@ void RE4XeSSOutputHandoff::on_post_present(
     log_marker_return();
 }
 
+void RE4XeSSOutputHandoff::observe_fence_completion() noexcept {
+    auto& trace = RE4XeSSLifetimeTrace::instance();
+    if (!trace.enabled()) {
+        return;
+    }
+
+    std::lock_guard lock{ m_retirement_mutex };
+    if (!m_has_generation_snapshot.load(std::memory_order_acquire) || m_retirement_fence == nullptr) {
+        return;
+    }
+
+    const auto completed = m_retirement_fence->GetCompletedValue();
+    const auto cached_completed = m_last_completed_retirement_value;
+    if (completed == std::numeric_limits<uint64_t>::max()) {
+        RE4XeSSLifetimeTrace::Event event{};
+        event.kind = RE4XeSSLifetimeTrace::Kind::DownstreamFenceComplete;
+        event.output_generation = m_output_generation_id;
+        event.device = reinterpret_cast<uintptr_t>(m_device.Get());
+        event.queue = reinterpret_cast<uintptr_t>(m_queue.Get());
+        event.thread_id = GetCurrentThreadId();
+        event.actual_completed_value = completed;
+        event.actual_completed_value_valid = false;
+        event.cached_completed_value = cached_completed;
+        event.cached_completed_value_valid = true;
+        event.command_queue_type = m_queue != nullptr
+            ? static_cast<int32_t>(m_queue->GetDesc().Type) : -1;
+        event.command_queue_type_valid = m_queue != nullptr;
+        event.mapping_ambiguous = true;
+        RE4XeSSLifetimeTrace::set_reason(event, "fence-returned-uint64-max-not-completion");
+        trace.record(event);
+        return;
+    }
+    if (completed <= m_trace_last_observed_completed_value) {
+        return;
+    }
+    m_trace_last_observed_completed_value = completed;
+
+    while (m_trace_marker_count != 0 && m_trace_markers[0].fence_value <= completed) {
+        const auto marker = m_trace_markers[0];
+        for (size_t i = 1; i < m_trace_marker_count; ++i) {
+            m_trace_markers[i - 1] = m_trace_markers[i];
+        }
+        --m_trace_marker_count;
+
+        RE4XeSSLifetimeTrace::Event event{};
+        event.kind = RE4XeSSLifetimeTrace::Kind::DownstreamFenceComplete;
+        event.trace_id = marker.trace_id;
+        event.install_id = marker.install_id;
+        event.frame_id = marker.frame_id;
+        event.frame_valid = true;
+        event.present_ordinal = marker.present_ordinal;
+        event.output_generation = marker.output_generation;
+        event.downstream_fence_value = marker.fence_value;
+        event.actual_completed_value = completed;
+        event.actual_completed_value_valid = true;
+        event.output_resource = marker.output_resource;
+        event.device = reinterpret_cast<uintptr_t>(m_device.Get());
+        event.queue = reinterpret_cast<uintptr_t>(m_queue.Get());
+        event.command_queue_type = m_queue != nullptr
+            ? static_cast<int32_t>(m_queue->GetDesc().Type) : -1;
+        event.command_queue_type_valid = m_queue != nullptr;
+        event.thread_id = GetCurrentThreadId();
+        event.marker_queued = true;
+        event.cached_completed_value = cached_completed;
+        event.cached_completed_value_valid = true;
+        event.mapping_ambiguous = true;
+        RE4XeSSLifetimeTrace::set_reason(event, "downstream-fence-completion-observed");
+        trace.record(event);
+    }
+}
+
 RE4XeSSOutputHandoff::Snapshot RE4XeSSOutputHandoff::snapshot() const {
     std::lock_guard lock{ m_retirement_mutex };
     return {
@@ -1420,6 +1750,20 @@ RE4XeSSOutputHandoff::Snapshot RE4XeSSOutputHandoff::snapshot() const {
         m_installed_snapshot.load(std::memory_order_acquire),
         m_retirement_status,
         m_failure_reason,
+        m_output_generation_id,
+        m_installed_install_id,
+        m_installed_trace_id,
+        m_installed_frame,
+        m_installed_present_ordinal,
+        m_signature.control_generation,
+        m_installed_device_reset_generation,
+        m_last_signaled_retirement_value,
+        m_last_completed_retirement_value,
+        m_installed_mode_token,
+        reinterpret_cast<uintptr_t>(m_resource_pin.Get()),
+        reinterpret_cast<uintptr_t>(m_handoff_state.get()),
+        reinterpret_cast<uintptr_t>(m_installed_overlay),
+        m_marker_pending,
     };
 }
 
@@ -1611,6 +1955,15 @@ void RE4XeSSOutputHandoff::release_generation() noexcept {
     m_last_signaled_retirement_value = 0;
     m_last_completed_retirement_value = 0;
     m_installed_frame = 0;
+    m_output_generation_id = 0;
+    m_installed_install_id = 0;
+    m_installed_trace_id = 0;
+    m_installed_present_ordinal = 0;
+    m_installed_submit_ordinal = 0;
+    m_installed_writer_fence_value = 0;
+    m_installed_bridge_slot = 0;
+    m_trace_last_observed_completed_value = 0;
+    m_trace_marker_count = 0;
     m_installed_device_reset_generation = 0;
     m_installed_mode_token = 0;
     m_last_confirmed_post_overlay_layer = 0;

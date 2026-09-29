@@ -493,8 +493,9 @@ bool RE4XeSSRuntime::execute(
     const bool log_api_call = log_index < MAX_EXECUTE_API_LOGS || log_transition_detail;
     const auto log_context = [&](spdlog::level::level_enum level, std::string_view stage, std::string_view detail) {
         spdlog::log(level,
-            "[RE4XeSS][Execute] {} frame={} workerThread={} controlGeneration={} resetGeneration={} slot={} submission={} commandList=0x{:x} color=0x{:x} depth=0x{:x} convertedMV=0x{:x} originalMV=0x{:x} output=0x{:x} input={}x{} outputExtent={}x{} resetHistory={} cumulativeSuccess={} cumulativeFailure={} detail={}",
+            "[RE4XeSS][Execute] {} traceId={} frame={} workerThread={} controlGeneration={} resetGeneration={} slot={} submission={} commandList=0x{:x} color=0x{:x} depth=0x{:x} convertedMV=0x{:x} originalMV=0x{:x} output=0x{:x} input={}x{} outputExtent={}x{} resetHistory={} cumulativeSuccess={} cumulativeFailure={} detail={}",
             stage,
+            static_cast<unsigned long long>(diagnostics.trace_id),
             static_cast<unsigned long long>(diagnostics.frame_id),
             GetCurrentThreadId(),
             static_cast<unsigned long long>(diagnostics.control_generation),
