@@ -25,37 +25,82 @@ constexpr uintptr_t RE4_OVERLAY_MAIN_TARGET_STATE_OFFSET = 0x90;
 constexpr uint32_t RE4_OVERLAY_WRITER_METHOD_RVA = 0x44AF030;
 std::atomic<uint64_t> transition_provenance_sequence{};
 
-constexpr bool is_valid_engine_writer_assignment(
-    uint32_t pre_write_rva,
-    uint32_t post_write_rva,
-    uintptr_t previous_state,
+constexpr bool is_valid_engine_writer_transaction(
+    uint32_t clear_pre_write_rva,
+    uint32_t clear_post_write_rva,
+    uint32_t replacement_pre_write_rva,
+    uint32_t replacement_post_write_rva,
+    uintptr_t cleared_state,
+    uintptr_t clear_state_after,
+    uintptr_t replacement_previous_state,
     uintptr_t incoming_state,
+    uintptr_t replacement_state_after,
+    uint64_t invocation_id,
+    uintptr_t invocation_stack_pointer,
+    uint64_t clear_pre_sequence,
+    uint64_t clear_post_sequence,
+    uint64_t replacement_pre_sequence,
+    uint64_t replacement_post_sequence,
+    uint64_t current_store_sequence,
     uintptr_t handoff_state,
-    uintptr_t saved_original_state) noexcept {
-    const bool clear_store =
-        (pre_write_rva == 0x44AF161 && post_write_rva == 0x44AF168) ||
-        (pre_write_rva == 0x44AF460 && post_write_rva == 0x44AF467);
-    if (clear_store) {
-        return incoming_state == 0 && previous_state != 0 &&
-            (previous_state == handoff_state || previous_state == saved_original_state);
-    }
-
-    const bool replacement_store =
-        (pre_write_rva == 0x44AF179 && post_write_rva == 0x44AF180) ||
-        (pre_write_rva == 0x44AF478 && post_write_rva == 0x44AF47F);
-    return replacement_store && incoming_state != 0 && previous_state == 0;
+    uintptr_t saved_original_state,
+    bool same_invocation,
+    bool clear_write_confirmed,
+    bool replacement_write_confirmed) noexcept {
+    const bool first_store_path =
+        clear_pre_write_rva == 0x44AF161 && clear_post_write_rva == 0x44AF168 &&
+        replacement_pre_write_rva == 0x44AF179 && replacement_post_write_rva == 0x44AF180;
+    const bool second_store_path =
+        clear_pre_write_rva == 0x44AF460 && clear_post_write_rva == 0x44AF467 &&
+        replacement_pre_write_rva == 0x44AF478 && replacement_post_write_rva == 0x44AF47F;
+    return (first_store_path || second_store_path) && same_invocation &&
+        clear_write_confirmed && replacement_write_confirmed &&
+        invocation_id != 0 && invocation_stack_pointer != 0 &&
+        clear_pre_sequence < clear_post_sequence &&
+        clear_post_sequence < replacement_pre_sequence &&
+        replacement_pre_sequence < replacement_post_sequence &&
+        replacement_post_sequence == current_store_sequence &&
+        handoff_state != 0 && cleared_state == handoff_state &&
+        clear_state_after == 0 && replacement_previous_state == 0 &&
+        incoming_state != 0 && incoming_state != handoff_state &&
+        incoming_state != saved_original_state && replacement_state_after == incoming_state;
 }
 
-static_assert(is_valid_engine_writer_assignment(
-    0x44AF161, 0x44AF168, 0x100, 0, 0x100, 0x200));
-static_assert(is_valid_engine_writer_assignment(
-    0x44AF179, 0x44AF180, 0, 0x300, 0x100, 0x200));
-static_assert(!is_valid_engine_writer_assignment(
-    0x44AF161, 0x44AF168, 0x100, 0x300, 0x100, 0x200));
-static_assert(!is_valid_engine_writer_assignment(
-    0x44AF179, 0x44AF180, 0x100, 0x300, 0x100, 0x200));
-static_assert(!is_valid_engine_writer_assignment(
-    0x44AF179, 0x44AF47F, 0, 0x300, 0x100, 0x200));
+static_assert(is_valid_engine_writer_transaction(
+    0x44AF161, 0x44AF168, 0x44AF179, 0x44AF180,
+    0x100, 0, 0, 0x300, 0x300, 1, 0xABC0, 1, 2, 3, 4, 4, 0x100, 0x200, true, true, true));
+static_assert(is_valid_engine_writer_transaction(
+    0x44AF460, 0x44AF467, 0x44AF478, 0x44AF47F,
+    0x100, 0, 0, 0x300, 0x300, 1, 0xABC0, 1, 2, 3, 4, 4, 0x100, 0x200, true, true, true));
+static_assert(!is_valid_engine_writer_transaction(
+    0x44AF161, 0x44AF168, 0, 0, 0x100, 0, 0, 0, 0, 1, 0xABC0, 1, 2, 3, 4, 4, 0x100, 0x200, true, true, false));
+static_assert(!is_valid_engine_writer_transaction(
+    0x44AF161, 0x44AF168, 0x44AF179, 0x44AF180,
+    0x100, 0, 0, 0x300, 0x300, 1, 0xABC0, 1, 2, 3, 4, 4, 0x100, 0x200, false, true, true));
+static_assert(!is_valid_engine_writer_transaction(
+    0x44AF161, 0x44AF168, 0x44AF179, 0x44AF180,
+    0x100, 0, 0, 0, 0, 1, 0xABC0, 1, 2, 3, 4, 4, 0x100, 0x200, true, true, true));
+static_assert(!is_valid_engine_writer_transaction(
+    0x44AF161, 0x44AF168, 0x44AF179, 0x44AF180,
+    0x200, 0, 0, 0x300, 0x300, 1, 0xABC0, 1, 2, 3, 4, 4, 0x100, 0x200, true, true, true));
+static_assert(!is_valid_engine_writer_transaction(
+    0x44AF161, 0x44AF168, 0x44AF478, 0x44AF47F,
+    0x100, 0, 0, 0x300, 0x300, 1, 0xABC0, 1, 2, 3, 4, 4, 0x100, 0x200, true, true, true));
+static_assert(!is_valid_engine_writer_transaction(
+    0x44AF161, 0x44AF168, 0x44AF179, 0x44AF180,
+    0x100, 0, 0x300, 0x300, 0x300, 1, 0xABC0, 1, 2, 3, 4, 4, 0x100, 0x200, true, true, true));
+static_assert(!is_valid_engine_writer_transaction(
+    0x44AF161, 0x44AF168, 0x44AF179, 0x44AF180,
+    0x100, 0, 0, 0x300, 0x301, 1, 0xABC0, 1, 2, 3, 4, 4, 0x100, 0x200, true, true, true));
+static_assert(!is_valid_engine_writer_transaction(
+    0x44AF161, 0x44AF168, 0x44AF179, 0x44AF180,
+    0x100, 0, 0, 0x300, 0x300, 0, 0xABC0, 1, 2, 3, 4, 4, 0x100, 0x200, true, true, true));
+static_assert(!is_valid_engine_writer_transaction(
+    0x44AF161, 0x44AF168, 0x44AF179, 0x44AF180,
+    0x100, 0, 0, 0x300, 0x300, 1, 0xABC0, 1, 2, 4, 3, 3, 0x100, 0x200, true, true, true));
+static_assert(!is_valid_engine_writer_transaction(
+    0x44AF161, 0x44AF168, 0x44AF179, 0x44AF180,
+    0x100, 0, 0, 0x300, 0x300, 1, 0xABC0, 1, 2, 3, 4, 5, 0x100, 0x200, true, true, true));
 
 struct RetainedOutputGeneration {
     sdk::intrusive_ptr<sdk::renderer::TargetState> handoff_state{};
@@ -115,7 +160,7 @@ bool RE4XeSSOutputHandoff::is_verified_engine_replacement_locked(
     return m_installed && m_installed_overlay == reinterpret_cast<sdk::renderer::layer::Overlay*>(layer_identity) &&
         !m_hard_quarantined && !m_bridge_writer_uncertain && !m_device_removed &&
         !m_identity_mismatch_latched.load(std::memory_order_acquire) &&
-        witness.sequence > m_last_accepted_engine_writer_sequence &&
+        witness.sequence > m_last_consumed_engine_writer_sequence &&
         witness.control_generation == observation.control_generation &&
         witness.control_generation > m_signature.control_generation &&
         witness.device_reset_generation == observation.device_reset_generation &&
@@ -123,15 +168,31 @@ bool RE4XeSSOutputHandoff::is_verified_engine_replacement_locked(
         witness.mode_token == observation.requested_mode_token &&
         witness.overlay == layer_identity && witness.slot == slot_identity &&
         witness.incoming_state == observed_state && witness.method_rva == RE4_OVERLAY_WRITER_METHOD_RVA &&
-        witness.destination_validated && witness.write_confirmed && witness.re4_image_identity_verified &&
+        witness.writer_thread_id != 0 && witness.destination_validated && witness.same_invocation && witness.clear_write_confirmed &&
+        witness.replacement_write_confirmed && witness.re4_image_identity_verified &&
         m_signature.template_state == reinterpret_cast<uintptr_t>(m_saved_original_state.get()) &&
-        is_valid_engine_writer_assignment(
-            witness.pre_write_rva,
-            witness.post_write_rva,
-            witness.previous_state,
+        is_valid_engine_writer_transaction(
+            witness.clear_pre_write_rva,
+            witness.clear_post_write_rva,
+            witness.replacement_pre_write_rva,
+            witness.replacement_post_write_rva,
+            witness.cleared_state,
+            witness.clear_state_after,
+            witness.replacement_previous_state,
             witness.incoming_state,
+            witness.replacement_state_after,
+            witness.invocation_id,
+            witness.invocation_stack_pointer,
+            witness.clear_pre_sequence,
+            witness.clear_post_sequence,
+            witness.replacement_pre_sequence,
+            witness.replacement_post_sequence,
+            witness.current_store_sequence,
             reinterpret_cast<uintptr_t>(m_handoff_state.get()),
-            reinterpret_cast<uintptr_t>(m_saved_original_state.get()));
+            reinterpret_cast<uintptr_t>(m_saved_original_state.get()),
+            witness.same_invocation,
+            witness.clear_write_confirmed,
+            witness.replacement_write_confirmed);
 }
 
 bool RE4XeSSOutputHandoff::restore(
@@ -192,7 +253,9 @@ bool RE4XeSSOutputHandoff::restore(
                 observation);
             if (engine_replacement_accepted) {
                 accepted_installed_generation = m_signature.control_generation;
-                m_last_accepted_engine_writer_sequence = writer_witness.sequence;
+                // Consuming the monotonically sequenced witness prevents a later restore
+                // from reusing the same engine transaction as proof for another replacement.
+                m_last_consumed_engine_writer_sequence = writer_witness.sequence;
                 m_installed = false;
                 m_installed_snapshot.store(false, std::memory_order_release);
                 m_installed_overlay = nullptr;
@@ -208,7 +271,7 @@ bool RE4XeSSOutputHandoff::restore(
         }
         if (engine_replacement_accepted) {
             spdlog::info(
-                "[RE4XeSS][EngineTargetReplacement] accepted controlGeneration={} installedGeneration={} modeToken={} deviceResetGeneration={} writerThread={} callbackThread={} methodRva=0x{:x} writeRva=0x{:x}->0x{:x} overlay=0x{:x} slot=0x{:x} previous=0x{:x} current=0x{:x} markerPending={} lastSignaled={} action=leave-engine-value-in-slot; retire-displaced-handoff-through-existing-fence-gates",
+                "[RE4XeSS][EngineTargetReplacement] accepted controlGeneration={} installedGeneration={} modeToken={} deviceResetGeneration={} writerThread={} callbackThread={} methodRva=0x{:x} writerInvocationId={} writerFrameRsp=0x{:x} clearSequence={}->{} replacementSequence={}->{} currentStoreSequence={} clearRva=0x{:x}->0x{:x} replacementRva=0x{:x}->0x{:x} overlay=0x{:x} slot=0x{:x} cleared=0x{:x}->0x{:x} replacement=0x{:x}->0x{:x} markerPending={} lastSignaled={} action=leave-engine-value-in-slot; retire-displaced-handoff-through-existing-fence-gates",
                 static_cast<unsigned long long>(observation.control_generation),
                 static_cast<unsigned long long>(accepted_installed_generation),
                 observation.requested_mode_token,
@@ -216,11 +279,22 @@ bool RE4XeSSOutputHandoff::restore(
                 writer_witness.writer_thread_id,
                 observation.callback_thread_id,
                 writer_witness.method_rva,
-                writer_witness.pre_write_rva,
-                writer_witness.post_write_rva,
+                static_cast<unsigned long long>(writer_witness.invocation_id),
+                writer_witness.invocation_stack_pointer,
+                static_cast<unsigned long long>(writer_witness.clear_pre_sequence),
+                static_cast<unsigned long long>(writer_witness.clear_post_sequence),
+                static_cast<unsigned long long>(writer_witness.replacement_pre_sequence),
+                static_cast<unsigned long long>(writer_witness.replacement_post_sequence),
+                static_cast<unsigned long long>(writer_witness.current_store_sequence),
+                writer_witness.clear_pre_write_rva,
+                writer_witness.clear_post_write_rva,
+                writer_witness.replacement_pre_write_rva,
+                writer_witness.replacement_post_write_rva,
                 writer_witness.overlay,
                 writer_witness.slot,
-                writer_witness.previous_state,
+                writer_witness.cleared_state,
+                writer_witness.clear_state_after,
+                writer_witness.replacement_previous_state,
                 writer_witness.incoming_state,
                 accepted_marker_pending,
                 static_cast<unsigned long long>(accepted_signaled_fence_value));
@@ -1443,18 +1517,29 @@ void RE4XeSSOutputHandoff::observe_overlay(
             width,
             height);
     } else if (log_engine_replacement) {
-        spdlog::info("[RE4XeSS][EngineTargetReplacement] observed controlGeneration={} modeToken={} deviceResetGeneration={} writerThread={} observerThread={} methodRva=0x{:x} writeRva=0x{:x}->0x{:x} overlay=0x{:x} slot=0x{:x} previous=0x{:x} current=0x{:x} action=await-pre-overlay-retirement-reconciliation",
+        spdlog::info("[RE4XeSS][EngineTargetReplacement] observed controlGeneration={} modeToken={} deviceResetGeneration={} writerThread={} observerThread={} methodRva=0x{:x} writerInvocationId={} writerFrameRsp=0x{:x} clearSequence={}->{} replacementSequence={}->{} currentStoreSequence={} clearRva=0x{:x}->0x{:x} replacementRva=0x{:x}->0x{:x} overlay=0x{:x} slot=0x{:x} cleared=0x{:x}->0x{:x} replacement=0x{:x}->0x{:x} action=await-pre-overlay-retirement-reconciliation",
             static_cast<unsigned long long>(writer_witness.control_generation),
             writer_witness.mode_token,
             static_cast<unsigned long long>(writer_witness.device_reset_generation),
             writer_witness.writer_thread_id,
             observation.callback_thread_id,
             writer_witness.method_rva,
-            writer_witness.pre_write_rva,
-            writer_witness.post_write_rva,
+            static_cast<unsigned long long>(writer_witness.invocation_id),
+            writer_witness.invocation_stack_pointer,
+            static_cast<unsigned long long>(writer_witness.clear_pre_sequence),
+            static_cast<unsigned long long>(writer_witness.clear_post_sequence),
+            static_cast<unsigned long long>(writer_witness.replacement_pre_sequence),
+            static_cast<unsigned long long>(writer_witness.replacement_post_sequence),
+            static_cast<unsigned long long>(writer_witness.current_store_sequence),
+            writer_witness.clear_pre_write_rva,
+            writer_witness.clear_post_write_rva,
+            writer_witness.replacement_pre_write_rva,
+            writer_witness.replacement_post_write_rva,
             writer_witness.overlay,
             writer_witness.slot,
-            writer_witness.previous_state,
+            writer_witness.cleared_state,
+            writer_witness.clear_state_after,
+            writer_witness.replacement_previous_state,
             writer_witness.incoming_state);
     } else if (log_mismatch) {
         uintptr_t last_confirmed_layer{};

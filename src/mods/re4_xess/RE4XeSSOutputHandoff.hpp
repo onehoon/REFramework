@@ -50,19 +50,33 @@ public:
 
     struct EngineWriterWitness {
         uint64_t sequence{};
+        uint64_t invocation_id{};
+        uintptr_t invocation_stack_pointer{};
+        uint64_t clear_pre_sequence{};
+        uint64_t clear_post_sequence{};
+        uint64_t replacement_pre_sequence{};
+        uint64_t replacement_post_sequence{};
+        uint64_t current_store_sequence{};
         uint64_t control_generation{};
         uint64_t device_reset_generation{};
         int32_t mode_token{};
         uint32_t writer_thread_id{};
         uintptr_t overlay{};
         uintptr_t slot{};
-        uintptr_t previous_state{};
+        uintptr_t cleared_state{};
+        uintptr_t clear_state_after{};
+        uintptr_t replacement_previous_state{};
         uintptr_t incoming_state{};
+        uintptr_t replacement_state_after{};
         uint32_t method_rva{};
-        uint32_t pre_write_rva{};
-        uint32_t post_write_rva{};
+        uint32_t clear_pre_write_rva{};
+        uint32_t clear_post_write_rva{};
+        uint32_t replacement_pre_write_rva{};
+        uint32_t replacement_post_write_rva{};
         bool destination_validated{};
-        bool write_confirmed{};
+        bool same_invocation{};
+        bool clear_write_confirmed{};
+        bool replacement_write_confirmed{};
         bool re4_image_identity_verified{};
     };
 
@@ -221,7 +235,7 @@ private:
     bool m_device_removed{};
     bool m_post_overlay_mismatch_logged{};
     bool m_last_confirmed_post_overlay_valid{};
-    uint64_t m_last_accepted_engine_writer_sequence{};
+    uint64_t m_last_consumed_engine_writer_sequence{};
     uint64_t m_engine_replacement_observed_sequence{};
     std::atomic<bool> m_identity_mismatch_latched{};
     std::atomic<uint64_t> m_mode_transition_generation{};
