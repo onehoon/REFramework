@@ -22,7 +22,40 @@ constexpr uint32_t MODE_TRANSITION_OBSERVATION_BUDGET = 4;
 constexpr uint32_t TRANSITION_PROVENANCE_EVENT_BUDGET = 32;
 constexpr uint32_t TRANSITION_PROVENANCE_WINDOW_BUDGET = 16;
 constexpr uintptr_t RE4_OVERLAY_MAIN_TARGET_STATE_OFFSET = 0x90;
+constexpr uint32_t RE4_OVERLAY_WRITER_METHOD_RVA = 0x44AF030;
 std::atomic<uint64_t> transition_provenance_sequence{};
+
+constexpr bool is_valid_engine_writer_assignment(
+    uint32_t pre_write_rva,
+    uint32_t post_write_rva,
+    uintptr_t previous_state,
+    uintptr_t incoming_state,
+    uintptr_t handoff_state,
+    uintptr_t saved_original_state) noexcept {
+    const bool clear_store =
+        (pre_write_rva == 0x44AF161 && post_write_rva == 0x44AF168) ||
+        (pre_write_rva == 0x44AF460 && post_write_rva == 0x44AF467);
+    if (clear_store) {
+        return incoming_state == 0 && previous_state != 0 &&
+            (previous_state == handoff_state || previous_state == saved_original_state);
+    }
+
+    const bool replacement_store =
+        (pre_write_rva == 0x44AF179 && post_write_rva == 0x44AF180) ||
+        (pre_write_rva == 0x44AF478 && post_write_rva == 0x44AF47F);
+    return replacement_store && incoming_state != 0 && previous_state == 0;
+}
+
+static_assert(is_valid_engine_writer_assignment(
+    0x44AF161, 0x44AF168, 0x100, 0, 0x100, 0x200));
+static_assert(is_valid_engine_writer_assignment(
+    0x44AF179, 0x44AF180, 0, 0x300, 0x100, 0x200));
+static_assert(!is_valid_engine_writer_assignment(
+    0x44AF161, 0x44AF168, 0x100, 0x300, 0x100, 0x200));
+static_assert(!is_valid_engine_writer_assignment(
+    0x44AF179, 0x44AF180, 0x100, 0x300, 0x100, 0x200));
+static_assert(!is_valid_engine_writer_assignment(
+    0x44AF179, 0x44AF47F, 0, 0x300, 0x100, 0x200));
 
 struct RetainedOutputGeneration {
     sdk::intrusive_ptr<sdk::renderer::TargetState> handoff_state{};
@@ -73,9 +106,38 @@ RE4XeSSOutputHandoff::~RE4XeSSOutputHandoff() {
     }
 }
 
+bool RE4XeSSOutputHandoff::is_verified_engine_replacement_locked(
+    const EngineWriterWitness& witness,
+    uintptr_t layer_identity,
+    uintptr_t slot_identity,
+    uintptr_t observed_state,
+    const ObservationContext& observation) const noexcept {
+    return m_installed && m_installed_overlay == reinterpret_cast<sdk::renderer::layer::Overlay*>(layer_identity) &&
+        !m_hard_quarantined && !m_bridge_writer_uncertain && !m_device_removed &&
+        !m_identity_mismatch_latched.load(std::memory_order_acquire) &&
+        witness.sequence > m_last_accepted_engine_writer_sequence &&
+        witness.control_generation == observation.control_generation &&
+        witness.control_generation > m_signature.control_generation &&
+        witness.device_reset_generation == observation.device_reset_generation &&
+        witness.device_reset_generation == m_installed_device_reset_generation &&
+        witness.mode_token == observation.requested_mode_token &&
+        witness.overlay == layer_identity && witness.slot == slot_identity &&
+        witness.incoming_state == observed_state && witness.method_rva == RE4_OVERLAY_WRITER_METHOD_RVA &&
+        witness.destination_validated && witness.write_confirmed && witness.re4_image_identity_verified &&
+        m_signature.template_state == reinterpret_cast<uintptr_t>(m_saved_original_state.get()) &&
+        is_valid_engine_writer_assignment(
+            witness.pre_write_rva,
+            witness.post_write_rva,
+            witness.previous_state,
+            witness.incoming_state,
+            reinterpret_cast<uintptr_t>(m_handoff_state.get()),
+            reinterpret_cast<uintptr_t>(m_saved_original_state.get()));
+}
+
 bool RE4XeSSOutputHandoff::restore(
     sdk::renderer::layer::Overlay* layer,
     const ObservationContext& observation,
+    const EngineWriterWitness& writer_witness,
     std::string& error) {
     error.clear();
     if (m_identity_mismatch_latched.load(std::memory_order_acquire)) {
@@ -116,6 +178,59 @@ bool RE4XeSSOutputHandoff::restore(
     if (observed_target_state == m_handoff_state.get()) {
         main_state = m_saved_original_state;
     } else if (observed_target_state != m_saved_original_state.get()) {
+        bool engine_replacement_accepted{};
+        uint64_t accepted_installed_generation{};
+        bool accepted_marker_pending{};
+        uint64_t accepted_signaled_fence_value{};
+        {
+            std::lock_guard lock{ m_retirement_mutex };
+            engine_replacement_accepted = is_verified_engine_replacement_locked(
+                writer_witness,
+                reinterpret_cast<uintptr_t>(layer),
+                reinterpret_cast<uintptr_t>(&main_state),
+                reinterpret_cast<uintptr_t>(observed_target_state),
+                observation);
+            if (engine_replacement_accepted) {
+                accepted_installed_generation = m_signature.control_generation;
+                m_last_accepted_engine_writer_sequence = writer_witness.sequence;
+                m_installed = false;
+                m_installed_snapshot.store(false, std::memory_order_release);
+                m_installed_overlay = nullptr;
+                m_retirement_requested = true;
+                m_missing_marker = m_marker_pending;
+                m_retirement_status = m_marker_pending
+                    ? RetirementStatus::MissingMarker
+                    : RetirementStatus::Draining;
+                m_failure_reason = "Verified RE4 mode-transition writer replaced Overlay main TargetState; preserving the engine value and retiring the displaced output generation";
+                accepted_marker_pending = m_marker_pending;
+                accepted_signaled_fence_value = m_last_signaled_retirement_value;
+            }
+        }
+        if (engine_replacement_accepted) {
+            spdlog::info(
+                "[RE4XeSS][EngineTargetReplacement] accepted controlGeneration={} installedGeneration={} modeToken={} deviceResetGeneration={} writerThread={} callbackThread={} methodRva=0x{:x} writeRva=0x{:x}->0x{:x} overlay=0x{:x} slot=0x{:x} previous=0x{:x} current=0x{:x} markerPending={} lastSignaled={} action=leave-engine-value-in-slot; retire-displaced-handoff-through-existing-fence-gates",
+                static_cast<unsigned long long>(observation.control_generation),
+                static_cast<unsigned long long>(accepted_installed_generation),
+                observation.requested_mode_token,
+                static_cast<unsigned long long>(observation.device_reset_generation),
+                writer_witness.writer_thread_id,
+                observation.callback_thread_id,
+                writer_witness.method_rva,
+                writer_witness.pre_write_rva,
+                writer_witness.post_write_rva,
+                writer_witness.overlay,
+                writer_witness.slot,
+                writer_witness.previous_state,
+                writer_witness.incoming_state,
+                accepted_marker_pending,
+                static_cast<unsigned long long>(accepted_signaled_fence_value));
+            log_transition_provenance(
+                "engine-target-replacement-accepted", observation,
+                reinterpret_cast<uintptr_t>(layer),
+                reinterpret_cast<uintptr_t>(observed_target_state), true, 1u << 8);
+            return true;
+        }
+
         error = "Overlay main TargetState changed to an unexpected object while the XeSS handoff was installed";
         bool first_mismatch{};
         uintptr_t installed_layer_identity{};
@@ -359,12 +474,14 @@ void RE4XeSSOutputHandoff::configure_transition_provenance(
     uint32_t image_checksum) noexcept {
     m_provenance_enabled.store(enabled, std::memory_order_release);
     spdlog::info(
-        "[RE4XeSS][HandoffProvenance] armed={} reason={} imageBase=0x{:x} imageSize=0x{:x} imageChecksum=0x{:x} activation=DebugLog+RE4XeSS_HandoffProvenance writerInstrumentation=not-armed writerReason=no-validated-writer-site",
+        "[RE4XeSS][HandoffProvenance] armed={} reason={} imageIdentity={} imageBase=0x{:x} imageSize=0x{:x} imageChecksum=0x{:x} activation=DebugLog+RE4XeSS_HandoffProvenance writerInstrumentation={}",
         enabled,
         reason,
+        image_size == 0x0E405000 && image_checksum == 0x0DEE3479 ? "RE4-1.5.9.0-verified" : "unverified",
         image_base,
         image_size,
-        image_checksum);
+        image_checksum,
+        enabled ? "deferred-until-live-overlay-anchor" : "disabled");
 }
 
 void RE4XeSSOutputHandoff::log_transition_provenance(
@@ -386,7 +503,7 @@ void RE4XeSSOutputHandoff::log_transition_provenance(
         window_remaining, window_remaining - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
     }
     const bool window_sample = window_remaining != 0;
-    if (!first_phase && !window_sample && !current_state_known) {
+    if (!first_phase && !window_sample) {
         return;
     }
 
@@ -1234,7 +1351,8 @@ RE4XeSSOutputHandoff::Snapshot RE4XeSSOutputHandoff::snapshot() const {
 
 void RE4XeSSOutputHandoff::observe_overlay(
     sdk::renderer::layer::Overlay* layer,
-    const ObservationContext& observation) {
+    const ObservationContext& observation,
+    const EngineWriterWitness& writer_witness) {
     if (layer == nullptr) {
         return;
     }
@@ -1279,6 +1397,8 @@ void RE4XeSSOutputHandoff::observe_overlay(
         ? "handoff"
         : observed_state == saved_state ? "saved-original" : "third-object";
     bool log_mismatch{};
+    bool verified_engine_replacement{};
+    bool log_engine_replacement{};
     if (still_installed) {
         std::lock_guard lock{ m_retirement_mutex };
         if (m_installed && layer == m_installed_overlay &&
@@ -1289,9 +1409,20 @@ void RE4XeSSOutputHandoff::observe_overlay(
             m_last_confirmed_post_overlay_frame = frame;
             m_last_confirmed_post_overlay_valid = true;
         }
-    } else if (debug_log) {
+    } else {
         std::lock_guard lock{ m_retirement_mutex };
-        if (!m_post_overlay_mismatch_logged) {
+        verified_engine_replacement = is_verified_engine_replacement_locked(
+            writer_witness,
+            reinterpret_cast<uintptr_t>(layer),
+            reinterpret_cast<uintptr_t>(&main_state),
+            observed_state,
+            observation);
+        if (verified_engine_replacement) {
+            if (m_engine_replacement_observed_sequence != writer_witness.sequence) {
+                m_engine_replacement_observed_sequence = writer_witness.sequence;
+                log_engine_replacement = debug_log;
+            }
+        } else if (debug_log && !m_post_overlay_mismatch_logged) {
             m_post_overlay_mismatch_logged = true;
             log_mismatch = true;
         }
@@ -1311,6 +1442,20 @@ void RE4XeSSOutputHandoff::observe_overlay(
             resource_identity,
             width,
             height);
+    } else if (log_engine_replacement) {
+        spdlog::info("[RE4XeSS][EngineTargetReplacement] observed controlGeneration={} modeToken={} deviceResetGeneration={} writerThread={} observerThread={} methodRva=0x{:x} writeRva=0x{:x}->0x{:x} overlay=0x{:x} slot=0x{:x} previous=0x{:x} current=0x{:x} action=await-pre-overlay-retirement-reconciliation",
+            static_cast<unsigned long long>(writer_witness.control_generation),
+            writer_witness.mode_token,
+            static_cast<unsigned long long>(writer_witness.device_reset_generation),
+            writer_witness.writer_thread_id,
+            observation.callback_thread_id,
+            writer_witness.method_rva,
+            writer_witness.pre_write_rva,
+            writer_witness.post_write_rva,
+            writer_witness.overlay,
+            writer_witness.slot,
+            writer_witness.previous_state,
+            writer_witness.incoming_state);
     } else if (log_mismatch) {
         uintptr_t last_confirmed_layer{};
         uintptr_t last_confirmed_state{};

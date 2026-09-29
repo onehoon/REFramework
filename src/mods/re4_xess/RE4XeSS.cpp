@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -1467,19 +1468,63 @@ public:
             m_capture_stopped.load(std::memory_order_acquire));
     }
 
-    void configure_overlay_writer_probe(bool enabled) noexcept {
+    void configure_overlay_writer_probe(bool enabled, bool diagnostics_enabled) noexcept {
         m_overlay_writer_enabled.store(enabled, std::memory_order_release);
+        m_overlay_writer_diagnostics_enabled.store(diagnostics_enabled, std::memory_order_release);
+        if (diagnostics_enabled) {
+            spdlog::info("[RE4XeSS][HandoffProvenance] writerProbe={} reason={}",
+                enabled ? "awaiting-live-overlay-anchor" : "disabled",
+                enabled ? "waiting-for-first-validated-overlay-callback" : "provenance-activation-rejected");
+        }
     }
 
-    void note_overlay_writer_transition(uint64_t generation, int32_t mode) noexcept {
+    void note_overlay_writer_transition(
+        uint64_t generation,
+        int32_t mode,
+        uint64_t device_reset_generation) noexcept {
         if (!m_overlay_writer_enabled.load(std::memory_order_acquire)) {
             return;
         }
         m_overlay_writer_generation.store(generation, std::memory_order_release);
         m_overlay_writer_mode.store(mode, std::memory_order_release);
+        m_overlay_writer_device_reset_generation.store(device_reset_generation, std::memory_order_release);
         m_overlay_writer_events.store(0, std::memory_order_release);
+        m_overlay_writer_confirmed_writes.store(0, std::memory_order_release);
+        m_overlay_writer_unconfirmed_writes.store(0, std::memory_order_release);
         m_overlay_writer_frames.store(0, std::memory_order_release);
         m_overlay_writer_capture.store(true, std::memory_order_release);
+    }
+
+    RE4XeSSOutputHandoff::EngineWriterWitness latest_confirmed_overlay_writer_witness() const noexcept {
+        for (size_t attempt = 0; attempt < 2; ++attempt) {
+            const auto version_before = m_overlay_writer_witness_version.load(std::memory_order_acquire);
+            if (version_before == 0 || (version_before & 1u) != 0) {
+                continue;
+            }
+
+            RE4XeSSOutputHandoff::EngineWriterWitness witness{};
+            witness.sequence = m_overlay_writer_witness_sequence.load(std::memory_order_relaxed);
+            witness.control_generation = m_overlay_writer_witness_generation.load(std::memory_order_relaxed);
+            witness.device_reset_generation = m_overlay_writer_witness_device_reset_generation.load(std::memory_order_relaxed);
+            witness.mode_token = m_overlay_writer_witness_mode.load(std::memory_order_relaxed);
+            witness.writer_thread_id = m_overlay_writer_witness_thread.load(std::memory_order_relaxed);
+            witness.overlay = m_overlay_writer_witness_overlay.load(std::memory_order_relaxed);
+            witness.slot = m_overlay_writer_witness_slot.load(std::memory_order_relaxed);
+            witness.previous_state = m_overlay_writer_witness_previous.load(std::memory_order_relaxed);
+            witness.incoming_state = m_overlay_writer_witness_incoming.load(std::memory_order_relaxed);
+            witness.method_rva = m_overlay_writer_witness_method_rva.load(std::memory_order_relaxed);
+            witness.pre_write_rva = m_overlay_writer_witness_pre_rva.load(std::memory_order_relaxed);
+            witness.post_write_rva = m_overlay_writer_witness_post_rva.load(std::memory_order_relaxed);
+            witness.destination_validated = m_overlay_writer_witness_destination_validated.load(std::memory_order_relaxed);
+            witness.write_confirmed = m_overlay_writer_witness_write_confirmed.load(std::memory_order_relaxed);
+            witness.re4_image_identity_verified = m_overlay_writer_witness_image_verified.load(std::memory_order_relaxed);
+
+            const auto version_after = m_overlay_writer_witness_version.load(std::memory_order_acquire);
+            if (version_before == version_after) {
+                return witness;
+            }
+        }
+        return {};
     }
 
     void observe_overlay_writer(sdk::renderer::layer::Overlay* overlay) noexcept {
@@ -1491,9 +1536,13 @@ public:
         if (m_overlay_writer_capture.load(std::memory_order_acquire) &&
             m_overlay_writer_frames.fetch_add(1, std::memory_order_acq_rel) == 63) {
             m_overlay_writer_capture.store(false, std::memory_order_release);
-            spdlog::info("[RE4XeSS][OverlayWriter] capture-ended generation={} frames=64 events={} (no writer attribution if events=0)",
-                m_overlay_writer_generation.load(std::memory_order_acquire),
-                m_overlay_writer_events.load(std::memory_order_acquire));
+            if (m_overlay_writer_diagnostics_enabled.load(std::memory_order_acquire)) {
+                spdlog::info("[RE4XeSS][OverlayWriter] capture-ended generation={} frames=64 attemptedStores={} confirmedWrites={} unconfirmedWrites={} (zero events means no validated writer site executed in the window)",
+                    m_overlay_writer_generation.load(std::memory_order_acquire),
+                    m_overlay_writer_events.load(std::memory_order_acquire),
+                    m_overlay_writer_confirmed_writes.load(std::memory_order_acquire),
+                    m_overlay_writer_unconfirmed_writes.load(std::memory_order_acquire));
+            }
         }
         if (m_overlay_writer_attempted.exchange(true, std::memory_order_acq_rel)) {
             return;
@@ -1515,26 +1564,39 @@ public:
             !matches_bytes(image.base + 0x44AF054, { 0x48, 0x8B, 0xF1 }) ||
             !matches_bytes(image.base + 0x44AF13C, { 0xE8, 0x8F, 0x13, 0xFC, 0xFF }) ||
             !matches_bytes(image.base + 0x44AF161, { 0x4C, 0x89, 0xB6, 0x90, 0x00, 0x00, 0x00 }) ||
+            !matches_bytes(image.base + 0x44AF168, { 0x48, 0x85, 0xC9, 0x74, 0x05 }) ||
             !matches_bytes(image.base + 0x44AF179, { 0x48, 0x89, 0x9E, 0x90, 0x00, 0x00, 0x00 }) ||
+            !matches_bytes(image.base + 0x44AF180, { 0x48, 0x85, 0xC9, 0x74, 0x05 }) ||
             !matches_bytes(image.base + 0x44AF43B, { 0xE8, 0x90, 0x10, 0xFC, 0xFF }) ||
             !matches_bytes(image.base + 0x44AF460, { 0x4C, 0x89, 0xB6, 0x90, 0x00, 0x00, 0x00 }) ||
-            !matches_bytes(image.base + 0x44AF478, { 0x48, 0x89, 0xBE, 0x90, 0x00, 0x00, 0x00 })) {
-            spdlog::warn("[RE4XeSS][OverlayWriter] not armed: image, Overlay vtable, slot, or instruction validation failed imageSize=0x{:x} checksum=0x{:x} overlay=0x{:x} slot=0x{:x} vtable=0x{:x} method=0x{:x}",
-                image.size, image.checksum, overlay_address, slot_address,
-                overlay_vtable, writer_method);
+            !matches_bytes(image.base + 0x44AF467, { 0x48, 0x85, 0xC9, 0x74, 0x05 }) ||
+            !matches_bytes(image.base + 0x44AF478, { 0x48, 0x89, 0xBE, 0x90, 0x00, 0x00, 0x00 }) ||
+            !matches_bytes(image.base + 0x44AF47F, { 0x48, 0x85, 0xC9, 0x74, 0x05 })) {
+            if (m_overlay_writer_diagnostics_enabled.load(std::memory_order_acquire)) {
+                spdlog::warn("[RE4XeSS][OverlayWriter] not armed: image, Overlay vtable, slot, or instruction validation failed imageSize=0x{:x} checksum=0x{:x} overlay=0x{:x} slot=0x{:x} vtable=0x{:x} method=0x{:x}",
+                    image.size, image.checksum, overlay_address, slot_address,
+                    overlay_vtable, writer_method);
+            }
             return;
         }
 
-        constexpr std::array<uint32_t, 2> sites{ 0x44AF179, 0x44AF478 };
-        constexpr std::array<safetyhook::MidHookFn, 2> callbacks{
-            &overlay_writer_callback<0>, &overlay_writer_callback<1>
+        constexpr std::array<safetyhook::MidHookFn, OVERLAY_WRITER_HOOK_COUNT> callbacks{
+            &overlay_writer_callback<0>, &overlay_writer_callback<1>,
+            &overlay_writer_callback<2>, &overlay_writer_callback<3>,
+            &overlay_writer_callback<4>, &overlay_writer_callback<5>,
+            &overlay_writer_callback<6>, &overlay_writer_callback<7>,
         };
-        for (size_t index = 0; index < sites.size(); ++index) {
+        for (size_t index = 0; index < OVERLAY_WRITER_HOOK_RVAS.size(); ++index) {
             m_overlay_writer_hooks[index] = safetyhook::create_mid(
-                reinterpret_cast<void*>(image.base + sites[index]), callbacks[index],
+                reinterpret_cast<void*>(image.base + OVERLAY_WRITER_HOOK_RVAS[index]), callbacks[index],
                 safetyhook::MidHook::StartDisabled);
-            if (!m_overlay_writer_hooks[index] || m_overlay_writer_hooks[index].original_bytes().size() != 7) {
-                spdlog::warn("[RE4XeSS][OverlayWriter] not armed: unsafe hook span site=0x{:x}", sites[index]);
+            if (!m_overlay_writer_hooks[index] ||
+                m_overlay_writer_hooks[index].original_bytes().size() != OVERLAY_WRITER_HOOK_SPANS[index]) {
+                if (m_overlay_writer_diagnostics_enabled.load(std::memory_order_acquire)) {
+                    spdlog::warn("[RE4XeSS][OverlayWriter] not armed: unsafe hook span hook={} siteRva=0x{:x} expected={} actual={}",
+                        index, OVERLAY_WRITER_HOOK_RVAS[index], OVERLAY_WRITER_HOOK_SPANS[index],
+                        m_overlay_writer_hooks[index] ? m_overlay_writer_hooks[index].original_bytes().size() : 0);
+                }
                 return;
             }
         }
@@ -1543,18 +1605,39 @@ public:
                 for (auto& installed : m_overlay_writer_hooks) {
                     if (installed) (void)installed.disable();
                 }
-                spdlog::warn("[RE4XeSS][OverlayWriter] not armed: hook enable failed");
+                if (m_overlay_writer_diagnostics_enabled.load(std::memory_order_acquire)) {
+                    spdlog::warn("[RE4XeSS][OverlayWriter] not armed: hook enable failed");
+                }
                 return;
             }
         }
         m_overlay_writer_image_base.store(image.base, std::memory_order_release);
         m_overlay_writer_active.store(true, std::memory_order_release);
-        spdlog::info("[RE4XeSS][OverlayWriter] armed imageBase=0x{:x} overlay=0x{:x} slot=0x{:x} liveVtable=0x{:x} liveVcall40=0x{:x} nativeMethodRva=0x44af030 sites=[0x44af179,0x44af478] capture=64 pre-Overlay frames per mode transition",
-            image.base, overlay_address, slot_address, overlay_vtable, writer_method);
+        if (m_overlay_writer_diagnostics_enabled.load(std::memory_order_acquire)) {
+            spdlog::info("[RE4XeSS][OverlayWriter] armed imageBase=0x{:x} imageSize=0x{:x} imageChecksum=0x{:x} imageIdentity=RE4-1.5.9.0-verified overlay=0x{:x} slot=0x{:x} slotOffset=0x90 liveVtable=0x{:x} liveVcall40=0x{:x} nativeMethodRva=0x44af030 hooks=8 stages=pre/post exactBytesValidated=true capture=64 pre-Overlay frames per mode transition",
+                image.base, image.size, image.checksum, overlay_address, slot_address, overlay_vtable, writer_method);
+        }
     }
 
 private:
-    template <size_t Site>
+    struct OverlayWriterPending {
+        uint64_t event{};
+        uintptr_t overlay{};
+        uintptr_t slot{};
+        uintptr_t prior{};
+        uintptr_t incoming{};
+        uintptr_t caller_return{};
+        uintptr_t caller_rva{};
+        uint64_t generation{};
+        uint64_t device_reset_generation{};
+        int32_t mode_token{};
+        uint32_t thread_id{};
+        bool prior_readable{};
+        bool caller_readable{};
+        bool valid{};
+    };
+
+    template <size_t HookIndex>
     static void overlay_writer_callback(safetyhook::Context& context) {
         auto& probe = instance();
         if (!probe.m_overlay_writer_enabled.load(std::memory_order_acquire) ||
@@ -1563,27 +1646,125 @@ private:
             context.rsi != probe.m_overlay_writer_overlay.load(std::memory_order_acquire)) {
             return;
         }
-        const auto event = probe.m_overlay_writer_events.fetch_add(1, std::memory_order_acq_rel);
-        if (event >= 16) {
+        constexpr size_t store_index = HookIndex / 2;
+        constexpr bool after_store = (HookIndex % 2) != 0;
+        auto& pending = s_pending_overlay_writer_stores[store_index];
+        const auto slot = context.rsi + RE4_TARGET_STATE_SLOT_OFFSET;
+        const auto image_base = probe.m_overlay_writer_image_base.load(std::memory_order_acquire);
+        if constexpr (!after_store) {
+            const auto event = probe.m_overlay_writer_events.fetch_add(1, std::memory_order_acq_rel);
+            if (event >= MAX_OVERLAY_WRITER_EVENTS) {
+                return;
+            }
+            uintptr_t prior{};
+            const bool prior_readable = read_private_memory(slot, &prior, sizeof(prior));
+            const auto incoming = overlay_writer_source_register(store_index, context);
+            uintptr_t caller_return{};
+            const bool caller_readable = context.rsp <= UINTPTR_MAX - 0x138 &&
+                read_private_memory(context.rsp + 0x138, &caller_return, sizeof(caller_return));
+            const auto caller_rva = caller_readable && caller_return >= image_base &&
+                caller_return < image_base + EXPECTED_IMAGE_SIZE ? caller_return - image_base : 0;
+            pending = {
+                event + 1,
+                context.rsi,
+                slot,
+                prior,
+                incoming,
+                caller_return,
+                caller_rva,
+                probe.m_overlay_writer_generation.load(std::memory_order_acquire),
+                probe.m_overlay_writer_device_reset_generation.load(std::memory_order_acquire),
+                probe.m_overlay_writer_mode.load(std::memory_order_acquire),
+                GetCurrentThreadId(),
+                prior_readable,
+                caller_readable,
+                true,
+            };
+            const auto timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (probe.m_overlay_writer_diagnostics_enabled.load(std::memory_order_acquire)) {
+                spdlog::info("[RE4XeSS][OverlayWriter] stage=pre-write timestampUs={} event={} tid={} module=re4.exe methodRva=0x44af030 siteRva=0x{:x} destination=0x{:x} destinationValidated=true overlay=0x{:x} slot=0x{:x} prior=0x{:x} priorReadable={} incoming=0x{:x} sourceRegister={} callerReturn=0x{:x} callerRva=0x{:x} callerReadable={} controlGeneration={} modeToken={} framesSinceTransition={}",
+                    static_cast<long long>(timestamp_us), event + 1, pending.thread_id,
+                    OVERLAY_WRITER_PRE_RVAS[store_index], slot, context.rsi, slot, prior,
+                    prior_readable, incoming, overlay_writer_source_register_name(store_index),
+                    caller_return, caller_rva, caller_readable, pending.generation, pending.mode_token,
+                    probe.m_overlay_writer_frames.load(std::memory_order_acquire));
+            }
+        } else {
+            if (!pending.valid || pending.overlay != context.rsi || pending.slot != slot ||
+                pending.thread_id != GetCurrentThreadId()) {
+                return;
+            }
+            uintptr_t observed{};
+            const bool observed_readable = read_private_memory(slot, &observed, sizeof(observed));
+            const bool confirmed = observed_readable && observed == pending.incoming;
+            if (confirmed) {
+                probe.m_overlay_writer_confirmed_writes.fetch_add(1, std::memory_order_acq_rel);
+                probe.publish_overlay_writer_witness(store_index, pending);
+            } else {
+                probe.m_overlay_writer_unconfirmed_writes.fetch_add(1, std::memory_order_acq_rel);
+            }
+            const auto timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (probe.m_overlay_writer_diagnostics_enabled.load(std::memory_order_acquire)) {
+                spdlog::info("[RE4XeSS][OverlayWriter] stage=post-write timestampUs={} event={} tid={} module=re4.exe methodRva=0x44af030 siteRva=0x{:x} destination=0x{:x} destinationValidated=true overlay=0x{:x} slot=0x{:x} prior=0x{:x} incoming=0x{:x} observedAfter=0x{:x} slotReadValid={} confirmedWrite={} preSiteRva=0x{:x} callerReturn=0x{:x} callerRva=0x{:x} controlGeneration={} modeToken={}",
+                    static_cast<long long>(timestamp_us), pending.event, GetCurrentThreadId(),
+                    OVERLAY_WRITER_POST_RVAS[store_index], slot, context.rsi, slot, pending.prior,
+                    pending.incoming, observed, observed_readable, confirmed,
+                    OVERLAY_WRITER_PRE_RVAS[store_index], pending.caller_return, pending.caller_rva,
+                    pending.generation, pending.mode_token);
+            }
+            pending.valid = false;
+        }
+    }
+
+    static uintptr_t overlay_writer_source_register(size_t store_index, safetyhook::Context& context) noexcept {
+        switch (store_index) {
+        case 0: return context.r14;
+        case 1: return context.rbx;
+        case 2: return context.r14;
+        case 3: return context.rdi;
+        default: return 0;
+        }
+    }
+
+    static const char* overlay_writer_source_register_name(size_t store_index) noexcept {
+        switch (store_index) {
+        case 0: return "r14";
+        case 1: return "rbx";
+        case 2: return "r14";
+        case 3: return "rdi";
+        default: return "unknown";
+        }
+    }
+
+    void publish_overlay_writer_witness(
+        size_t store_index,
+        const OverlayWriterPending& pending) noexcept {
+        if (store_index >= OVERLAY_WRITER_STORE_COUNT ||
+            m_overlay_writer_witness_writer.test_and_set(std::memory_order_acquire)) {
             return;
         }
-        const auto slot = context.rsi + RE4_TARGET_STATE_SLOT_OFFSET;
-        uintptr_t prior{};
-        const bool prior_readable = read_private_memory(slot, &prior, sizeof(prior));
-        const auto incoming = Site == 0 ? context.rbx : context.rdi;
-        uintptr_t caller_return{};
-        const bool caller_readable = context.rsp <= UINTPTR_MAX - 0x138 &&
-            read_private_memory(context.rsp + 0x138, &caller_return, sizeof(caller_return));
-        const auto image_base = probe.m_overlay_writer_image_base.load(std::memory_order_acquire);
-        const auto caller_rva = caller_readable && caller_return >= image_base &&
-            caller_return < image_base + EXPECTED_IMAGE_SIZE ? caller_return - image_base : 0;
-        spdlog::info("[RE4XeSS][OverlayWriter] stage=pre-write siteRva=0x{:x} methodRva=0x44af030 event={} tid={} overlay=0x{:x} slot=0x{:x} prior=0x{:x} priorReadable={} incoming=0x{:x} callerReturn=0x{:x} callerRva=0x{:x} callerReadable={} controlGeneration={} modeToken={} framesSinceTransition={}",
-            Site == 0 ? 0x44AF179 : 0x44AF478, event + 1, GetCurrentThreadId(),
-            context.rsi, slot, prior, prior_readable, incoming,
-            caller_return, caller_rva, caller_readable,
-            probe.m_overlay_writer_generation.load(std::memory_order_acquire),
-            probe.m_overlay_writer_mode.load(std::memory_order_acquire),
-            probe.m_overlay_writer_frames.load(std::memory_order_acquire));
+
+        m_overlay_writer_witness_version.fetch_add(1, std::memory_order_acq_rel);
+        const auto sequence = m_overlay_writer_witness_next_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+        m_overlay_writer_witness_sequence.store(sequence, std::memory_order_relaxed);
+        m_overlay_writer_witness_generation.store(pending.generation, std::memory_order_relaxed);
+        m_overlay_writer_witness_device_reset_generation.store(pending.device_reset_generation, std::memory_order_relaxed);
+        m_overlay_writer_witness_mode.store(pending.mode_token, std::memory_order_relaxed);
+        m_overlay_writer_witness_thread.store(pending.thread_id, std::memory_order_relaxed);
+        m_overlay_writer_witness_overlay.store(pending.overlay, std::memory_order_relaxed);
+        m_overlay_writer_witness_slot.store(pending.slot, std::memory_order_relaxed);
+        m_overlay_writer_witness_previous.store(pending.prior, std::memory_order_relaxed);
+        m_overlay_writer_witness_incoming.store(pending.incoming, std::memory_order_relaxed);
+        m_overlay_writer_witness_method_rva.store(0x44AF030, std::memory_order_relaxed);
+        m_overlay_writer_witness_pre_rva.store(OVERLAY_WRITER_PRE_RVAS[store_index], std::memory_order_relaxed);
+        m_overlay_writer_witness_post_rva.store(OVERLAY_WRITER_POST_RVAS[store_index], std::memory_order_relaxed);
+        m_overlay_writer_witness_destination_validated.store(true, std::memory_order_relaxed);
+        m_overlay_writer_witness_write_confirmed.store(true, std::memory_order_relaxed);
+        m_overlay_writer_witness_image_verified.store(true, std::memory_order_relaxed);
+        m_overlay_writer_witness_version.fetch_add(1, std::memory_order_release);
+        m_overlay_writer_witness_writer.clear(std::memory_order_release);
     }
 
     struct ImageInfo {
@@ -1765,6 +1946,22 @@ private:
     static constexpr uint32_t MAX_CREATOR_CAPTURE_FRAMES = 1800;
     static constexpr size_t MAX_CAPTURED_CALLS = SITE_COUNT * MAX_CAPTURED_CALLS_PER_SITE;
     static constexpr size_t HOOK_COUNT = SITE_COUNT * 2;
+    static constexpr size_t OVERLAY_WRITER_STORE_COUNT = 4;
+    static constexpr size_t OVERLAY_WRITER_HOOK_COUNT = OVERLAY_WRITER_STORE_COUNT * 2;
+    static constexpr uint32_t MAX_OVERLAY_WRITER_EVENTS = 16;
+    static constexpr std::array<uint32_t, OVERLAY_WRITER_STORE_COUNT> OVERLAY_WRITER_PRE_RVAS{
+        0x44AF161, 0x44AF179, 0x44AF460, 0x44AF478
+    };
+    static constexpr std::array<uint32_t, OVERLAY_WRITER_STORE_COUNT> OVERLAY_WRITER_POST_RVAS{
+        0x44AF168, 0x44AF180, 0x44AF467, 0x44AF47F
+    };
+    static constexpr std::array<uint32_t, OVERLAY_WRITER_HOOK_COUNT> OVERLAY_WRITER_HOOK_RVAS{
+        0x44AF161, 0x44AF168, 0x44AF179, 0x44AF180,
+        0x44AF460, 0x44AF467, 0x44AF478, 0x44AF47F
+    };
+    static constexpr std::array<size_t, OVERLAY_WRITER_HOOK_COUNT> OVERLAY_WRITER_HOOK_SPANS{
+        7, 5, 7, 5, 7, 5, 7, 5
+    };
     static constexpr std::array<uint32_t, SITE_COUNT> PRE_HOOK_RVAS{
         0x447AF53,
         0x47212A0,
@@ -1812,16 +2009,38 @@ private:
     std::atomic<bool> m_live_anchor_invalid_logged{};
     std::atomic<bool> m_live_anchor_trusted{};
     std::atomic<bool> m_overlay_writer_enabled{};
+    std::atomic<bool> m_overlay_writer_diagnostics_enabled{};
     std::atomic<bool> m_overlay_writer_attempted{};
     std::atomic<bool> m_overlay_writer_active{};
     std::atomic<bool> m_overlay_writer_capture{};
     std::atomic<uintptr_t> m_overlay_writer_overlay{};
     std::atomic<uintptr_t> m_overlay_writer_image_base{};
     std::atomic<uint64_t> m_overlay_writer_generation{};
+    std::atomic<uint64_t> m_overlay_writer_device_reset_generation{};
     std::atomic<int32_t> m_overlay_writer_mode{};
     std::atomic<uint32_t> m_overlay_writer_frames{};
     std::atomic<uint32_t> m_overlay_writer_events{};
-    std::array<safetyhook::MidHook, 2> m_overlay_writer_hooks{};
+    std::atomic<uint32_t> m_overlay_writer_confirmed_writes{};
+    std::atomic<uint32_t> m_overlay_writer_unconfirmed_writes{};
+    std::atomic_flag m_overlay_writer_witness_writer = ATOMIC_FLAG_INIT;
+    std::atomic<uint64_t> m_overlay_writer_witness_version{};
+    std::atomic<uint64_t> m_overlay_writer_witness_next_sequence{};
+    std::atomic<uint64_t> m_overlay_writer_witness_sequence{};
+    std::atomic<uint64_t> m_overlay_writer_witness_generation{};
+    std::atomic<uint64_t> m_overlay_writer_witness_device_reset_generation{};
+    std::atomic<int32_t> m_overlay_writer_witness_mode{};
+    std::atomic<uint32_t> m_overlay_writer_witness_thread{};
+    std::atomic<uintptr_t> m_overlay_writer_witness_overlay{};
+    std::atomic<uintptr_t> m_overlay_writer_witness_slot{};
+    std::atomic<uintptr_t> m_overlay_writer_witness_previous{};
+    std::atomic<uintptr_t> m_overlay_writer_witness_incoming{};
+    std::atomic<uint32_t> m_overlay_writer_witness_method_rva{};
+    std::atomic<uint32_t> m_overlay_writer_witness_pre_rva{};
+    std::atomic<uint32_t> m_overlay_writer_witness_post_rva{};
+    std::atomic<bool> m_overlay_writer_witness_destination_validated{};
+    std::atomic<bool> m_overlay_writer_witness_write_confirmed{};
+    std::atomic<bool> m_overlay_writer_witness_image_verified{};
+    std::array<safetyhook::MidHook, OVERLAY_WRITER_HOOK_COUNT> m_overlay_writer_hooks{};
     std::atomic<uintptr_t> m_provenance_overlay_object{};
     std::atomic<uintptr_t> m_provenance_overlay_slot{};
     std::atomic<bool> m_provenance_slot_invalid_logged{};
@@ -1869,6 +2088,7 @@ private:
     static inline thread_local std::array<size_t, MAX_CREATOR_ACTIVE_DEPTH> s_creator_active_calls{};
     static inline thread_local size_t s_creator_active_depth{};
     inline static thread_local std::array<PendingObservation, MAX_CAPTURED_CALLS> s_pending_observations{};
+    inline static thread_local std::array<OverlayWriterPending, OVERLAY_WRITER_STORE_COUNT> s_pending_overlay_writer_stores{};
 
     static bool read_memory(uintptr_t address, void* destination, size_t size) noexcept {
         if (address == 0 || destination == nullptr || size == 0 || address > UINTPTR_MAX - size) {
@@ -4021,9 +4241,11 @@ void RE4XeSS::on_config_load(const utility::Config& cfg) {
         !d3d12_renderer ? "renderer-not-d3d12" :
         !image.valid ? "main-image-identity-unreadable" :
         !image.expected_re4_build ? "unsupported-re4-image" : "enabled";
+    const bool engine_writer_witness_enabled = d3d12_renderer && image.expected_re4_build;
     m_output_handoff.configure_transition_provenance(
         provenance_enabled, provenance_reason, image.base, image.size, image.checksum);
-    TargetStateFactoryProbe::instance().configure_overlay_writer_probe(provenance_enabled);
+    TargetStateFactoryProbe::instance().configure_overlay_writer_probe(
+        engine_writer_witness_enabled, provenance_enabled);
 
     const auto persisted_mode = cfg.get<std::string>(std::string{ UPSCALING_MODE_CONFIG_KEY });
     if (!persisted_mode) {
@@ -4067,7 +4289,9 @@ void RE4XeSS::request_mode(UpscalingMode mode) {
         static_cast<int32_t>(mode),
         m_device_reset_generation.load(std::memory_order_acquire));
     TargetStateFactoryProbe::instance().note_overlay_writer_transition(
-        control_generation, static_cast<int32_t>(mode));
+        control_generation,
+        static_cast<int32_t>(mode),
+        m_device_reset_generation.load(std::memory_order_acquire));
     spdlog::info("[RE4XeSS][Config] mode changed: {} -> {} controlGeneration={} requestThread={}",
         mode_to_display_label(old_mode),
         mode_to_display_label(mode),
@@ -4827,6 +5051,8 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         overlap_epoch,
     };
     TargetStateFactoryProbe::instance().observe_overlay_writer(layer);
+    const auto engine_writer_witness =
+        TargetStateFactoryProbe::instance().latest_confirmed_overlay_writer_witness();
     if (m_output_handoff.identity_mismatch_latched()) {
         const auto producer = get_producer_snapshot();
         (void)m_output_handoff.poll_retirement(producer.bridge_idle, producer.bridge_device_removed);
@@ -4857,7 +5083,8 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
     };
 
     std::string restore_error;
-    if (!m_output_handoff.restore(layer, handoff_observation, restore_error)) {
+    if (!m_output_handoff.restore(
+            layer, handoff_observation, engine_writer_witness, restore_error)) {
         const auto handoff = m_output_handoff.snapshot();
         set_owner_unavailable(restore_error, true,
             handoff.retirement == RE4XeSSOutputHandoff::RetirementStatus::Quarantined);
@@ -5298,5 +5525,8 @@ void RE4XeSS::on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* 
         GetCurrentThreadId(),
         false,
     };
-    m_output_handoff.observe_overlay(layer, observation);
+    m_output_handoff.observe_overlay(
+        layer,
+        observation,
+        TargetStateFactoryProbe::instance().latest_confirmed_overlay_writer_witness());
 }

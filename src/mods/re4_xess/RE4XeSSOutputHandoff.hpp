@@ -48,6 +48,24 @@ public:
         bool frame_id_valid{};
     };
 
+    struct EngineWriterWitness {
+        uint64_t sequence{};
+        uint64_t control_generation{};
+        uint64_t device_reset_generation{};
+        int32_t mode_token{};
+        uint32_t writer_thread_id{};
+        uintptr_t overlay{};
+        uintptr_t slot{};
+        uintptr_t previous_state{};
+        uintptr_t incoming_state{};
+        uint32_t method_rva{};
+        uint32_t pre_write_rva{};
+        uint32_t post_write_rva{};
+        bool destination_validated{};
+        bool write_confirmed{};
+        bool re4_image_identity_verified{};
+    };
+
     RE4XeSSOutputHandoff() = default;
     ~RE4XeSSOutputHandoff();
 
@@ -57,6 +75,7 @@ public:
     bool restore(
         sdk::renderer::layer::Overlay* layer,
         const ObservationContext& observation,
+        const EngineWriterWitness& writer_witness,
         std::string& error);
     void request_retirement(std::string_view reason);
     void note_mode_transition(
@@ -96,7 +115,8 @@ public:
         const ObservationContext& observation) noexcept;
     void observe_overlay(
         sdk::renderer::layer::Overlay* layer,
-        const ObservationContext& observation);
+        const ObservationContext& observation,
+        const EngineWriterWitness& writer_witness);
     bool identity_mismatch_latched() const noexcept;
     Snapshot snapshot() const;
 
@@ -127,6 +147,12 @@ private:
     void release_generation() noexcept;
     void preserve_quarantined_generation() noexcept;
     bool confirmed_device_removal(bool bridge_device_removed) const noexcept;
+    bool is_verified_engine_replacement_locked(
+        const EngineWriterWitness& witness,
+        uintptr_t layer_identity,
+        uintptr_t slot_identity,
+        uintptr_t observed_state,
+        const ObservationContext& observation) const noexcept;
     bool consume_mode_transition_observation(const ObservationContext& observation) noexcept;
     void log_transition_provenance(
         std::string_view phase,
@@ -195,6 +221,8 @@ private:
     bool m_device_removed{};
     bool m_post_overlay_mismatch_logged{};
     bool m_last_confirmed_post_overlay_valid{};
+    uint64_t m_last_accepted_engine_writer_sequence{};
+    uint64_t m_engine_replacement_observed_sequence{};
     std::atomic<bool> m_identity_mismatch_latched{};
     std::atomic<uint64_t> m_mode_transition_generation{};
     std::atomic<uint32_t> m_mode_transition_observation_budget{};
