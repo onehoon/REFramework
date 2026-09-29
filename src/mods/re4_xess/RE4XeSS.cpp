@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <initializer_list>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -1560,7 +1561,6 @@ public:
             return;
         }
         const auto overlay_address = reinterpret_cast<uintptr_t>(overlay);
-        m_overlay_writer_overlay.store(overlay_address, std::memory_order_release);
         if (m_overlay_writer_diagnostic_capture.load(std::memory_order_acquire) &&
             m_overlay_writer_frames.fetch_add(1, std::memory_order_acq_rel) == 63) {
             m_overlay_writer_diagnostic_capture.store(false, std::memory_order_release);
@@ -1574,20 +1574,63 @@ public:
                     m_overlay_writer_transaction_overflow.load(std::memory_order_acquire));
             }
         }
-        if (m_overlay_writer_attempted.exchange(true, std::memory_order_acq_rel)) {
+
+        if (m_overlay_writer_active.load(std::memory_order_acquire)) {
+            m_overlay_writer_overlay.store(overlay_address, std::memory_order_release);
+            return;
+        }
+        if (m_overlay_writer_permanently_unavailable.load(std::memory_order_acquire)) {
             return;
         }
 
+        std::unique_lock install_lock{ m_overlay_writer_install_mutex, std::try_to_lock };
+        if (!install_lock.owns_lock() ||
+            !m_overlay_writer_enabled.load(std::memory_order_acquire)) {
+            return;
+        }
+        if (m_overlay_writer_active.load(std::memory_order_acquire)) {
+            m_overlay_writer_overlay.store(overlay_address, std::memory_order_release);
+            return;
+        }
+        if (m_overlay_writer_permanently_unavailable.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        constexpr uint32_t MAX_OVERLAY_WRITER_INSTALL_ATTEMPTS = 8;
+        ++m_overlay_writer_install_attempts;
+        const auto install_attempt = m_overlay_writer_install_attempts;
+        const auto diagnostics_enabled = m_overlay_writer_diagnostics_enabled.load(std::memory_order_acquire);
+
         const auto image = inspect_main_image();
+        const auto mark_permanently_unavailable = [&](const char* reason) {
+            m_overlay_writer_last_install_failure = reason;
+            m_overlay_writer_permanently_unavailable.store(true, std::memory_order_release);
+            spdlog::warn("[RE4XeSS][OverlayWriter] unavailable reason={} attempt={} imageSize=0x{:x} checksum=0x{:x} overlay=0x{:x}; engine replacement remains fail-closed",
+                reason, install_attempt, image.size, image.checksum, overlay_address);
+        };
+        const auto report_retryable_failure = [&](const char* reason) {
+            m_overlay_writer_last_install_failure = reason;
+            if (install_attempt >= MAX_OVERLAY_WRITER_INSTALL_ATTEMPTS) {
+                m_overlay_writer_permanently_unavailable.store(true, std::memory_order_release);
+                spdlog::warn("[RE4XeSS][OverlayWriter] unavailable reason=retry-budget-exhausted lastFailure={} attempts={} overlay=0x{:x}; engine replacement remains fail-closed",
+                    reason, install_attempt, overlay_address);
+            } else if (diagnostics_enabled) {
+                spdlog::info("[RE4XeSS][OverlayWriter] retryable-not-armed reason={} attempt={}/{} overlay=0x{:x}",
+                    reason, install_attempt, MAX_OVERLAY_WRITER_INSTALL_ATTEMPTS, overlay_address);
+            }
+        };
         const auto slot_address = reinterpret_cast<uintptr_t>(&overlay->get_main_target_state());
         uintptr_t overlay_vtable{};
         uintptr_t writer_method{};
-        if (!image.valid || image.size != EXPECTED_IMAGE_SIZE || image.checksum != EXPECTED_IMAGE_CHECKSUM ||
-            slot_address != overlay_address + RE4_TARGET_STATE_SLOT_OFFSET ||
-            !read_private_memory(overlay_address, &overlay_vtable, sizeof(overlay_vtable)) ||
-            !read_memory(overlay_vtable + 0x40, &writer_method, sizeof(writer_method)) ||
-            writer_method != image.base + 0x44AF030 ||
-            !is_executable_range(image, 0x44AF030, 0x449) ||
+        if (!image.valid) {
+            report_retryable_failure("main-image-metadata-unavailable");
+            return;
+        }
+        if (image.size != EXPECTED_IMAGE_SIZE || image.checksum != EXPECTED_IMAGE_CHECKSUM) {
+            mark_permanently_unavailable("unsupported-re4-image");
+            return;
+        }
+        if (!is_executable_range(image, 0x44AF030, 0x449) ||
             !is_executable_range(image, 0x44704D0, 0x18) ||
             !matches_bytes(image.base + 0x44704D0, { 0x48, 0x8B, 0x0D, 0xB9, 0x08, 0x3E, 0x09 }) ||
             !matches_bytes(image.base + 0x44704E3, { 0xE9, 0x98, 0x1C, 0x36, 0x00 }) ||
@@ -1602,51 +1645,116 @@ public:
             !matches_bytes(image.base + 0x44AF467, { 0x48, 0x85, 0xC9, 0x74, 0x05 }) ||
             !matches_bytes(image.base + 0x44AF478, { 0x48, 0x89, 0xBE, 0x90, 0x00, 0x00, 0x00 }) ||
             !matches_bytes(image.base + 0x44AF47F, { 0x48, 0x85, 0xC9, 0x74, 0x05 })) {
-            if (m_overlay_writer_diagnostics_enabled.load(std::memory_order_acquire)) {
-                spdlog::warn("[RE4XeSS][OverlayWriter] not armed: image, Overlay vtable, slot, or instruction validation failed imageSize=0x{:x} checksum=0x{:x} overlay=0x{:x} slot=0x{:x} vtable=0x{:x} method=0x{:x}",
-                    image.size, image.checksum, overlay_address, slot_address,
-                    overlay_vtable, writer_method);
-            }
+            mark_permanently_unavailable("writer-instruction-validation-failed");
+            return;
+        }
+        if (slot_address != overlay_address + RE4_TARGET_STATE_SLOT_OFFSET ||
+            !read_private_memory(overlay_address, &overlay_vtable, sizeof(overlay_vtable)) ||
+            overlay_vtable > UINTPTR_MAX - 0x40 ||
+            !read_memory(overlay_vtable + 0x40, &writer_method, sizeof(writer_method)) ||
+            writer_method != image.base + 0x44AF030) {
+            report_retryable_failure("overlay-vtable-or-slot-not-ready");
             return;
         }
 
+        m_overlay_writer_overlay.store(overlay_address, std::memory_order_release);
         constexpr std::array<safetyhook::MidHookFn, OVERLAY_WRITER_HOOK_COUNT> callbacks{
             &overlay_writer_callback<0>, &overlay_writer_callback<1>,
             &overlay_writer_callback<2>, &overlay_writer_callback<3>,
             &overlay_writer_callback<4>, &overlay_writer_callback<5>,
             &overlay_writer_callback<6>, &overlay_writer_callback<7>,
         };
+        std::array<safetyhook::MidHook, OVERLAY_WRITER_HOOK_COUNT> pending_hooks{};
         for (size_t index = 0; index < OVERLAY_WRITER_HOOK_RVAS.size(); ++index) {
-            m_overlay_writer_hooks[index] = safetyhook::create_mid(
+            pending_hooks[index] = safetyhook::create_mid(
                 reinterpret_cast<void*>(image.base + OVERLAY_WRITER_HOOK_RVAS[index]), callbacks[index],
                 safetyhook::MidHook::StartDisabled);
-            if (!m_overlay_writer_hooks[index] ||
-                m_overlay_writer_hooks[index].original_bytes().size() != OVERLAY_WRITER_HOOK_SPANS[index]) {
-                if (m_overlay_writer_diagnostics_enabled.load(std::memory_order_acquire)) {
-                    spdlog::warn("[RE4XeSS][OverlayWriter] not armed: unsafe hook span hook={} siteRva=0x{:x} expected={} actual={}",
-                        index, OVERLAY_WRITER_HOOK_RVAS[index], OVERLAY_WRITER_HOOK_SPANS[index],
-                        m_overlay_writer_hooks[index] ? m_overlay_writer_hooks[index].original_bytes().size() : 0);
+            if (!pending_hooks[index]) {
+                if (!rollback_overlay_writer_hooks(pending_hooks, image.base)) {
+                    m_overlay_writer_hooks = std::move(pending_hooks);
+                    mark_permanently_unavailable("hook-creation-rollback-unconfirmed");
+                    return;
                 }
+                report_retryable_failure("hook-creation-failed-rollback-confirmed");
+                return;
+            }
+            if (pending_hooks[index].original_bytes().size() != OVERLAY_WRITER_HOOK_SPANS[index]) {
+                if (!rollback_overlay_writer_hooks(pending_hooks, image.base)) {
+                    m_overlay_writer_hooks = std::move(pending_hooks);
+                    mark_permanently_unavailable("hook-span-mismatch-rollback-unconfirmed");
+                    return;
+                }
+                mark_permanently_unavailable("hook-span-mismatch");
                 return;
             }
         }
-        for (auto& hook : m_overlay_writer_hooks) {
+
+        for (auto& hook : pending_hooks) {
             if (!hook.enable()) {
-                for (auto& installed : m_overlay_writer_hooks) {
-                    if (installed) (void)installed.disable();
+                if (!rollback_overlay_writer_hooks(pending_hooks, image.base)) {
+                    m_overlay_writer_hooks = std::move(pending_hooks);
+                    mark_permanently_unavailable("hook-enable-failed-rollback-unconfirmed");
+                    return;
                 }
-                if (m_overlay_writer_diagnostics_enabled.load(std::memory_order_acquire)) {
-                    spdlog::warn("[RE4XeSS][OverlayWriter] not armed: hook enable failed");
-                }
+                report_retryable_failure("hook-enable-failed-rollback-confirmed");
                 return;
             }
         }
+
+        m_overlay_writer_hooks = std::move(pending_hooks);
         m_overlay_writer_image_base.store(image.base, std::memory_order_release);
         m_overlay_writer_active.store(true, std::memory_order_release);
         if (m_overlay_writer_diagnostics_enabled.load(std::memory_order_acquire)) {
-            spdlog::info("[RE4XeSS][OverlayWriter] armed imageBase=0x{:x} imageSize=0x{:x} imageChecksum=0x{:x} imageIdentity=RE4-1.5.9.0-verified overlay=0x{:x} slot=0x{:x} slotOffset=0x90 liveVtable=0x{:x} liveVcall40=0x{:x} nativeMethodRva=0x44af030 hooks=8 stages=pre/post exactBytesValidated=true diagnosticCapture=64 pre-Overlay frames per mode transition transactionObservation=generation-scoped",
-                image.base, image.size, image.checksum, overlay_address, slot_address, overlay_vtable, writer_method);
+            spdlog::info("[RE4XeSS][OverlayWriter] armed attempts={} imageBase=0x{:x} imageSize=0x{:x} imageChecksum=0x{:x} imageIdentity=RE4-1.5.9.0-verified overlay=0x{:x} slot=0x{:x} slotOffset=0x90 liveVtable=0x{:x} liveVcall40=0x{:x} nativeMethodRva=0x44af030 hooks=8 stages=pre/post exactBytesValidated=true diagnosticCapture=64 pre-Overlay frames per mode transition transactionObservation=generation-scoped previousFailure={}",
+                install_attempt, image.base, image.size, image.checksum, overlay_address, slot_address,
+                overlay_vtable, writer_method,
+                m_overlay_writer_last_install_failure != nullptr ? m_overlay_writer_last_install_failure : "none");
         }
+    }
+
+    template <size_t HookCount>
+    static bool rollback_overlay_writer_hooks(
+        std::array<safetyhook::MidHook, HookCount>& hooks,
+        uintptr_t image_base) noexcept {
+        constexpr std::array<uint32_t, 8> hook_rvas{
+            0x44AF161, 0x44AF168, 0x44AF179, 0x44AF180,
+            0x44AF460, 0x44AF467, 0x44AF478, 0x44AF47F,
+        };
+        constexpr std::array<size_t, 8> expected_spans{ 7, 5, 7, 5, 7, 5, 7, 5 };
+        constexpr std::array<std::array<uint8_t, 7>, 8> expected_bytes{{
+            { 0x4C, 0x89, 0xB6, 0x90, 0x00, 0x00, 0x00 },
+            { 0x48, 0x85, 0xC9, 0x74, 0x05 },
+            { 0x48, 0x89, 0x9E, 0x90, 0x00, 0x00, 0x00 },
+            { 0x48, 0x85, 0xC9, 0x74, 0x05 },
+            { 0x4C, 0x89, 0xB6, 0x90, 0x00, 0x00, 0x00 },
+            { 0x48, 0x85, 0xC9, 0x74, 0x05 },
+            { 0x48, 0x89, 0xBE, 0x90, 0x00, 0x00, 0x00 },
+            { 0x48, 0x85, 0xC9, 0x74, 0x05 },
+        }};
+        static_assert(HookCount == expected_spans.size());
+        bool rollback_confirmed = true;
+        for (auto& hook : hooks) {
+            if (hook && !hook.disable()) {
+                rollback_confirmed = false;
+            }
+        }
+        for (size_t index = 0; index < hooks.size(); ++index) {
+            const auto& hook = hooks[index];
+            std::array<uint8_t, 7> current_bytes{};
+            if (!read_memory(image_base + hook_rvas[index], current_bytes.data(), expected_spans[index]) ||
+                !std::equal(expected_bytes[index].begin(),
+                    expected_bytes[index].begin() + expected_spans[index], current_bytes.begin())) {
+                rollback_confirmed = false;
+            }
+            if (hook) {
+                const auto& original_bytes = hook.original_bytes();
+                if (hook.enabled() || original_bytes.size() != expected_spans[index] ||
+                    !std::equal(original_bytes.begin(), original_bytes.end(), expected_bytes[index].begin())) {
+                    rollback_confirmed = false;
+                }
+            }
+        }
+        return rollback_confirmed;
     }
 
 private:
@@ -2252,8 +2360,11 @@ private:
     std::atomic<bool> m_live_anchor_trusted{};
     std::atomic<bool> m_overlay_writer_enabled{};
     std::atomic<bool> m_overlay_writer_diagnostics_enabled{};
-    std::atomic<bool> m_overlay_writer_attempted{};
     std::atomic<bool> m_overlay_writer_active{};
+    std::atomic<bool> m_overlay_writer_permanently_unavailable{};
+    std::mutex m_overlay_writer_install_mutex{};
+    uint32_t m_overlay_writer_install_attempts{};
+    const char* m_overlay_writer_last_install_failure{};
     std::atomic<bool> m_overlay_writer_transaction_enabled{};
     std::atomic<bool> m_overlay_writer_diagnostic_capture{};
     std::atomic<uintptr_t> m_overlay_writer_overlay{};
