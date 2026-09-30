@@ -244,6 +244,71 @@ void test_mapping_pending_interval_and_active_budgets(Trace& trace) {
     assert(summary.dump_windows_suppressed >= 5);
 }
 
+void test_scene_extent_and_jitter_trace(Trace& trace) {
+    Trace::Event view_size{};
+    view_size.kind = Trace::Kind::SceneViewSize;
+    view_size.frame_id = 99001;
+    view_size.frame_valid = true;
+    view_size.scene_view = 0x1234;
+    view_size.scene_view_native_width = 2560.0f;
+    view_size.scene_view_native_height = 1440.0f;
+    view_size.scene_view_effective_width = 1706.0f;
+    view_size.scene_view_effective_height = 960.0f;
+    view_size.input_width = 1706;
+    view_size.input_height = 960;
+    view_size.display_width = 2560;
+    view_size.display_height = 1440;
+    view_size.input_resolution_valid = true;
+    view_size.temporal_active = true;
+    view_size.scene_view_override_applied = true;
+    view_size.control_generation = 8;
+    view_size.device_reset_generation = 3;
+    Trace::set_reason(view_size, "reduced-scene-view-applied");
+    assert(trace.record(view_size) != 0);
+
+    // Multiple get_Size calls in one scene frame produce one diagnostic sample.
+    view_size.scene_view = 0x5678;
+    assert(trace.record(view_size) == 0);
+
+    Trace::Event scene_frame{};
+    scene_frame.kind = Trace::Kind::SceneFrame;
+    scene_frame.frame_id = 99001;
+    scene_frame.frame_valid = true;
+    scene_frame.input_width = 1706;
+    scene_frame.input_height = 960;
+    scene_frame.display_width = 2560;
+    scene_frame.display_height = 1440;
+    scene_frame.input_resolution_valid = true;
+    scene_frame.jitter_applied = true;
+    scene_frame.jitter_x_pixels = 0.25f;
+    scene_frame.jitter_y_pixels = -0.166667f;
+    scene_frame.jitter_sample_index = 4;
+    scene_frame.jitter_phase_count = 16;
+    Trace::set_reason(scene_frame, "primary-scene-jitter-applied");
+    assert(trace.record(scene_frame) != 0);
+
+    const auto recent = trace.recent(2);
+    assert(recent.size() == 2);
+    assert(recent[0].kind == Trace::Kind::SceneViewSize);
+    assert(recent[0].frame_id == recent[1].frame_id);
+    assert(recent[0].scene_view == 0x1234);
+    assert(recent[0].scene_view_native_width == 2560.0f);
+    assert(recent[0].scene_view_effective_width == 1706.0f);
+    assert(recent[0].scene_view_override_applied);
+    assert(recent[1].kind == Trace::Kind::SceneFrame);
+    assert(recent[1].input_width == 1706);
+    assert(recent[1].display_height == 1440);
+    assert(recent[1].jitter_applied);
+    assert(recent[1].jitter_sample_index == 4);
+    assert(recent[1].jitter_phase_count == 16);
+    assert(recent[1].output_use_token == 0);
+    assert(recent[1].consumer_evidence == Trace::ConsumerEvidence::Unknown);
+
+    const auto summary = trace.summary();
+    assert(summary.active_event_counts[static_cast<size_t>(Trace::Kind::SceneViewSize)] == 1);
+    assert(summary.active_event_counts[static_cast<size_t>(Trace::Kind::SceneFrame)] == 1);
+}
+
 } // namespace
 
 int main() {
@@ -252,6 +317,7 @@ int main() {
     const auto output_use_token = test_output_use_token_issuance_lifecycle();
     test_phase_transition_and_correlated_first_submit(trace, output_use_token);
     test_mapping_pending_interval_and_active_budgets(trace);
+    test_scene_extent_and_jitter_trace(trace);
     assert(trace.claim_final_summary());
     assert(!trace.claim_final_summary());
     std::cout << "RE4 XeSS lifetime-trace tests passed\n";

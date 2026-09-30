@@ -7517,3 +7517,24 @@ Present -> exact consumer -> marker -> GPU completion           NOT PROVEN
 Output ring / lifetime-policy change                            NOT AUTHORIZED
 Temporal continuity                                             NOT ACCEPTED
 ~~~
+
+## 53. PR66 visual-flicker follow-up — frame extent/jitter correlation added; runtime pending
+
+The September 30 paired capture reports visible UI flicker, but contains no pixel/frame evidence that identifies the affected layer. Do not label it a proven RE4 HUD, REF menu, or OptiScaler menu defect. The source does confirm a frame-wide coherency risk: temporal mode can override SceneView to reduced input dimensions and inject/advance jitter before pre-Overlay later skips XeSS output because the single output's post-Present marker is pending. That makes a reduced-resolution/jittered scene without a new XeSS output a plausible visual-flicker contributor; it does not prove which image route or UI layer was presented.
+
+The bounded debug-only LifetimeTrace now records at most one `scene-view-size` sample per `(scene frame, control generation, device-reset generation)`, with the native size returned by the original getter, effective size after the existing override decision, opaque SceneView identity, temporal/override flags, and input/display extents. The existing `scene-frame` event now includes the same input/display extents and the actually applied centered-Halton jitter in pixels plus sample index/phase count. Both events use the renderer frame ID and remain in the existing bounded ring/dump budget. This changes no sizing, jitter, execute, install, marker, fence, reset, quarantine, or reuse behavior.
+
+Existing RenderContext boundary samples continue to report their explicit callback stage and Overlay-main state, but they are not GPU read evidence. The repo still has no validated RE4-owned binding/draw site that observes the actual output SRV/resource on a command list, nor a proven final compositor route. No global DX12 hook or guessed game address was added. Present/install matching remains candidate-only; `consumerEvidence` stays Unknown unless a real reader observer is established.
+
+Runtime reproduction and matched frame captures are pending; game execution was intentionally skipped. Next capture should distinguish native baseline, steady XeSS On, and a marker-pending skip, with game HUD and each optional overlay separately visible/hidden. The new trace should correlate SceneView native/effective extent and jitter with Submit/Skip/OutputInstall/Restore and existing Present/fence observations. A narrowly filtered GPU capture or independently validated RE4 reader path is still needed to establish actual output consumption and the final presented image. Do not implement a fallback switch, output ring, reader association, or marker/history policy change before that evidence.
+
+~~~text
+Frame extent/jitter correlation             SOURCE/BUILD/TEST VALIDATED; runtime capture pending
+UI layer identity / pixel flicker           NOT PROVEN
+SceneView reduced+jitter then no new output  SOURCE-CONFIRMED RISK; visual causality unproven
+Actual output SRV/draw consumer              NOT OBSERVED
+Present -> consumer -> marker -> completion  NOT PROVEN
+Output ring / reuse or history policy change NOT AUTHORIZED
+Temporal continuity / visual acceptance     NOT ACCEPTED
+PR66                                          KEEP DRAFT/OPEN
+~~~

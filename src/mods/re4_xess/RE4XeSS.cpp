@@ -219,6 +219,7 @@ const char* lifetime_trace_kind_name(RE4XeSSLifetimeTrace::Kind kind) noexcept {
     using Kind = RE4XeSSLifetimeTrace::Kind;
     switch (kind) {
     case Kind::SceneFrame: return "scene-frame";
+    case Kind::SceneViewSize: return "scene-view-size";
     case Kind::PreOverlay: return "pre-overlay";
     case Kind::Submit: return "submit";
     case Kind::OutputInstall: return "output-install";
@@ -306,7 +307,7 @@ void dump_re4_xess_lifetime_trace(
     const auto summary = trace.summary();
     const auto events = trace.recent(reservation.event_count);
     const auto bounded_reason = reason.substr(0, 64);
-    spdlog::info("[RE4XeSS][LifetimeTrace] window reason={} class={} window={} phase={} selected={} retained={} preActiveEvents={} activeEvents={} preActiveOverwritten={} activeOverwritten={} activeInstalls={} activeUnmarked={} activeUnmarkedHighWater={} activeMarkedGpuIncomplete={} activeExecuteSuccess={} activeMarkerQueued={} activeResetHistory={} activeContinuous={} activeSkips={} activeMarkerPendingSkips={} activeBridgeBusySkips={} activeTemporalGateSkips={} activeRenderContextSamples={} activeRenderContextStateMatches={} activeRenderContextResourceMatches={} activeRenderContextOverlayMainStateMatches={} activeRenderContextOverlayMainResourceMatches={} activeMapUnknown={} activeMapCandidate={} activeMapProven={} dumpRequests={} dumpEmitted={} dumpSuppressed={} eventLinesReserved={} eventLinesEmitted={} bytesReserved={} allEvents={}",
+    spdlog::info("[RE4XeSS][LifetimeTrace] window reason={} class={} window={} phase={} selected={} retained={} preActiveEvents={} activeEvents={} preActiveOverwritten={} activeOverwritten={} activeInstalls={} activeUnmarked={} activeUnmarkedHighWater={} activeMarkedGpuIncomplete={} activeExecuteSuccess={} activeMarkerQueued={} activeResetHistory={} activeContinuous={} activeSkips={} activeMarkerPendingSkips={} activeBridgeBusySkips={} activeTemporalGateSkips={} activeSceneViewSizeSamples={} activeSceneJitterFrames={} activeRenderContextSamples={} activeRenderContextStateMatches={} activeRenderContextResourceMatches={} activeRenderContextOverlayMainStateMatches={} activeRenderContextOverlayMainResourceMatches={} activeMapUnknown={} activeMapCandidate={} activeMapProven={} dumpRequests={} dumpEmitted={} dumpSuppressed={} eventLinesReserved={} eventLinesEmitted={} bytesReserved={} allEvents={}",
         bounded_reason,
         lifetime_trace_dump_window_name(window),
         reservation.index,
@@ -329,6 +330,8 @@ void dump_re4_xess_lifetime_trace(
         static_cast<unsigned long long>(summary.active_marker_pending_skips),
         static_cast<unsigned long long>(summary.active_bridge_busy_skips),
         static_cast<unsigned long long>(summary.active_temporal_gate_skips),
+        static_cast<unsigned long long>(summary.active_event_counts[static_cast<size_t>(RE4XeSSLifetimeTrace::Kind::SceneViewSize)]),
+        static_cast<unsigned long long>(summary.active_event_counts[static_cast<size_t>(RE4XeSSLifetimeTrace::Kind::SceneFrame)]),
         static_cast<unsigned long long>(summary.active_render_context_samples),
         static_cast<unsigned long long>(summary.active_render_context_state_matches),
         static_cast<unsigned long long>(summary.active_render_context_resource_matches),
@@ -346,7 +349,7 @@ void dump_re4_xess_lifetime_trace(
         static_cast<unsigned long long>(summary.total_events));
 
     for (const auto& event : events) {
-        spdlog::info("[RE4XeSS][LifetimeTrace] seq={} us={} phase={} kind={} trace={} install={} outputUseToken={} consumerEvidence={} frame={} frameValid={} sceneOrd={} callbackOrd={} overlapEpoch={} submit={} present={} relatedPresent={} outputGen={} controlGen={} deviceGen={} bridgeSlot={} writerFence={} downstreamFence={} cachedCompleted={} cachedValid={} actualCompleted={} actualValid={} writerTxn={} writerInvocation={} writerSeq={} clearSeq={}->{} replacementSeq={}->{} writerRva=0x{:x} presentTimes={}::{}/{} output=0x{:x} targetState=0x{:x} renderContext=0x{:x} contextStage={} contextTargetState=0x{:x} contextTargetResource=0x{:x} contextSampleValid={} contextStateMatch={} contextResourceMatch={} overlayMainState=0x{:x} overlayMainResource=0x{:x} contextOverlayMainStateMatch={} contextOverlayMainResourceMatch={} overlay=0x{:x} swapchain=0x{:x} device=0x{:x} queue=0x{:x} queueType={} queueTypeValid={} tid={} presentTids={}->{} presentSource={} present1={} presentReturned={} callbacksSuppressed={} originalSkipped={} result=0x{:08x} apiOk={} queueSubmitted={} markerQueued={} resetHistory={} mappingState={} mappingAmbiguous={} reason={}",
+        spdlog::info("[RE4XeSS][LifetimeTrace] seq={} us={} phase={} kind={} trace={} install={} outputUseToken={} consumerEvidence={} frame={} frameValid={} sceneView=0x{:x} sceneViewSizeNative={}x{} sceneViewSizeEffective={}x{} temporalActive={} sceneViewOverride={} xessInput={}x{} display={}x{} inputResolutionValid={} jitterApplied={} jitterPixels=({}, {}) jitterPhase={}/{} sceneOrd={} callbackOrd={} overlapEpoch={} submit={} present={} relatedPresent={} outputGen={} controlGen={} deviceGen={} bridgeSlot={} writerFence={} downstreamFence={} cachedCompleted={} cachedValid={} actualCompleted={} actualValid={} writerTxn={} writerInvocation={} writerSeq={} clearSeq={}->{} replacementSeq={}->{} writerRva=0x{:x} presentTimes={}::{}/{} output=0x{:x} targetState=0x{:x} renderContext=0x{:x} contextStage={} contextTargetState=0x{:x} contextTargetResource=0x{:x} contextSampleValid={} contextStateMatch={} contextResourceMatch={} overlayMainState=0x{:x} overlayMainResource=0x{:x} contextOverlayMainStateMatch={} contextOverlayMainResourceMatch={} overlay=0x{:x} swapchain=0x{:x} device=0x{:x} queue=0x{:x} queueType={} queueTypeValid={} tid={} presentTids={}->{} presentSource={} present1={} presentReturned={} callbacksSuppressed={} originalSkipped={} result=0x{:08x} apiOk={} queueSubmitted={} markerQueued={} resetHistory={} mappingState={} mappingAmbiguous={} reason={}",
             static_cast<unsigned long long>(event.sequence),
             static_cast<unsigned long long>(event.timestamp_us),
             lifetime_trace_phase_name(event.capture_phase),
@@ -357,6 +360,23 @@ void dump_re4_xess_lifetime_trace(
             lifetime_trace_consumer_evidence_name(event.consumer_evidence),
             static_cast<unsigned long long>(event.frame_id),
             event.frame_valid,
+            event.scene_view,
+            event.scene_view_native_width,
+            event.scene_view_native_height,
+            event.scene_view_effective_width,
+            event.scene_view_effective_height,
+            event.temporal_active,
+            event.scene_view_override_applied,
+            event.input_width,
+            event.input_height,
+            event.display_width,
+            event.display_height,
+            event.input_resolution_valid,
+            event.jitter_applied,
+            event.jitter_x_pixels,
+            event.jitter_y_pixels,
+            event.jitter_sample_index,
+            event.jitter_phase_count,
             static_cast<unsigned long long>(event.scene_ordinal),
             static_cast<unsigned long long>(event.callback_ordinal),
             static_cast<unsigned long long>(event.overlap_epoch),
@@ -435,7 +455,7 @@ void log_re4_xess_lifetime_summary() {
         return active ? summary.active_event_counts[index] : summary.pre_active_event_counts[index];
     };
     using Kind = RE4XeSSLifetimeTrace::Kind;
-    spdlog::info("[RE4XeSS][LifetimeTrace] lifecycle-summary activeStarted={} recorded={} retained={} overwritten={} preActiveEvents={} preScene={} preOverlay={} preSkip={} activeEvents={} activeScene={} activePreOverlay={} activeSubmit={} activeInstall={} activeOverlayContextSamples={} activeOverlayContextStateMatches={} activeOverlayContextResourceMatches={} activeOverlayContextOverlayMainStateMatches={} activeOverlayContextOverlayMainResourceMatches={} installedUnmarked={} installedUnmarkedHighWater={} markedGpuIncomplete={} activeRestore={} activeModeChange={} activePostPresent={} activeMarker={} activeSkip={} activeExecuteSuccess={} activeResetHistory={} activeContinuous={} activeMarkerPendingSkip={} activeBridgeBusySkip={} activeTemporalGateSkip={} activeMapUnknown={} activeMapCandidate={} activeMapProven={} preOverwritten={} activeOverwritten={} dumpRequests={} dumpEmitted={} dumpSuppressed={} eventLinesReserved={} eventLinesEmitted={} bytesReserved={} activeGameplayDumpEmitted={}",
+    spdlog::info("[RE4XeSS][LifetimeTrace] lifecycle-summary activeStarted={} recorded={} retained={} overwritten={} preActiveEvents={} preScene={} preOverlay={} preSkip={} activeEvents={} activeScene={} activeSceneViewSizeSamples={} activeJitterFrames={} activePreOverlay={} activeSubmit={} activeInstall={} activeOverlayContextSamples={} activeOverlayContextStateMatches={} activeOverlayContextResourceMatches={} activeOverlayContextOverlayMainStateMatches={} activeOverlayContextOverlayMainResourceMatches={} installedUnmarked={} installedUnmarkedHighWater={} markedGpuIncomplete={} activeRestore={} activeModeChange={} activePostPresent={} activeMarker={} activeSkip={} activeExecuteSuccess={} activeResetHistory={} activeContinuous={} activeMarkerPendingSkip={} activeBridgeBusySkip={} activeTemporalGateSkip={} activeMapUnknown={} activeMapCandidate={} activeMapProven={} preOverwritten={} activeOverwritten={} dumpRequests={} dumpEmitted={} dumpSuppressed={} eventLinesReserved={} eventLinesEmitted={} bytesReserved={} activeGameplayDumpEmitted={}",
         summary.active_capture_started,
         static_cast<unsigned long long>(summary.total_events),
         static_cast<unsigned long long>(summary.retained_events),
@@ -445,6 +465,8 @@ void log_re4_xess_lifetime_summary() {
         static_cast<unsigned long long>(kind_count(Kind::PreOverlay, false)),
         static_cast<unsigned long long>(kind_count(Kind::Skip, false)),
         static_cast<unsigned long long>(summary.active_events),
+        static_cast<unsigned long long>(kind_count(Kind::SceneFrame, true)),
+        static_cast<unsigned long long>(kind_count(Kind::SceneViewSize, true)),
         static_cast<unsigned long long>(kind_count(Kind::SceneFrame, true)),
         static_cast<unsigned long long>(kind_count(Kind::PreOverlay, true)),
         static_cast<unsigned long long>(kind_count(Kind::Submit, true)),
@@ -5779,14 +5801,52 @@ void RE4XeSS::update_load_state() {
 }
 
 void RE4XeSS::on_view_get_size(REManagedObject* scene_view, float* result) {
-    (void)scene_view;
-    if (!is_temporal_active() || !m_load_observation_valid || result == nullptr ||
-        m_input_resolution.optimal.x == 0 || m_input_resolution.optimal.y == 0) {
+    const bool temporal_active = is_temporal_active();
+    const bool override_applied = temporal_active && m_load_observation_valid && result != nullptr &&
+        m_input_resolution.optimal.x != 0 && m_input_resolution.optimal.y != 0;
+    const float native_width = result != nullptr ? result[0] : 0.0f;
+    const float native_height = result != nullptr ? result[1] : 0.0f;
+
+    if (override_applied) {
+        result[0] = static_cast<float>(m_input_resolution.optimal.x);
+        result[1] = static_cast<float>(m_input_resolution.optimal.y);
+    }
+
+    auto& lifetime_trace = RE4XeSSLifetimeTrace::instance();
+    if (!lifetime_trace.enabled() || result == nullptr) {
         return;
     }
 
-    result[0] = static_cast<float>(m_input_resolution.optimal.x);
-    result[1] = static_cast<float>(m_input_resolution.optimal.y);
+    const auto* renderer = sdk::renderer::get_renderer();
+    const auto frame = renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
+    if (!frame) {
+        return;
+    }
+
+    RE4XeSSLifetimeTrace::Event trace_event{};
+    trace_event.kind = RE4XeSSLifetimeTrace::Kind::SceneViewSize;
+    trace_event.frame_id = static_cast<uint64_t>(*frame);
+    trace_event.frame_valid = true;
+    trace_event.scene_view = reinterpret_cast<uintptr_t>(scene_view);
+    trace_event.scene_view_native_width = native_width;
+    trace_event.scene_view_native_height = native_height;
+    trace_event.scene_view_effective_width = result[0];
+    trace_event.scene_view_effective_height = result[1];
+    trace_event.input_width = m_input_resolution.optimal.x;
+    trace_event.input_height = m_input_resolution.optimal.y;
+    trace_event.display_width = m_display_resolution.x;
+    trace_event.display_height = m_display_resolution.y;
+    trace_event.input_resolution_valid = m_input_resolution_valid;
+    trace_event.temporal_active = temporal_active;
+    trace_event.scene_view_override_applied = override_applied;
+    trace_event.control_generation = m_control_generation.load(std::memory_order_acquire);
+    trace_event.device_reset_generation = m_device_reset_generation.load(std::memory_order_acquire);
+    trace_event.thread_id = GetCurrentThreadId();
+    RE4XeSSLifetimeTrace::set_reason(
+        trace_event,
+        override_applied ? "reduced-scene-view-applied" :
+            temporal_active ? "temporal-view-gate-closed" : "native-scene-view");
+    lifetime_trace.record(trace_event);
 }
 
 void RE4XeSS::on_camera_get_projection_matrix(REManagedObject* camera, Matrix4x4f* result) {
@@ -5959,8 +6019,18 @@ void RE4XeSS::on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* re
         trace_event.scene_ordinal = m_scene_lifetime_ordinal.fetch_add(1, std::memory_order_relaxed) + 1;
         trace_event.control_generation = m_control_generation.load(std::memory_order_acquire);
         trace_event.device_reset_generation = m_device_reset_generation.load(std::memory_order_acquire);
+        trace_event.input_width = m_input_resolution.optimal.x;
+        trace_event.input_height = m_input_resolution.optimal.y;
+        trace_event.display_width = m_display_resolution.x;
+        trace_event.display_height = m_display_resolution.y;
+        trace_event.input_resolution_valid = m_input_resolution_valid;
+        trace_event.jitter_applied = true;
+        trace_event.jitter_x_pixels = jitter_x;
+        trace_event.jitter_y_pixels = jitter_y;
+        trace_event.jitter_sample_index = static_cast<uint32_t>(sample_index);
+        trace_event.jitter_phase_count = m_jitter_phase_count;
         trace_event.thread_id = GetCurrentThreadId();
-        RE4XeSSLifetimeTrace::set_reason(trace_event, "primary-scene-cached");
+        RE4XeSSLifetimeTrace::set_reason(trace_event, "primary-scene-jitter-applied");
         lifetime_trace.record(trace_event);
     }
 }

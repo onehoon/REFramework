@@ -15,6 +15,7 @@ class RE4XeSSLifetimeTrace final {
 public:
     enum class Kind : uint8_t {
         SceneFrame,
+        SceneViewSize,
         PreOverlay,
         Submit,
         OutputInstall,
@@ -144,8 +145,21 @@ public:
         uint64_t present_entry_time_us{};
         uint64_t original_present_enter_time_us{};
         uint64_t original_present_return_time_us{};
+        uint32_t input_width{};
+        uint32_t input_height{};
+        uint32_t display_width{};
+        uint32_t display_height{};
+        uint32_t jitter_sample_index{};
+        uint32_t jitter_phase_count{};
+        float scene_view_native_width{};
+        float scene_view_native_height{};
+        float scene_view_effective_width{};
+        float scene_view_effective_height{};
+        float jitter_x_pixels{};
+        float jitter_y_pixels{};
         uintptr_t output_resource{};
         uintptr_t target_state{};
+        uintptr_t scene_view{};
         uintptr_t render_context{};
         uintptr_t render_context_target_state{};
         uintptr_t render_context_target_resource{};
@@ -187,6 +201,10 @@ public:
         bool actual_completed_value_valid{};
         bool command_queue_type_valid{};
         bool mapping_observed{};
+        bool input_resolution_valid{};
+        bool temporal_active{};
+        bool scene_view_override_applied{};
+        bool jitter_applied{};
         CapturePhase capture_phase{ CapturePhase::PreActive };
         MappingState mapping_state{ MappingState::Unknown };
         RenderContextStage render_context_stage{ RenderContextStage::None };
@@ -279,6 +297,18 @@ public:
         event.timestamp_us = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(now).count());
         std::lock_guard lock{ m_mutex };
+        if (event.kind == Kind::SceneViewSize && event.frame_valid) {
+            if (m_last_scene_view_frame_valid &&
+                m_last_scene_view_frame_id == event.frame_id &&
+                m_last_scene_view_control_generation == event.control_generation &&
+                m_last_scene_view_device_reset_generation == event.device_reset_generation) {
+                return 0;
+            }
+            m_last_scene_view_frame_id = event.frame_id;
+            m_last_scene_view_control_generation = event.control_generation;
+            m_last_scene_view_device_reset_generation = event.device_reset_generation;
+            m_last_scene_view_frame_valid = true;
+        }
         if (event.kind == Kind::OutputInstall) {
             const bool starting_active_capture = !m_active_capture_started;
             m_active_capture_started = true;
@@ -660,6 +690,10 @@ private:
     bool m_first_mapping_window_claimed{};
     bool m_final_summary_emitted{};
     bool m_pending_present_window_claimed{};
+    uint64_t m_last_scene_view_frame_id{};
+    uint64_t m_last_scene_view_control_generation{};
+    uint64_t m_last_scene_view_device_reset_generation{};
+    bool m_last_scene_view_frame_valid{};
     uint32_t m_claimed_anomaly_windows{};
     uint64_t m_pending_present_install_id{};
     uint64_t m_pending_present_last_ordinal{};
