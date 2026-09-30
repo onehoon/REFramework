@@ -262,6 +262,20 @@ const char* lifetime_trace_render_context_stage_name(
     return "unknown";
 }
 
+const char* lifetime_trace_consumer_evidence_name(
+    RE4XeSSLifetimeTrace::ConsumerEvidence evidence) noexcept {
+    using Evidence = RE4XeSSLifetimeTrace::ConsumerEvidence;
+    switch (evidence) {
+    case Evidence::Unknown: return "unknown";
+    case Evidence::ReaderNotObserved: return "reader-not-observed";
+    case Evidence::ReaderObservedSubmitUnproven: return "reader-observed-submit-unproven";
+    case Evidence::QueueOrderProven: return "queue-order-proven";
+    case Evidence::PresentConsumerProven: return "present-consumer-proven";
+    case Evidence::GpuComplete: return "gpu-complete";
+    }
+    return "unknown";
+}
+
 const char* lifetime_trace_dump_window_name(RE4XeSSLifetimeTrace::DumpWindow window) noexcept {
     using DumpWindow = RE4XeSSLifetimeTrace::DumpWindow;
     switch (window) {
@@ -332,13 +346,15 @@ void dump_re4_xess_lifetime_trace(
         static_cast<unsigned long long>(summary.total_events));
 
     for (const auto& event : events) {
-        spdlog::info("[RE4XeSS][LifetimeTrace] seq={} us={} phase={} kind={} trace={} install={} frame={} frameValid={} sceneOrd={} callbackOrd={} overlapEpoch={} submit={} present={} relatedPresent={} outputGen={} controlGen={} deviceGen={} bridgeSlot={} writerFence={} downstreamFence={} cachedCompleted={} cachedValid={} actualCompleted={} actualValid={} writerTxn={} writerInvocation={} writerSeq={} clearSeq={}->{} replacementSeq={}->{} writerRva=0x{:x} presentTimes={}::{}/{} output=0x{:x} targetState=0x{:x} renderContext=0x{:x} contextStage={} contextTargetState=0x{:x} contextTargetResource=0x{:x} contextSampleValid={} contextStateMatch={} contextResourceMatch={} overlayMainState=0x{:x} overlayMainResource=0x{:x} contextOverlayMainStateMatch={} contextOverlayMainResourceMatch={} overlay=0x{:x} swapchain=0x{:x} device=0x{:x} queue=0x{:x} queueType={} queueTypeValid={} tid={} presentTids={}->{} presentSource={} present1={} presentReturned={} callbacksSuppressed={} originalSkipped={} result=0x{:08x} apiOk={} queueSubmitted={} markerQueued={} resetHistory={} mappingState={} mappingAmbiguous={} reason={}",
+        spdlog::info("[RE4XeSS][LifetimeTrace] seq={} us={} phase={} kind={} trace={} install={} outputUseToken={} consumerEvidence={} frame={} frameValid={} sceneOrd={} callbackOrd={} overlapEpoch={} submit={} present={} relatedPresent={} outputGen={} controlGen={} deviceGen={} bridgeSlot={} writerFence={} downstreamFence={} cachedCompleted={} cachedValid={} actualCompleted={} actualValid={} writerTxn={} writerInvocation={} writerSeq={} clearSeq={}->{} replacementSeq={}->{} writerRva=0x{:x} presentTimes={}::{}/{} output=0x{:x} targetState=0x{:x} renderContext=0x{:x} contextStage={} contextTargetState=0x{:x} contextTargetResource=0x{:x} contextSampleValid={} contextStateMatch={} contextResourceMatch={} overlayMainState=0x{:x} overlayMainResource=0x{:x} contextOverlayMainStateMatch={} contextOverlayMainResourceMatch={} overlay=0x{:x} swapchain=0x{:x} device=0x{:x} queue=0x{:x} queueType={} queueTypeValid={} tid={} presentTids={}->{} presentSource={} present1={} presentReturned={} callbacksSuppressed={} originalSkipped={} result=0x{:08x} apiOk={} queueSubmitted={} markerQueued={} resetHistory={} mappingState={} mappingAmbiguous={} reason={}",
             static_cast<unsigned long long>(event.sequence),
             static_cast<unsigned long long>(event.timestamp_us),
             lifetime_trace_phase_name(event.capture_phase),
             lifetime_trace_kind_name(event.kind),
             static_cast<unsigned long long>(event.trace_id),
             static_cast<unsigned long long>(event.install_id),
+            static_cast<unsigned long long>(event.output_use_token),
+            lifetime_trace_consumer_evidence_name(event.consumer_evidence),
             static_cast<unsigned long long>(event.frame_id),
             event.frame_valid,
             static_cast<unsigned long long>(event.scene_ordinal),

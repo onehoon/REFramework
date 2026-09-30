@@ -41,6 +41,7 @@ public:
         std::string failure_reason{};
         uint64_t output_generation{};
         uint64_t install_id{};
+        uint64_t output_use_token{};
         uint64_t installed_trace_id{};
         uint64_t installed_frame{};
         uint64_t installed_present_ordinal{};
@@ -224,6 +225,8 @@ private:
     uint64_t m_output_generation_id{};
     uint64_t m_next_install_id{};
     uint64_t m_installed_install_id{};
+    uint64_t m_next_output_use_token{};
+    uint64_t m_installed_output_use_token{};
     uint64_t m_installed_trace_id{};
     uint64_t m_installed_present_ordinal{};
     uint64_t m_installed_submit_ordinal{};

@@ -46,6 +46,8 @@ void test_phase_transition_and_correlated_first_submit(Trace& trace) {
     install.kind = Trace::Kind::OutputInstall;
     install.trace_id = 42;
     install.install_id = 1;
+    install.output_use_token = 17;
+    install.consumer_evidence = Trace::ConsumerEvidence::ReaderNotObserved;
     install.mapping_observed = true;
     install.mapping_state = Trace::MappingState::InferredCandidate;
     Trace::set_reason(install, "install");
@@ -92,9 +94,13 @@ void test_phase_transition_and_correlated_first_submit(Trace& trace) {
     assert(recent[2].capture_phase == Trace::CapturePhase::ActiveXeSS);
     assert(recent[3].kind == Trace::Kind::OutputInstall);
     assert(recent[3].capture_phase == Trace::CapturePhase::ActiveXeSS);
+    assert(recent[3].output_use_token == 17);
+    assert(recent[3].consumer_evidence == Trace::ConsumerEvidence::ReaderNotObserved);
     assert(recent[4].kind == Trace::Kind::OverlayRenderContext);
     assert(recent[4].mapping_state == Trace::MappingState::Unknown);
     assert(recent[4].render_context_stage == Trace::RenderContextStage::BeforeOriginalOverlayDraw);
+    assert(recent[4].output_use_token == 0);
+    assert(recent[4].consumer_evidence == Trace::ConsumerEvidence::Unknown);
     assert(trace.claim_first_output_install_window());
     assert(!trace.claim_first_output_install_window());
     assert(trace.claim_first_execute_success_window());

@@ -48,6 +48,15 @@ public:
         PostOverlayCallbackOriginalStatusUnknown,
     };
 
+    enum class ConsumerEvidence : uint8_t {
+        Unknown,
+        ReaderNotObserved,
+        ReaderObservedSubmitUnproven,
+        QueueOrderProven,
+        PresentConsumerProven,
+        GpuComplete,
+    };
+
     enum class DumpWindow : uint8_t {
         PreActive,
         ActiveMilestone,
@@ -78,6 +87,7 @@ public:
         uint64_t timestamp_us{};
         uint64_t trace_id{};
         uint64_t install_id{};
+        uint64_t output_use_token{}; // Issued per install; only an observed reader may propagate it.
         uint64_t frame_id{};
         uint64_t scene_ordinal{};
         uint64_t callback_ordinal{};
@@ -147,6 +157,7 @@ public:
         CapturePhase capture_phase{ CapturePhase::PreActive };
         MappingState mapping_state{ MappingState::Unknown };
         RenderContextStage render_context_stage{ RenderContextStage::None };
+        ConsumerEvidence consumer_evidence{ ConsumerEvidence::Unknown };
         std::array<char, 64> reason{};
     };
 
