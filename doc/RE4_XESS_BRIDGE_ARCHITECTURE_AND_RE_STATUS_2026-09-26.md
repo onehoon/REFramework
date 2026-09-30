@@ -7282,3 +7282,9 @@ PR66: Draft / Open / unmerged.
 ~~~
 
 The trace deliberately does not install a process-wide `ExecuteCommandLists` hook. Current callback-boundary observations cannot identify which engine command submission actually reads a given output; adding such a hook without a narrower validated RE4 boundary would exceed the evidence and scope. Use the new runtime trace to establish callback/Present/fence order first. If the consumer-to-Present relation remains ambiguous, investigate a bounded RE4-specific read-only submission boundary on this PR; do not infer FIFO use from timestamps and do not change output reuse rules until that relation and queue ordering are proven.
+
+### PR66 quality-transition TargetState chain update (2026-09-30)
+
+PR66 adds bounded, allocation-free history for completed verified RE4 Overlay writer transactions so a `handoff -> A -> B` sequence is reconciled as one causal chain rather than requiring the last transaction alone to clear the original handoff. It requires contiguous observed store sequence, exact Overlay/slot and control/device/mode identity, same writer thread, validated clear/replacement sites, current terminal pointer, and a stable snapshot tied to the live store sequence. The chain is consumed once; overflow, missing/interleaved stores, stale evidence, or any mismatch still quarantines. The engine-installed TargetState is never overwritten and existing writer/downstream fence, retirement, and quarantine behavior is unchanged.
+
+Standalone deterministic writer-chain tests and a local x64 Release build pass. Quality-change runtime validation that XeSS Execute resumes after the chained replacement remains pending; PR66 is still Draft/Open/unmerged. Output-ring and marker-pending behavior are not changed by this update.

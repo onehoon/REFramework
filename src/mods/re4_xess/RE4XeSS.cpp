@@ -1606,10 +1606,12 @@ public:
         if (!m_overlay_writer_enabled.load(std::memory_order_acquire)) {
             return;
         }
+        std::lock_guard lock{ m_overlay_writer_transition_mutex };
         m_overlay_writer_mode.store(mode, std::memory_order_release);
         m_overlay_writer_device_reset_generation.store(device_reset_generation, std::memory_order_release);
         // Publish generation last: callbacks that observe it with acquire also see this tuple.
         m_overlay_writer_generation.store(generation, std::memory_order_release);
+        m_overlay_writer_witness_history.reset();
         m_overlay_writer_events.store(0, std::memory_order_release);
         m_overlay_writer_confirmed_writes.store(0, std::memory_order_release);
         m_overlay_writer_unconfirmed_writes.store(0, std::memory_order_release);
@@ -1620,56 +1622,30 @@ public:
         m_overlay_writer_diagnostic_capture.store(true, std::memory_order_release);
     }
 
-    RE4XeSSOutputHandoff::EngineWriterWitness latest_confirmed_overlay_writer_witness() const noexcept {
-        for (size_t attempt = 0; attempt < 2; ++attempt) {
-            const auto version_before = m_overlay_writer_witness_version.load(std::memory_order_acquire);
-            if (version_before == 0 || (version_before & 1u) != 0) {
-                continue;
+    re4_xess::EngineWriterWitnessChain confirmed_overlay_writer_witness_chain() const noexcept {
+        const auto callbacks_before = m_overlay_writer_callback_in_flight.load(std::memory_order_acquire);
+        const auto sequence_before = m_overlay_writer_store_sequence.load(std::memory_order_acquire);
+        auto chain = m_overlay_writer_witness_history.snapshot();
+        const auto sequence_after = m_overlay_writer_store_sequence.load(std::memory_order_acquire);
+        const auto callbacks_after = m_overlay_writer_callback_in_flight.load(std::memory_order_acquire);
+        chain.current_store_sequence = sequence_after;
+        chain.live_store_sequence = &m_overlay_writer_store_sequence;
+        chain.stable = callbacks_before == 0 && callbacks_after == 0 && sequence_before == sequence_after;
+        for (size_t index = 1; index < chain.count; ++index) {
+            auto witness = chain.entries[index];
+            auto position = index;
+            while (position > 0 &&
+                witness.clear_pre_sequence < chain.entries[position - 1].clear_pre_sequence) {
+                chain.entries[position] = chain.entries[position - 1];
+                --position;
             }
-            const auto store_sequence_before =
-                m_overlay_writer_store_sequence.load(std::memory_order_acquire);
-
-            RE4XeSSOutputHandoff::EngineWriterWitness witness{};
-            witness.sequence = m_overlay_writer_witness_sequence.load(std::memory_order_relaxed);
-            witness.invocation_id = m_overlay_writer_witness_invocation_id.load(std::memory_order_relaxed);
-            witness.invocation_stack_pointer = m_overlay_writer_witness_stack_pointer.load(std::memory_order_relaxed);
-            witness.clear_pre_sequence = m_overlay_writer_witness_clear_pre_sequence.load(std::memory_order_relaxed);
-            witness.clear_post_sequence = m_overlay_writer_witness_clear_post_sequence.load(std::memory_order_relaxed);
-            witness.replacement_pre_sequence = m_overlay_writer_witness_replacement_pre_sequence.load(std::memory_order_relaxed);
-            witness.replacement_post_sequence = m_overlay_writer_witness_replacement_post_sequence.load(std::memory_order_relaxed);
-            witness.control_generation = m_overlay_writer_witness_generation.load(std::memory_order_relaxed);
-            witness.device_reset_generation = m_overlay_writer_witness_device_reset_generation.load(std::memory_order_relaxed);
-            witness.mode_token = m_overlay_writer_witness_mode.load(std::memory_order_relaxed);
-            witness.writer_thread_id = m_overlay_writer_witness_thread.load(std::memory_order_relaxed);
-            witness.overlay = m_overlay_writer_witness_overlay.load(std::memory_order_relaxed);
-            witness.slot = m_overlay_writer_witness_slot.load(std::memory_order_relaxed);
-            witness.cleared_state = m_overlay_writer_witness_cleared_state.load(std::memory_order_relaxed);
-            witness.clear_state_after = m_overlay_writer_witness_clear_state_after.load(std::memory_order_relaxed);
-            witness.replacement_previous_state = m_overlay_writer_witness_replacement_previous.load(std::memory_order_relaxed);
-            witness.incoming_state = m_overlay_writer_witness_incoming.load(std::memory_order_relaxed);
-            witness.replacement_state_after = m_overlay_writer_witness_replacement_after.load(std::memory_order_relaxed);
-            witness.method_rva = m_overlay_writer_witness_method_rva.load(std::memory_order_relaxed);
-            witness.clear_pre_write_rva = m_overlay_writer_witness_clear_pre_rva.load(std::memory_order_relaxed);
-            witness.clear_post_write_rva = m_overlay_writer_witness_clear_post_rva.load(std::memory_order_relaxed);
-            witness.replacement_pre_write_rva = m_overlay_writer_witness_replacement_pre_rva.load(std::memory_order_relaxed);
-            witness.replacement_post_write_rva = m_overlay_writer_witness_replacement_post_rva.load(std::memory_order_relaxed);
-            witness.destination_validated = m_overlay_writer_witness_destination_validated.load(std::memory_order_relaxed);
-            witness.same_invocation = m_overlay_writer_witness_same_invocation.load(std::memory_order_relaxed);
-            witness.clear_write_confirmed = m_overlay_writer_witness_clear_write_confirmed.load(std::memory_order_relaxed);
-            witness.replacement_write_confirmed = m_overlay_writer_witness_replacement_write_confirmed.load(std::memory_order_relaxed);
-            witness.re4_image_identity_verified = m_overlay_writer_witness_image_verified.load(std::memory_order_relaxed);
-
-            const auto version_after = m_overlay_writer_witness_version.load(std::memory_order_acquire);
-            const auto store_sequence_after =
-                m_overlay_writer_store_sequence.load(std::memory_order_acquire);
-            if (version_before == version_after &&
-                store_sequence_before == store_sequence_after &&
-                witness.replacement_post_sequence == store_sequence_after) {
-                witness.current_store_sequence = store_sequence_after;
-                return witness;
-            }
+            chain.entries[position] = witness;
         }
-        return {};
+        return chain;
+    }
+
+    void consume_overlay_writer_witnesses_through(uint64_t terminal_store_sequence) noexcept {
+        m_overlay_writer_witness_history.consume_through(terminal_store_sequence);
     }
 
     void observe_overlay_writer(sdk::renderer::layer::Overlay* overlay) noexcept {
@@ -1891,11 +1867,23 @@ private:
         int32_t mode_token{};
         uint32_t thread_id{};
         bool clear_store{};
+        bool tracked_overlay{};
         bool transaction_attached{};
         bool prior_readable{};
         bool caller_readable{};
         bool diagnostic_log{};
         bool valid{};
+    };
+
+    struct OverlayWriterCallbackGuard {
+        explicit OverlayWriterCallbackGuard(std::atomic<uint32_t>& in_flight) noexcept
+            : counter{ in_flight } {
+            counter.fetch_add(1, std::memory_order_acq_rel);
+        }
+        ~OverlayWriterCallbackGuard() {
+            counter.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        std::atomic<uint32_t>& counter;
     };
 
     struct OverlayWriterTransactionPending {
@@ -1963,15 +1951,17 @@ private:
         auto& probe = instance();
         if (!probe.m_overlay_writer_enabled.load(std::memory_order_acquire) ||
             !probe.m_overlay_writer_active.load(std::memory_order_acquire) ||
-            !probe.m_overlay_writer_transaction_enabled.load(std::memory_order_acquire) ||
-            context.rsi != probe.m_overlay_writer_overlay.load(std::memory_order_acquire)) {
+            !probe.m_overlay_writer_transaction_enabled.load(std::memory_order_acquire)) {
             return;
         }
+        OverlayWriterCallbackGuard callback_guard{ probe.m_overlay_writer_callback_in_flight };
         constexpr size_t store_index = HookIndex / 2;
         constexpr bool after_store = (HookIndex % 2) != 0;
         constexpr size_t branch_index = store_index / 2;
         constexpr bool clear_store = (store_index % 2) == 0;
         auto& pending = s_pending_overlay_writer_stores[store_index];
+        const auto tracked_overlay =
+            context.rsi == probe.m_overlay_writer_overlay.load(std::memory_order_acquire);
         const auto slot = context.rsi + RE4_TARGET_STATE_SLOT_OFFSET;
         const auto image_base = probe.m_overlay_writer_image_base.load(std::memory_order_acquire);
         if constexpr (!after_store) {
@@ -1979,6 +1969,7 @@ private:
             const auto event = probe.m_overlay_writer_events.fetch_add(1, std::memory_order_acq_rel);
             const auto store_sequence = probe.m_overlay_writer_store_sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
             const bool diagnostic_log =
+                tracked_overlay &&
                 probe.m_overlay_writer_diagnostic_capture.load(std::memory_order_acquire) &&
                 probe.m_overlay_writer_diagnostics_enabled.load(std::memory_order_acquire) &&
                 event < MAX_OVERLAY_WRITER_DIAGNOSTIC_EVENTS;
@@ -1990,8 +1981,9 @@ private:
                 probe.m_overlay_writer_device_reset_generation.load(std::memory_order_acquire);
             const auto mode_token = probe.m_overlay_writer_mode.load(std::memory_order_acquire);
             uint64_t invocation_id{};
-            auto* transaction = find_overlay_writer_transaction(
-                branch_index, context.rsp, clear_store);
+            auto* transaction = tracked_overlay
+                ? find_overlay_writer_transaction(branch_index, context.rsp, clear_store)
+                : nullptr;
             if constexpr (clear_store) {
                 if (transaction != nullptr) {
                     *transaction = {};
@@ -2054,6 +2046,7 @@ private:
             pending.mode_token = mode_token;
             pending.thread_id = GetCurrentThreadId();
             pending.clear_store = clear_store;
+            pending.tracked_overlay = tracked_overlay;
             pending.transaction_attached = transaction != nullptr;
             pending.prior_readable = prior_readable;
             pending.caller_readable = caller_readable;
@@ -2073,6 +2066,8 @@ private:
                     probe.m_overlay_writer_frames.load(std::memory_order_acquire));
             }
         } else {
+            const auto post_store_sequence =
+                probe.m_overlay_writer_store_sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
             if (!pending.valid || pending.overlay != context.rsi || pending.slot != slot ||
                 pending.thread_id != GetCurrentThreadId() ||
                 pending.invocation_stack_pointer != context.rsp) {
@@ -2088,13 +2083,14 @@ private:
             const bool confirmed = observed_readable && observed == pending.incoming &&
                 pending.prior_readable && pending.loaded_previous == pending.prior &&
                 generation_still_current;
-            if (confirmed) {
+            if (pending.tracked_overlay && confirmed) {
                 probe.m_overlay_writer_confirmed_writes.fetch_add(1, std::memory_order_acq_rel);
-            } else {
+            } else if (pending.tracked_overlay) {
                 probe.m_overlay_writer_unconfirmed_writes.fetch_add(1, std::memory_order_acq_rel);
             }
-            auto* transaction_candidate = find_overlay_writer_transaction(
-                branch_index, pending.invocation_stack_pointer, false);
+            auto* transaction_candidate = pending.tracked_overlay
+                ? find_overlay_writer_transaction(branch_index, pending.invocation_stack_pointer, false)
+                : nullptr;
             auto* transaction = pending.transaction_attached && transaction_candidate != nullptr &&
                 transaction_candidate->invocation_id == pending.invocation_id
                 ? transaction_candidate
@@ -2113,8 +2109,7 @@ private:
                         transaction->device_reset_generation == pending.device_reset_generation &&
                         transaction->mode_token == pending.mode_token;
                     transaction->clear_state_after = observed;
-                    transaction->clear_post_sequence =
-                        probe.m_overlay_writer_store_sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
+                    transaction->clear_post_sequence = post_store_sequence;
                     transaction->clear_post_write_rva = OVERLAY_WRITER_POST_RVAS[store_index];
                     transaction->clear_write_confirmed = transaction_matches && confirmed &&
                         observed == 0 && pending.incoming == 0;
@@ -2133,8 +2128,7 @@ private:
                     transaction->mode_token == pending.mode_token &&
                     transaction->branch_index == branch_index;
                 transaction->replacement_state_after = observed;
-                transaction->replacement_post_sequence =
-                    probe.m_overlay_writer_store_sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
+                transaction->replacement_post_sequence = post_store_sequence;
                 transaction->replacement_post_write_rva = OVERLAY_WRITER_POST_RVAS[store_index];
                 transaction->replacement_write_confirmed = transaction_matches && confirmed &&
                     transaction->incoming_state != 0 &&
@@ -2191,44 +2185,50 @@ private:
         const OverlayWriterTransactionPending& transaction) noexcept {
         if (transaction.branch_index >= OVERLAY_WRITER_BRANCH_COUNT ||
             !transaction.valid || !transaction.clear_write_confirmed ||
-            !transaction.replacement_write_confirmed ||
-            m_overlay_writer_witness_writer.test_and_set(std::memory_order_acquire)) {
+            !transaction.replacement_write_confirmed) {
             return;
         }
 
-        m_overlay_writer_witness_version.fetch_add(1, std::memory_order_acq_rel);
-        const auto sequence = m_overlay_writer_witness_next_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
-        m_overlay_writer_witness_sequence.store(sequence, std::memory_order_relaxed);
-        m_overlay_writer_witness_invocation_id.store(transaction.invocation_id, std::memory_order_relaxed);
-        m_overlay_writer_witness_stack_pointer.store(transaction.invocation_stack_pointer, std::memory_order_relaxed);
-        m_overlay_writer_witness_clear_pre_sequence.store(transaction.clear_pre_sequence, std::memory_order_relaxed);
-        m_overlay_writer_witness_clear_post_sequence.store(transaction.clear_post_sequence, std::memory_order_relaxed);
-        m_overlay_writer_witness_replacement_pre_sequence.store(transaction.replacement_pre_sequence, std::memory_order_relaxed);
-        m_overlay_writer_witness_replacement_post_sequence.store(transaction.replacement_post_sequence, std::memory_order_relaxed);
-        m_overlay_writer_witness_generation.store(transaction.generation, std::memory_order_relaxed);
-        m_overlay_writer_witness_device_reset_generation.store(transaction.device_reset_generation, std::memory_order_relaxed);
-        m_overlay_writer_witness_mode.store(transaction.mode_token, std::memory_order_relaxed);
-        m_overlay_writer_witness_thread.store(transaction.writer_thread_id, std::memory_order_relaxed);
-        m_overlay_writer_witness_overlay.store(transaction.overlay, std::memory_order_relaxed);
-        m_overlay_writer_witness_slot.store(transaction.slot, std::memory_order_relaxed);
-        m_overlay_writer_witness_cleared_state.store(transaction.cleared_state, std::memory_order_relaxed);
-        m_overlay_writer_witness_clear_state_after.store(transaction.clear_state_after, std::memory_order_relaxed);
-        m_overlay_writer_witness_replacement_previous.store(transaction.replacement_previous_state, std::memory_order_relaxed);
-        m_overlay_writer_witness_incoming.store(transaction.incoming_state, std::memory_order_relaxed);
-        m_overlay_writer_witness_replacement_after.store(transaction.replacement_state_after, std::memory_order_relaxed);
-        m_overlay_writer_witness_method_rva.store(0x44AF030, std::memory_order_relaxed);
-        m_overlay_writer_witness_clear_pre_rva.store(transaction.clear_pre_write_rva, std::memory_order_relaxed);
-        m_overlay_writer_witness_clear_post_rva.store(transaction.clear_post_write_rva, std::memory_order_relaxed);
-        m_overlay_writer_witness_replacement_pre_rva.store(transaction.replacement_pre_write_rva, std::memory_order_relaxed);
-        m_overlay_writer_witness_replacement_post_rva.store(transaction.replacement_post_write_rva, std::memory_order_relaxed);
-        m_overlay_writer_witness_destination_validated.store(true, std::memory_order_relaxed);
-        m_overlay_writer_witness_same_invocation.store(true, std::memory_order_relaxed);
-        m_overlay_writer_witness_clear_write_confirmed.store(true, std::memory_order_relaxed);
-        m_overlay_writer_witness_replacement_write_confirmed.store(true, std::memory_order_relaxed);
-        m_overlay_writer_witness_image_verified.store(true, std::memory_order_relaxed);
-        m_overlay_writer_witness_version.fetch_add(1, std::memory_order_release);
-        m_overlay_writer_witness_writer.clear(std::memory_order_release);
-        m_overlay_writer_confirmed_transactions.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard lock{ m_overlay_writer_transition_mutex };
+        if (transaction.generation != m_overlay_writer_generation.load(std::memory_order_acquire) ||
+            transaction.device_reset_generation != m_overlay_writer_device_reset_generation.load(std::memory_order_acquire) ||
+            transaction.mode_token != m_overlay_writer_mode.load(std::memory_order_acquire)) {
+            return;
+        }
+        re4_xess::EngineWriterWitness witness{};
+        witness.sequence = transaction.replacement_post_sequence;
+        witness.invocation_id = transaction.invocation_id;
+        witness.invocation_stack_pointer = transaction.invocation_stack_pointer;
+        witness.clear_pre_sequence = transaction.clear_pre_sequence;
+        witness.clear_post_sequence = transaction.clear_post_sequence;
+        witness.replacement_pre_sequence = transaction.replacement_pre_sequence;
+        witness.replacement_post_sequence = transaction.replacement_post_sequence;
+        witness.current_store_sequence = transaction.replacement_post_sequence;
+        witness.control_generation = transaction.generation;
+        witness.device_reset_generation = transaction.device_reset_generation;
+        witness.mode_token = transaction.mode_token;
+        witness.writer_thread_id = transaction.writer_thread_id;
+        witness.overlay = transaction.overlay;
+        witness.slot = transaction.slot;
+        witness.cleared_state = transaction.cleared_state;
+        witness.clear_state_after = transaction.clear_state_after;
+        witness.replacement_previous_state = transaction.replacement_previous_state;
+        witness.incoming_state = transaction.incoming_state;
+        witness.replacement_state_after = transaction.replacement_state_after;
+        witness.method_rva = re4_xess::OVERLAY_WRITER_METHOD_RVA;
+        witness.clear_pre_write_rva = transaction.clear_pre_write_rva;
+        witness.clear_post_write_rva = transaction.clear_post_write_rva;
+        witness.replacement_pre_write_rva = transaction.replacement_pre_write_rva;
+        witness.replacement_post_write_rva = transaction.replacement_post_write_rva;
+        witness.destination_validated = true;
+        witness.same_invocation = true;
+        witness.clear_write_confirmed = true;
+        witness.replacement_write_confirmed = true;
+        witness.re4_image_identity_verified = true;
+
+        if (m_overlay_writer_witness_history.publish(witness)) {
+            m_overlay_writer_confirmed_transactions.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     struct ImageInfo {
@@ -2491,42 +2491,14 @@ private:
     std::atomic<uint32_t> m_overlay_writer_frames{};
     std::atomic<uint64_t> m_overlay_writer_events{};
     std::atomic<uint64_t> m_overlay_writer_store_sequence{};
+    std::atomic<uint32_t> m_overlay_writer_callback_in_flight{};
     std::atomic<uint64_t> m_overlay_writer_next_invocation_id{};
     std::atomic<uint64_t> m_overlay_writer_transaction_overflow{};
     std::atomic<uint64_t> m_overlay_writer_confirmed_writes{};
     std::atomic<uint64_t> m_overlay_writer_unconfirmed_writes{};
     std::atomic<uint64_t> m_overlay_writer_confirmed_transactions{};
-    std::atomic_flag m_overlay_writer_witness_writer = ATOMIC_FLAG_INIT;
-    std::atomic<uint64_t> m_overlay_writer_witness_version{};
-    std::atomic<uint64_t> m_overlay_writer_witness_next_sequence{};
-    std::atomic<uint64_t> m_overlay_writer_witness_sequence{};
-    std::atomic<uint64_t> m_overlay_writer_witness_invocation_id{};
-    std::atomic<uintptr_t> m_overlay_writer_witness_stack_pointer{};
-    std::atomic<uint64_t> m_overlay_writer_witness_clear_pre_sequence{};
-    std::atomic<uint64_t> m_overlay_writer_witness_clear_post_sequence{};
-    std::atomic<uint64_t> m_overlay_writer_witness_replacement_pre_sequence{};
-    std::atomic<uint64_t> m_overlay_writer_witness_replacement_post_sequence{};
-    std::atomic<uint64_t> m_overlay_writer_witness_generation{};
-    std::atomic<uint64_t> m_overlay_writer_witness_device_reset_generation{};
-    std::atomic<int32_t> m_overlay_writer_witness_mode{};
-    std::atomic<uint32_t> m_overlay_writer_witness_thread{};
-    std::atomic<uintptr_t> m_overlay_writer_witness_overlay{};
-    std::atomic<uintptr_t> m_overlay_writer_witness_slot{};
-    std::atomic<uintptr_t> m_overlay_writer_witness_cleared_state{};
-    std::atomic<uintptr_t> m_overlay_writer_witness_clear_state_after{};
-    std::atomic<uintptr_t> m_overlay_writer_witness_replacement_previous{};
-    std::atomic<uintptr_t> m_overlay_writer_witness_incoming{};
-    std::atomic<uintptr_t> m_overlay_writer_witness_replacement_after{};
-    std::atomic<uint32_t> m_overlay_writer_witness_method_rva{};
-    std::atomic<uint32_t> m_overlay_writer_witness_clear_pre_rva{};
-    std::atomic<uint32_t> m_overlay_writer_witness_clear_post_rva{};
-    std::atomic<uint32_t> m_overlay_writer_witness_replacement_pre_rva{};
-    std::atomic<uint32_t> m_overlay_writer_witness_replacement_post_rva{};
-    std::atomic<bool> m_overlay_writer_witness_destination_validated{};
-    std::atomic<bool> m_overlay_writer_witness_same_invocation{};
-    std::atomic<bool> m_overlay_writer_witness_clear_write_confirmed{};
-    std::atomic<bool> m_overlay_writer_witness_replacement_write_confirmed{};
-    std::atomic<bool> m_overlay_writer_witness_image_verified{};
+    mutable std::mutex m_overlay_writer_transition_mutex{};
+    re4_xess::EngineWriterWitnessHistory m_overlay_writer_witness_history{};
     std::array<safetyhook::MidHook, OVERLAY_WRITER_HOOK_COUNT> m_overlay_writer_hooks{};
     std::atomic<uintptr_t> m_provenance_overlay_object{};
     std::atomic<uintptr_t> m_provenance_overlay_slot{};
@@ -5728,8 +5700,8 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
     (void)record_lifetime_event(RE4XeSSLifetimeTrace::Kind::PreOverlay, "callback-enter");
     m_output_handoff.observe_fence_completion();
     TargetStateFactoryProbe::instance().observe_overlay_writer(layer);
-    const auto engine_writer_witness =
-        TargetStateFactoryProbe::instance().latest_confirmed_overlay_writer_witness();
+    const auto engine_writer_witness_chain =
+        TargetStateFactoryProbe::instance().confirmed_overlay_writer_witness_chain();
     if (m_output_handoff.identity_mismatch_latched()) {
         const auto producer = get_producer_snapshot();
         (void)m_output_handoff.poll_retirement(producer.bridge_idle, producer.bridge_device_removed);
@@ -5773,8 +5745,10 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
     };
 
     std::string restore_error;
+    uint64_t consumed_writer_terminal_sequence{};
     if (!m_output_handoff.restore(
-            layer, handoff_observation, engine_writer_witness, restore_error)) {
+            layer, handoff_observation, engine_writer_witness_chain, restore_error,
+            consumed_writer_terminal_sequence)) {
         const auto handoff = m_output_handoff.snapshot();
         set_owner_unavailable(restore_error, true,
             handoff.retirement == RE4XeSSOutputHandoff::RetirementStatus::Quarantined);
@@ -5782,6 +5756,10 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         clear_frame_state();
         trace_skip("output-handoff-restore-failed");
         return true;
+    }
+    if (consumed_writer_terminal_sequence != 0) {
+        TargetStateFactoryProbe::instance().consume_overlay_writer_witnesses_through(
+            consumed_writer_terminal_sequence);
     }
 
     const auto handoff_before_service = m_output_handoff.snapshot();
@@ -6330,11 +6308,12 @@ void RE4XeSS::on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* 
     };
     const auto before_observation = trace_enabled ? m_output_handoff.snapshot()
         : RE4XeSSOutputHandoff::Snapshot{};
-    const auto writer_witness = TargetStateFactoryProbe::instance().latest_confirmed_overlay_writer_witness();
+    const auto writer_witness_chain =
+        TargetStateFactoryProbe::instance().confirmed_overlay_writer_witness_chain();
     m_output_handoff.observe_overlay(
         layer,
         observation,
-        writer_witness);
+        writer_witness_chain);
     if (trace_enabled) {
         const auto after_observation = m_output_handoff.snapshot();
         RE4XeSSLifetimeTrace::Event event{};
@@ -6349,17 +6328,20 @@ void RE4XeSS::on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* 
         event.output_generation = before_observation.output_generation;
         event.control_generation = before_observation.installed_control_generation;
         event.device_reset_generation = before_observation.installed_device_reset_generation;
-        event.writer_sequence = writer_witness.sequence;
-        event.writer_invocation_id = writer_witness.invocation_id;
-        event.writer_clear_pre_sequence = writer_witness.clear_pre_sequence;
-        event.writer_clear_post_sequence = writer_witness.clear_post_sequence;
-        event.writer_replacement_pre_sequence = writer_witness.replacement_pre_sequence;
-        event.writer_replacement_post_sequence = writer_witness.replacement_post_sequence;
-        event.writer_method_rva = writer_witness.method_rva;
-        event.writer_transaction_confirmed = writer_witness.same_invocation &&
-            writer_witness.clear_write_confirmed &&
-            writer_witness.replacement_write_confirmed &&
-            writer_witness.re4_image_identity_verified;
+        if (writer_witness_chain.count > 0) {
+            const auto& writer_witness = writer_witness_chain.entries[writer_witness_chain.count - 1];
+            event.writer_sequence = writer_witness.sequence;
+            event.writer_invocation_id = writer_witness.invocation_id;
+            event.writer_clear_pre_sequence = writer_witness.clear_pre_sequence;
+            event.writer_clear_post_sequence = writer_witness.clear_post_sequence;
+            event.writer_replacement_pre_sequence = writer_witness.replacement_pre_sequence;
+            event.writer_replacement_post_sequence = writer_witness.replacement_post_sequence;
+            event.writer_method_rva = writer_witness.method_rva;
+            event.writer_transaction_confirmed = writer_witness.same_invocation &&
+                writer_witness.clear_write_confirmed &&
+                writer_witness.replacement_write_confirmed &&
+                writer_witness.re4_image_identity_verified;
+        }
         event.downstream_fence_value = before_observation.last_signaled_fence_value;
         event.output_resource = before_observation.output_resource;
         event.target_state = reinterpret_cast<uintptr_t>(layer->get_main_target_state().get());

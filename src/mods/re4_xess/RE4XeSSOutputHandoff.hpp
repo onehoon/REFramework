@@ -12,6 +12,7 @@
 
 #include "RE4XeSSD3D12.hpp"
 #include "RE4XeSSLifetimeTrace.hpp"
+#include "RE4XeSSWriterChain.hpp"
 #include <sdk/Renderer.hpp>
 
 class RE4XeSSOutputHandoff final {
@@ -75,38 +76,6 @@ public:
         bool command_queue_type_valid{};
     };
 
-    struct EngineWriterWitness {
-        uint64_t sequence{};
-        uint64_t invocation_id{};
-        uintptr_t invocation_stack_pointer{};
-        uint64_t clear_pre_sequence{};
-        uint64_t clear_post_sequence{};
-        uint64_t replacement_pre_sequence{};
-        uint64_t replacement_post_sequence{};
-        uint64_t current_store_sequence{};
-        uint64_t control_generation{};
-        uint64_t device_reset_generation{};
-        int32_t mode_token{};
-        uint32_t writer_thread_id{};
-        uintptr_t overlay{};
-        uintptr_t slot{};
-        uintptr_t cleared_state{};
-        uintptr_t clear_state_after{};
-        uintptr_t replacement_previous_state{};
-        uintptr_t incoming_state{};
-        uintptr_t replacement_state_after{};
-        uint32_t method_rva{};
-        uint32_t clear_pre_write_rva{};
-        uint32_t clear_post_write_rva{};
-        uint32_t replacement_pre_write_rva{};
-        uint32_t replacement_post_write_rva{};
-        bool destination_validated{};
-        bool same_invocation{};
-        bool clear_write_confirmed{};
-        bool replacement_write_confirmed{};
-        bool re4_image_identity_verified{};
-    };
-
     RE4XeSSOutputHandoff() = default;
     ~RE4XeSSOutputHandoff();
 
@@ -116,8 +85,9 @@ public:
     bool restore(
         sdk::renderer::layer::Overlay* layer,
         const ObservationContext& observation,
-        const EngineWriterWitness& writer_witness,
-        std::string& error);
+        const re4_xess::EngineWriterWitnessChain& writer_witness_chain,
+        std::string& error,
+        uint64_t& consumed_writer_terminal_sequence);
     void request_retirement(std::string_view reason);
     void note_mode_transition(
         uint64_t control_generation,
@@ -158,7 +128,7 @@ public:
     void observe_overlay(
         sdk::renderer::layer::Overlay* layer,
         const ObservationContext& observation,
-        const EngineWriterWitness& writer_witness);
+        const re4_xess::EngineWriterWitnessChain& writer_witness_chain);
     bool identity_mismatch_latched() const noexcept;
     Snapshot snapshot() const;
 
@@ -190,11 +160,12 @@ private:
     void preserve_quarantined_generation() noexcept;
     bool confirmed_device_removal(bool bridge_device_removed) const noexcept;
     bool is_verified_engine_replacement_locked(
-        const EngineWriterWitness& witness,
+        const re4_xess::EngineWriterWitnessChain& witness_chain,
         uintptr_t layer_identity,
         uintptr_t slot_identity,
         uintptr_t observed_state,
-        const ObservationContext& observation) const noexcept;
+        const ObservationContext& observation,
+        re4_xess::EngineWriterChainValidation* validation = nullptr) const noexcept;
     bool consume_mode_transition_observation(const ObservationContext& observation) noexcept;
     void log_transition_provenance(
         std::string_view phase,
