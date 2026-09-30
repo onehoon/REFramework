@@ -264,6 +264,7 @@ bool RE4XeSSOutputHandoff::restore(
         uint64_t accepted_install_present{};
         uint64_t accepted_output_generation{};
         uintptr_t accepted_output{};
+        uintptr_t accepted_handoff_state{};
         re4_xess::EngineWriterChainValidation writer_validation{};
         {
             std::lock_guard lock{ m_retirement_mutex };
@@ -307,6 +308,7 @@ bool RE4XeSSOutputHandoff::restore(
                 accepted_install_present = m_installed_present_ordinal;
                 accepted_output_generation = m_output_generation_id;
                 accepted_output = reinterpret_cast<uintptr_t>(m_resource_pin.Get());
+                accepted_handoff_state = reinterpret_cast<uintptr_t>(m_handoff_state.get());
             }
         }
         if (engine_replacement_accepted) {
@@ -344,6 +346,27 @@ bool RE4XeSSOutputHandoff::restore(
                 writer_witness.incoming_state,
                 accepted_marker_pending,
                 static_cast<unsigned long long>(accepted_signaled_fence_value));
+            const auto divergence_sequence = find_matching_provenance_divergence(
+                reinterpret_cast<uintptr_t>(layer),
+                reinterpret_cast<uintptr_t>(&main_state),
+                reinterpret_cast<uintptr_t>(observed_target_state),
+                accepted_handoff_state,
+                observation.control_generation,
+                observation.device_reset_generation);
+            if (divergence_sequence != 0) {
+                spdlog::info(
+                    "[RE4XeSS][HandoffProvenance] divergence-resolved seq={} resolution=accepted-verified-engine-writer-chain chainLength={} firstInvocationId={} terminalStoreSequence={} controlGeneration={} deviceResetGeneration={} overlay=0x{:x} slot=0x{:x} current=0x{:x} expectedHandoff=0x{:x}",
+                    static_cast<unsigned long long>(divergence_sequence),
+                    writer_validation.chain_length,
+                    static_cast<unsigned long long>(writer_validation.first_invocation_id),
+                    static_cast<unsigned long long>(writer_validation.terminal_store_sequence),
+                    static_cast<unsigned long long>(observation.control_generation),
+                    static_cast<unsigned long long>(observation.device_reset_generation),
+                    reinterpret_cast<uintptr_t>(layer),
+                    reinterpret_cast<uintptr_t>(&main_state),
+                    reinterpret_cast<uintptr_t>(observed_target_state),
+                    accepted_handoff_state);
+            }
             RE4XeSSLifetimeTrace::Event trace_event{};
             trace_event.kind = RE4XeSSLifetimeTrace::Kind::OutputRestore;
             trace_event.trace_id = accepted_trace_id;
@@ -851,6 +874,7 @@ void RE4XeSSOutputHandoff::log_transition_provenance(
         saved_state,
         observation.frame_id_valid,
         slot_read_valid,
+        false,
         identity_changed,
         marker_pending,
         installed,
@@ -861,17 +885,18 @@ void RE4XeSSOutputHandoff::log_transition_provenance(
     size_t preceding_count{};
     {
         std::lock_guard lock{ m_provenance_mutex };
-        if (slot_read_valid) {
-            m_provenance_ring[m_provenance_ring_next] = sample;
-            m_provenance_ring_next = (m_provenance_ring_next + 1) % m_provenance_ring.size();
-            m_provenance_ring_size = std::min(m_provenance_ring_size + 1, m_provenance_ring.size());
-        }
         if (first_divergence) {
             if (m_provenance_divergence_count == 0) {
                 ++m_provenance_divergence_count;
             } else {
                 first_divergence = false;
             }
+        }
+        sample.first_divergence = first_divergence;
+        if (slot_read_valid) {
+            m_provenance_ring[m_provenance_ring_next] = sample;
+            m_provenance_ring_next = (m_provenance_ring_next + 1) % m_provenance_ring.size();
+            m_provenance_ring_size = std::min(m_provenance_ring_size + 1, m_provenance_ring.size());
         }
         if (first_divergence) {
             preceding_count = m_provenance_ring_size;
@@ -934,7 +959,7 @@ void RE4XeSSOutputHandoff::log_transition_provenance(
         previous_current_state);
 
     if (first_divergence) {
-        spdlog::error("[RE4XeSS][HandoffProvenance] first-divergence seq={} current=0x{:x} expected=0x{:x} saved=0x{:x} precedingSamples={}; writer=unknown",
+        spdlog::warn("[RE4XeSS][HandoffProvenance] first-divergence-pending seq={} current=0x{:x} expected=0x{:x} saved=0x{:x} precedingSamples={} resolution=awaiting-validated-writer-chain",
             static_cast<unsigned long long>(sample.sequence), observed_current_state, handoff_state, saved_state, preceding_count);
         for (size_t i = 0; i < preceding_count; ++i) {
             const auto& prior = preceding[i];
@@ -948,6 +973,30 @@ void RE4XeSSOutputHandoff::log_transition_provenance(
                 prior.retirement_requested, prior.hard_quarantined, prior.identity_changed);
         }
     }
+}
+
+uint64_t RE4XeSSOutputHandoff::find_matching_provenance_divergence(
+    uintptr_t layer_identity,
+    uintptr_t slot_identity,
+    uintptr_t current_state_identity,
+    uintptr_t expected_state_identity,
+    uint64_t control_generation,
+    uint64_t device_reset_generation) noexcept {
+    std::lock_guard lock{ m_provenance_mutex };
+    for (size_t offset = 0; offset < m_provenance_ring_size; ++offset) {
+        const auto index = (m_provenance_ring_next + m_provenance_ring.size() - 1 - offset) %
+            m_provenance_ring.size();
+        const auto& sample = m_provenance_ring[index];
+        if (sample.first_divergence && sample.slot_read_valid &&
+            sample.overlay == layer_identity && sample.slot == slot_identity &&
+            sample.current_state == current_state_identity &&
+            sample.expected_state == expected_state_identity &&
+            sample.control_generation == control_generation &&
+            sample.device_reset_generation == device_reset_generation) {
+            return sample.sequence;
+        }
+    }
+    return 0;
 }
 
 bool RE4XeSSOutputHandoff::consume_mode_transition_observation(
@@ -1442,6 +1491,10 @@ bool RE4XeSSOutputHandoff::install(
         trace_event.queue_submitted = true;
         trace_event.writer_signal_succeeded = true;
         trace_event.mapping_ambiguous = true;
+        trace_event.mapping_observed = true;
+        trace_event.mapping_state = observation.present_ordinal_valid
+            ? RE4XeSSLifetimeTrace::MappingState::InferredCandidate
+            : RE4XeSSLifetimeTrace::MappingState::Unknown;
         RE4XeSSLifetimeTrace::set_reason(trace_event,
             observation.present_ordinal_valid ? "installed-present-context-only" : "install-present-unknown");
         RE4XeSSLifetimeTrace::instance().record(trace_event);
@@ -1611,6 +1664,10 @@ void RE4XeSSOutputHandoff::on_post_present(
         event.marker_queued = queued;
         // A Present callback ordinal is not proof that a command list read this output.
         event.mapping_ambiguous = true;
+        event.mapping_observed = true;
+        event.mapping_state = observation.present_ordinal_valid
+            ? RE4XeSSLifetimeTrace::MappingState::InferredCandidate
+            : RE4XeSSLifetimeTrace::MappingState::Unknown;
         RE4XeSSLifetimeTrace::set_reason(event, reason);
         RE4XeSSLifetimeTrace::instance().record(event);
     };

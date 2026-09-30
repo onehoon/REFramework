@@ -3515,7 +3515,7 @@ No engine-owned command list should be modified.
 
 ### Gate I — XeSS output integration
 
-**Status: NATIVE DISCOVERY CLOSED by Capture 30b; production XeSS output handoff still requires implementation-time validation.**
+**Status (updated 2026-09-30): native discovery is closed; the production XeSS output handoff is implemented and runtime-exercised, but acceptance is incomplete.** Earlier text in this gate describing implementation as wholly pending is superseded by PR66 runtime sections 47–48 below.
 
 Capture 28 proves:
 
@@ -3536,13 +3536,15 @@ Capture 30b closes the remaining native draw-discovery questions:
 - the candidate follows the active swapchain buffer;
 - the Capture 28/30 copy destination remains at observed state `0x0` in this window and is not the proven final screen-output source.
 
-What remains under Gate I is implementation-time validation:
+The latest PR66 capture has eight OutputHandoff install-complete events and public XeSS Execute activity through OptiScaler. This proves that the output resource and engine TargetState handoff reach the live path; an install event alone does not prove the final on-screen pixels or UI composition are correct.
 
-- create and own the XeSS output resource;
-- establish the exact state transitions for the chosen production handoff;
-- feed display-resolution XeSS output into RE4's own post/UI/presentation path without bypassing UI composition;
-- validate resize, fullscreen/Alt+Tab, swapchain recreation, and device reset;
-- verify no new HUD/UI contamination or presentation artifact appears.
+What remains under Gate I is:
+
+- prove the installed output is consumed by the intended downstream GPU submission and map that submission to the eligible Present/queue and its retirement marker;
+- complete D3D12 state/lifetime validation for the handoff output and prove safe retirement;
+- establish sustained temporal output without the current marker-pending reset churn;
+- visually verify final output and preserved UI/HUD;
+- validate resize, fullscreen/Alt+Tab, swapchain recreation, and device reset.
 
 Do not add descriptor-heap tracing preemptively. Reopen descriptor/SRV provenance only if the production implementation produces an ambiguity or contradiction.
 
@@ -7288,3 +7290,207 @@ The trace deliberately does not install a process-wide `ExecuteCommandLists` hoo
 PR66 adds bounded, allocation-free history for completed verified RE4 Overlay writer transactions so a `handoff -> A -> B` sequence is reconciled as one causal chain rather than requiring the last transaction alone to clear the original handoff. It requires contiguous observed store sequence, exact Overlay/slot and control/device/mode identity, same writer thread, validated clear/replacement sites, current terminal pointer, and a stable snapshot tied to the live store sequence. The chain is consumed once; overflow, missing/interleaved stores, stale evidence, or any mismatch still quarantines. The engine-installed TargetState is never overwritten and existing writer/downstream fence, retirement, and quarantine behavior is unchanged.
 
 Standalone deterministic writer-chain tests and a local x64 Release build pass. Quality-change runtime validation that XeSS Execute resumes after the chained replacement remains pending; PR66 is still Draft/Open/unmerged. Output-ring and marker-pending behavior are not changed by this update.
+
+## 48. PR66 latest paired runtime status — 2026-09-30 21:04–21:05 KST
+
+This section supersedes the pending-runtime statements in sections 46–47 and the earlier writer-chain checkpoint above where those statements describe current status. It does not rewrite their historical evidence.
+
+### Capture identity and transition result
+
+The tested PR #66 source HEAD was `a5e36fca710042fb366a4833e14c3a9c0c15eb87`, matching the local branch and remote PR HEAD at review. The paired logs are:
+
+~~~text
+build-load-accessor/runtime-test-20260930/re2_framework_log.txt.run1
+build-load-accessor/runtime-test-20260930/OptiScaler.log.run1
+~~~
+
+The PR is Draft/Open/unmerged. Its Build PR check completed successfully in run `36711929572`.
+
+The user changed modes through Off -> Performance -> Balanced -> Ultra Quality Plus -> Performance -> Ultra Quality Plus -> Native AA -> Ultra Performance -> Ultra Quality. REF logged eight `OutputTransition phase=install-complete` records. It accepted two verified `handoff -> A -> B` writer chains, at control generations 2 and 6. Each acceptance matched the same live Overlay and `+0x90` slot, contiguous writer store sequence, expected generation/mode and terminal pointer; REF left the engine's terminal TargetState in the slot and retired only the displaced handoff through existing fence gates. This confirms the chain reconciliation on two observed transitions only; it does not imply every quality transition required or exercised a multi-transaction chain.
+
+OptiScaler logged 1,120 `hk_xessD3D12Execute` entries. REF independently reached `cumulativeSuccess=1024 cumulativeFailure=0` at its Execute checkpoint. These are API invocation/checkpoint totals, not proof of the same number of uninterrupted displayed frames.
+
+### Temporal and OutputHandoff result
+
+The run recorded 921 `output-handoff-marker-pending` history resets and 16 `pre-overlay-temporal-gate-invalid` resets. The marker-pending path continues to skip submissions and invalidate temporal history as designed; these counts represent an outstanding production continuity issue, not a logging-only issue. A sustained low-reset session is not accepted. Controlled Off/On, Load Save, resize/fullscreen, and long-session tests also remain pending.
+
+### Phase A Gate A remains blocked
+
+The latest run exercised the bounded LifetimeTrace, but it still did not establish the causal chain required before changing output reuse policy:
+
+~~~text
+installed output
+    -> actual downstream consumer command submission / queue
+    -> eligible Present on that queue
+    -> marker Signal and fence completion for that output
+~~~
+
+Evidence and diagnostic gap:
+
+- The OutputTransition `post-present-marker-attempt` records still report `frameKnown=false`; there is no explicit frame/install token joining the callback to the installed output.
+- The emitted LifetimeTrace event samples contain `present`, `post-present-callback`, `pre-overlay`, `post-overlay-observation`, and `skip` kinds. No `submit`, `output-install`, or `marker` kind is present in the emitted event records.
+- LifetimeTrace checkpoint summary counters for installed/unmarked outputs, successful submit classes, marker skips/completions, and mapping ambiguities remain zero, while the separate OutputTransition stream records eight completed installs and the regular reset logs record marker-pending skips.
+- Consequently the current capture proves neither downstream consumer submission identity nor which Present/marker retires a particular installed output. Callback adjacency, timestamps, successful XeSS API calls, and a queue Signal are not substitutes for that proof.
+
+This is both a still-unmet correlation gate and a diagnostic coverage discrepancy to resolve in read-only instrumentation. The narrow next step is to make the per-install Submit/OutputInstall/Marker events and summary classification visible and carry an explicit validated install/frame token through the eligible Present and marker path; if that still cannot identify the real consumer submission, investigate a bounded RE4-specific read-only submission boundary. Do not add a process-wide `ExecuteCommandLists` hook without a validated boundary.
+
+### Implementation-order decision
+
+~~~text
+Writer-chain reconciliation       runtime-observed twice; broader matrix pending
+Phase A exact consumer/marker map  NOT PROVEN; instrumentation correlation gap remains
+Phase B bounded output ring        NOT IMPLEMENTED; do not start before Gate A
+Phase C temporal continuity        NOT ACCEPTED; reset churn remains high
+PR66                              Draft / Open / unmerged
+XeFG                              OFF and out of scope for this SR capture
+~~~
+
+## 49. PR66 phase-aware lifetime capture — active gameplay reached, Present ownership still unproven
+
+This section supersedes the Phase-A diagnostic-gap conclusion in §48 for the new paired capture only. It does not alter the historical 21:04–21:05 capture or authorize an OutputHandoff lifetime change.
+
+### Capture identity
+
+~~~text
+RE4 run                    2026-09-30 22:09:29–22:11:51 KST
+REF embedded base          a5e36fca710042fb366a4833e14c3a9c0c15eb87
+REF test DLL SHA-256        3C5CA779B421A6B970A3BD552A354F69BC73908AC0716D1531315A053C91956E
+OptiScaler                  v0.9.5-pre4 / a556a639 / 20260929_135800
+Paired logs                 build-load-accessor/runtime-test-phase-aware-20260930-2211/
+PR66                        Draft / Open / unmerged
+~~~
+
+OptiScaler recorded 817 `hk_xessD3D12Execute` calls and 817 `Upscaling done: true` records. The REF log contains active-phase Submit, OutputInstall, OutputRestore, PostPresentCallback, Marker, Skip and downstream-fence-complete events, with IDs and queue/fence data. Thus the previous “no active dump was emitted” diagnosis is no longer current for this run: the phase-aware capture reached active XeSS gameplay and emitted bounded windows. The earlier 32-dump exhaustion was genuine for the older capture, not evidence that its in-memory recorder had stopped.
+
+At the 22:11:32.577 mode-transition window, active counters were 429 successful submits/installs, 269 successful submissions with `resetHistory`, 160 continuous submissions, 269 skips (264 marker-pending and 5 temporal-gate), and 428 queued markers. These are the counters at that checkpoint, not whole-session frame totals. Across the paired log, the separate visible reset records reached 559 marker-pending and 12 temporal-gate events. The marker-pending path therefore still causes real skipped submissions/history invalidation; this is not just diagnostic noise.
+
+### Observed frame-to-marker sequence
+
+The bounded capture includes an active `frame=31068`, `trace=30677`, `install_id=428` submit/install, followed by a PostPresent callback and queued downstream marker carrying the same `install_id=428`, `present=31066`, and downstream fence value 141. The subsequent `frame=31069` boundary observes fence 141 complete and restores the output before another submit. This is an **inferred candidate** association only: the event explicitly says `marker-queued-different-present-ordinal`, no downstream consumer command submission was observed, and the lifetime trace's active mapping counters remain `proven=0`. A timestamp, callback adjacency, shared install ID, or successful queue Signal does not prove that Present 31066 read output 428.
+
+The first active output also shows the continuity stall directly: after the initial successful install at frame 30370, frame 30371 reaches pre-Overlay while the marker is pending and is skipped; the marker is queued later. The active dump budget preserved the first install/execute, first marker-pending, first queued marker, periodic, and mode-transition windows. Ten window records are present; nine dump windows emitted event lines, one later request was suppressed by the class budget. The capture contains quality/Off transitions while active, but it does not satisfy sustained temporal-continuity acceptance.
+
+### Diagnostic follow-up and gate
+
+The captured build's active window summary did not print the already-maintained `installed_unmarked_high_water` (nor current unmarked/marked-incomplete counts). The follow-up source now includes those three values in each bounded window and the independent one-shot lifecycle summary. This formatting addition has not yet been runtime-captured. The paired REF log also ends without a `[LifetimeTrace] lifecycle-summary` line, so runtime emission of the shutdown summary remains unverified; do not interpret the missing line as zero counters.
+
+The follow-up source and this status update pass `git diff --check`; the standalone lifetime-trace tests and existing writer-chain tests both pass. A new Release x64 `dinput8.dll` is built at `build-load-accessor/bin/REFramework/dinput8.dll`, PE machine `0x8664`, SHA-256 `837D34B8A7025332F6E77F5C2A1D6BAD03EF8C9C6143725F58B8537C35CBC5E0`. It is installed in the RE4 directory after confirming no `re4.exe` was running; the prior phase-aware DLL was preserved as `dinput8.dll.phase-aware-pre-summary-fields-20260930.bak`. Runtime validation of the added counters and normal-exit summary is still pending. Per the test-before-push workflow, this source change has not been committed or pushed yet.
+
+~~~text
+Phase-aware active capture         OBSERVED
+OutputInstall / Restore / Marker   OBSERVED
+Frame N -> N+1 marker-pending     OBSERVED; submission skipped and history invalidated
+Active output high-water printed  PENDING NEXT RUNTIME CAPTURE
+Present -> actual downstream read  NOT PROVEN
+Output -> reader -> Present -> marker -> GPU-complete chain NOT PROVEN
+Bounded output ring               NOT IMPLEMENTED; blocked on ownership proof and overlap evidence
+Temporal continuity               NOT ACCEPTED; marker-pending churn remains
+XeFG                              OFF and out of scope
+~~~
+
+Do not accept a ring design from the candidate mapping above. Next runtime evidence must include the new high-water field and lifecycle summary from a normal game exit (if that shutdown path invokes the Mod destructor), while preserving explicit `unknown / inferred-candidate / proven` labels. If consumer identity is still unknown, continue with a narrowly bounded, read-only RE4 submission-boundary investigation; do not add a process-wide command-list hook or change reuse, marker, fence, quarantine, or history-reset policy.
+
+Do not relax marker-pending behavior, suppress the associated history reset, accept an unverified TargetState, clear quarantine, or release retained output early to improve counters. Output-ring sizing and implementation remain downstream of Gate A evidence. PR66 must stay Draft until the writer-transition and independent lifetime/temporal safety gates pass.
+
+## 51. PR66 paired active capture — 2026-09-30 22:53–22:54 KST
+
+The paired logs are preserved in `build-load-accessor/runtime-test-phase-aware-20260930-2253/`. The run used the delivered PR66 test DLL, and the REF log independently confirms the exact file hash:
+
+~~~text
+REF PR/base stamp         a5e36fca710042fb366a4833e14c3a9c0c15eb87
+REF DLL SHA-256           8C7C37FC58D7D36BB5AB6A409D53F373BCC6E2392543698DE7EB24F5E6CF4CA1
+OptiScaler                v0.9.5-pre4 / a556a639 / 20260929_135800
+OptiScaler XeSS Execute   819; Upscaling done: true 819
+REF log SHA-256           D5368DFBEA6FA935FD584E68273E763677430A2DE41AD6C9289B810ACA50FE52
+OptiScaler log SHA-256    2BE7B9C743A7E4D2AA809922ADD33577E3EF3B9CD91A018745F4D28F8803C37D
+PR66                      Draft / Open / unmerged
+~~~
+
+The runtime identity line exactly matches the delivered DLL SHA. The capture contains active `Submit`, `OutputInstall`, `OutputRestore`, `PostPresentCallback`, `Marker`, `Skip`, and downstream-fence completion events, so phase-aware instrumentation is working in active gameplay. At the 22:54:11.121 checkpoint, the active counters were 530 successful submits/installs, 320 reset-history submits, 210 continuous submits, 318 skips (308 marker-pending and 10 temporal-gate), 529 queued markers, `installedUnmarked=1`, unmarked-output high-water 1, `markedGpuIncomplete=0`, and mapping counts unknown=530 / inferred-candidate=1,058 / proven=0. At the preceding 22:54:05.492 checkpoint, `markedGpuIncomplete=1`. These are checkpoint values, not whole-run final totals. Across the visible REF log, there are 538 `output-handoff-marker-pending` resets and 20 `pre-overlay-temporal-gate-invalid` resets; both are real submission/history disruptions, not log-only counters.
+
+The bounded frame sequence at the end of the active trace demonstrates the exact marker-late ordering:
+
+~~~text
+frame 12393 / trace 11889 / submit 90 -> OutputInstall install 529; writer fence 90
+frame 12394 / trace 11890 enters pre-Overlay
+install 529 restores with reason=restore-marker-pending; frame 12394 skips with output-handoff-marker-pending
+PostPresent callback observes install 529 and Present ordinal 12392
+marker queues downstream fence 90, labeled inferred-candidate / different-present-ordinal
+frame 12395 enters pre-Overlay
+then the trace observes actual downstream GetCompletedValue=90
+~~~
+
+The candidate association is explicit: current bookkeeping associates Present 12392 and fence 90 with `install_id=529`. That does **not** prove Present 12392 submitted or consumed a GPU read of output 529. Producer submit/install and the observed Present/marker carry the same Direct queue identity, and the actual fence completion is distinct from the cached value; however, no downstream reader command submission/resource-use edge is recorded. Therefore the marker can currently certify only completion of work ordered before its Signal on that queue, not that a particular output was read. Gate A remains blocked and no ring/reuse/lifetime change is authorized.
+
+Two first-divergence records were emitted as pending and each resolved to an accepted verified two-transaction engine writer chain (control generations 2 and 8). OptiScaler execute calls continued after each resolution: 622 were logged after the first acceptance and 289 after the second, for 819 total. The run logged no `OutputHandoffMismatch` or `hardQuarantined=true`; this validates the observed chain scenarios only, not every transition. No writer ownership or quarantine rule was relaxed.
+
+The log contains bounded checkpoint summaries but no `[LifetimeTrace] lifecycle-summary`; it also has no `REFramework shutting down...` record, so the `RE4XeSS` destructor summary was not observed. Do not interpret its absence as zero counts. The trace ring had recorded 9,319 active events at the last snapshot and overwritten 5,223; its retained sample is intentionally bounded. The full capture ends with configuration save/cleanup lines, but the available logs do not establish the process-exit mechanism.
+
+~~~text
+Active trace event coverage             PASS
+Runtime REF DLL identity                PASS (embedded SHA matches delivered DLL)
+Verified writer-chain wording/resolution PASS (2 pending -> accepted/resolved)
+Execute resumes after observed chains   PASS (OptiScaler calls continue)
+Marker-pending N -> N+1 skip/reset       CONFIRMED
+Output -> actual downstream reader      NOT PROVEN
+Eligible Present -> exact reader marker NOT PROVEN
+Whole-run final summary/high-water      NOT OBSERVED
+Output ring / lifetime policy change    NOT AUTHORIZED
+Temporal continuity                    NOT ACCEPTED
+~~~
+
+This capture closes the active-event and writer-chain wording runtime checks, but not the consumer ownership proof. Continue with a narrow, read-only downstream submission/resource-use correlation; do not add a process-wide `ExecuteCommandLists` hook, infer ownership from queue identity or callback adjacency, or change marker, fence, reuse, quarantine, or history-reset behavior. Keep PR66 Draft/Open.
+
+## 50. PR66 next paired active capture — Gate A ordering reproduced, ownership still unknown
+
+Capture files preserved under `build-load-accessor/runtime-test-phase-aware-20260930-2225/`.
+
+~~~text
+Run window                 2026-09-30 22:25:24–22:26:25 KST (log timestamps)
+REF embedded base stamp    a5e36fca710042fb366a4833e14c3a9c0c15eb87
+REF DLL identified SHA-256 837D34B8A7025332F6E77F5C2A1D6BAD03EF8C9C6143725F58B8537C35CBC5E0
+OptiScaler                 v0.9.5-pre4 / a556a639 / 20260929_135800
+OptiScaler Execute         986; Upscaling done: true 986
+PR66                       Draft / Open / unmerged
+~~~
+
+The hash above identifies the delivered test artifact correlated with this run; the REF runtime log itself contains the embedded base commit/build stamp, not a self-computed DLL SHA. The next delivery remains separately identified by its artifact SHA before runtime use.
+
+### Active counters and actual frame ordering
+
+The new phase-aware output now contains the previously missing high-water fields. At the last emitted mode-transition snapshot (`22:25:59.855`), LifetimeTrace reports 422 active successful submits/installs, 249 `resetHistory` submits, 173 continuous submits, 248 skips (245 marker-pending and 3 temporal-gate), 422 queued markers, `installedUnmarkedHighWater=1`, `mappingUnknown=422`, `mappingCandidate=844`, and `mappingProven=0`. These are snapshot counters at that timestamp, not a whole-run terminal summary. The full visible REF log contains 577 marker-pending resets and 22 temporal-gate resets; no `[LifetimeTrace] lifecycle-summary` was emitted, so the final session totals/high-water cannot be asserted.
+
+The earliest active sequence establishes the skip ordering without changing policy: `frame=9408 / trace=9005 / install=1` submits and installs; the next `frame=9409 / trace=9006` reaches pre-Overlay, finds the previous output's marker pending, restores only under the existing gate, and skips the submission. Later, PostPresent callback `present=9406` queues a marker for `install=1`, downstream fence 1. A later sample shows the same pattern around frames 10078–10079; actual `GetCompletedValue` is logged separately from the cached completion value. This confirms a real marker-pending skip/reset, but not that Present 9406 consumed output 1: install-time Present identity is unknown and the marker says `different-present-ordinal`.
+
+At the last active snapshot, unmarked-output high-water is one. That is not sufficient to size or authorize a ring because the output-to-reader/Present association remains candidate-only and the final summary is absent. The fixed event store retained 4,096 of 6,559 active events at the last snapshot (2,463 active events overwritten); nine of ten bounded dump windows emitted event lines and one request was suppressed. Active submit/install/marker/skip events are now present, so the former pre-active dump starvation is resolved for this capture.
+
+### Quality transitions and writer-provenance log correction
+
+The run logged eight mode requests and seven new XeSS context/init sequences, including a gameplay Off (`mode token 0`) followed by re-enable. Four quality transitions were accepted as verified `chainLength=2` engine writer replacements. However, each was preceded by an error-level `HandoffProvenance first-divergence; writer=unknown` line, followed by the successful chain acceptance. This is diagnostic severity/causal-reporting noise, not evidence that the accepted transitions failed; the raw pre-acceptance pointer/sample evidence must remain available.
+
+The next narrow diagnostic change will report the initial divergence as pending validation, then emit a sequence-linked resolved record only when the same Overlay, slot, generations, and terminal pointer match an accepted verified writer chain. Unverified third-object restore failures must continue to emit errors and quarantine. No TargetState ownership, writer acceptance, retirement, marker, fence, quarantine, or history-reset policy changes are allowed.
+
+### Gate decision
+
+~~~text
+Phase-aware active capture and bounded windows    PASS
+Frame N -> N+1 marker-pending skip/reset          OBSERVED
+Separate cached vs actual fence completion        OBSERVED
+High-water at emitted checkpoint                 1 (not proven whole-run maximum)
+Verified quality writer chains                   4 accepted; diagnostic wording follow-up needed
+Actual downstream reader -> eligible Present     NOT PROVEN
+Output ring                                       NOT AUTHORIZED / NOT IMPLEMENTED
+Final independent lifecycle summary              NOT OBSERVED in this process log
+Temporal continuity                              NOT ACCEPTED; 577 marker resets / 22 gate resets
+~~~
+
+The post-capture source changes only the pending/resolved provenance wording and sequence link, and adds a one-shot SHA-256 log of the REF module file when RE4 debug logging is enabled. A Release x64 DLL passed local lifetime-trace/writer-chain tests and PE identity validation (`0x8664`), then was installed with the previous DLL backed up after confirming no `re4.exe` was running:
+
+~~~text
+New test DLL SHA-256  8C7C37FC58D7D36BB5AB6A409D53F373BCC6E2392543698DE7EB24F5E6CF4CA1
+Previous DLL SHA-256  837D34B8A7025332F6E77F5C2A1D6BAD03EF8C9C6143725F58B8537C35CBC5E0
+Backup                 dinput8.dll.pre-provenance-resolution-sha-log-20260930.bak
+Runtime validation     PENDING; do not commit/push before reviewing paired logs
+~~~
+
+Keep PR66 Draft and do not change output lifetime rules until the actual reader/queue/Present ownership edge is proven.

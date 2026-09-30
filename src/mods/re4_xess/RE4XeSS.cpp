@@ -18,6 +18,9 @@
 #include <utility>
 #include <vector>
 
+#include <Windows.h>
+#include <bcrypt.h>
+
 #include <sdk/GameIdentity.hpp>
 #include <sdk/RETypeDB.hpp>
 #include <sdk/RETypes.hpp>
@@ -52,6 +55,140 @@ constexpr std::array<const char*, 8> UPSCALING_MODE_LABELS{
     "Ultra Performance",
 };
 
+std::optional<std::string> reframework_module_sha256() {
+    const auto module = REFramework::get_reframework_module();
+    if (module == nullptr) {
+        return std::nullopt;
+    }
+
+    std::array<wchar_t, 32768> module_path{};
+    const auto path_length = GetModuleFileNameW(module, module_path.data(),
+        static_cast<DWORD>(module_path.size()));
+    if (path_length == 0 || path_length >= module_path.size()) {
+        return std::nullopt;
+    }
+
+    struct Sha256Api {
+        using OpenAlgorithmProvider = NTSTATUS(WINAPI*)(BCRYPT_ALG_HANDLE*, LPCWSTR, LPCWSTR, ULONG);
+        using GetProperty = NTSTATUS(WINAPI*)(BCRYPT_HANDLE, LPCWSTR, PUCHAR, ULONG, ULONG*, ULONG);
+        using CreateHash = NTSTATUS(WINAPI*)(BCRYPT_ALG_HANDLE, BCRYPT_HASH_HANDLE*, PUCHAR, ULONG,
+            PUCHAR, ULONG, ULONG);
+        using HashData = NTSTATUS(WINAPI*)(BCRYPT_HASH_HANDLE, PUCHAR, ULONG, ULONG);
+        using FinishHash = NTSTATUS(WINAPI*)(BCRYPT_HASH_HANDLE, PUCHAR, ULONG, ULONG);
+        using DestroyHash = NTSTATUS(WINAPI*)(BCRYPT_HASH_HANDLE);
+        using CloseAlgorithmProvider = NTSTATUS(WINAPI*)(BCRYPT_ALG_HANDLE, ULONG);
+
+        HMODULE module{};
+        OpenAlgorithmProvider open_algorithm_provider{};
+        GetProperty get_property{};
+        CreateHash create_hash{};
+        HashData hash_data{};
+        FinishHash finish_hash{};
+        DestroyHash destroy_hash{};
+        CloseAlgorithmProvider close_algorithm_provider{};
+        BCRYPT_ALG_HANDLE algorithm{};
+        BCRYPT_HASH_HANDLE hash{};
+
+        ~Sha256Api() {
+            if (hash != nullptr && destroy_hash != nullptr) {
+                destroy_hash(hash);
+            }
+            if (algorithm != nullptr && close_algorithm_provider != nullptr) {
+                close_algorithm_provider(algorithm, 0);
+            }
+            if (module != nullptr) {
+                FreeLibrary(module);
+            }
+        }
+    } api;
+
+    api.module = LoadLibraryExW(L"bcrypt.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (api.module == nullptr) {
+        return std::nullopt;
+    }
+    api.open_algorithm_provider = reinterpret_cast<Sha256Api::OpenAlgorithmProvider>(
+        GetProcAddress(api.module, "BCryptOpenAlgorithmProvider"));
+    api.get_property = reinterpret_cast<Sha256Api::GetProperty>(
+        GetProcAddress(api.module, "BCryptGetProperty"));
+    api.create_hash = reinterpret_cast<Sha256Api::CreateHash>(
+        GetProcAddress(api.module, "BCryptCreateHash"));
+    api.hash_data = reinterpret_cast<Sha256Api::HashData>(GetProcAddress(api.module, "BCryptHashData"));
+    api.finish_hash = reinterpret_cast<Sha256Api::FinishHash>(GetProcAddress(api.module, "BCryptFinishHash"));
+    api.destroy_hash = reinterpret_cast<Sha256Api::DestroyHash>(GetProcAddress(api.module, "BCryptDestroyHash"));
+    api.close_algorithm_provider = reinterpret_cast<Sha256Api::CloseAlgorithmProvider>(
+        GetProcAddress(api.module, "BCryptCloseAlgorithmProvider"));
+    if (api.open_algorithm_provider == nullptr || api.get_property == nullptr || api.create_hash == nullptr ||
+        api.hash_data == nullptr || api.finish_hash == nullptr || api.destroy_hash == nullptr ||
+        api.close_algorithm_provider == nullptr ||
+        api.open_algorithm_provider(&api.algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0) {
+        return std::nullopt;
+    }
+
+    ULONG object_length{};
+    ULONG hash_length{};
+    ULONG result_length{};
+    if (api.get_property(api.algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&object_length),
+            sizeof(object_length), &result_length, 0) < 0 ||
+        api.get_property(api.algorithm, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hash_length),
+            sizeof(hash_length), &result_length, 0) < 0 || hash_length != 32) {
+        return std::nullopt;
+    }
+
+    std::vector<UCHAR> hash_object(object_length);
+    if (api.create_hash(api.algorithm, &api.hash, hash_object.data(), object_length, nullptr, 0, 0) < 0) {
+        return std::nullopt;
+    }
+
+    const auto file = CreateFileW(module_path.data(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return std::nullopt;
+    }
+    struct FileCloser {
+        HANDLE handle;
+        ~FileCloser() { CloseHandle(handle); }
+    } file_closer{ file };
+
+    std::array<UCHAR, 64 * 1024> buffer{};
+    for (;;) {
+        DWORD bytes_read{};
+        if (!ReadFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &bytes_read, nullptr)) {
+            return std::nullopt;
+        }
+        if (bytes_read == 0) {
+            break;
+        }
+        if (api.hash_data(api.hash, buffer.data(), bytes_read, 0) < 0) {
+            return std::nullopt;
+        }
+    }
+
+    std::array<UCHAR, 32> digest{};
+    if (api.finish_hash(api.hash, digest.data(), static_cast<ULONG>(digest.size()), 0) < 0) {
+        return std::nullopt;
+    }
+    constexpr char HEX[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(digest.size() * 2);
+    for (const auto byte : digest) {
+        result.push_back(HEX[byte >> 4]);
+        result.push_back(HEX[byte & 0x0f]);
+    }
+    return result;
+}
+
+void log_re4_xess_runtime_identity() {
+    static std::once_flag logged;
+    std::call_once(logged, [] {
+        if (const auto digest = reframework_module_sha256(); digest.has_value()) {
+            spdlog::info("[RE4XeSS][RuntimeIdentity] refDllSha256={}", *digest);
+        } else {
+            spdlog::warn("[RE4XeSS][RuntimeIdentity] refDllSha256=unavailable");
+        }
+    });
+}
+
 const char* lifetime_trace_kind_name(RE4XeSSLifetimeTrace::Kind kind) noexcept {
     using Kind = RE4XeSSLifetimeTrace::Kind;
     switch (kind) {
@@ -60,6 +197,7 @@ const char* lifetime_trace_kind_name(RE4XeSSLifetimeTrace::Kind kind) noexcept {
     case Kind::Submit: return "submit";
     case Kind::OutputInstall: return "output-install";
     case Kind::OutputRestore: return "output-restore";
+    case Kind::ModeTransition: return "mode-transition";
     case Kind::PostOverlayObservation: return "post-overlay-observation";
     case Kind::Present: return "present";
     case Kind::PostPresentCallback: return "post-present-callback";
@@ -72,44 +210,89 @@ const char* lifetime_trace_kind_name(RE4XeSSLifetimeTrace::Kind kind) noexcept {
     return "unknown";
 }
 
-void dump_re4_xess_lifetime_trace(std::string_view reason, size_t event_count) {
+const char* lifetime_trace_phase_name(RE4XeSSLifetimeTrace::CapturePhase phase) noexcept {
+    return phase == RE4XeSSLifetimeTrace::CapturePhase::ActiveXeSS ? "active-xess" : "pre-active";
+}
+
+const char* lifetime_trace_mapping_name(RE4XeSSLifetimeTrace::MappingState state) noexcept {
+    using MappingState = RE4XeSSLifetimeTrace::MappingState;
+    switch (state) {
+    case MappingState::Unknown: return "unknown";
+    case MappingState::InferredCandidate: return "inferred-candidate";
+    case MappingState::Proven: return "proven";
+    }
+    return "unknown";
+}
+
+const char* lifetime_trace_dump_window_name(RE4XeSSLifetimeTrace::DumpWindow window) noexcept {
+    using DumpWindow = RE4XeSSLifetimeTrace::DumpWindow;
+    switch (window) {
+    case DumpWindow::PreActive: return "pre-active";
+    case DumpWindow::ActiveMilestone: return "active-milestone";
+    case DumpWindow::Anomaly: return "anomaly";
+    case DumpWindow::ModeTransition: return "mode-transition";
+    case DumpWindow::Periodic: return "periodic";
+    case DumpWindow::Count: break;
+    }
+    return "unknown";
+}
+
+void dump_re4_xess_lifetime_trace(
+    std::string_view reason,
+    size_t event_count,
+    RE4XeSSLifetimeTrace::DumpWindow window) {
     auto& trace = RE4XeSSLifetimeTrace::instance();
     if (!trace.enabled()) {
         return;
     }
 
-    static std::atomic<uint32_t> dump_count{};
-    const auto dump_index = dump_count.fetch_add(1, std::memory_order_relaxed);
-    if (dump_index >= 32) {
+    RE4XeSSLifetimeTrace::DumpReservation reservation{};
+    if (!trace.reserve_dump(window, event_count, reservation)) {
         return;
     }
 
     const auto summary = trace.summary();
-    const auto events = trace.recent(event_count);
-    spdlog::info("[RE4XeSS][LifetimeTrace] checkpoint reason={} dump={} retained={} overwritten={} installsUnmarked={} installsUnmarkedHighWater={} markersGPUIncomplete={} mappingAmbiguities={} submitSuccessResetHistory={} submitSuccessContinuous={} frameSkips={} markerPendingSkips={} bridgeBusySkips={} temporalGateSkips={} unmatchedMarkers={} unmatchedCompletions={} evictedInstallRecords={} allEvents={}",
-        reason,
-        dump_index + 1,
+    const auto events = trace.recent(reservation.event_count);
+    const auto bounded_reason = reason.substr(0, 64);
+    spdlog::info("[RE4XeSS][LifetimeTrace] window reason={} class={} window={} phase={} selected={} retained={} preActiveEvents={} activeEvents={} preActiveOverwritten={} activeOverwritten={} activeInstalls={} activeUnmarked={} activeUnmarkedHighWater={} activeMarkedGpuIncomplete={} activeExecuteSuccess={} activeMarkerQueued={} activeResetHistory={} activeContinuous={} activeSkips={} activeMarkerPendingSkips={} activeBridgeBusySkips={} activeTemporalGateSkips={} activeMapUnknown={} activeMapCandidate={} activeMapProven={} dumpRequests={} dumpEmitted={} dumpSuppressed={} eventLinesReserved={} eventLinesEmitted={} bytesReserved={} allEvents={}",
+        bounded_reason,
+        lifetime_trace_dump_window_name(window),
+        reservation.index,
+        reservation.active_phase ? "active-xess" : "pre-active",
         events.size(),
-        summary.overwritten_events,
-        summary.installed_unmarked,
-        summary.installed_unmarked_high_water,
-        summary.marked_gpu_incomplete,
-        summary.mapping_ambiguities,
-        summary.successful_reset_history_submits,
-        summary.successful_continuous_submits,
-        summary.skipped_submits,
-        summary.marker_pending_skips,
-        summary.bridge_busy_skips,
-        summary.temporal_gate_skips,
-        summary.unmatched_markers,
-        summary.unmatched_completions,
-        summary.evicted_install_records,
-        summary.total_events);
+        static_cast<unsigned long long>(summary.retained_events),
+        static_cast<unsigned long long>(summary.pre_active_events),
+        static_cast<unsigned long long>(summary.active_events),
+        static_cast<unsigned long long>(summary.pre_active_overwritten_events),
+        static_cast<unsigned long long>(summary.active_overwritten_events),
+        static_cast<unsigned long long>(summary.active_output_installs),
+        static_cast<unsigned long long>(summary.installed_unmarked),
+        static_cast<unsigned long long>(summary.installed_unmarked_high_water),
+        static_cast<unsigned long long>(summary.marked_gpu_incomplete),
+        static_cast<unsigned long long>(summary.active_successful_submissions),
+        static_cast<unsigned long long>(summary.active_marker_queued),
+        static_cast<unsigned long long>(summary.active_reset_history_submits),
+        static_cast<unsigned long long>(summary.active_continuous_submits),
+        static_cast<unsigned long long>(summary.active_skipped_submits),
+        static_cast<unsigned long long>(summary.active_marker_pending_skips),
+        static_cast<unsigned long long>(summary.active_bridge_busy_skips),
+        static_cast<unsigned long long>(summary.active_temporal_gate_skips),
+        static_cast<unsigned long long>(summary.active_mapping_unknown),
+        static_cast<unsigned long long>(summary.active_mapping_inferred_candidates),
+        static_cast<unsigned long long>(summary.active_mapping_proven),
+        static_cast<unsigned long long>(summary.dump_requests),
+        static_cast<unsigned long long>(summary.dump_windows_emitted),
+        static_cast<unsigned long long>(summary.dump_windows_suppressed),
+        static_cast<unsigned long long>(summary.dump_event_lines_reserved),
+        static_cast<unsigned long long>(summary.dump_event_lines_emitted),
+        static_cast<unsigned long long>(summary.dump_bytes_reserved),
+        static_cast<unsigned long long>(summary.total_events));
 
     for (const auto& event : events) {
-        spdlog::info("[RE4XeSS][LifetimeTrace] seq={} us={} kind={} trace={} install={} frame={} frameValid={} sceneOrd={} callbackOrd={} overlapEpoch={} submit={} present={} relatedPresent={} outputGen={} controlGen={} deviceGen={} bridgeSlot={} writerFence={} downstreamFence={} cachedCompleted={} cachedValid={} actualCompleted={} actualValid={} writerTxn={} writerInvocation={} writerSeq={} clearSeq={}->{} replacementSeq={}->{} writerRva=0x{:x} presentTimes={}::{}/{} output=0x{:x} targetState=0x{:x} overlay=0x{:x} swapchain=0x{:x} device=0x{:x} queue=0x{:x} queueType={} queueTypeValid={} tid={} presentTids={}->{} presentSource={} present1={} presentReturned={} callbacksSuppressed={} originalSkipped={} result=0x{:08x} apiOk={} queueSubmitted={} markerQueued={} resetHistory={} mappingAmbiguous={} reason={}",
+        spdlog::info("[RE4XeSS][LifetimeTrace] seq={} us={} phase={} kind={} trace={} install={} frame={} frameValid={} sceneOrd={} callbackOrd={} overlapEpoch={} submit={} present={} relatedPresent={} outputGen={} controlGen={} deviceGen={} bridgeSlot={} writerFence={} downstreamFence={} cachedCompleted={} cachedValid={} actualCompleted={} actualValid={} writerTxn={} writerInvocation={} writerSeq={} clearSeq={}->{} replacementSeq={}->{} writerRva=0x{:x} presentTimes={}::{}/{} output=0x{:x} targetState=0x{:x} overlay=0x{:x} swapchain=0x{:x} device=0x{:x} queue=0x{:x} queueType={} queueTypeValid={} tid={} presentTids={}->{} presentSource={} present1={} presentReturned={} callbacksSuppressed={} originalSkipped={} result=0x{:08x} apiOk={} queueSubmitted={} markerQueued={} resetHistory={} mappingState={} mappingAmbiguous={} reason={}",
             static_cast<unsigned long long>(event.sequence),
             static_cast<unsigned long long>(event.timestamp_us),
+            lifetime_trace_phase_name(event.capture_phase),
             lifetime_trace_kind_name(event.kind),
             static_cast<unsigned long long>(event.trace_id),
             static_cast<unsigned long long>(event.install_id),
@@ -163,9 +346,65 @@ void dump_re4_xess_lifetime_trace(std::string_view reason, size_t event_count) {
             event.queue_submitted,
             event.marker_queued,
             event.reset_history,
+            lifetime_trace_mapping_name(event.mapping_state),
             event.mapping_ambiguous,
             event.reason.data());
     }
+    trace.note_dump_emitted(reservation, events.size());
+}
+
+void log_re4_xess_lifetime_summary() {
+    auto& trace = RE4XeSSLifetimeTrace::instance();
+    if (!trace.claim_final_summary()) {
+        return;
+    }
+
+    const auto summary = trace.summary();
+    const auto kind_count = [&](RE4XeSSLifetimeTrace::Kind kind, bool active) {
+        const auto index = static_cast<size_t>(kind);
+        return active ? summary.active_event_counts[index] : summary.pre_active_event_counts[index];
+    };
+    using Kind = RE4XeSSLifetimeTrace::Kind;
+    spdlog::info("[RE4XeSS][LifetimeTrace] lifecycle-summary activeStarted={} recorded={} retained={} overwritten={} preActiveEvents={} preScene={} preOverlay={} preSkip={} activeEvents={} activeScene={} activePreOverlay={} activeSubmit={} activeInstall={} installedUnmarked={} installedUnmarkedHighWater={} markedGpuIncomplete={} activeRestore={} activeModeChange={} activePostPresent={} activeMarker={} activeSkip={} activeExecuteSuccess={} activeResetHistory={} activeContinuous={} activeMarkerPendingSkip={} activeBridgeBusySkip={} activeTemporalGateSkip={} activeMapUnknown={} activeMapCandidate={} activeMapProven={} preOverwritten={} activeOverwritten={} dumpRequests={} dumpEmitted={} dumpSuppressed={} eventLinesReserved={} eventLinesEmitted={} bytesReserved={} activeGameplayDumpEmitted={}",
+        summary.active_capture_started,
+        static_cast<unsigned long long>(summary.total_events),
+        static_cast<unsigned long long>(summary.retained_events),
+        static_cast<unsigned long long>(summary.overwritten_events),
+        static_cast<unsigned long long>(summary.pre_active_events),
+        static_cast<unsigned long long>(kind_count(Kind::SceneFrame, false)),
+        static_cast<unsigned long long>(kind_count(Kind::PreOverlay, false)),
+        static_cast<unsigned long long>(kind_count(Kind::Skip, false)),
+        static_cast<unsigned long long>(summary.active_events),
+        static_cast<unsigned long long>(kind_count(Kind::SceneFrame, true)),
+        static_cast<unsigned long long>(kind_count(Kind::PreOverlay, true)),
+        static_cast<unsigned long long>(kind_count(Kind::Submit, true)),
+        static_cast<unsigned long long>(kind_count(Kind::OutputInstall, true)),
+        static_cast<unsigned long long>(summary.installed_unmarked),
+        static_cast<unsigned long long>(summary.installed_unmarked_high_water),
+        static_cast<unsigned long long>(summary.marked_gpu_incomplete),
+        static_cast<unsigned long long>(kind_count(Kind::OutputRestore, true)),
+        static_cast<unsigned long long>(kind_count(Kind::ModeTransition, true)),
+        static_cast<unsigned long long>(kind_count(Kind::PostPresentCallback, true)),
+        static_cast<unsigned long long>(kind_count(Kind::Marker, true)),
+        static_cast<unsigned long long>(kind_count(Kind::Skip, true)),
+        static_cast<unsigned long long>(summary.active_successful_submissions),
+        static_cast<unsigned long long>(summary.active_reset_history_submits),
+        static_cast<unsigned long long>(summary.active_continuous_submits),
+        static_cast<unsigned long long>(summary.active_marker_pending_skips),
+        static_cast<unsigned long long>(summary.active_bridge_busy_skips),
+        static_cast<unsigned long long>(summary.active_temporal_gate_skips),
+        static_cast<unsigned long long>(summary.active_mapping_unknown),
+        static_cast<unsigned long long>(summary.active_mapping_inferred_candidates),
+        static_cast<unsigned long long>(summary.active_mapping_proven),
+        static_cast<unsigned long long>(summary.pre_active_overwritten_events),
+        static_cast<unsigned long long>(summary.active_overwritten_events),
+        static_cast<unsigned long long>(summary.dump_requests),
+        static_cast<unsigned long long>(summary.dump_windows_emitted),
+        static_cast<unsigned long long>(summary.dump_windows_suppressed),
+        static_cast<unsigned long long>(summary.dump_event_lines_reserved),
+        static_cast<unsigned long long>(summary.dump_event_lines_emitted),
+        static_cast<unsigned long long>(summary.dump_bytes_reserved),
+        static_cast<unsigned long long>(summary.active_gameplay_dump_emitted));
 }
 
 std::optional<UpscalingMode> mode_from_config_token(std::string_view token) {
@@ -4517,6 +4756,7 @@ std::filesystem::path reframework_module_directory() {
 
 RE4XeSS::~RE4XeSS() {
     m_worker.stop();
+    log_re4_xess_lifetime_summary();
 }
 
 std::optional<std::string> RE4XeSS::on_initialize() {
@@ -4683,6 +4923,8 @@ void RE4XeSS::on_post_present() {
     const auto handoff = m_output_handoff.snapshot();
     const bool present_valid = present.active && present.returned && present.result_valid &&
         present.return_thread_id == GetCurrentThreadId();
+    const bool marker_was_pending = handoff.marker_pending;
+    const auto prior_signaled_value = handoff.last_signaled_fence_value;
     RE4XeSSLifetimeTrace::Event present_event{};
     present_event.kind = RE4XeSSLifetimeTrace::Kind::PostPresentCallback;
     present_event.trace_id = handoff.marker_pending ? handoff.installed_trace_id : 0;
@@ -4715,6 +4957,10 @@ void RE4XeSS::on_post_present() {
     present_event.present_callbacks_suppressed = present.render_callbacks_suppressed;
     present_event.original_present_skipped = present.original_call_skipped;
     present_event.mapping_ambiguous = handoff.marker_pending;
+    present_event.mapping_observed = handoff.marker_pending;
+    present_event.mapping_state = handoff.marker_pending && present_valid
+        ? RE4XeSSLifetimeTrace::MappingState::InferredCandidate
+        : RE4XeSSLifetimeTrace::MappingState::Unknown;
     present_event.present_entry_time_us = present.entry_time_us;
     present_event.original_present_enter_time_us = present.original_call_enter_time_us;
     present_event.original_present_return_time_us = present.original_call_return_time_us;
@@ -4725,9 +4971,6 @@ void RE4XeSS::on_post_present() {
         present.render_callbacks_suppressed ? "unexpected-suppressed-post-callback" :
         "post-present-callback-entered");
     lifetime_trace.record(present_event);
-    if (lifetime_trace.enabled() && present.ordinal != 0 && present.ordinal % 512 == 0) {
-        dump_re4_xess_lifetime_trace("present-window-checkpoint", 96);
-    }
 
     const RE4XeSSOutputHandoff::ObservationContext observation{
         static_cast<int32_t>(m_requested_mode.load(std::memory_order_acquire)),
@@ -4751,6 +4994,46 @@ void RE4XeSS::on_post_present() {
     };
 
     m_output_handoff.on_post_present(hook->get_device(), hook->get_command_queue(), observation);
+    const auto handoff_after_present = m_output_handoff.snapshot();
+    if (marker_was_pending && present_valid && lifetime_trace.note_pending_present(
+            handoff.install_id, present.ordinal)) {
+        if (lifetime_trace.claim_anomaly_window(
+                RE4XeSSLifetimeTrace::AnomalyWindow::MarkerPendingAcrossPresent)) {
+            dump_re4_xess_lifetime_trace(
+                "marker-pending-across-two-present-intervals",
+                32,
+                RE4XeSSLifetimeTrace::DumpWindow::Anomaly);
+        }
+    }
+    if (marker_was_pending && !handoff_after_present.marker_pending &&
+        handoff_after_present.last_signaled_fence_value > prior_signaled_value &&
+        lifetime_trace.claim_first_marker_queued_window()) {
+        dump_re4_xess_lifetime_trace(
+            "first-downstream-marker-queued",
+            32,
+            RE4XeSSLifetimeTrace::DumpWindow::ActiveMilestone);
+    }
+    if (lifetime_trace.claim_first_mapping_window()) {
+        dump_re4_xess_lifetime_trace(
+            "first-present-mapping-observation-not-proof",
+            32,
+            RE4XeSSLifetimeTrace::DumpWindow::Anomaly);
+    }
+    if (handoff_after_present.retirement == RE4XeSSOutputHandoff::RetirementStatus::Quarantined &&
+        !handoff_after_present.failure_reason.empty() &&
+        lifetime_trace.claim_anomaly_window(RE4XeSSLifetimeTrace::AnomalyWindow::WriterOrFenceFailure)) {
+        dump_re4_xess_lifetime_trace(
+            "writer-or-fence-quarantine",
+            32,
+            RE4XeSSLifetimeTrace::DumpWindow::Anomaly);
+    }
+    if (lifetime_trace.enabled() && lifetime_trace.active_capture_started() &&
+        present.ordinal != 0 && present.ordinal % 512 == 0) {
+        dump_re4_xess_lifetime_trace(
+            "present-window-checkpoint",
+            32,
+            RE4XeSSLifetimeTrace::DumpWindow::Periodic);
+    }
 }
 
 void RE4XeSS::on_device_reset() {
@@ -4768,6 +5051,9 @@ void RE4XeSS::on_config_load(const utility::Config& cfg) {
     m_handoff_provenance_opt_in = cfg.get<bool>(std::string{ HANDOFF_PROVENANCE_CONFIG_KEY }).value_or(false);
     const auto debug_log = REFrameworkConfig::get() != nullptr &&
         REFrameworkConfig::get()->is_debug_log_enabled();
+    if (debug_log) {
+        log_re4_xess_runtime_identity();
+    }
     const bool d3d12_renderer = g_framework != nullptr &&
         g_framework->get_renderer_type() == REFramework::RendererType::D3D12;
     auto& lifetime_trace = RE4XeSSLifetimeTrace::instance();
@@ -4837,6 +5123,30 @@ void RE4XeSS::request_mode(UpscalingMode mode) {
         control_generation,
         static_cast<int32_t>(mode),
         m_device_reset_generation.load(std::memory_order_acquire));
+    auto& lifetime_trace = RE4XeSSLifetimeTrace::instance();
+    const auto installed = m_output_handoff.snapshot();
+    if (lifetime_trace.enabled() && installed.installed) {
+        RE4XeSSLifetimeTrace::Event event{};
+        event.kind = RE4XeSSLifetimeTrace::Kind::ModeTransition;
+        event.install_id = installed.install_id;
+        event.frame_id = installed.installed_frame;
+        event.frame_valid = installed.installed_frame != 0;
+        event.present_ordinal = installed.installed_present_ordinal;
+        event.output_generation = installed.output_generation;
+        event.control_generation = control_generation;
+        event.device_reset_generation = m_device_reset_generation.load(std::memory_order_acquire);
+        event.output_resource = installed.output_resource;
+        event.target_state = installed.target_state;
+        event.overlay = installed.overlay;
+        event.thread_id = request_thread_id;
+        event.result = static_cast<int32_t>(old_mode);
+        RE4XeSSLifetimeTrace::set_reason(event, "requested-mode-transition-with-installed-handoff");
+        lifetime_trace.record(event);
+        dump_re4_xess_lifetime_trace(
+            "mode-transition-with-installed-handoff",
+            32,
+            RE4XeSSLifetimeTrace::DumpWindow::ModeTransition);
+    }
     spdlog::info("[RE4XeSS][Config] mode changed: {} -> {} controlGeneration={} requestThread={}",
         mode_to_display_label(old_mode),
         mode_to_display_label(mode),
@@ -5664,8 +5974,29 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         }
         (void)record_lifetime_event(RE4XeSSLifetimeTrace::Kind::Skip, reason);
         const auto skip_count = m_lifetime_skip_count.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (skip_count <= 8 || skip_count % 512 == 0) {
-            dump_re4_xess_lifetime_trace(reason, 96);
+        if (!lifetime_trace.active_capture_started()) {
+            if (skip_count == 1 || skip_count == 512) {
+                dump_re4_xess_lifetime_trace(
+                    reason,
+                    32,
+                    RE4XeSSLifetimeTrace::DumpWindow::PreActive);
+            }
+        } else if (reason == "output-handoff-restore-failed" ||
+            reason == "output-handoff-install-failed" ||
+            reason == "output-handoff-unavailable" ||
+            reason == "xess-execute-fault") {
+            if (lifetime_trace.claim_anomaly_window(
+                    RE4XeSSLifetimeTrace::AnomalyWindow::WriterOrFenceFailure)) {
+                dump_re4_xess_lifetime_trace(
+                    reason,
+                    32,
+                    RE4XeSSLifetimeTrace::DumpWindow::Anomaly);
+            }
+        } else if (skip_count % 512 == 0) {
+            dump_re4_xess_lifetime_trace(
+                reason,
+                32,
+                RE4XeSSLifetimeTrace::DumpWindow::Periodic);
         }
     };
 
@@ -6052,6 +6383,13 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
             invalidate_history("output-handoff-marker-pending");
             clear_frame_state();
             trace_skip("output-handoff-marker-pending");
+            if (lifetime_trace.claim_anomaly_window(
+                    RE4XeSSLifetimeTrace::AnomalyWindow::FirstMarkerPending)) {
+                dump_re4_xess_lifetime_trace(
+                    "first-output-handoff-marker-pending",
+                    32,
+                    RE4XeSSLifetimeTrace::DumpWindow::Anomaly);
+            }
             return true;
         }
 
@@ -6071,6 +6409,14 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         invalidate_history("output-handoff-unavailable");
         clear_frame_state();
         trace_skip(handoff_error.empty() ? "output-handoff-unavailable" : std::string_view{ handoff_error });
+        if (handoff_state.retirement == RE4XeSSOutputHandoff::RetirementStatus::Quarantined &&
+            lifetime_trace.claim_anomaly_window(
+                RE4XeSSLifetimeTrace::AnomalyWindow::WriterOrFenceFailure)) {
+            dump_re4_xess_lifetime_trace(
+                "output-handoff-quarantined",
+                32,
+                RE4XeSSLifetimeTrace::DumpWindow::Anomaly);
+        }
         return true;
     }
     m_output_handoff_control_generation = control_generation;
@@ -6136,10 +6482,20 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
     }
     RE4XeSSLifetimeTrace::set_reason(submit_event, submit_reason);
     lifetime_trace.record(submit_event);
+    if (submit_event.successful_submission &&
+        lifetime_trace.claim_first_execute_success_window()) {
+        dump_re4_xess_lifetime_trace(
+            "first-public-xess-execute-success",
+            32,
+            RE4XeSSLifetimeTrace::DumpWindow::ActiveMilestone);
+    }
     if (submit_event.successful_submission) {
         const auto submitted = m_lifetime_submit_count.fetch_add(1, std::memory_order_relaxed) + 1;
         if (submitted % 1024 == 0) {
-            dump_re4_xess_lifetime_trace("submit-checkpoint", 96);
+            dump_re4_xess_lifetime_trace(
+                "submit-checkpoint",
+                32,
+                RE4XeSSLifetimeTrace::DumpWindow::Periodic);
         }
     }
     if (submit_result.status == RE4XeSSWorker::SubmitResult::Status::Submitted) {
@@ -6192,6 +6548,19 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
             clear_frame_state();
             trace_skip("output-handoff-install-failed");
             return true;
+        }
+
+        if (lifetime_trace.claim_first_output_install_window()) {
+            dump_re4_xess_lifetime_trace(
+                "first-successful-output-install",
+                32,
+                RE4XeSSLifetimeTrace::DumpWindow::ActiveMilestone);
+        }
+        if (lifetime_trace.claim_first_execute_success_window()) {
+            dump_re4_xess_lifetime_trace(
+                "first-public-xess-execute-success",
+                32,
+                RE4XeSSLifetimeTrace::DumpWindow::ActiveMilestone);
         }
 
         m_last_color_identity = color_identity;

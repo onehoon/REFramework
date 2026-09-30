@@ -174,6 +174,13 @@ private:
         uintptr_t current_state_identity,
         bool current_state_known,
         uint32_t phase_bit) noexcept;
+    uint64_t find_matching_provenance_divergence(
+        uintptr_t layer_identity,
+        uintptr_t slot_identity,
+        uintptr_t current_state_identity,
+        uintptr_t expected_state_identity,
+        uint64_t control_generation,
+        uint64_t device_reset_generation) noexcept;
 
     struct ProvenanceSample {
         std::string_view phase{};
@@ -192,6 +199,7 @@ private:
         uintptr_t saved_state{};
         bool frame_id_valid{};
         bool slot_read_valid{};
+        bool first_divergence{};
         bool identity_changed{};
         bool marker_pending{};
         bool installed{};

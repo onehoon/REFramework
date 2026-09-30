@@ -19,6 +19,7 @@ public:
         Submit,
         OutputInstall,
         OutputRestore,
+        ModeTransition,
         PostOverlayObservation,
         Present,
         PostPresentCallback,
@@ -27,6 +28,42 @@ public:
         DownstreamFenceComplete,
         Skip,
         Count,
+    };
+
+    enum class CapturePhase : uint8_t {
+        PreActive,
+        ActiveXeSS,
+    };
+
+    enum class MappingState : uint8_t {
+        Unknown,
+        InferredCandidate,
+        Proven,
+    };
+
+    enum class DumpWindow : uint8_t {
+        PreActive,
+        ActiveMilestone,
+        Anomaly,
+        ModeTransition,
+        Periodic,
+        Count,
+    };
+
+    enum class AnomalyWindow : uint8_t {
+        FirstMarkerPending,
+        MarkerPendingAcrossPresent,
+        FirstUnprovenPresentMapping,
+        WriterOrFenceFailure,
+        Count,
+    };
+
+    struct DumpReservation {
+        DumpWindow window{ DumpWindow::PreActive };
+        uint32_t index{};
+        size_t event_count{};
+        size_t estimated_bytes{};
+        bool active_phase{};
     };
 
     struct Event {
@@ -89,13 +126,31 @@ public:
         bool cached_completed_value_valid{};
         bool actual_completed_value_valid{};
         bool command_queue_type_valid{};
+        bool mapping_observed{};
+        CapturePhase capture_phase{ CapturePhase::PreActive };
+        MappingState mapping_state{ MappingState::Unknown };
         std::array<char, 64> reason{};
     };
 
     struct Summary {
         std::array<uint64_t, static_cast<size_t>(Kind::Count)> event_counts{};
+        std::array<uint64_t, static_cast<size_t>(Kind::Count)> pre_active_event_counts{};
+        std::array<uint64_t, static_cast<size_t>(Kind::Count)> active_event_counts{};
         uint64_t overwritten_events{};
         uint64_t total_events{};
+        uint64_t pre_active_events{};
+        uint64_t active_events{};
+        uint64_t pre_active_overwritten_events{};
+        uint64_t active_overwritten_events{};
+        uint64_t active_successful_submissions{};
+        uint64_t active_reset_history_submits{};
+        uint64_t active_continuous_submits{};
+        uint64_t active_skipped_submits{};
+        uint64_t active_marker_queued{};
+        uint64_t active_output_installs{};
+        uint64_t active_marker_pending_skips{};
+        uint64_t active_bridge_busy_skips{};
+        uint64_t active_temporal_gate_skips{};
         uint64_t installed_unmarked{};
         uint64_t installed_unmarked_high_water{};
         uint64_t marked_gpu_incomplete{};
@@ -109,9 +164,27 @@ public:
         uint64_t unmatched_markers{};
         uint64_t unmatched_completions{};
         uint64_t evicted_install_records{};
+        uint64_t mapping_unknown{};
+        uint64_t mapping_inferred_candidates{};
+        uint64_t mapping_proven{};
+        uint64_t active_mapping_unknown{};
+        uint64_t active_mapping_inferred_candidates{};
+        uint64_t active_mapping_proven{};
+        uint64_t dump_requests{};
+        uint64_t dump_windows_emitted{};
+        uint64_t dump_windows_suppressed{};
+        uint64_t dump_event_lines_reserved{};
+        uint64_t dump_event_lines_emitted{};
+        uint64_t dump_bytes_reserved{};
+        uint64_t active_gameplay_dump_emitted{};
+        uint64_t retained_events{};
+        bool active_capture_started{};
     };
 
     static constexpr size_t CAPACITY = 4096;
+    static constexpr size_t MAX_EVENTS_PER_DUMP = 32;
+    static constexpr size_t MAX_DUMP_EVENT_LINES = 512;
+    static constexpr size_t MAX_DUMP_BYTES = 1'100'000;
 
     static RE4XeSSLifetimeTrace& instance() noexcept {
         static RE4XeSSLifetimeTrace trace{};
@@ -139,7 +212,47 @@ public:
         event.timestamp_us = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(now).count());
         std::lock_guard lock{ m_mutex };
+        if (event.kind == Kind::OutputInstall) {
+            const bool starting_active_capture = !m_active_capture_started;
+            m_active_capture_started = true;
+            m_active_capture_started_snapshot.store(true, std::memory_order_release);
+            if (starting_active_capture && event.trace_id != 0) {
+                // The first successful Execute immediately precedes its OutputInstall in
+                // the same coordinator transaction; count that submit in the active window.
+                const auto preceding_count = (std::min)(m_size, MAX_EVENTS_PER_DUMP);
+                for (size_t offset = 0; offset < preceding_count; ++offset) {
+                    const auto event_index = (m_next + CAPACITY - 1 - offset) % CAPACITY;
+                    auto& prior = m_events[event_index];
+                    if (prior.trace_id == event.trace_id && prior.kind == Kind::Submit &&
+                        prior.successful_submission && prior.capture_phase == CapturePhase::PreActive) {
+                        prior.capture_phase = CapturePhase::ActiveXeSS;
+                        --m_summary.pre_active_events;
+                        --m_summary.pre_active_event_counts[static_cast<size_t>(Kind::Submit)];
+                        ++m_summary.active_events;
+                        ++m_summary.active_event_counts[static_cast<size_t>(Kind::Submit)];
+                        ++m_summary.active_successful_submissions;
+                        if (prior.reset_history) {
+                            ++m_summary.active_reset_history_submits;
+                        } else {
+                            ++m_summary.active_continuous_submits;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        event.capture_phase = m_active_capture_started
+            ? CapturePhase::ActiveXeSS
+            : CapturePhase::PreActive;
         event.sequence = ++m_sequence;
+        if (m_size == CAPACITY) {
+            const auto& overwritten = m_events[m_next];
+            if (overwritten.capture_phase == CapturePhase::ActiveXeSS) {
+                ++m_summary.active_overwritten_events;
+            } else {
+                ++m_summary.pre_active_overwritten_events;
+            }
+        }
         m_events[m_next] = event;
         m_next = (m_next + 1) % CAPACITY;
         if (m_size == CAPACITY) {
@@ -149,10 +262,36 @@ public:
         ++m_counts[static_cast<size_t>(event.kind)];
         m_summary.event_counts = m_counts;
         ++m_summary.total_events;
+        if (event.capture_phase == CapturePhase::ActiveXeSS) {
+            ++m_summary.active_events;
+            ++m_summary.active_event_counts[static_cast<size_t>(event.kind)];
+        } else {
+            ++m_summary.pre_active_events;
+            ++m_summary.pre_active_event_counts[static_cast<size_t>(event.kind)];
+        }
+        if (event.mapping_observed) {
+            switch (event.mapping_state) {
+            case MappingState::Unknown:
+                ++m_summary.mapping_unknown;
+                if (event.capture_phase == CapturePhase::ActiveXeSS) ++m_summary.active_mapping_unknown;
+                break;
+            case MappingState::InferredCandidate:
+                ++m_summary.mapping_inferred_candidates;
+                if (event.capture_phase == CapturePhase::ActiveXeSS) ++m_summary.active_mapping_inferred_candidates;
+                break;
+            case MappingState::Proven:
+                ++m_summary.mapping_proven;
+                if (event.capture_phase == CapturePhase::ActiveXeSS) ++m_summary.active_mapping_proven;
+                break;
+            }
+        }
+        m_summary.retained_events = m_size;
+        m_summary.active_capture_started = m_active_capture_started;
         if (event.kind == Kind::PostPresentCallback && event.mapping_ambiguous) {
             ++m_summary.mapping_ambiguities;
         }
         if (event.kind == Kind::OutputInstall) {
+            ++m_summary.active_output_installs;
             auto& install = m_installs[event.install_id % CAPACITY];
             if (install.active && !install.marked && m_summary.installed_unmarked != 0) {
                 --m_summary.installed_unmarked;
@@ -166,6 +305,9 @@ public:
             m_summary.installed_unmarked_high_water = (std::max)(
                 m_summary.installed_unmarked_high_water, m_summary.installed_unmarked);
         } else if (event.kind == Kind::Marker && event.marker_queued) {
+            if (event.capture_phase == CapturePhase::ActiveXeSS) {
+                ++m_summary.active_marker_queued;
+            }
             auto& install = m_installs[event.install_id % CAPACITY];
             if (install.active && install.install_id == event.install_id && !install.marked) {
                 install.marked = true;
@@ -187,24 +329,194 @@ public:
                 ++m_summary.unmatched_completions;
             }
         } else if (event.kind == Kind::Submit && event.successful_submission) {
+            m_first_execute_success_seen = true;
+            if (event.capture_phase == CapturePhase::ActiveXeSS) {
+                ++m_summary.active_successful_submissions;
+            }
             if (event.reset_history) {
                 ++m_summary.successful_reset_history_submits;
+                if (event.capture_phase == CapturePhase::ActiveXeSS) {
+                    ++m_summary.active_reset_history_submits;
+                }
             } else {
                 ++m_summary.successful_continuous_submits;
+                if (event.capture_phase == CapturePhase::ActiveXeSS) {
+                    ++m_summary.active_continuous_submits;
+                }
             }
         } else if (event.kind == Kind::Skip) {
             if (event.frame_valid) {
                 ++m_summary.skipped_submits;
-                if (std::strcmp(event.reason.data(), "output-handoff-marker-pending") == 0) {
-                    ++m_summary.marker_pending_skips;
-                } else if (std::strcmp(event.reason.data(), "xess-command-ring-busy") == 0) {
-                    ++m_summary.bridge_busy_skips;
-                } else if (std::strcmp(event.reason.data(), "pre-overlay-temporal-gate-invalid") == 0) {
-                    ++m_summary.temporal_gate_skips;
+                if (event.capture_phase == CapturePhase::ActiveXeSS) {
+                    ++m_summary.active_skipped_submits;
+                }
+            }
+            if (std::strcmp(event.reason.data(), "output-handoff-marker-pending") == 0) {
+                ++m_summary.marker_pending_skips;
+                if (event.capture_phase == CapturePhase::ActiveXeSS) {
+                    ++m_summary.active_marker_pending_skips;
+                }
+            } else if (std::strcmp(event.reason.data(), "xess-command-ring-busy") == 0) {
+                ++m_summary.bridge_busy_skips;
+                if (event.capture_phase == CapturePhase::ActiveXeSS) {
+                    ++m_summary.active_bridge_busy_skips;
+                }
+            } else if (std::strcmp(event.reason.data(), "pre-overlay-temporal-gate-invalid") == 0) {
+                ++m_summary.temporal_gate_skips;
+                if (event.capture_phase == CapturePhase::ActiveXeSS) {
+                    ++m_summary.active_temporal_gate_skips;
                 }
             }
         }
         return event.sequence;
+    }
+
+    bool active_capture_started() const noexcept {
+        return m_active_capture_started_snapshot.load(std::memory_order_acquire);
+    }
+
+    bool claim_first_output_install_window() noexcept {
+        std::lock_guard lock{ m_mutex };
+        if (!m_active_capture_started || m_first_output_install_window_claimed) {
+            return false;
+        }
+        m_first_output_install_window_claimed = true;
+        return true;
+    }
+
+    bool claim_first_execute_success_window() noexcept {
+        std::lock_guard lock{ m_mutex };
+        if (!m_active_capture_started || m_first_execute_success_window_claimed ||
+            !m_first_execute_success_seen) {
+            return false;
+        }
+        m_first_execute_success_window_claimed = true;
+        return true;
+    }
+
+    bool claim_first_marker_queued_window() noexcept {
+        std::lock_guard lock{ m_mutex };
+        if (!m_active_capture_started || m_first_marker_queued_window_claimed ||
+            m_summary.active_marker_queued == 0) {
+            return false;
+        }
+        m_first_marker_queued_window_claimed = true;
+        return true;
+    }
+
+    bool claim_first_mapping_window() noexcept {
+        std::lock_guard lock{ m_mutex };
+        if (!m_active_capture_started || m_first_mapping_window_claimed ||
+            (m_summary.active_mapping_unknown == 0 && m_summary.active_mapping_inferred_candidates == 0)) {
+            return false;
+        }
+        m_first_mapping_window_claimed = true;
+        return true;
+    }
+
+    bool claim_anomaly_window(AnomalyWindow anomaly) noexcept {
+        std::lock_guard lock{ m_mutex };
+        if (!m_active_capture_started) {
+            return false;
+        }
+        const auto bit = uint32_t{ 1 } << static_cast<uint8_t>(anomaly);
+        if ((m_claimed_anomaly_windows & bit) != 0) {
+            return false;
+        }
+        m_claimed_anomaly_windows |= bit;
+        return true;
+    }
+
+    bool note_pending_present(uint64_t install_id, uint64_t present_ordinal) noexcept {
+        std::lock_guard lock{ m_mutex };
+        if (!m_active_capture_started || install_id == 0 || present_ordinal == 0) {
+            return false;
+        }
+        if (install_id != m_pending_present_install_id) {
+            m_pending_present_install_id = install_id;
+            m_pending_present_last_ordinal = 0;
+            m_pending_present_count = 0;
+            m_pending_present_window_claimed = false;
+        }
+        if (present_ordinal == m_pending_present_last_ordinal) {
+            return false;
+        }
+        m_pending_present_last_ordinal = present_ordinal;
+        ++m_pending_present_count;
+        if (m_pending_present_count < 2 || m_pending_present_window_claimed) {
+            return false;
+        }
+        m_pending_present_window_claimed = true;
+        return true;
+    }
+
+    bool reserve_dump(DumpWindow window, size_t requested_events, DumpReservation& reservation) noexcept {
+        constexpr std::array<uint32_t, static_cast<size_t>(DumpWindow::Count)> WINDOW_LIMITS{
+            2, 5, 6, 2, 1,
+        };
+        constexpr uint32_t MAX_DUMP_WINDOWS = 16;
+        constexpr size_t MAX_EVENT_LINE_BYTES = 2048;
+        constexpr size_t MAX_WINDOW_HEADER_BYTES = 1024;
+        std::lock_guard lock{ m_mutex };
+        ++m_summary.dump_requests;
+        const auto index = static_cast<size_t>(window);
+        const bool pre_active_window = window == DumpWindow::PreActive;
+        if (index >= WINDOW_LIMITS.size() ||
+            (pre_active_window && m_active_capture_started) ||
+            (!pre_active_window && !m_active_capture_started) ||
+            m_dump_window_counts[index] >= WINDOW_LIMITS[index] ||
+            m_dump_windows_reserved >= MAX_DUMP_WINDOWS) {
+            ++m_summary.dump_windows_suppressed;
+            return false;
+        }
+
+        auto event_count = (std::min)(requested_events, MAX_EVENTS_PER_DUMP);
+        event_count = (std::min)(event_count, MAX_DUMP_EVENT_LINES - m_dump_event_lines_reserved);
+        const auto bytes_available = MAX_DUMP_BYTES - m_dump_bytes_reserved;
+        if (bytes_available <= MAX_WINDOW_HEADER_BYTES) {
+            ++m_summary.dump_windows_suppressed;
+            return false;
+        }
+        event_count = (std::min)(event_count,
+            (bytes_available - MAX_WINDOW_HEADER_BYTES) / MAX_EVENT_LINE_BYTES);
+        if (event_count == 0) {
+            ++m_summary.dump_windows_suppressed;
+            return false;
+        }
+
+        ++m_dump_window_counts[index];
+        ++m_dump_windows_reserved;
+        const auto estimated_bytes = MAX_WINDOW_HEADER_BYTES + event_count * MAX_EVENT_LINE_BYTES;
+        m_dump_event_lines_reserved += event_count;
+        m_dump_bytes_reserved += estimated_bytes;
+        m_summary.dump_event_lines_reserved = m_dump_event_lines_reserved;
+        m_summary.dump_bytes_reserved = m_dump_bytes_reserved;
+        reservation = DumpReservation{
+            window,
+            m_dump_windows_reserved,
+            event_count,
+            estimated_bytes,
+            m_active_capture_started,
+        };
+        return true;
+    }
+
+    void note_dump_emitted(const DumpReservation& reservation, size_t event_lines) noexcept {
+        std::lock_guard lock{ m_mutex };
+        ++m_summary.dump_windows_emitted;
+        m_summary.dump_event_lines_emitted += (std::min)(event_lines, reservation.event_count);
+        if (reservation.active_phase) {
+            ++m_summary.active_gameplay_dump_emitted;
+        }
+    }
+
+    bool claim_final_summary() noexcept {
+        std::lock_guard lock{ m_mutex };
+        if (m_final_summary_emitted || (!m_active_capture_started && m_summary.total_events == 0)) {
+            return false;
+        }
+        m_final_summary_emitted = true;
+        return true;
     }
 
     std::vector<Event> recent(size_t max_count) const {
@@ -253,8 +565,25 @@ private:
     std::array<uint64_t, static_cast<size_t>(Kind::Count)> m_counts{};
     Summary m_summary{};
     std::atomic<bool> m_enabled{};
+    std::atomic<bool> m_active_capture_started_snapshot{};
     std::atomic<uint64_t> m_next_trace_id{};
     uint64_t m_sequence{};
     size_t m_next{};
     size_t m_size{};
+    bool m_active_capture_started{};
+    bool m_first_execute_success_seen{};
+    bool m_first_output_install_window_claimed{};
+    bool m_first_execute_success_window_claimed{};
+    bool m_first_marker_queued_window_claimed{};
+    bool m_first_mapping_window_claimed{};
+    bool m_final_summary_emitted{};
+    bool m_pending_present_window_claimed{};
+    uint32_t m_claimed_anomaly_windows{};
+    uint64_t m_pending_present_install_id{};
+    uint64_t m_pending_present_last_ordinal{};
+    uint32_t m_pending_present_count{};
+    std::array<uint32_t, static_cast<size_t>(DumpWindow::Count)> m_dump_window_counts{};
+    uint32_t m_dump_windows_reserved{};
+    size_t m_dump_event_lines_reserved{};
+    size_t m_dump_bytes_reserved{};
 };
