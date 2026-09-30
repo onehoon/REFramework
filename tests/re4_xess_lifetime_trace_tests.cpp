@@ -9,6 +9,51 @@ using Trace = RE4XeSSLifetimeTrace;
 
 namespace {
 
+uint64_t test_output_use_token_issuance_lifecycle() {
+    Trace::OutputUseTokenIssuer issuer;
+    assert(issuer.active_token() == 0);
+
+    // A rejected install must neither issue nor expose a token.
+    assert(issuer.on_install_result(false, true) == 0);
+    assert(issuer.active_token() == 0);
+
+    const auto first_token = issuer.on_install_result(true, true);
+    assert(first_token != 0);
+    assert(issuer.active_token() == first_token);
+
+    // A rejected attempt cannot replace the token belonging to an outstanding restored handoff.
+    assert(issuer.on_install_result(false, true) == 0);
+    assert(issuer.active_token() == first_token);
+
+    // Safe generation retirement clears only the active association, not the issuer sequence.
+    issuer.retire_generation();
+    assert(issuer.active_token() == 0);
+    const auto second_token = issuer.on_install_result(true, true);
+    assert(second_token != 0);
+    assert(second_token == first_token + 1);
+
+    // Successful untraced installs expose zero; re-enabling tracing cannot resurrect a stale token.
+    issuer.retire_generation();
+    assert(issuer.on_install_result(true, false) == 0);
+    assert(issuer.active_token() == 0);
+    issuer.retire_generation();
+    const auto third_token = issuer.on_install_result(true, true);
+    assert(third_token != 0);
+    assert(third_token == second_token + 1);
+    assert(third_token != first_token);
+    return first_token;
+}
+
+void assert_latest_event_has_no_reader_token(
+    const Trace& trace,
+    Trace::Kind expected_kind) {
+    const auto recent = trace.recent(1);
+    assert(recent.size() == 1);
+    assert(recent.front().kind == expected_kind);
+    assert(recent.front().output_use_token == 0);
+    assert(recent.front().consumer_evidence == Trace::ConsumerEvidence::Unknown);
+}
+
 void record_simple(Trace& trace, Trace::Kind kind, uint64_t trace_id = 0) {
     Trace::Event event{};
     event.kind = kind;
@@ -26,7 +71,7 @@ void complete_reservation(Trace& trace, Trace::DumpWindow window) {
     trace.note_dump_emitted(reservation, 1);
 }
 
-void test_phase_transition_and_correlated_first_submit(Trace& trace) {
+void test_phase_transition_and_correlated_first_submit(Trace& trace, uint64_t output_use_token) {
     record_simple(trace, Trace::Kind::PreOverlay);
     record_simple(trace, Trace::Kind::Skip);
     complete_reservation(trace, Trace::DumpWindow::PreActive);
@@ -45,8 +90,8 @@ void test_phase_transition_and_correlated_first_submit(Trace& trace) {
     Trace::Event install{};
     install.kind = Trace::Kind::OutputInstall;
     install.trace_id = 42;
-    install.install_id = 1;
-    install.output_use_token = 17;
+    install.install_id = 700;
+    install.output_use_token = output_use_token;
     install.consumer_evidence = Trace::ConsumerEvidence::ReaderNotObserved;
     install.mapping_observed = true;
     install.mapping_state = Trace::MappingState::InferredCandidate;
@@ -94,7 +139,8 @@ void test_phase_transition_and_correlated_first_submit(Trace& trace) {
     assert(recent[2].capture_phase == Trace::CapturePhase::ActiveXeSS);
     assert(recent[3].kind == Trace::Kind::OutputInstall);
     assert(recent[3].capture_phase == Trace::CapturePhase::ActiveXeSS);
-    assert(recent[3].output_use_token == 17);
+    assert(recent[3].install_id == 700);
+    assert(recent[3].output_use_token == output_use_token);
     assert(recent[3].consumer_evidence == Trace::ConsumerEvidence::ReaderNotObserved);
     assert(recent[4].kind == Trace::Kind::OverlayRenderContext);
     assert(recent[4].mapping_state == Trace::MappingState::Unknown);
@@ -116,29 +162,37 @@ void test_mapping_pending_interval_and_active_budgets(Trace& trace) {
 
     Trace::Event post_present{};
     post_present.kind = Trace::Kind::PostPresentCallback;
-    post_present.install_id = 1;
+    post_present.install_id = 700;
     post_present.mapping_observed = true;
     post_present.mapping_state = Trace::MappingState::InferredCandidate;
+    assert(post_present.output_use_token == 0);
+    assert(post_present.consumer_evidence == Trace::ConsumerEvidence::Unknown);
+    assert(post_present.mapping_state == Trace::MappingState::InferredCandidate);
     Trace::set_reason(post_present, "candidate-only");
     trace.record(post_present);
+    assert_latest_event_has_no_reader_token(trace, Trace::Kind::PostPresentCallback);
     assert(trace.claim_first_mapping_window());
     assert(!trace.claim_first_mapping_window());
 
-    assert(!trace.note_pending_present(1, 100));
-    assert(!trace.note_pending_present(1, 100));
-    assert(trace.note_pending_present(1, 101));
-    assert(!trace.note_pending_present(1, 102));
+    assert(!trace.note_pending_present(700, 100));
+    assert(!trace.note_pending_present(700, 100));
+    assert(trace.note_pending_present(700, 101));
+    assert(!trace.note_pending_present(700, 102));
     assert(!trace.note_pending_present(2, 1));
     assert(trace.note_pending_present(2, 2));
 
     Trace::Event marker{};
     marker.kind = Trace::Kind::Marker;
-    marker.install_id = 1;
+    marker.install_id = 700;
     marker.marker_queued = true;
     marker.mapping_observed = true;
     marker.mapping_state = Trace::MappingState::InferredCandidate;
+    assert(marker.output_use_token == 0);
+    assert(marker.consumer_evidence == Trace::ConsumerEvidence::Unknown);
+    assert(marker.mapping_state == Trace::MappingState::InferredCandidate);
     Trace::set_reason(marker, "marker-queued");
     trace.record(marker);
+    assert_latest_event_has_no_reader_token(trace, Trace::Kind::Marker);
     auto summary = trace.summary();
     assert(summary.installed_unmarked == 0);
     assert(summary.installed_unmarked_high_water == 1);
@@ -148,12 +202,15 @@ void test_mapping_pending_interval_and_active_budgets(Trace& trace) {
 
     Trace::Event completion{};
     completion.kind = Trace::Kind::DownstreamFenceComplete;
-    completion.install_id = 1;
+    completion.install_id = 700;
     completion.marker_queued = true;
     completion.actual_completed_value = 1;
     completion.actual_completed_value_valid = true;
+    assert(completion.output_use_token == 0);
+    assert(completion.consumer_evidence == Trace::ConsumerEvidence::Unknown);
     Trace::set_reason(completion, "downstream-complete");
     trace.record(completion);
+    assert_latest_event_has_no_reader_token(trace, Trace::Kind::DownstreamFenceComplete);
     summary = trace.summary();
     assert(summary.installed_unmarked == 0);
     assert(summary.installed_unmarked_high_water == 1);
@@ -192,7 +249,8 @@ void test_mapping_pending_interval_and_active_budgets(Trace& trace) {
 int main() {
     auto& trace = Trace::instance();
     trace.configure(true);
-    test_phase_transition_and_correlated_first_submit(trace);
+    const auto output_use_token = test_output_use_token_issuance_lifecycle();
+    test_phase_transition_and_correlated_first_submit(trace, output_use_token);
     test_mapping_pending_interval_and_active_budgets(trace);
     assert(trace.claim_final_summary());
     assert(!trace.claim_final_summary());

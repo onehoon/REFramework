@@ -225,8 +225,7 @@ private:
     uint64_t m_output_generation_id{};
     uint64_t m_next_install_id{};
     uint64_t m_installed_install_id{};
-    uint64_t m_next_output_use_token{};
-    uint64_t m_installed_output_use_token{};
+    RE4XeSSLifetimeTrace::OutputUseTokenIssuer m_output_use_token_issuer{};
     uint64_t m_installed_trace_id{};
     uint64_t m_installed_present_ordinal{};
     uint64_t m_installed_submit_ordinal{};

@@ -57,6 +57,39 @@ public:
         GpuComplete,
     };
 
+    class OutputUseTokenIssuer final {
+    public:
+        // This diagnostic identity is independent of install_id and never authorizes resource reuse.
+        uint64_t on_install_result(bool install_succeeded, bool trace_enabled) noexcept {
+            if (!install_succeeded) {
+                return 0;
+            }
+
+            if (!trace_enabled) {
+                m_active_token = 0;
+                return 0;
+            }
+
+            if (++m_next_token == 0) {
+                ++m_next_token;
+            }
+            m_active_token = m_next_token;
+            return m_active_token;
+        }
+
+        void retire_generation() noexcept {
+            m_active_token = 0;
+        }
+
+        uint64_t active_token() const noexcept {
+            return m_active_token;
+        }
+
+    private:
+        uint64_t m_next_token{};
+        uint64_t m_active_token{};
+    };
+
     enum class DumpWindow : uint8_t {
         PreActive,
         ActiveMilestone,

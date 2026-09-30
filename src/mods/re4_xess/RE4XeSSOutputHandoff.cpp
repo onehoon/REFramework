@@ -1265,7 +1265,6 @@ RE4XeSSOutputHandoff::PrepareResult RE4XeSSOutputHandoff::prepare(
     m_last_completed_retirement_value = 0;
     m_installed_frame = 0;
     m_installed_install_id = 0;
-    m_installed_output_use_token = 0;
     m_installed_trace_id = 0;
     m_installed_present_ordinal = 0;
     m_installed_submit_ordinal = 0;
@@ -1446,7 +1445,7 @@ bool RE4XeSSOutputHandoff::install(
     m_installed = true;
     m_installed_frame = observation.frame_id;
     m_installed_install_id = ++m_next_install_id;
-    m_installed_output_use_token = trace_enabled ? ++m_next_output_use_token : 0;
+    const auto output_use_token = m_output_use_token_issuer.on_install_result(true, trace_enabled);
     m_installed_trace_id = observation.trace_id;
     m_installed_present_ordinal = observation.present_ordinal_valid ? observation.present_ordinal : 0;
     m_installed_submit_ordinal = observation.submit_ordinal;
@@ -1464,7 +1463,6 @@ bool RE4XeSSOutputHandoff::install(
     const auto output_identity = reinterpret_cast<uintptr_t>(m_resource_pin.Get());
     const auto output_generation = m_output_generation_id;
     const auto install_id = m_installed_install_id;
-    const auto output_use_token = m_installed_output_use_token;
     const auto install_present_ordinal = m_installed_present_ordinal;
 
     if (trace_enabled) {
@@ -1854,7 +1852,7 @@ RE4XeSSOutputHandoff::Snapshot RE4XeSSOutputHandoff::snapshot() const {
         m_failure_reason,
         m_output_generation_id,
         m_installed_install_id,
-        m_installed_output_use_token,
+        m_output_use_token_issuer.active_token(),
         m_installed_trace_id,
         m_installed_frame,
         m_installed_present_ordinal,
@@ -2052,6 +2050,7 @@ void RE4XeSSOutputHandoff::release_generation() noexcept {
         }
         m_has_generation_snapshot.store(false, std::memory_order_release);
         m_installed_snapshot.store(false, std::memory_order_release);
+        m_output_use_token_issuer.retire_generation();
         m_retirement_status = RetirementStatus::NoGeneration;
         m_marker_pending = false;
         m_missing_marker = false;
@@ -2072,7 +2071,6 @@ void RE4XeSSOutputHandoff::release_generation() noexcept {
     m_installed_frame = 0;
     m_output_generation_id = 0;
     m_installed_install_id = 0;
-    m_installed_output_use_token = 0;
     m_installed_trace_id = 0;
     m_installed_present_ordinal = 0;
     m_installed_submit_ordinal = 0;
