@@ -7494,3 +7494,25 @@ Runtime validation     PENDING; do not commit/push before reviewing paired logs
 ~~~
 
 Keep PR66 Draft and do not change output lifetime rules until the actual reader/queue/Present ownership edge is proven.
+
+## 52. PR66 Overlay callback RenderContext probe — bounded source diagnostics; runtime skipped
+
+The local-only RenderContext probe is retained as a bounded, read-only boundary observation, with its callback stages corrected to match the actual hook control flow. `Hooks.cpp`'s `LAYER_HOOK_BODY` calls every pre-callback, invokes the original layer draw only when all pre-callbacks return true, and then invokes every post-callback regardless. Consequently the second sample is named `post-overlay-callback-original-status-unknown`; it must not be described as “after original draw” unless a separate observation proves that the original call ran.
+
+For each sample, the trace records the immutable `install_id` correlation value, frame and generation, Overlay identity, installed handoff TargetState/resource, borrowed RenderContext identity, its current TargetState/native resource, and the Overlay main TargetState/native resource observed at the same callback boundary. The event includes an explicit stage and separate equality flags for (a) the installed output and (b) the Overlay main target. `RenderContext::get_render_target()` is the existing SDK accessor reading the current TargetState pointer at `RenderContext + 0x98`; it is sampled synchronously while the hook callback is active. Only opaque `uintptr_t` values are retained; no COM reference is added and no pointer is dereferenced after the callback.
+
+This evidence is intentionally limited to the callback's current render-target state. It does not identify an SRV/descriptor binding, a command list, a downstream reader, or a GPU submission. A match is not a consumer proof; a mismatch does not establish that the installed output was not read later. The existing `install_id` is a correlation identity only and is not promoted into a consumed reader token. No current probe propagates an output-use token through a verified reader.
+
+Capture 30b narrows the next static/runtime boundary to the unique final-window `DrawInstanced(3,1,0,0)` on the last engine DIRECT submission before Present, but the capture did not record the draw's descriptor/SRV resource identity. The repository has no existing command-list identity/SRV observer at that site. The installed executable was read-only identified as RE4 `1.5.9.0`, SHA-256 `A1082B154105FAC7CA22668FFC1C99A8BFC9F1B945439276C556EDEA7597A5B7`; no address-based observer was added. Global D3D12 interception, guessed offsets, and guessed game addresses remain disallowed. The next safe investigation is to locate a specific RE4-owned binding/draw call path for this exact image, or use a narrowly filtered GPU capture that can observe the exact XeSS output resource and its submission; until then the consumer, Present, and marker relationship remains unknown.
+
+The source/build identity and fresh local DLL SHA-256 are recorded in the PR #66 follow-up comment after this diagnostic build. This turn intentionally skipped game execution as requested. The source build and deterministic tests do not satisfy Gate A.
+
+~~~text
+Pre-original callback RenderContext + Overlay-main comparison  SOURCE/BUILD/TEST VALIDATED; game capture skipped
+Post-overlay callback stage semantics                          VALIDATED FROM Hooks.cpp; original-call outcome unknown
+Exact downstream draw/dispatch/copy reading XeSS output       NOT OBSERVED
+Reader command list -> DIRECT queue submission                 NOT PROVEN
+Present -> exact consumer -> marker -> GPU completion           NOT PROVEN
+Output ring / lifetime-policy change                            NOT AUTHORIZED
+Temporal continuity                                             NOT ACCEPTED
+~~~

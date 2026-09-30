@@ -18,6 +18,7 @@ public:
         PreOverlay,
         Submit,
         OutputInstall,
+        OverlayRenderContext,
         OutputRestore,
         ModeTransition,
         PostOverlayObservation,
@@ -39,6 +40,12 @@ public:
         Unknown,
         InferredCandidate,
         Proven,
+    };
+
+    enum class RenderContextStage : uint8_t {
+        None,
+        BeforeOriginalOverlayDraw,
+        PostOverlayCallbackOriginalStatusUnknown,
     };
 
     enum class DumpWindow : uint8_t {
@@ -96,6 +103,11 @@ public:
         uint64_t original_present_return_time_us{};
         uintptr_t output_resource{};
         uintptr_t target_state{};
+        uintptr_t render_context{};
+        uintptr_t render_context_target_state{};
+        uintptr_t render_context_target_resource{};
+        uintptr_t overlay_main_target_state{};
+        uintptr_t overlay_main_target_resource{};
         uintptr_t overlay{};
         uintptr_t swapchain{};
         uintptr_t device{};
@@ -123,12 +135,18 @@ public:
         bool successful_submission{};
         bool marker_queued{};
         bool mapping_ambiguous{};
+        bool render_context_sample_valid{};
+        bool render_context_target_state_matches_output{};
+        bool render_context_target_resource_matches_output{};
+        bool render_context_target_state_matches_overlay_main{};
+        bool render_context_target_resource_matches_overlay_main{};
         bool cached_completed_value_valid{};
         bool actual_completed_value_valid{};
         bool command_queue_type_valid{};
         bool mapping_observed{};
         CapturePhase capture_phase{ CapturePhase::PreActive };
         MappingState mapping_state{ MappingState::Unknown };
+        RenderContextStage render_context_stage{ RenderContextStage::None };
         std::array<char, 64> reason{};
     };
 
@@ -149,6 +167,11 @@ public:
         uint64_t active_marker_queued{};
         uint64_t active_output_installs{};
         uint64_t active_marker_pending_skips{};
+        uint64_t active_render_context_samples{};
+        uint64_t active_render_context_state_matches{};
+        uint64_t active_render_context_resource_matches{};
+        uint64_t active_render_context_overlay_main_state_matches{};
+        uint64_t active_render_context_overlay_main_resource_matches{};
         uint64_t active_bridge_busy_skips{};
         uint64_t active_temporal_gate_skips{};
         uint64_t installed_unmarked{};
@@ -268,6 +291,21 @@ public:
         } else {
             ++m_summary.pre_active_events;
             ++m_summary.pre_active_event_counts[static_cast<size_t>(event.kind)];
+        }
+        if (event.capture_phase == CapturePhase::ActiveXeSS && event.render_context_sample_valid) {
+            ++m_summary.active_render_context_samples;
+            if (event.render_context_target_state_matches_output) {
+                ++m_summary.active_render_context_state_matches;
+            }
+            if (event.render_context_target_resource_matches_output) {
+                ++m_summary.active_render_context_resource_matches;
+            }
+            if (event.render_context_target_state_matches_overlay_main) {
+                ++m_summary.active_render_context_overlay_main_state_matches;
+            }
+            if (event.render_context_target_resource_matches_overlay_main) {
+                ++m_summary.active_render_context_overlay_main_resource_matches;
+            }
         }
         if (event.mapping_observed) {
             switch (event.mapping_state) {

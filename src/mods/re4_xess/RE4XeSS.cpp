@@ -44,6 +44,32 @@ constexpr std::string_view UPSCALING_MODE_CONFIG_KEY{ "RE4XeSS_UpscalingMode" };
 constexpr std::string_view HANDOFF_PROVENANCE_CONFIG_KEY{ "RE4XeSS_HandoffProvenance" };
 constexpr char INHIBIT_BIT_BACKING_FIELD_NAME[]{ "<InhibitBit>k__BackingField" };
 
+struct RenderContextTargetSnapshot {
+    uintptr_t context{};
+    uintptr_t target_state{};
+    uintptr_t target_resource{};
+    bool valid{};
+};
+
+RenderContextTargetSnapshot snapshot_render_context_target(void* render_context) noexcept {
+    RenderContextTargetSnapshot snapshot{};
+    snapshot.context = reinterpret_cast<uintptr_t>(render_context);
+    if (render_context == nullptr) {
+        return snapshot;
+    }
+
+    // Diagnostic-only observation at the existing Overlay::draw hook boundary.
+    // The RenderContext target is transient and does not prove GPU submission.
+    const auto* context = static_cast<sdk::renderer::RenderContext*>(render_context);
+    const auto* target_state = context->get_render_target();
+    snapshot.target_state = reinterpret_cast<uintptr_t>(target_state);
+    if (target_state != nullptr) {
+        snapshot.target_resource = reinterpret_cast<uintptr_t>(target_state->get_native_resource_d3d12());
+    }
+    snapshot.valid = true;
+    return snapshot;
+}
+
 constexpr std::array<const char*, 8> UPSCALING_MODE_LABELS{
     "Off",
     "Native AA",
@@ -196,6 +222,7 @@ const char* lifetime_trace_kind_name(RE4XeSSLifetimeTrace::Kind kind) noexcept {
     case Kind::PreOverlay: return "pre-overlay";
     case Kind::Submit: return "submit";
     case Kind::OutputInstall: return "output-install";
+    case Kind::OverlayRenderContext: return "overlay-render-context";
     case Kind::OutputRestore: return "output-restore";
     case Kind::ModeTransition: return "mode-transition";
     case Kind::PostOverlayObservation: return "post-overlay-observation";
@@ -220,6 +247,17 @@ const char* lifetime_trace_mapping_name(RE4XeSSLifetimeTrace::MappingState state
     case MappingState::Unknown: return "unknown";
     case MappingState::InferredCandidate: return "inferred-candidate";
     case MappingState::Proven: return "proven";
+    }
+    return "unknown";
+}
+
+const char* lifetime_trace_render_context_stage_name(
+    RE4XeSSLifetimeTrace::RenderContextStage stage) noexcept {
+    using Stage = RE4XeSSLifetimeTrace::RenderContextStage;
+    switch (stage) {
+    case Stage::BeforeOriginalOverlayDraw: return "pre-original-overlay-draw";
+    case Stage::PostOverlayCallbackOriginalStatusUnknown: return "post-overlay-callback-original-status-unknown";
+    case Stage::None: return "none";
     }
     return "unknown";
 }
@@ -254,7 +292,7 @@ void dump_re4_xess_lifetime_trace(
     const auto summary = trace.summary();
     const auto events = trace.recent(reservation.event_count);
     const auto bounded_reason = reason.substr(0, 64);
-    spdlog::info("[RE4XeSS][LifetimeTrace] window reason={} class={} window={} phase={} selected={} retained={} preActiveEvents={} activeEvents={} preActiveOverwritten={} activeOverwritten={} activeInstalls={} activeUnmarked={} activeUnmarkedHighWater={} activeMarkedGpuIncomplete={} activeExecuteSuccess={} activeMarkerQueued={} activeResetHistory={} activeContinuous={} activeSkips={} activeMarkerPendingSkips={} activeBridgeBusySkips={} activeTemporalGateSkips={} activeMapUnknown={} activeMapCandidate={} activeMapProven={} dumpRequests={} dumpEmitted={} dumpSuppressed={} eventLinesReserved={} eventLinesEmitted={} bytesReserved={} allEvents={}",
+    spdlog::info("[RE4XeSS][LifetimeTrace] window reason={} class={} window={} phase={} selected={} retained={} preActiveEvents={} activeEvents={} preActiveOverwritten={} activeOverwritten={} activeInstalls={} activeUnmarked={} activeUnmarkedHighWater={} activeMarkedGpuIncomplete={} activeExecuteSuccess={} activeMarkerQueued={} activeResetHistory={} activeContinuous={} activeSkips={} activeMarkerPendingSkips={} activeBridgeBusySkips={} activeTemporalGateSkips={} activeRenderContextSamples={} activeRenderContextStateMatches={} activeRenderContextResourceMatches={} activeRenderContextOverlayMainStateMatches={} activeRenderContextOverlayMainResourceMatches={} activeMapUnknown={} activeMapCandidate={} activeMapProven={} dumpRequests={} dumpEmitted={} dumpSuppressed={} eventLinesReserved={} eventLinesEmitted={} bytesReserved={} allEvents={}",
         bounded_reason,
         lifetime_trace_dump_window_name(window),
         reservation.index,
@@ -277,6 +315,11 @@ void dump_re4_xess_lifetime_trace(
         static_cast<unsigned long long>(summary.active_marker_pending_skips),
         static_cast<unsigned long long>(summary.active_bridge_busy_skips),
         static_cast<unsigned long long>(summary.active_temporal_gate_skips),
+        static_cast<unsigned long long>(summary.active_render_context_samples),
+        static_cast<unsigned long long>(summary.active_render_context_state_matches),
+        static_cast<unsigned long long>(summary.active_render_context_resource_matches),
+        static_cast<unsigned long long>(summary.active_render_context_overlay_main_state_matches),
+        static_cast<unsigned long long>(summary.active_render_context_overlay_main_resource_matches),
         static_cast<unsigned long long>(summary.active_mapping_unknown),
         static_cast<unsigned long long>(summary.active_mapping_inferred_candidates),
         static_cast<unsigned long long>(summary.active_mapping_proven),
@@ -289,7 +332,7 @@ void dump_re4_xess_lifetime_trace(
         static_cast<unsigned long long>(summary.total_events));
 
     for (const auto& event : events) {
-        spdlog::info("[RE4XeSS][LifetimeTrace] seq={} us={} phase={} kind={} trace={} install={} frame={} frameValid={} sceneOrd={} callbackOrd={} overlapEpoch={} submit={} present={} relatedPresent={} outputGen={} controlGen={} deviceGen={} bridgeSlot={} writerFence={} downstreamFence={} cachedCompleted={} cachedValid={} actualCompleted={} actualValid={} writerTxn={} writerInvocation={} writerSeq={} clearSeq={}->{} replacementSeq={}->{} writerRva=0x{:x} presentTimes={}::{}/{} output=0x{:x} targetState=0x{:x} overlay=0x{:x} swapchain=0x{:x} device=0x{:x} queue=0x{:x} queueType={} queueTypeValid={} tid={} presentTids={}->{} presentSource={} present1={} presentReturned={} callbacksSuppressed={} originalSkipped={} result=0x{:08x} apiOk={} queueSubmitted={} markerQueued={} resetHistory={} mappingState={} mappingAmbiguous={} reason={}",
+        spdlog::info("[RE4XeSS][LifetimeTrace] seq={} us={} phase={} kind={} trace={} install={} frame={} frameValid={} sceneOrd={} callbackOrd={} overlapEpoch={} submit={} present={} relatedPresent={} outputGen={} controlGen={} deviceGen={} bridgeSlot={} writerFence={} downstreamFence={} cachedCompleted={} cachedValid={} actualCompleted={} actualValid={} writerTxn={} writerInvocation={} writerSeq={} clearSeq={}->{} replacementSeq={}->{} writerRva=0x{:x} presentTimes={}::{}/{} output=0x{:x} targetState=0x{:x} renderContext=0x{:x} contextStage={} contextTargetState=0x{:x} contextTargetResource=0x{:x} contextSampleValid={} contextStateMatch={} contextResourceMatch={} overlayMainState=0x{:x} overlayMainResource=0x{:x} contextOverlayMainStateMatch={} contextOverlayMainResourceMatch={} overlay=0x{:x} swapchain=0x{:x} device=0x{:x} queue=0x{:x} queueType={} queueTypeValid={} tid={} presentTids={}->{} presentSource={} present1={} presentReturned={} callbacksSuppressed={} originalSkipped={} result=0x{:08x} apiOk={} queueSubmitted={} markerQueued={} resetHistory={} mappingState={} mappingAmbiguous={} reason={}",
             static_cast<unsigned long long>(event.sequence),
             static_cast<unsigned long long>(event.timestamp_us),
             lifetime_trace_phase_name(event.capture_phase),
@@ -327,6 +370,17 @@ void dump_re4_xess_lifetime_trace(
             static_cast<unsigned long long>(event.original_present_return_time_us),
             event.output_resource,
             event.target_state,
+            event.render_context,
+            lifetime_trace_render_context_stage_name(event.render_context_stage),
+            event.render_context_target_state,
+            event.render_context_target_resource,
+            event.render_context_sample_valid,
+            event.render_context_target_state_matches_output,
+            event.render_context_target_resource_matches_output,
+            event.overlay_main_target_state,
+            event.overlay_main_target_resource,
+            event.render_context_target_state_matches_overlay_main,
+            event.render_context_target_resource_matches_overlay_main,
             event.overlay,
             event.swapchain,
             event.device,
@@ -365,7 +419,7 @@ void log_re4_xess_lifetime_summary() {
         return active ? summary.active_event_counts[index] : summary.pre_active_event_counts[index];
     };
     using Kind = RE4XeSSLifetimeTrace::Kind;
-    spdlog::info("[RE4XeSS][LifetimeTrace] lifecycle-summary activeStarted={} recorded={} retained={} overwritten={} preActiveEvents={} preScene={} preOverlay={} preSkip={} activeEvents={} activeScene={} activePreOverlay={} activeSubmit={} activeInstall={} installedUnmarked={} installedUnmarkedHighWater={} markedGpuIncomplete={} activeRestore={} activeModeChange={} activePostPresent={} activeMarker={} activeSkip={} activeExecuteSuccess={} activeResetHistory={} activeContinuous={} activeMarkerPendingSkip={} activeBridgeBusySkip={} activeTemporalGateSkip={} activeMapUnknown={} activeMapCandidate={} activeMapProven={} preOverwritten={} activeOverwritten={} dumpRequests={} dumpEmitted={} dumpSuppressed={} eventLinesReserved={} eventLinesEmitted={} bytesReserved={} activeGameplayDumpEmitted={}",
+    spdlog::info("[RE4XeSS][LifetimeTrace] lifecycle-summary activeStarted={} recorded={} retained={} overwritten={} preActiveEvents={} preScene={} preOverlay={} preSkip={} activeEvents={} activeScene={} activePreOverlay={} activeSubmit={} activeInstall={} activeOverlayContextSamples={} activeOverlayContextStateMatches={} activeOverlayContextResourceMatches={} activeOverlayContextOverlayMainStateMatches={} activeOverlayContextOverlayMainResourceMatches={} installedUnmarked={} installedUnmarkedHighWater={} markedGpuIncomplete={} activeRestore={} activeModeChange={} activePostPresent={} activeMarker={} activeSkip={} activeExecuteSuccess={} activeResetHistory={} activeContinuous={} activeMarkerPendingSkip={} activeBridgeBusySkip={} activeTemporalGateSkip={} activeMapUnknown={} activeMapCandidate={} activeMapProven={} preOverwritten={} activeOverwritten={} dumpRequests={} dumpEmitted={} dumpSuppressed={} eventLinesReserved={} eventLinesEmitted={} bytesReserved={} activeGameplayDumpEmitted={}",
         summary.active_capture_started,
         static_cast<unsigned long long>(summary.total_events),
         static_cast<unsigned long long>(summary.retained_events),
@@ -379,6 +433,11 @@ void log_re4_xess_lifetime_summary() {
         static_cast<unsigned long long>(kind_count(Kind::PreOverlay, true)),
         static_cast<unsigned long long>(kind_count(Kind::Submit, true)),
         static_cast<unsigned long long>(kind_count(Kind::OutputInstall, true)),
+        static_cast<unsigned long long>(summary.active_render_context_samples),
+        static_cast<unsigned long long>(summary.active_render_context_state_matches),
+        static_cast<unsigned long long>(summary.active_render_context_resource_matches),
+        static_cast<unsigned long long>(summary.active_render_context_overlay_main_state_matches),
+        static_cast<unsigned long long>(summary.active_render_context_overlay_main_resource_matches),
         static_cast<unsigned long long>(summary.installed_unmarked),
         static_cast<unsigned long long>(summary.installed_unmarked_high_water),
         static_cast<unsigned long long>(summary.marked_gpu_incomplete),
@@ -5891,7 +5950,6 @@ void RE4XeSS::on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* re
 }
 
 bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* render_context) {
-    (void)render_context;
     const auto callback_thread_id = GetCurrentThreadId();
     const auto debug_log = REFrameworkConfig::get()->is_debug_log_enabled();
     auto overlap_epoch = m_pre_overlay_overlap_epoch.load(std::memory_order_acquire);
@@ -6550,6 +6608,74 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
             return true;
         }
 
+        if (trace_enabled) {
+            const auto installed = m_output_handoff.snapshot();
+            const auto context_target = snapshot_render_context_target(render_context);
+            const auto& overlay_main = layer->get_main_target_state();
+            const auto overlay_main_state = reinterpret_cast<uintptr_t>(overlay_main.get());
+            const auto overlay_main_resource = overlay_main != nullptr
+                ? reinterpret_cast<uintptr_t>(overlay_main->get_native_resource_d3d12())
+                : 0;
+            RE4XeSSLifetimeTrace::Event context_event{};
+            context_event.kind = RE4XeSSLifetimeTrace::Kind::OverlayRenderContext;
+            context_event.render_context_stage = RE4XeSSLifetimeTrace::RenderContextStage::BeforeOriginalOverlayDraw;
+            context_event.trace_id = trace_id;
+            context_event.install_id = installed.install_id;
+            context_event.frame_id = packet.frame_id;
+            context_event.frame_valid = true;
+            context_event.callback_ordinal = callback_ordinal;
+            context_event.present_ordinal = present_is_current() ? present_diagnostics.ordinal : 0;
+            context_event.output_generation = installed.output_generation;
+            context_event.control_generation = control_generation;
+            context_event.device_reset_generation = reset_generation;
+            context_event.output_resource = installed.output_resource;
+            context_event.target_state = installed.target_state;
+            context_event.render_context = context_target.context;
+            context_event.render_context_target_state = context_target.target_state;
+            context_event.render_context_target_resource = context_target.target_resource;
+            context_event.render_context_sample_valid = context_target.valid;
+            context_event.render_context_target_state_matches_output =
+                context_target.target_state != 0 && context_target.target_state == installed.target_state;
+            context_event.render_context_target_resource_matches_output =
+                context_target.target_resource != 0 && context_target.target_resource == installed.output_resource;
+            context_event.overlay_main_target_state = overlay_main_state;
+            context_event.overlay_main_target_resource = overlay_main_resource;
+            context_event.render_context_target_state_matches_overlay_main =
+                context_target.target_state != 0 && context_target.target_state == overlay_main_state;
+            context_event.render_context_target_resource_matches_overlay_main =
+                context_target.target_resource != 0 && context_target.target_resource == overlay_main_resource;
+            context_event.overlay = reinterpret_cast<uintptr_t>(layer);
+            context_event.swapchain = present_diagnostics.swapchain;
+            context_event.device = reinterpret_cast<uintptr_t>(control_request.device.Get());
+            context_event.queue = reinterpret_cast<uintptr_t>(control_request.queue.Get());
+            context_event.command_queue_type = control_request.queue != nullptr
+                ? static_cast<int32_t>(control_request.queue->GetDesc().Type) : -1;
+            context_event.command_queue_type_valid = control_request.queue != nullptr;
+            context_event.thread_id = callback_thread_id;
+            context_event.present_entry_thread_id = present_diagnostics.entry_thread_id;
+            context_event.present_return_thread_id = present_diagnostics.return_thread_id;
+            context_event.present_source = static_cast<int32_t>(present_diagnostics.source);
+            context_event.present1 = present_diagnostics.present1;
+            context_event.present_returned = present_diagnostics.returned;
+            context_event.present_callbacks_suppressed = present_diagnostics.render_callbacks_suppressed;
+            context_event.original_present_skipped = present_diagnostics.original_call_skipped;
+            context_event.present_valid = present_is_current();
+            RE4XeSSLifetimeTrace::set_reason(context_event,
+                !context_target.valid ? "pre-original-render-context-null" :
+                context_target.target_state == 0 ? "pre-original-context-target-null" :
+                context_target.target_resource == 0 ? "pre-original-context-native-resource-null" :
+                context_event.render_context_target_resource_matches_output
+                    ? "before-original-context-output-resource-match-not-submit-proof" :
+                context_event.render_context_target_state_matches_output
+                    ? "before-original-context-targetstate-match-not-submit-proof" :
+                context_event.render_context_target_resource_matches_overlay_main
+                    ? "pre-original-context-resource-matches-overlay-main-not-submit-proof" :
+                context_event.render_context_target_state_matches_overlay_main
+                    ? "pre-original-context-targetstate-matches-overlay-main-not-submit-proof" :
+                "pre-original-overlay-draw-context-snapshot");
+            lifetime_trace.record(context_event);
+        }
+
         if (lifetime_trace.claim_first_output_install_window()) {
             dump_re4_xess_lifetime_trace(
                 "first-successful-output-install",
@@ -6638,7 +6764,6 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
 
 
 void RE4XeSS::on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* render_context) {
-    (void)render_context;
     if (m_output_handoff.identity_mismatch_latched()) {
         return;
     }
@@ -6677,6 +6802,19 @@ void RE4XeSS::on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* 
     };
     const auto before_observation = trace_enabled ? m_output_handoff.snapshot()
         : RE4XeSSOutputHandoff::Snapshot{};
+    uintptr_t overlay_main_state_before_observation{};
+    uintptr_t overlay_main_resource_before_observation{};
+    if (trace_enabled && before_observation.installed) {
+        const auto& overlay_main_before_observation = layer->get_main_target_state();
+        overlay_main_state_before_observation = reinterpret_cast<uintptr_t>(overlay_main_before_observation.get());
+        if (overlay_main_before_observation != nullptr) {
+            overlay_main_resource_before_observation = reinterpret_cast<uintptr_t>(
+                overlay_main_before_observation->get_native_resource_d3d12());
+        }
+    }
+    const auto context_target = trace_enabled && before_observation.installed
+        ? snapshot_render_context_target(render_context)
+        : RenderContextTargetSnapshot{};
     const auto writer_witness_chain =
         TargetStateFactoryProbe::instance().confirmed_overlay_writer_witness_chain();
     m_output_handoff.observe_overlay(
@@ -6714,6 +6852,21 @@ void RE4XeSS::on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* 
         event.downstream_fence_value = before_observation.last_signaled_fence_value;
         event.output_resource = before_observation.output_resource;
         event.target_state = reinterpret_cast<uintptr_t>(layer->get_main_target_state().get());
+        event.render_context_stage = RE4XeSSLifetimeTrace::RenderContextStage::PostOverlayCallbackOriginalStatusUnknown;
+        event.render_context = context_target.context;
+        event.render_context_target_state = context_target.target_state;
+        event.render_context_target_resource = context_target.target_resource;
+        event.render_context_sample_valid = context_target.valid;
+        event.render_context_target_state_matches_output = context_target.target_state != 0 &&
+            context_target.target_state == before_observation.target_state;
+        event.render_context_target_resource_matches_output = context_target.target_resource != 0 &&
+            context_target.target_resource == before_observation.output_resource;
+        event.overlay_main_target_state = overlay_main_state_before_observation;
+        event.overlay_main_target_resource = overlay_main_resource_before_observation;
+        event.render_context_target_state_matches_overlay_main = context_target.target_state != 0 &&
+            context_target.target_state == overlay_main_state_before_observation;
+        event.render_context_target_resource_matches_overlay_main = context_target.target_resource != 0 &&
+            context_target.target_resource == overlay_main_resource_before_observation;
         event.overlay = reinterpret_cast<uintptr_t>(layer);
         event.swapchain = present.swapchain;
         event.device = present.device;
@@ -6735,6 +6888,19 @@ void RE4XeSS::on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* 
             event.target_state == before_observation.target_state;
         RE4XeSSLifetimeTrace::set_reason(event,
             !before_observation.installed ? "overlay-observed-no-installed-output" :
+            !context_target.valid ? "post-overlay-callback-render-context-null-original-status-unknown" :
+            context_target.target_state == 0 ? "post-overlay-callback-context-target-null-original-status-unknown" :
+            context_target.target_resource == 0 ? "post-overlay-callback-native-resource-null-original-status-unknown" :
+            event.render_context_target_resource_matches_output
+                ? (state_matches_handoff
+                    ? "post-overlay-callback-context-output-match-not-submit-proof"
+                    : "post-overlay-callback-context-output-match-slot-diverged") :
+            event.render_context_target_state_matches_output
+                ? "post-overlay-callback-context-targetstate-match-not-submit-proof" :
+            event.render_context_target_resource_matches_overlay_main
+                ? "post-overlay-callback-context-resource-matches-overlay-main-not-submit-proof" :
+            event.render_context_target_state_matches_overlay_main
+                ? "post-overlay-callback-context-targetstate-matches-overlay-main-not-submit-proof" :
             !state_matches_handoff ? "overlay-target-differs-from-handoff-not-reader-proof" :
             !present_valid ? "handoff-target-observed-present-context-unknown-not-reader-proof" :
             "handoff-target-observed-not-gpu-reader-proof");
