@@ -286,6 +286,9 @@ void test_mapping_pending_interval_and_active_budgets(Trace& trace) {
 void test_known_loading_native_admission() {
     using RE4XeSSLoadEligibility::Snapshot;
     using RE4XeSSLoadEligibility::allows_temporal_rendering;
+    using RE4XeSSLoadEligibility::evaluate;
+    using RE4XeSSLoadEligibility::reset_history_for_next_submission;
+    using RE4XeSSLoadEligibility::UpdateWindow;
 
     // Normal observed, rebaselined gameplay may still bootstrap the first
     // XeSS frame; bridge.execution_ready is intentionally *not* part of this gate.
@@ -341,6 +344,68 @@ void test_known_loading_native_admission() {
     assert(recovered.override_applied);
     assert(recovered.effective_width == 1280.0f &&
         recovered.effective_height == 720.0f);
+
+    const auto make_window = [](const Snapshot& state) {
+        UpdateWindow window{};
+        window.sequence_before = 20;
+        window.sequence_after = 20;
+        window.state = state;
+        return window;
+    };
+    const auto verify_overlap_native = [&](UpdateWindow overlapped) {
+        overlapped.state = normal;
+        const auto admission = evaluate(overlapped);
+        assert(admission.published_eligible);
+        assert(admission.update_overlapped);
+        assert(!admission.effective_admitted);
+        assert(admission.invalidate_history);
+
+        // Camera/scene temporal mutation and pre-Overlay submission share this
+        // effective gate; a rejected window cannot jitter or submit XeSS work.
+        const auto overlap_size = RE4XeSSSceneView::decide_size(
+            true, 1920.0f, 1080.0f, admission.effective_admitted,
+            admission.published_eligible, 1280, 720);
+        assert(!overlap_size.override_applied);
+        assert(overlap_size.effective_width == 1920.0f &&
+            overlap_size.effective_height == 1080.0f);
+        assert(reset_history_for_next_submission(false, admission.invalidate_history));
+    };
+
+    auto overlap = make_window(normal);
+    overlap.active_before = 1;
+    verify_overlap_native(overlap);
+
+    overlap = make_window(normal);
+    overlap.active_after = 1;
+    verify_overlap_native(overlap);
+
+    overlap = make_window(normal);
+    overlap.sequence_after++;
+    verify_overlap_native(overlap);
+
+    // A completed publication during the callback is also an overlap even if
+    // the updater is no longer active when the second sample is read.
+    overlap = make_window(normal);
+    overlap.sequence_before = 20;
+    overlap.sequence_after = 22;
+    verify_overlap_native(overlap);
+
+    const auto stable_recovery = make_window(normal);
+    const auto recovered_admission = evaluate(stable_recovery);
+    assert(recovered_admission.published_eligible);
+    assert(!recovered_admission.update_overlapped);
+    assert(recovered_admission.effective_admitted);
+    const auto resumed_size = RE4XeSSSceneView::decide_size(
+        true, 1920.0f, 1080.0f, recovered_admission.effective_admitted,
+        recovered_admission.published_eligible, 1280, 720);
+    assert(resumed_size.override_applied);
+    assert(reset_history_for_next_submission(false, true));
+    assert(!reset_history_for_next_submission(false, false));
+
+    // The overlap observed by an earlier callback remains a veto until a
+    // temporal consumer invalidates history and consumes the pending marker.
+    assert(!evaluate(stable_recovery, true).effective_admitted);
+    assert(evaluate(stable_recovery, true).invalidate_history);
 }
 
 void test_load_state_snapshot_publication_helpers() {
@@ -379,6 +444,7 @@ void test_load_state_snapshot_publication_helpers() {
     window.active_after = 0;
     window.sequence_after = 13;
     assert(window.overlapped());
+    assert(!RE4XeSSLoadEligibility::allows_temporal_rendering(window));
 }
 
 void test_scene_view_override_decision() {

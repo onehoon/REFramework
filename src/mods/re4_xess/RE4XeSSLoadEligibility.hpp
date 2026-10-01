@@ -29,6 +29,13 @@ struct UpdateWindow {
     }
 };
 
+struct AdmissionDecision {
+    bool published_eligible{};
+    bool update_overlapped{};
+    bool effective_admitted{};
+    bool invalidate_history{};
+};
+
 [[nodiscard]] constexpr uint32_t encode(const Snapshot& state) noexcept {
     return (static_cast<uint32_t>(state.observation_valid) << 0) |
         (static_cast<uint32_t>(state.pause_observed) << 1) |
@@ -55,5 +62,27 @@ struct UpdateWindow {
     return state.observation_valid && state.pause_observed && !state.pause_active &&
         state.normal_inhibit_baseline_valid && !state.inhibit_departure_pending &&
         !state.load_transition_active && !state.startup_rebaseline_pending;
+}
+
+[[nodiscard]] constexpr bool allows_temporal_rendering(const UpdateWindow& window) noexcept {
+    return !window.overlapped() && allows_temporal_rendering(window.state);
+}
+
+[[nodiscard]] constexpr AdmissionDecision evaluate(
+    const UpdateWindow& window,
+    bool overlap_reset_pending = false) noexcept {
+    const bool overlap = window.overlapped() || overlap_reset_pending;
+    return AdmissionDecision{
+        allows_temporal_rendering(window.state),
+        overlap,
+        allows_temporal_rendering(window) && !overlap_reset_pending,
+        overlap,
+    };
+}
+
+[[nodiscard]] constexpr bool reset_history_for_next_submission(
+    bool first_valid_frame_reset_pending,
+    bool history_invalid) noexcept {
+    return first_valid_frame_reset_pending || history_invalid;
 }
 } // namespace RE4XeSSLoadEligibility

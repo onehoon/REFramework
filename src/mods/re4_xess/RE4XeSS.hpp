@@ -124,13 +124,21 @@ private:
     bool is_temporal_active() const;
     RE4XeSSLoadEligibility::UpdateWindow begin_load_state_trace() const noexcept;
     void finish_load_state_trace(RE4XeSSLoadEligibility::UpdateWindow& window) const noexcept;
+    bool admit_load_state_window(RE4XeSSLoadEligibility::UpdateWindow& window) noexcept;
+    bool validate_load_state_window(RE4XeSSLoadEligibility::UpdateWindow& window) noexcept;
     void set_load_state_trace_fields(
         RE4XeSSLifetimeTrace::Event& event,
-        const RE4XeSSLoadEligibility::UpdateWindow& window) const noexcept;
+        const RE4XeSSLoadEligibility::UpdateWindow& window,
+        bool effective_admitted,
+        bool overlap_reset_pending) const noexcept;
     void trace_load_state_admission(
         uint32_t callback_kind,
         std::string_view reason,
-        const RE4XeSSLoadEligibility::UpdateWindow& window);
+        const RE4XeSSLoadEligibility::UpdateWindow& window,
+        bool effective_admitted,
+        bool temporal_active,
+        bool scene_view_override_applied,
+        bool overlap_reset_pending);
 
     std::atomic<UpscalingMode> m_requested_mode{ UpscalingMode::Off };
     std::atomic<uint64_t> m_control_generation{};
@@ -215,6 +223,7 @@ private:
     std::atomic<uint64_t> m_load_state_update_overlap_count{};
     std::atomic<uint32_t> m_load_state_update_thread_id{};
     std::atomic<uint32_t> m_load_state_update_active_count{};
+    std::atomic<bool> m_load_state_overlap_reset_pending{};
     std::array<std::atomic<uint64_t>, 4> m_last_load_admission_signatures{};
     std::atomic<uint32_t> m_load_admission_event_count{};
     bool m_handoff_provenance_opt_in{};

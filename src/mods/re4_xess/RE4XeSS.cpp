@@ -374,7 +374,7 @@ void dump_re4_xess_lifetime_trace(
         static_cast<unsigned long long>(summary.total_events));
 
     for (const auto& event : events) {
-        spdlog::info("[RE4XeSS][LifetimeTrace] seq={} us={} phase={} kind={} trace={} install={} outputUseToken={} consumerEvidence={} frame={} frameValid={} sceneView=0x{:x} sceneViewSizeNative={}x{} sceneViewSizeEffective={}x{} temporalActive={} sceneViewOverride={} sceneViewSameIdentityChanged={} sceneViewCrossIdentityVaried={} sceneViewFrameKeyReentered={} xessInput={}x{} display={}x{} inputResolutionValid={} jitterApplied={} jitterPixels=({}, {}) jitterPhase={}/{} sceneOrd={} callbackOrd={} overlapEpoch={} submit={} present={} relatedPresent={} outputGen={} controlGen={} deviceGen={} bridgeSlot={} writerFence={} downstreamFence={} cachedCompleted={} cachedValid={} actualCompleted={} actualValid={} writerTxn={} writerInvocation={} writerSeq={} clearSeq={}->{} replacementSeq={}->{} writerRva=0x{:x} presentTimes={}::{}/{} output=0x{:x} targetState=0x{:x} renderContext=0x{:x} contextStage={} contextTargetState=0x{:x} contextTargetResource=0x{:x} contextSampleValid={} contextStateMatch={} contextResourceMatch={} overlayMainState=0x{:x} overlayMainResource=0x{:x} contextOverlayMainStateMatch={} contextOverlayMainResourceMatch={} overlay=0x{:x} swapchain=0x{:x} device=0x{:x} queue=0x{:x} queueType={} queueTypeValid={} tid={} presentTids={}->{} presentSource={} present1={} presentReturned={} callbacksSuppressed={} originalSkipped={} result=0x{:08x} apiOk={} queueSubmitted={} markerQueued={} resetHistory={} mappingState={} mappingAmbiguous={} reason={}",
+        spdlog::info("[RE4XeSS][LifetimeTrace] seq={} us={} phase={} kind={} trace={} install={} outputUseToken={} consumerEvidence={} frame={} frameValid={} sceneView=0x{:x} sceneViewSizeNative={}x{} sceneViewSizeEffective={}x{} temporalActive={} sceneViewOverride={} loadFlags=0x{:x} loadObserved={} loadPublishedEligible={} loadEffectiveAdmitted={} loadUpdateOverlapped={} loadOverlapResetPending={} loadUpdateSequence={}->{} loadUpdateActive={}->{} sceneViewSameIdentityChanged={} sceneViewCrossIdentityVaried={} sceneViewFrameKeyReentered={} xessInput={}x{} display={}x{} inputResolutionValid={} jitterApplied={} jitterPixels=({}, {}) jitterPhase={}/{} sceneOrd={} callbackOrd={} overlapEpoch={} submit={} present={} relatedPresent={} outputGen={} controlGen={} deviceGen={} bridgeSlot={} writerFence={} downstreamFence={} cachedCompleted={} cachedValid={} actualCompleted={} actualValid={} writerTxn={} writerInvocation={} writerSeq={} clearSeq={}->{} replacementSeq={}->{} writerRva=0x{:x} presentTimes={}::{}/{} output=0x{:x} targetState=0x{:x} renderContext=0x{:x} contextStage={} contextTargetState=0x{:x} contextTargetResource=0x{:x} contextSampleValid={} contextStateMatch={} contextResourceMatch={} overlayMainState=0x{:x} overlayMainResource=0x{:x} contextOverlayMainStateMatch={} contextOverlayMainResourceMatch={} overlay=0x{:x} swapchain=0x{:x} device=0x{:x} queue=0x{:x} queueType={} queueTypeValid={} tid={} presentTids={}->{} presentSource={} present1={} presentReturned={} callbacksSuppressed={} originalSkipped={} result=0x{:08x} apiOk={} queueSubmitted={} markerQueued={} resetHistory={} mappingState={} mappingAmbiguous={} reason={}",
             static_cast<unsigned long long>(event.sequence),
             static_cast<unsigned long long>(event.timestamp_us),
             lifetime_trace_phase_name(event.capture_phase),
@@ -392,6 +392,16 @@ void dump_re4_xess_lifetime_trace(
             event.scene_view_effective_height,
             event.temporal_active,
             event.scene_view_override_applied,
+            event.load_state_flags,
+            event.load_state_observation_valid,
+            event.load_state_published_eligible,
+            event.load_state_effective_admitted,
+            event.load_state_update_overlapped,
+            event.load_state_overlap_reset_pending,
+            static_cast<unsigned long long>(event.load_state_update_sequence_before),
+            static_cast<unsigned long long>(event.load_state_update_sequence_after),
+            event.load_state_update_active_before,
+            event.load_state_update_active_after,
             event.scene_view_same_identity_changed,
             event.scene_view_cross_identity_varied,
             event.scene_view_frame_key_reentered,
@@ -4946,9 +4956,42 @@ void RE4XeSS::finish_load_state_trace(RE4XeSSLoadEligibility::UpdateWindow& wind
     window.overlap_count = m_load_state_update_overlap_count.load(std::memory_order_acquire);
 }
 
+bool RE4XeSS::admit_load_state_window(
+    RE4XeSSLoadEligibility::UpdateWindow& window) noexcept {
+    if (window.overlapped()) {
+        m_load_state_overlap_reset_pending.store(true, std::memory_order_release);
+    }
+    return RE4XeSSLoadEligibility::evaluate(
+        window,
+        m_load_state_overlap_reset_pending.load(std::memory_order_acquire)).effective_admitted;
+}
+
+bool RE4XeSS::validate_load_state_window(
+    RE4XeSSLoadEligibility::UpdateWindow& window) noexcept {
+    const auto sequence_before = m_load_state_update_sequence.load(std::memory_order_acquire);
+    const auto active_before = m_load_state_update_active_count.load(std::memory_order_acquire);
+    const auto published_bits = m_published_load_state_bits.load(std::memory_order_acquire);
+    const auto active_after = m_load_state_update_active_count.load(std::memory_order_acquire);
+    const auto sequence_after = m_load_state_update_sequence.load(std::memory_order_acquire);
+
+    window.active_after = (std::max)(window.active_after, (std::max)(active_before, active_after));
+    window.sequence_after = sequence_after;
+    window.overlap_count = m_load_state_update_overlap_count.load(std::memory_order_acquire);
+
+    const bool stable = !window.overlapped() && active_before == 0 && active_after == 0 &&
+        sequence_before == window.sequence_before && sequence_after == window.sequence_before &&
+        published_bits == RE4XeSSLoadEligibility::encode(window.state);
+    if (!stable) {
+        m_load_state_overlap_reset_pending.store(true, std::memory_order_release);
+    }
+    return stable && !m_load_state_overlap_reset_pending.load(std::memory_order_acquire);
+}
+
 void RE4XeSS::set_load_state_trace_fields(
     RE4XeSSLifetimeTrace::Event& event,
-    const RE4XeSSLoadEligibility::UpdateWindow& window) const noexcept {
+    const RE4XeSSLoadEligibility::UpdateWindow& window,
+    bool effective_admitted,
+    bool overlap_reset_pending) const noexcept {
     event.load_state_update_sequence_before = window.sequence_before;
     event.load_state_update_sequence_after = window.sequence_after;
     event.load_state_update_overlap_count = window.overlap_count;
@@ -4957,14 +5000,21 @@ void RE4XeSS::set_load_state_trace_fields(
     event.load_state_update_active_after = window.active_after;
     event.load_state_flags = RE4XeSSLoadEligibility::encode(window.state);
     event.load_state_observation_valid = window.state.observation_valid;
-    event.load_state_admitted = RE4XeSSLoadEligibility::allows_temporal_rendering(window.state);
+    event.load_state_published_eligible =
+        RE4XeSSLoadEligibility::allows_temporal_rendering(window.state);
+    event.load_state_effective_admitted = effective_admitted;
     event.load_state_update_overlapped = window.overlapped();
+    event.load_state_overlap_reset_pending = overlap_reset_pending;
 }
 
 void RE4XeSS::trace_load_state_admission(
     uint32_t callback_kind,
     std::string_view reason,
-    const RE4XeSSLoadEligibility::UpdateWindow& window) {
+    const RE4XeSSLoadEligibility::UpdateWindow& window,
+    bool effective_admitted,
+    bool temporal_active,
+    bool scene_view_override_applied,
+    bool overlap_reset_pending) {
     auto& trace = RE4XeSSLifetimeTrace::instance();
     if (!trace.enabled() || callback_kind >= m_last_load_admission_signatures.size()) {
         return;
@@ -4982,6 +5032,10 @@ void RE4XeSS::trace_load_state_admission(
     mix(window.update_thread_id);
     mix(RE4XeSSLoadEligibility::encode(window.state));
     mix(RE4XeSSLoadEligibility::allows_temporal_rendering(window.state));
+    mix(effective_admitted);
+    mix(temporal_active);
+    mix(scene_view_override_applied);
+    mix(overlap_reset_pending);
     mix(window.overlapped());
     for (const auto character : reason) {
         signature ^= static_cast<uint8_t>(character);
@@ -5018,12 +5072,14 @@ void RE4XeSS::trace_load_state_admission(
             event.frame_valid = true;
         }
     }
-    set_load_state_trace_fields(event, window);
+    event.temporal_active = temporal_active;
+    event.scene_view_override_applied = scene_view_override_applied;
+    set_load_state_trace_fields(event, window, effective_admitted, overlap_reset_pending);
     RE4XeSSLifetimeTrace::set_reason(event, reason);
     trace.record(event);
 
     spdlog::info(
-        "[RE4XeSS][LoadAdmission] callback={} frame={} frameValid={} tid={} updateTid={} sequence={}->{} active={}->{} overlaps={} flags=0x{:x} observed={} admitted={} updateOverlapped={} reason={}",
+        "[RE4XeSS][LoadAdmission] callback={} frame={} frameValid={} tid={} updateTid={} sequence={}->{} active={}->{} overlaps={} flags=0x{:x} observed={} publishedEligible={} effectiveAdmitted={} temporalActive={} sceneViewOverrideApplied={} updateOverlapped={} overlapResetPending={} reason={}",
         load_state_callback_name(callback_kind),
         static_cast<unsigned long long>(event.frame_id),
         event.frame_valid,
@@ -5036,8 +5092,12 @@ void RE4XeSS::trace_load_state_admission(
         static_cast<unsigned long long>(event.load_state_update_overlap_count),
         event.load_state_flags,
         event.load_state_observation_valid,
-        event.load_state_admitted,
+        event.load_state_published_eligible,
+        event.load_state_effective_admitted,
+        event.temporal_active,
+        event.scene_view_override_applied,
         event.load_state_update_overlapped,
+        event.load_state_overlap_reset_pending,
         reason);
 }
 
@@ -5993,15 +6053,12 @@ void RE4XeSS::on_view_get_size(REManagedObject* scene_view, float* result) {
     const bool temporal_active = is_temporal_active();
     // A prepared XeSS context does not authorize reduced SceneView rendering
     // while the already-observed LoadAccessor state forbids a new XeSS frame.
-    const bool load_admitted = RE4XeSSLoadEligibility::allows_temporal_rendering(load_window.state);
+    bool load_admitted = admit_load_state_window(load_window);
     const bool load_observation_valid = load_window.state.observation_valid;
-    trace_load_state_admission(0, load_observation_valid
-            ? (load_admitted ? "eligible" : "native-load-window")
-            : "observation-unavailable",
-        load_window);
     const float native_width = result != nullptr ? result[0] : 0.0f;
     const float native_height = result != nullptr ? result[1] : 0.0f;
-    const auto size_decision = RE4XeSSSceneView::decide_size(
+
+    auto size_decision = RE4XeSSSceneView::decide_size(
         result != nullptr,
         native_width,
         native_height,
@@ -6009,12 +6066,45 @@ void RE4XeSS::on_view_get_size(REManagedObject* scene_view, float* result) {
         load_observation_valid,
         m_input_resolution.optimal.x,
         m_input_resolution.optimal.y);
+
+    // Revalidate an actual reduced-size candidate immediately before writing
+    // the getter result. This is an optimistic, nonblocking check; it is not a
+    // frame-wide admission token.
+    if (size_decision.override_applied && !validate_load_state_window(load_window)) {
+        load_admitted = false;
+        size_decision = RE4XeSSSceneView::decide_size(
+            result != nullptr,
+            native_width,
+            native_height,
+            false,
+            load_observation_valid,
+            m_input_resolution.optimal.x,
+            m_input_resolution.optimal.y);
+    }
     const bool override_applied = size_decision.override_applied;
 
     if (override_applied) {
         result[0] = size_decision.effective_width;
         result[1] = size_decision.effective_height;
     }
+
+    const bool overlap_reset_pending =
+        m_load_state_overlap_reset_pending.load(std::memory_order_acquire);
+    const bool update_overlap = load_window.overlapped() || overlap_reset_pending;
+    const auto admission_reason = update_overlap
+        ? "load-state-update-overlapped"
+        : !load_observation_valid ? "observation-unavailable"
+            : !load_admitted ? "native-load-window"
+            : override_applied ? "reduced-scene-view-applied"
+            : temporal_active ? "temporal-view-gate-closed" : "native-scene-view";
+    trace_load_state_admission(
+        0,
+        admission_reason,
+        load_window,
+        load_admitted,
+        temporal_active,
+        override_applied,
+        overlap_reset_pending);
 
     auto& lifetime_trace = RE4XeSSLifetimeTrace::instance();
     if (!lifetime_trace.enabled() || result == nullptr) {
@@ -6044,13 +6134,14 @@ void RE4XeSS::on_view_get_size(REManagedObject* scene_view, float* result) {
     trace_event.temporal_active = temporal_active;
     trace_event.scene_view_override_applied = override_applied;
     trace_event.load_state_callback_kind = 0;
-    set_load_state_trace_fields(trace_event, load_window);
+    set_load_state_trace_fields(trace_event, load_window, load_admitted, overlap_reset_pending);
     trace_event.control_generation = m_control_generation.load(std::memory_order_acquire);
     trace_event.device_reset_generation = m_device_reset_generation.load(std::memory_order_acquire);
     trace_event.thread_id = GetCurrentThreadId();
     RE4XeSSLifetimeTrace::set_reason(
         trace_event,
         override_applied ? "reduced-scene-view-applied" :
+            update_overlap ? "load-state-update-overlapped" :
             temporal_active && !load_admitted ? "native-load-window" :
             temporal_active ? "temporal-view-gate-closed" : "native-scene-view");
     lifetime_trace.record(trace_event);
@@ -6059,12 +6150,18 @@ void RE4XeSS::on_view_get_size(REManagedObject* scene_view, float* result) {
 void RE4XeSS::on_camera_get_projection_matrix(REManagedObject* camera, Matrix4x4f* result) {
     auto load_window = begin_load_state_trace();
     finish_load_state_trace(load_window);
-    const bool load_admitted = RE4XeSSLoadEligibility::allows_temporal_rendering(load_window.state);
+    const bool load_admitted = admit_load_state_window(load_window);
     const bool temporal_active = is_temporal_active();
-    trace_load_state_admission(1, !load_window.state.observation_valid
-            ? "observation-unavailable"
-            : load_admitted ? "eligible" : "native-load-window",
-        load_window);
+    const bool overlap_reset_pending =
+        m_load_state_overlap_reset_pending.load(std::memory_order_acquire);
+    const bool update_overlap = load_window.overlapped() || overlap_reset_pending;
+    const auto admission_reason = update_overlap
+        ? "load-state-update-overlapped"
+        : !load_window.state.observation_valid ? "observation-unavailable"
+            : load_admitted ? "eligible" : "native-load-window";
+    trace_load_state_admission(
+        1, admission_reason, load_window, load_admitted, temporal_active, false,
+        overlap_reset_pending);
     if (!temporal_active || !load_admitted || camera == nullptr || result == nullptr) {
         return;
     }
@@ -6103,6 +6200,15 @@ void RE4XeSS::on_camera_get_projection_matrix(REManagedObject* camera, Matrix4x4
         return;
     }
 
+    if (!validate_load_state_window(load_window)) {
+        const bool overlap_reset_pending =
+            m_load_state_overlap_reset_pending.load(std::memory_order_acquire);
+        trace_load_state_admission(
+            1, "load-state-update-overlapped", load_window, false, temporal_active, false,
+            overlap_reset_pending);
+        return;
+    }
+
     m_camera_near = near_plane;
     m_camera_far = far_plane;
     m_camera_metadata_valid = true;
@@ -6121,11 +6227,23 @@ void RE4XeSS::on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* re
 
     auto load_window = begin_load_state_trace();
     finish_load_state_trace(load_window);
-    const bool load_admitted = RE4XeSSLoadEligibility::allows_temporal_rendering(load_window.state);
-    trace_load_state_admission(2, !load_window.state.observation_valid
-            ? "observation-unavailable"
-            : load_admitted ? "eligible" : "native-load-window",
-        load_window);
+    const bool load_admitted = admit_load_state_window(load_window);
+    const bool overlap_reset_pending =
+        m_load_state_overlap_reset_pending.load(std::memory_order_acquire);
+    const auto admission = RE4XeSSLoadEligibility::evaluate(load_window, overlap_reset_pending);
+    const bool update_overlap = admission.update_overlapped;
+    const auto admission_reason = update_overlap
+        ? "load-state-update-overlapped"
+        : !load_window.state.observation_valid ? "observation-unavailable"
+        : load_admitted ? "eligible" : "native-load-window";
+    trace_load_state_admission(
+        2, admission_reason, load_window, load_admitted, true, false,
+        overlap_reset_pending);
+    if (update_overlap) {
+        m_load_state_overlap_reset_pending.exchange(false, std::memory_order_acq_rel);
+        invalidate_history("load-state-update-overlapped");
+        return;
+    }
     if (!load_window.state.observation_valid) {
         invalidate_history("load-state-observation-unavailable");
         return;
@@ -6196,6 +6314,18 @@ void RE4XeSS::on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* re
     const auto matrix_jitter_x = 2.0f * jitter_x / static_cast<float>(m_input_resolution.optimal.x);
     const auto matrix_jitter_y = -2.0f * jitter_y / static_cast<float>(m_input_resolution.optimal.y);
 
+    if (!validate_load_state_window(load_window)) {
+        const bool overlap_reset_pending =
+            m_load_state_overlap_reset_pending.load(std::memory_order_acquire);
+        trace_load_state_admission(
+            2, "load-state-update-overlapped", load_window, false, true, false,
+            overlap_reset_pending);
+        m_load_state_overlap_reset_pending.exchange(false, std::memory_order_acq_rel);
+        invalidate_history("load-state-update-overlapped");
+        clear_frame_state();
+        return;
+    }
+
     for (size_t i = 0; i < infos.size(); ++i) {
         auto* info = infos[i];
         if (info == nullptr) {
@@ -6253,7 +6383,7 @@ void RE4XeSS::on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* re
         trace_event.jitter_phase_count = m_jitter_phase_count;
         trace_event.thread_id = GetCurrentThreadId();
         trace_event.load_state_callback_kind = 2;
-        set_load_state_trace_fields(trace_event, load_window);
+        set_load_state_trace_fields(trace_event, load_window, true, false);
         RE4XeSSLifetimeTrace::set_reason(trace_event, "primary-scene-jitter-applied");
         lifetime_trace.record(trace_event);
     }
@@ -6277,6 +6407,9 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
     const bool trace_enabled = lifetime_trace.enabled();
     auto load_window = begin_load_state_trace();
     finish_load_state_trace(load_window);
+    bool load_effective_admitted = admit_load_state_window(load_window);
+    bool load_overlap_reset_pending =
+        m_load_state_overlap_reset_pending.load(std::memory_order_acquire);
     const auto trace_id = trace_enabled ? lifetime_trace.next_trace_id() : 0;
     const auto callback_ordinal = trace_enabled
         ? m_pre_overlay_lifetime_ordinal.fetch_add(1, std::memory_order_relaxed) + 1
@@ -6336,7 +6469,8 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         event.present_valid = present_is_current();
         event.mapping_ambiguous = !present_is_current();
         event.load_state_callback_kind = 3;
-        set_load_state_trace_fields(event, load_window);
+        set_load_state_trace_fields(
+            event, load_window, load_effective_admitted, load_overlap_reset_pending);
         RE4XeSSLifetimeTrace::set_reason(event, reason);
         return lifetime_trace.record(event);
     };
@@ -6621,18 +6755,33 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
     }
     load_window = begin_load_state_trace();
     finish_load_state_trace(load_window);
-    const bool load_admitted = RE4XeSSLoadEligibility::allows_temporal_rendering(load_window.state);
-    trace_load_state_admission(3, !load_window.state.observation_valid
-            ? "observation-unavailable"
-            : load_admitted ? "eligible" : "native-load-window",
-        load_window);
+    load_effective_admitted = admit_load_state_window(load_window);
+    load_overlap_reset_pending =
+        m_load_state_overlap_reset_pending.load(std::memory_order_acquire);
+    const auto admission = RE4XeSSLoadEligibility::evaluate(
+        load_window, load_overlap_reset_pending);
+    const bool update_overlap = admission.update_overlapped;
+    const auto admission_reason = update_overlap
+        ? "load-state-update-overlapped"
+        : !load_window.state.observation_valid ? "observation-unavailable"
+        : load_effective_admitted ? "eligible" : "native-load-window";
+    trace_load_state_admission(
+        3, admission_reason, load_window, load_effective_admitted, true, false,
+        load_overlap_reset_pending);
+    if (update_overlap) {
+        m_load_state_overlap_reset_pending.exchange(false, std::memory_order_acq_rel);
+        invalidate_history("load-state-update-overlapped");
+        clear_frame_state();
+        trace_skip("load-state-update-overlapped");
+        return true;
+    }
     if (!load_window.state.observation_valid) {
         invalidate_history("load-state-observation-unavailable");
         clear_frame_state();
         trace_skip("load-state-observation-unavailable");
         return true;
     }
-    if (!load_admitted) {
+    if (!load_effective_admitted) {
         invalidate_history("load-history-invalid");
         clear_frame_state();
         trace_skip("load-history-invalid");
@@ -6721,7 +6870,8 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
     packet.near_plane = m_camera_near;
     packet.far_plane = m_camera_far;
     packet.vertical_fov = m_cached_vertical_fov;
-    packet.reset_history = m_first_valid_frame_reset_pending || m_history_invalid;
+    packet.reset_history = RE4XeSSLoadEligibility::reset_history_for_next_submission(
+        m_first_valid_frame_reset_pending, m_history_invalid);
     packet.frame_id = *m_cached_scene_frame;
     packet.lifetime_trace_id = trace_id;
 
@@ -6814,6 +6964,32 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
     submit_request.device_reset_generation = reset_generation;
     submit_request.caller_thread_id = callback_thread_id;
 
+    // Recheck the load-state publication at the last CPU boundary before the
+    // worker can record/submit XeSS work. The prepared output remains uninstalled
+    // if this local admission check rejects the frame.
+    load_window = begin_load_state_trace();
+    finish_load_state_trace(load_window);
+    load_effective_admitted = admit_load_state_window(load_window);
+    load_overlap_reset_pending =
+        m_load_state_overlap_reset_pending.load(std::memory_order_acquire);
+    const auto submit_admission = RE4XeSSLoadEligibility::evaluate(
+        load_window, load_overlap_reset_pending);
+    const bool submit_overlap = submit_admission.update_overlapped;
+    if (!load_effective_admitted) {
+        const auto reason = submit_overlap ? "load-state-update-overlapped" :
+            !load_window.state.observation_valid ? "load-state-observation-unavailable" :
+            "load-history-invalid";
+        trace_load_state_admission(
+            3, reason, load_window, false, true, false, load_overlap_reset_pending);
+        if (submit_overlap) {
+            m_load_state_overlap_reset_pending.exchange(false, std::memory_order_acq_rel);
+        }
+        invalidate_history(reason);
+        clear_frame_state();
+        trace_skip(reason);
+        return true;
+    }
+
     const auto submit_result = m_worker.submit_sync(std::move(submit_request));
     publish_worker_snapshot(submit_result.snapshot);
     const auto handoff_after_submit = m_output_handoff.snapshot();
@@ -6848,6 +7024,8 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
     submit_event.api_succeeded = submit_result.execute_api_succeeded;
     submit_event.queue_submitted = submit_result.queue_submitted;
     submit_event.writer_signal_succeeded = submit_result.writer_signal_succeeded;
+    set_load_state_trace_fields(
+        submit_event, load_window, load_effective_admitted, load_overlap_reset_pending);
     submit_event.successful_submission = submit_result.status == RE4XeSSWorker::SubmitResult::Status::Submitted &&
         submit_result.execute_api_succeeded && submit_result.queue_submitted && submit_result.writer_signal_succeeded;
     const char* submit_reason = "dispatch-failed";

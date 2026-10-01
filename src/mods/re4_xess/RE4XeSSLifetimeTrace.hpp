@@ -218,8 +218,10 @@ public:
         bool scene_view_frame_key_reentered{};
         bool jitter_applied{};
         bool load_state_update_overlapped{};
+        bool load_state_overlap_reset_pending{};
         bool load_state_observation_valid{};
-        bool load_state_admitted{};
+        bool load_state_published_eligible{};
+        bool load_state_effective_admitted{};
         CapturePhase capture_phase{ CapturePhase::PreActive };
         MappingState mapping_state{ MappingState::Unknown };
         RenderContextStage render_context_stage{ RenderContextStage::None };
