@@ -1,6 +1,7 @@
 // cl /nologo /std:c++latest /EHsc /W4 /I src tests\re4_xess_lifetime_trace_tests.cpp /Fe:re4_xess_lifetime_trace_tests.exe
 
 #include "mods/re4_xess/RE4XeSSLifetimeTrace.hpp"
+#include "mods/re4_xess/RE4XeSSSceneViewDecision.hpp"
 
 #include <cassert>
 #include <iostream>
@@ -244,36 +245,107 @@ void test_mapping_pending_interval_and_active_budgets(Trace& trace) {
     assert(summary.dump_windows_suppressed >= 5);
 }
 
-void test_scene_extent_and_jitter_trace(Trace& trace) {
-    Trace::Event view_size{};
-    view_size.kind = Trace::Kind::SceneViewSize;
-    view_size.frame_id = 99001;
-    view_size.frame_valid = true;
-    view_size.scene_view = 0x1234;
-    view_size.scene_view_native_width = 2560.0f;
-    view_size.scene_view_native_height = 1440.0f;
-    view_size.scene_view_effective_width = 1706.0f;
-    view_size.scene_view_effective_height = 960.0f;
-    view_size.input_width = 1706;
-    view_size.input_height = 960;
-    view_size.display_width = 2560;
-    view_size.display_height = 1440;
-    view_size.input_resolution_valid = true;
-    view_size.temporal_active = true;
-    view_size.scene_view_override_applied = true;
-    view_size.control_generation = 8;
-    view_size.device_reset_generation = 3;
-    Trace::set_reason(view_size, "reduced-scene-view-applied");
-    assert(trace.record(view_size) != 0);
+void test_scene_view_override_decision() {
+    const auto active = RE4XeSSSceneView::decide_size(true, 2560.0f, 1440.0f, true, true, 1706, 960);
+    assert(active.override_applied);
+    assert(active.effective_width == 1706.0f && active.effective_height == 960.0f);
 
-    // Multiple get_Size calls in one scene frame produce one diagnostic sample.
-    view_size.scene_view = 0x5678;
-    assert(trace.record(view_size) == 0);
+    const auto temporal_off = RE4XeSSSceneView::decide_size(true, 2560.0f, 1440.0f, false, true, 1706, 960);
+    assert(!temporal_off.override_applied);
+    assert(temporal_off.effective_width == 2560.0f && temporal_off.effective_height == 1440.0f);
+
+    const auto load_unavailable = RE4XeSSSceneView::decide_size(true, 2560.0f, 1440.0f, true, false, 1706, 960);
+    assert(!load_unavailable.override_applied);
+    assert(load_unavailable.effective_width == 2560.0f && load_unavailable.effective_height == 1440.0f);
+
+    const auto invalid_input_extent = RE4XeSSSceneView::decide_size(true, 2560.0f, 1440.0f, true, true, 0, 960);
+    assert(!invalid_input_extent.override_applied);
+    assert(invalid_input_extent.effective_width == 2560.0f && invalid_input_extent.effective_height == 1440.0f);
+
+    const auto missing_result = RE4XeSSSceneView::decide_size(false, 0.0f, 0.0f, true, true, 1706, 960);
+    assert(!missing_result.override_applied);
+    assert(missing_result.effective_width == 0.0f && missing_result.effective_height == 0.0f);
+}
+
+void test_scene_extent_and_jitter_trace(Trace& trace) {
+    const auto before = trace.summary();
+    const auto scene_view_count_before =
+        before.active_event_counts[static_cast<size_t>(Trace::Kind::SceneViewSize)];
+
+    const auto make_view_size = [](uint64_t frame_id, uintptr_t scene_view) {
+        Trace::Event event{};
+        event.kind = Trace::Kind::SceneViewSize;
+        event.frame_id = frame_id;
+        event.frame_valid = true;
+        event.scene_view = scene_view;
+        event.scene_view_native_width = 2560.0f;
+        event.scene_view_native_height = 1440.0f;
+        event.scene_view_effective_width = 1706.0f;
+        event.scene_view_effective_height = 960.0f;
+        event.input_width = 1706;
+        event.input_height = 960;
+        event.display_width = 2560;
+        event.display_height = 1440;
+        event.input_resolution_valid = true;
+        event.temporal_active = true;
+        event.scene_view_override_applied = true;
+        event.control_generation = 8;
+        event.device_reset_generation = 3;
+        Trace::set_reason(event, "reduced-scene-view-applied");
+        return event;
+    };
+
+    auto view_size = make_view_size(99001, 0x1234);
+    assert(trace.record(view_size) != 0);
+    assert(trace.record(view_size) == 0); // Exact same-view/value duplicate is suppressed.
+
+    // A distinct SceneView identity in the same frame is retained even when the sizes match.
+    auto second_view = make_view_size(99001, 0x5678);
+    assert(trace.record(second_view) != 0);
+
+    // A changed extent for the same view is retained and explicitly marked as a conflict.
+    auto changed_extent = view_size;
+    changed_extent.scene_view_native_width = 1920.0f;
+    changed_extent.scene_view_native_height = 1080.0f;
+    changed_extent.scene_view_effective_width = 1280.0f;
+    changed_extent.scene_view_effective_height = 720.0f;
+    changed_extent.input_width = 1280;
+    changed_extent.input_height = 720;
+    assert(trace.record(changed_extent) != 0);
+
+    // A changed override flag with unchanged dimensions is separately visible and conflict-marked.
+    auto changed_override = changed_extent;
+    changed_override.scene_view_override_applied = false;
+    Trace::set_reason(changed_override, "temporal-view-gate-closed");
+    assert(trace.record(changed_override) != 0);
+    assert(trace.record(changed_override) == 0);
+
+    // Preserve a temporal-state discrepancy even when dimensions/override fields otherwise match.
+    auto changed_temporal_state = view_size;
+    changed_temporal_state.temporal_active = false;
+    assert(trace.record(changed_temporal_state) != 0);
+
+    // The same frame/view under a new control or device generation is not deduplicated.
+    auto new_control_generation = view_size;
+    new_control_generation.control_generation = 9;
+    assert(trace.record(new_control_generation) != 0);
+    auto new_device_generation = view_size;
+    new_device_generation.device_reset_generation = 4;
+    assert(trace.record(new_device_generation) != 0);
+
+    // Correlate a reduced SceneView/jitter sample with a subsequent marker-pending skip.
+    constexpr uint64_t skip_frame_id = 99002;
+    auto reduced_view = make_view_size(skip_frame_id, 0x9abc);
+    reduced_view.control_generation = 10;
+    reduced_view.device_reset_generation = 6;
+    assert(trace.record(reduced_view) != 0);
 
     Trace::Event scene_frame{};
     scene_frame.kind = Trace::Kind::SceneFrame;
-    scene_frame.frame_id = 99001;
+    scene_frame.frame_id = skip_frame_id;
     scene_frame.frame_valid = true;
+    scene_frame.control_generation = reduced_view.control_generation;
+    scene_frame.device_reset_generation = reduced_view.device_reset_generation;
     scene_frame.input_width = 1706;
     scene_frame.input_height = 960;
     scene_frame.display_width = 2560;
@@ -287,25 +359,84 @@ void test_scene_extent_and_jitter_trace(Trace& trace) {
     Trace::set_reason(scene_frame, "primary-scene-jitter-applied");
     assert(trace.record(scene_frame) != 0);
 
-    const auto recent = trace.recent(2);
-    assert(recent.size() == 2);
-    assert(recent[0].kind == Trace::Kind::SceneViewSize);
-    assert(recent[0].frame_id == recent[1].frame_id);
-    assert(recent[0].scene_view == 0x1234);
-    assert(recent[0].scene_view_native_width == 2560.0f);
-    assert(recent[0].scene_view_effective_width == 1706.0f);
-    assert(recent[0].scene_view_override_applied);
-    assert(recent[1].kind == Trace::Kind::SceneFrame);
-    assert(recent[1].input_width == 1706);
-    assert(recent[1].display_height == 1440);
-    assert(recent[1].jitter_applied);
-    assert(recent[1].jitter_sample_index == 4);
-    assert(recent[1].jitter_phase_count == 16);
-    assert(recent[1].output_use_token == 0);
-    assert(recent[1].consumer_evidence == Trace::ConsumerEvidence::Unknown);
+    Trace::Event pending_skip{};
+    pending_skip.kind = Trace::Kind::Skip;
+    pending_skip.frame_id = skip_frame_id;
+    pending_skip.frame_valid = true;
+    pending_skip.control_generation = reduced_view.control_generation;
+    pending_skip.device_reset_generation = reduced_view.device_reset_generation;
+    Trace::set_reason(pending_skip, "output-handoff-marker-pending");
+    assert(trace.record(pending_skip) != 0);
+
+    // The per-frame sample set is fixed; overflow is explicit in the summary.
+    constexpr uint64_t capped_frame_id = 99003;
+    for (size_t index = 0; index < Trace::MAX_SCENE_VIEW_OBSERVATIONS_PER_FRAME; ++index) {
+        auto sample = make_view_size(capped_frame_id, static_cast<uintptr_t>(0x10000 + index));
+        sample.control_generation = 10;
+        sample.device_reset_generation = 6;
+        assert(trace.record(sample) != 0);
+    }
+    auto dropped_sample = make_view_size(capped_frame_id, 0x20000);
+    dropped_sample.control_generation = 10;
+    dropped_sample.device_reset_generation = 6;
+    assert(trace.record(dropped_sample) == 0);
+
+    // Evicting an old frame-key window is also visible instead of silently claiming full coverage.
+    for (uint64_t frame_id = 99100; frame_id < 99110; ++frame_id) {
+        auto sample = make_view_size(frame_id, 0x30000);
+        sample.control_generation = 10;
+        sample.device_reset_generation = 6;
+        assert(trace.record(sample) != 0);
+    }
+
+    const auto recent = trace.recent(Trace::CAPACITY);
+    const auto find_event = [&](Trace::Kind kind, uint64_t frame_id, uint64_t control, uint64_t device) {
+        return std::find_if(recent.begin(), recent.end(), [&](const auto& event) {
+            return event.kind == kind && event.frame_id == frame_id &&
+                event.control_generation == control && event.device_reset_generation == device;
+        });
+    };
+    const auto retained_second_view = std::find_if(recent.begin(), recent.end(), [](const auto& event) {
+        return event.kind == Trace::Kind::SceneViewSize && event.frame_id == 99001 &&
+            event.control_generation == 8 && event.device_reset_generation == 3 &&
+            event.scene_view == 0x5678;
+    });
+    assert(retained_second_view != recent.end());
+    const auto retained_changed_extent = std::find_if(recent.begin(), recent.end(), [](const auto& event) {
+        return event.kind == Trace::Kind::SceneViewSize && event.frame_id == 99001 &&
+            event.scene_view == 0x1234 && event.scene_view_native_width == 1920.0f;
+    });
+    assert(retained_changed_extent != recent.end() && retained_changed_extent->scene_view_conflict);
+    const auto retained_changed_override = std::find_if(recent.begin(), recent.end(), [](const auto& event) {
+        return event.kind == Trace::Kind::SceneViewSize && event.frame_id == 99001 &&
+            event.scene_view == 0x1234 && !event.scene_view_override_applied;
+    });
+    assert(retained_changed_override != recent.end() && retained_changed_override->scene_view_conflict);
+    const auto retained_changed_temporal_state = std::find_if(recent.begin(), recent.end(), [](const auto& event) {
+        return event.kind == Trace::Kind::SceneViewSize && event.frame_id == 99001 &&
+            event.scene_view == 0x1234 && !event.temporal_active;
+    });
+    assert(retained_changed_temporal_state != recent.end() && retained_changed_temporal_state->scene_view_conflict);
+
+    const auto retained_scene_frame = find_event(
+        Trace::Kind::SceneFrame, skip_frame_id, reduced_view.control_generation, reduced_view.device_reset_generation);
+    const auto retained_skip = find_event(
+        Trace::Kind::Skip, skip_frame_id, reduced_view.control_generation, reduced_view.device_reset_generation);
+    assert(retained_scene_frame != recent.end() && retained_scene_frame->jitter_applied);
+    assert(retained_scene_frame->input_width == 1706 && retained_scene_frame->jitter_sample_index == 4);
+    assert(retained_scene_frame->output_use_token == 0);
+    assert(retained_scene_frame->consumer_evidence == Trace::ConsumerEvidence::Unknown);
+    assert(retained_skip != recent.end());
+    assert(std::strcmp(retained_skip->reason.data(), "output-handoff-marker-pending") == 0);
+    const auto retained_reduced_view = find_event(
+        Trace::Kind::SceneViewSize, skip_frame_id, reduced_view.control_generation, reduced_view.device_reset_generation);
+    assert(retained_reduced_view != recent.end() && retained_reduced_view->scene_view_override_applied);
 
     const auto summary = trace.summary();
-    assert(summary.active_event_counts[static_cast<size_t>(Trace::Kind::SceneViewSize)] == 1);
+    assert(summary.active_event_counts[static_cast<size_t>(Trace::Kind::SceneViewSize)] - scene_view_count_before == 26);
+    assert(summary.active_scene_view_size_conflicts == before.active_scene_view_size_conflicts + 3);
+    assert(summary.active_scene_view_size_observation_drops == before.active_scene_view_size_observation_drops + 1);
+    assert(summary.active_scene_view_frame_cache_evictions > before.active_scene_view_frame_cache_evictions);
     assert(summary.active_event_counts[static_cast<size_t>(Trace::Kind::SceneFrame)] == 1);
 }
 
@@ -317,6 +448,7 @@ int main() {
     const auto output_use_token = test_output_use_token_issuance_lifecycle();
     test_phase_transition_and_correlated_first_submit(trace, output_use_token);
     test_mapping_pending_interval_and_active_budgets(trace);
+    test_scene_view_override_decision();
     test_scene_extent_and_jitter_trace(trace);
     assert(trace.claim_final_summary());
     assert(!trace.claim_final_summary());

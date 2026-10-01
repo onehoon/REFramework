@@ -204,6 +204,7 @@ public:
         bool input_resolution_valid{};
         bool temporal_active{};
         bool scene_view_override_applied{};
+        bool scene_view_conflict{};
         bool jitter_applied{};
         CapturePhase capture_phase{ CapturePhase::PreActive };
         MappingState mapping_state{ MappingState::Unknown };
@@ -236,6 +237,12 @@ public:
         uint64_t active_render_context_overlay_main_resource_matches{};
         uint64_t active_bridge_busy_skips{};
         uint64_t active_temporal_gate_skips{};
+        uint64_t scene_view_size_conflicts{};
+        uint64_t active_scene_view_size_conflicts{};
+        uint64_t scene_view_size_observation_drops{};
+        uint64_t active_scene_view_size_observation_drops{};
+        uint64_t scene_view_frame_cache_evictions{};
+        uint64_t active_scene_view_frame_cache_evictions{};
         uint64_t installed_unmarked{};
         uint64_t installed_unmarked_high_water{};
         uint64_t marked_gpu_incomplete{};
@@ -267,6 +274,8 @@ public:
     };
 
     static constexpr size_t CAPACITY = 4096;
+    static constexpr size_t SCENE_VIEW_FRAME_CACHE_CAPACITY = 8;
+    static constexpr size_t MAX_SCENE_VIEW_OBSERVATIONS_PER_FRAME = 8;
     static constexpr size_t MAX_EVENTS_PER_DUMP = 32;
     static constexpr size_t MAX_DUMP_EVENT_LINES = 512;
     static constexpr size_t MAX_DUMP_BYTES = 1'100'000;
@@ -297,17 +306,9 @@ public:
         event.timestamp_us = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(now).count());
         std::lock_guard lock{ m_mutex };
-        if (event.kind == Kind::SceneViewSize && event.frame_valid) {
-            if (m_last_scene_view_frame_valid &&
-                m_last_scene_view_frame_id == event.frame_id &&
-                m_last_scene_view_control_generation == event.control_generation &&
-                m_last_scene_view_device_reset_generation == event.device_reset_generation) {
-                return 0;
-            }
-            m_last_scene_view_frame_id = event.frame_id;
-            m_last_scene_view_control_generation = event.control_generation;
-            m_last_scene_view_device_reset_generation = event.device_reset_generation;
-            m_last_scene_view_frame_valid = true;
+        if (event.kind == Kind::SceneViewSize && event.frame_valid &&
+            !admit_scene_view_observation_locked(event)) {
+            return 0;
         }
         if (event.kind == Kind::OutputInstall) {
             const bool starting_active_capture = !m_active_capture_started;
@@ -669,6 +670,137 @@ private:
         bool marked{};
     };
 
+    struct SceneViewObservation {
+        uintptr_t scene_view{};
+        float native_width{};
+        float native_height{};
+        float effective_width{};
+        float effective_height{};
+        uint32_t input_width{};
+        uint32_t input_height{};
+        uint32_t display_width{};
+        uint32_t display_height{};
+        bool input_resolution_valid{};
+        bool temporal_active{};
+        bool override_applied{};
+    };
+
+    struct SceneViewFrameObservations {
+        std::array<SceneViewObservation, MAX_SCENE_VIEW_OBSERVATIONS_PER_FRAME> observations{};
+        uint64_t frame_id{};
+        uint64_t control_generation{};
+        uint64_t device_reset_generation{};
+        size_t observation_count{};
+        bool valid{};
+    };
+
+    static SceneViewObservation scene_view_observation(const Event& event) noexcept {
+        return SceneViewObservation{
+            event.scene_view,
+            event.scene_view_native_width,
+            event.scene_view_native_height,
+            event.scene_view_effective_width,
+            event.scene_view_effective_height,
+            event.input_width,
+            event.input_height,
+            event.display_width,
+            event.display_height,
+            event.input_resolution_valid,
+            event.temporal_active,
+            event.scene_view_override_applied,
+        };
+    }
+
+    static bool same_scene_view_observation(
+        const SceneViewObservation& left,
+        const SceneViewObservation& right) noexcept {
+        return left.scene_view == right.scene_view &&
+            left.native_width == right.native_width &&
+            left.native_height == right.native_height &&
+            left.effective_width == right.effective_width &&
+            left.effective_height == right.effective_height &&
+            left.input_width == right.input_width &&
+            left.input_height == right.input_height &&
+            left.display_width == right.display_width &&
+            left.display_height == right.display_height &&
+            left.input_resolution_valid == right.input_resolution_valid &&
+            left.temporal_active == right.temporal_active &&
+            left.override_applied == right.override_applied;
+    }
+
+    static bool scene_view_observation_conflicts(
+        const SceneViewObservation& left,
+        const SceneViewObservation& right) noexcept {
+        return left.native_width != right.native_width ||
+            left.native_height != right.native_height ||
+            left.effective_width != right.effective_width ||
+            left.effective_height != right.effective_height ||
+            left.input_width != right.input_width ||
+            left.input_height != right.input_height ||
+            left.display_width != right.display_width ||
+            left.display_height != right.display_height ||
+            left.input_resolution_valid != right.input_resolution_valid ||
+            left.temporal_active != right.temporal_active ||
+            left.override_applied != right.override_applied;
+    }
+
+    bool admit_scene_view_observation_locked(Event& event) noexcept {
+        SceneViewFrameObservations* frame_state{};
+        for (auto& candidate : m_scene_view_frame_observations) {
+            if (candidate.valid && candidate.frame_id == event.frame_id &&
+                candidate.control_generation == event.control_generation &&
+                candidate.device_reset_generation == event.device_reset_generation) {
+                frame_state = &candidate;
+                break;
+            }
+        }
+
+        if (frame_state == nullptr) {
+            frame_state = &m_scene_view_frame_observations[m_next_scene_view_frame_cache];
+            if (frame_state->valid) {
+                ++m_summary.scene_view_frame_cache_evictions;
+                if (m_active_capture_started) {
+                    ++m_summary.active_scene_view_frame_cache_evictions;
+                }
+            }
+            *frame_state = {};
+            frame_state->frame_id = event.frame_id;
+            frame_state->control_generation = event.control_generation;
+            frame_state->device_reset_generation = event.device_reset_generation;
+            frame_state->valid = true;
+            m_next_scene_view_frame_cache =
+                (m_next_scene_view_frame_cache + 1) % SCENE_VIEW_FRAME_CACHE_CAPACITY;
+        }
+
+        const auto observation = scene_view_observation(event);
+        bool conflict{};
+        for (size_t index = 0; index < frame_state->observation_count; ++index) {
+            const auto& prior = frame_state->observations[index];
+            if (same_scene_view_observation(prior, observation)) {
+                return false;
+            }
+            conflict = conflict || scene_view_observation_conflicts(prior, observation);
+        }
+
+        if (frame_state->observation_count >= MAX_SCENE_VIEW_OBSERVATIONS_PER_FRAME) {
+            ++m_summary.scene_view_size_observation_drops;
+            if (m_active_capture_started) {
+                ++m_summary.active_scene_view_size_observation_drops;
+            }
+            return false;
+        }
+
+        frame_state->observations[frame_state->observation_count++] = observation;
+        event.scene_view_conflict = conflict;
+        if (conflict) {
+            ++m_summary.scene_view_size_conflicts;
+            if (m_active_capture_started) {
+                ++m_summary.active_scene_view_size_conflicts;
+            }
+        }
+        return true;
+    }
+
     RE4XeSSLifetimeTrace() = default;
 
     mutable std::mutex m_mutex{};
@@ -690,10 +822,8 @@ private:
     bool m_first_mapping_window_claimed{};
     bool m_final_summary_emitted{};
     bool m_pending_present_window_claimed{};
-    uint64_t m_last_scene_view_frame_id{};
-    uint64_t m_last_scene_view_control_generation{};
-    uint64_t m_last_scene_view_device_reset_generation{};
-    bool m_last_scene_view_frame_valid{};
+    std::array<SceneViewFrameObservations, SCENE_VIEW_FRAME_CACHE_CAPACITY> m_scene_view_frame_observations{};
+    size_t m_next_scene_view_frame_cache{};
     uint32_t m_claimed_anomaly_windows{};
     uint64_t m_pending_present_install_id{};
     uint64_t m_pending_present_last_ordinal{};
