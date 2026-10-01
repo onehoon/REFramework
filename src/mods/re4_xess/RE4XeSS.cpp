@@ -234,10 +234,21 @@ const char* lifetime_trace_kind_name(RE4XeSSLifetimeTrace::Kind kind) noexcept {
     case Kind::Marker: return "marker";
     case Kind::WriterFenceComplete: return "writer-fence-complete";
     case Kind::DownstreamFenceComplete: return "downstream-fence-complete";
+    case Kind::LoadAdmission: return "load-admission";
     case Kind::Skip: return "skip";
     case Kind::Count: break;
     }
     return "unknown";
+}
+
+const char* load_state_callback_name(uint32_t callback_kind) noexcept {
+    switch (callback_kind) {
+    case 0: return "scene-view-size";
+    case 1: return "camera-projection";
+    case 2: return "scene-layer-update";
+    case 3: return "pre-overlay";
+    default: return "unknown";
+    }
 }
 
 const char* lifetime_trace_phase_name(RE4XeSSLifetimeTrace::CapturePhase phase) noexcept {
@@ -4885,6 +4896,151 @@ RE4XeSS::~RE4XeSS() {
     log_re4_xess_lifetime_summary();
 }
 
+RE4XeSS::LoadStateUpdateScope::LoadStateUpdateScope(RE4XeSS& owner)
+    : m_owner(owner) {
+    const auto active_before = m_owner.m_load_state_update_active_count.fetch_add(
+        1, std::memory_order_acq_rel);
+    if (active_before != 0) {
+        m_owner.m_load_state_update_overlap_count.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    try {
+        m_lock = std::unique_lock<std::mutex>{ m_owner.m_load_state_mutex };
+    } catch (...) {
+        m_owner.m_load_state_update_active_count.fetch_sub(1, std::memory_order_release);
+        throw;
+    }
+    m_owner.m_load_state_update_thread_id.store(GetCurrentThreadId(), std::memory_order_release);
+}
+
+RE4XeSS::LoadStateUpdateScope::~LoadStateUpdateScope() noexcept {
+    const RE4XeSSLoadEligibility::Snapshot snapshot{
+        m_owner.m_load_observation_valid,
+        m_owner.m_pause_previous_valid,
+        m_owner.m_pause_previous,
+        m_owner.m_remembered_normal_inhibit_valid,
+        m_owner.m_inhibit_departure_pending,
+        m_owner.m_load_transition_active,
+        m_owner.m_startup_mid_load,
+    };
+    m_owner.m_published_load_state_bits.store(
+        RE4XeSSLoadEligibility::encode(snapshot), std::memory_order_release);
+    m_owner.m_load_state_update_sequence.fetch_add(1, std::memory_order_release);
+    m_owner.m_load_state_update_active_count.fetch_sub(1, std::memory_order_release);
+}
+
+RE4XeSSLoadEligibility::UpdateWindow RE4XeSS::begin_load_state_trace() const noexcept {
+    RE4XeSSLoadEligibility::UpdateWindow window{};
+    window.sequence_before = m_load_state_update_sequence.load(std::memory_order_acquire);
+    window.active_before = m_load_state_update_active_count.load(std::memory_order_acquire);
+    window.update_thread_id = m_load_state_update_thread_id.load(std::memory_order_acquire);
+    window.overlap_count = m_load_state_update_overlap_count.load(std::memory_order_acquire);
+    window.state = RE4XeSSLoadEligibility::decode(
+        m_published_load_state_bits.load(std::memory_order_acquire));
+    return window;
+}
+
+void RE4XeSS::finish_load_state_trace(RE4XeSSLoadEligibility::UpdateWindow& window) const noexcept {
+    window.active_after = m_load_state_update_active_count.load(std::memory_order_acquire);
+    window.sequence_after = m_load_state_update_sequence.load(std::memory_order_acquire);
+    window.overlap_count = m_load_state_update_overlap_count.load(std::memory_order_acquire);
+}
+
+void RE4XeSS::set_load_state_trace_fields(
+    RE4XeSSLifetimeTrace::Event& event,
+    const RE4XeSSLoadEligibility::UpdateWindow& window) const noexcept {
+    event.load_state_update_sequence_before = window.sequence_before;
+    event.load_state_update_sequence_after = window.sequence_after;
+    event.load_state_update_overlap_count = window.overlap_count;
+    event.load_state_update_thread_id = window.update_thread_id;
+    event.load_state_update_active_before = window.active_before;
+    event.load_state_update_active_after = window.active_after;
+    event.load_state_flags = RE4XeSSLoadEligibility::encode(window.state);
+    event.load_state_observation_valid = window.state.observation_valid;
+    event.load_state_admitted = RE4XeSSLoadEligibility::allows_temporal_rendering(window.state);
+    event.load_state_update_overlapped = window.overlapped();
+}
+
+void RE4XeSS::trace_load_state_admission(
+    uint32_t callback_kind,
+    std::string_view reason,
+    const RE4XeSSLoadEligibility::UpdateWindow& window) {
+    auto& trace = RE4XeSSLifetimeTrace::instance();
+    if (!trace.enabled() || callback_kind >= m_last_load_admission_signatures.size()) {
+        return;
+    }
+
+    uint64_t signature = 14695981039346656037ull;
+    const auto mix = [&signature](uint64_t value) {
+        for (uint32_t byte = 0; byte < 8; ++byte) {
+            signature ^= static_cast<uint8_t>(value >> (byte * 8));
+            signature *= 1099511628211ull;
+        }
+    };
+    mix(callback_kind);
+    mix(GetCurrentThreadId());
+    mix(window.update_thread_id);
+    mix(RE4XeSSLoadEligibility::encode(window.state));
+    mix(RE4XeSSLoadEligibility::allows_temporal_rendering(window.state));
+    mix(window.overlapped());
+    for (const auto character : reason) {
+        signature ^= static_cast<uint8_t>(character);
+        signature *= 1099511628211ull;
+    }
+    if (signature == 0) {
+        signature = 1;
+    }
+    if (m_last_load_admission_signatures[callback_kind].exchange(
+            signature, std::memory_order_acq_rel) == signature) {
+        return;
+    }
+
+    auto emitted = m_load_admission_event_count.load(std::memory_order_relaxed);
+    for (;;) {
+        if (emitted >= 32) {
+            return;
+        }
+        if (m_load_admission_event_count.compare_exchange_weak(
+                emitted, emitted + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            break;
+        }
+    }
+
+    RE4XeSSLifetimeTrace::Event event{};
+    event.kind = RE4XeSSLifetimeTrace::Kind::LoadAdmission;
+    event.load_state_callback_kind = callback_kind;
+    event.thread_id = GetCurrentThreadId();
+    event.control_generation = m_control_generation.load(std::memory_order_acquire);
+    event.device_reset_generation = m_device_reset_generation.load(std::memory_order_acquire);
+    if (const auto* renderer = sdk::renderer::get_renderer(); renderer != nullptr) {
+        if (const auto frame = renderer->get_render_frame(); frame.has_value()) {
+            event.frame_id = static_cast<uint64_t>(*frame);
+            event.frame_valid = true;
+        }
+    }
+    set_load_state_trace_fields(event, window);
+    RE4XeSSLifetimeTrace::set_reason(event, reason);
+    trace.record(event);
+
+    spdlog::info(
+        "[RE4XeSS][LoadAdmission] callback={} frame={} frameValid={} tid={} updateTid={} sequence={}->{} active={}->{} overlaps={} flags=0x{:x} observed={} admitted={} updateOverlapped={} reason={}",
+        load_state_callback_name(callback_kind),
+        static_cast<unsigned long long>(event.frame_id),
+        event.frame_valid,
+        event.thread_id,
+        event.load_state_update_thread_id,
+        static_cast<unsigned long long>(event.load_state_update_sequence_before),
+        static_cast<unsigned long long>(event.load_state_update_sequence_after),
+        event.load_state_update_active_before,
+        event.load_state_update_active_after,
+        static_cast<unsigned long long>(event.load_state_update_overlap_count),
+        event.load_state_flags,
+        event.load_state_observation_valid,
+        event.load_state_admitted,
+        event.load_state_update_overlapped,
+        reason);
+}
+
 std::optional<std::string> RE4XeSS::on_initialize() {
     if (!sdk::GameIdentity::get().is_re4()) {
         return std::nullopt;
@@ -5402,18 +5558,6 @@ bool RE4XeSS::is_temporal_active() const {
         m_temporal_ready;
 }
 
-bool RE4XeSS::load_state_allows_temporal_rendering() const {
-    return RE4XeSSLoadEligibility::allows_temporal_rendering({
-        m_load_observation_valid,
-        m_pause_previous_valid,
-        m_pause_previous,
-        m_remembered_normal_inhibit_valid,
-        m_inhibit_departure_pending,
-        m_load_transition_active,
-        m_startup_mid_load,
-    });
-}
-
 void RE4XeSS::invalidate_history(std::string_view reason, bool reset_jitter) {
     const bool was_valid = !m_history_invalid || !m_first_valid_frame_reset_pending;
     m_history_invalid = true;
@@ -5473,6 +5617,7 @@ void RE4XeSS::reset_temporal_state(std::string_view reason, bool reset_load_stat
         return;
     }
 
+    LoadStateUpdateScope load_state_update{ *this };
     m_pause_previous_valid = false;
     m_pause_previous = false;
     m_load_transition_active = false;
@@ -5657,6 +5802,7 @@ void RE4XeSS::update_temporal_configuration() {
 }
 
 void RE4XeSS::update_load_state() {
+    LoadStateUpdateScope load_state_update{ *this };
     const auto observation = read_game_load_snapshot();
     log_load_accessor_observation(observation);
     if (!observation.snapshot) {
@@ -5842,10 +5988,17 @@ void RE4XeSS::update_load_state() {
 }
 
 void RE4XeSS::on_view_get_size(REManagedObject* scene_view, float* result) {
+    auto load_window = begin_load_state_trace();
+    finish_load_state_trace(load_window);
     const bool temporal_active = is_temporal_active();
     // A prepared XeSS context does not authorize reduced SceneView rendering
     // while the already-observed LoadAccessor state forbids a new XeSS frame.
-    const bool load_admitted = load_state_allows_temporal_rendering();
+    const bool load_admitted = RE4XeSSLoadEligibility::allows_temporal_rendering(load_window.state);
+    const bool load_observation_valid = load_window.state.observation_valid;
+    trace_load_state_admission(0, load_observation_valid
+            ? (load_admitted ? "eligible" : "native-load-window")
+            : "observation-unavailable",
+        load_window);
     const float native_width = result != nullptr ? result[0] : 0.0f;
     const float native_height = result != nullptr ? result[1] : 0.0f;
     const auto size_decision = RE4XeSSSceneView::decide_size(
@@ -5853,7 +6006,7 @@ void RE4XeSS::on_view_get_size(REManagedObject* scene_view, float* result) {
         native_width,
         native_height,
         temporal_active && load_admitted,
-        m_load_observation_valid,
+        load_observation_valid,
         m_input_resolution.optimal.x,
         m_input_resolution.optimal.y);
     const bool override_applied = size_decision.override_applied;
@@ -5890,6 +6043,8 @@ void RE4XeSS::on_view_get_size(REManagedObject* scene_view, float* result) {
     trace_event.input_resolution_valid = m_input_resolution_valid;
     trace_event.temporal_active = temporal_active;
     trace_event.scene_view_override_applied = override_applied;
+    trace_event.load_state_callback_kind = 0;
+    set_load_state_trace_fields(trace_event, load_window);
     trace_event.control_generation = m_control_generation.load(std::memory_order_acquire);
     trace_event.device_reset_generation = m_device_reset_generation.load(std::memory_order_acquire);
     trace_event.thread_id = GetCurrentThreadId();
@@ -5902,8 +6057,15 @@ void RE4XeSS::on_view_get_size(REManagedObject* scene_view, float* result) {
 }
 
 void RE4XeSS::on_camera_get_projection_matrix(REManagedObject* camera, Matrix4x4f* result) {
-    if (!is_temporal_active() || !load_state_allows_temporal_rendering() ||
-        camera == nullptr || result == nullptr) {
+    auto load_window = begin_load_state_trace();
+    finish_load_state_trace(load_window);
+    const bool load_admitted = RE4XeSSLoadEligibility::allows_temporal_rendering(load_window.state);
+    const bool temporal_active = is_temporal_active();
+    trace_load_state_admission(1, !load_window.state.observation_valid
+            ? "observation-unavailable"
+            : load_admitted ? "eligible" : "native-load-window",
+        load_window);
+    if (!temporal_active || !load_admitted || camera == nullptr || result == nullptr) {
         return;
     }
 
@@ -5957,11 +6119,18 @@ void RE4XeSS::on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* re
         return;
     }
 
-    if (!m_load_observation_valid) {
+    auto load_window = begin_load_state_trace();
+    finish_load_state_trace(load_window);
+    const bool load_admitted = RE4XeSSLoadEligibility::allows_temporal_rendering(load_window.state);
+    trace_load_state_admission(2, !load_window.state.observation_valid
+            ? "observation-unavailable"
+            : load_admitted ? "eligible" : "native-load-window",
+        load_window);
+    if (!load_window.state.observation_valid) {
         invalidate_history("load-state-observation-unavailable");
         return;
     }
-    if (!load_state_allows_temporal_rendering()) {
+    if (!load_admitted) {
         invalidate_history("load-history-invalid");
         return;
     }
@@ -6083,6 +6252,8 @@ void RE4XeSS::on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* re
         trace_event.jitter_sample_index = static_cast<uint32_t>(sample_index);
         trace_event.jitter_phase_count = m_jitter_phase_count;
         trace_event.thread_id = GetCurrentThreadId();
+        trace_event.load_state_callback_kind = 2;
+        set_load_state_trace_fields(trace_event, load_window);
         RE4XeSSLifetimeTrace::set_reason(trace_event, "primary-scene-jitter-applied");
         lifetime_trace.record(trace_event);
     }
@@ -6104,6 +6275,8 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         }
     }
     const bool trace_enabled = lifetime_trace.enabled();
+    auto load_window = begin_load_state_trace();
+    finish_load_state_trace(load_window);
     const auto trace_id = trace_enabled ? lifetime_trace.next_trace_id() : 0;
     const auto callback_ordinal = trace_enabled
         ? m_pre_overlay_lifetime_ordinal.fetch_add(1, std::memory_order_relaxed) + 1
@@ -6162,6 +6335,8 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
             : E_PENDING;
         event.present_valid = present_is_current();
         event.mapping_ambiguous = !present_is_current();
+        event.load_state_callback_kind = 3;
+        set_load_state_trace_fields(event, load_window);
         RE4XeSSLifetimeTrace::set_reason(event, reason);
         return lifetime_trace.record(event);
     };
@@ -6444,13 +6619,20 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         trace_skip("temporal-mode-inactive");
         return true;
     }
-    if (!m_load_observation_valid) {
+    load_window = begin_load_state_trace();
+    finish_load_state_trace(load_window);
+    const bool load_admitted = RE4XeSSLoadEligibility::allows_temporal_rendering(load_window.state);
+    trace_load_state_admission(3, !load_window.state.observation_valid
+            ? "observation-unavailable"
+            : load_admitted ? "eligible" : "native-load-window",
+        load_window);
+    if (!load_window.state.observation_valid) {
         invalidate_history("load-state-observation-unavailable");
         clear_frame_state();
         trace_skip("load-state-observation-unavailable");
         return true;
     }
-    if (!load_state_allows_temporal_rendering()) {
+    if (!load_admitted) {
         invalidate_history("load-history-invalid");
         clear_frame_state();
         trace_skip("load-history-invalid");

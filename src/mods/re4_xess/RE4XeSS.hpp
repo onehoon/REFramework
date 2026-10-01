@@ -10,6 +10,7 @@
 
 #include "Mod.hpp"
 #include "RE4XeSSFrame.hpp"
+#include "RE4XeSSLoadEligibility.hpp"
 #include "RE4XeSSLifetimeTrace.hpp"
 #include "RE4XeSSOutputHandoff.hpp"
 #include "RE4XeSSWorker.hpp"
@@ -48,6 +49,18 @@ public:
     void on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* render_context) override;
 
 private:
+    class LoadStateUpdateScope final {
+    public:
+        explicit LoadStateUpdateScope(RE4XeSS& owner);
+        ~LoadStateUpdateScope() noexcept;
+        LoadStateUpdateScope(const LoadStateUpdateScope&) = delete;
+        LoadStateUpdateScope& operator=(const LoadStateUpdateScope&) = delete;
+
+    private:
+        RE4XeSS& m_owner;
+        std::unique_lock<std::mutex> m_lock;
+    };
+
     struct SceneInfoHistory {
         Matrix4x4f unjittered_projection{};
         Matrix4x4f view{};
@@ -109,7 +122,15 @@ private:
     void reset_temporal_state(std::string_view reason, bool reset_load_state);
     bool get_display_resolution(xess_2d_t& resolution) const;
     bool is_temporal_active() const;
-    bool load_state_allows_temporal_rendering() const;
+    RE4XeSSLoadEligibility::UpdateWindow begin_load_state_trace() const noexcept;
+    void finish_load_state_trace(RE4XeSSLoadEligibility::UpdateWindow& window) const noexcept;
+    void set_load_state_trace_fields(
+        RE4XeSSLifetimeTrace::Event& event,
+        const RE4XeSSLoadEligibility::UpdateWindow& window) const noexcept;
+    void trace_load_state_admission(
+        uint32_t callback_kind,
+        std::string_view reason,
+        const RE4XeSSLoadEligibility::UpdateWindow& window);
 
     std::atomic<UpscalingMode> m_requested_mode{ UpscalingMode::Off };
     std::atomic<uint64_t> m_control_generation{};
@@ -188,5 +209,13 @@ private:
     uint64_t m_post_pause_rebaseline_candidate{};
     uint32_t m_post_pause_rebaseline_stable_count{};
     bool m_load_observation_valid{};
+    mutable std::mutex m_load_state_mutex{};
+    std::atomic<uint32_t> m_published_load_state_bits{};
+    std::atomic<uint64_t> m_load_state_update_sequence{};
+    std::atomic<uint64_t> m_load_state_update_overlap_count{};
+    std::atomic<uint32_t> m_load_state_update_thread_id{};
+    std::atomic<uint32_t> m_load_state_update_active_count{};
+    std::array<std::atomic<uint64_t>, 4> m_last_load_admission_signatures{};
+    std::atomic<uint32_t> m_load_admission_event_count{};
     bool m_handoff_provenance_opt_in{};
 };

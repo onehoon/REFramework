@@ -343,6 +343,44 @@ void test_known_loading_native_admission() {
         recovered.effective_height == 720.0f);
 }
 
+void test_load_state_snapshot_publication_helpers() {
+    using RE4XeSSLoadEligibility::Snapshot;
+    using RE4XeSSLoadEligibility::decode;
+    using RE4XeSSLoadEligibility::encode;
+    using RE4XeSSLoadEligibility::UpdateWindow;
+
+    const Snapshot normal{true, true, false, true, false, false, false};
+    const auto decoded_normal = decode(encode(normal));
+    assert(decoded_normal.observation_valid);
+    assert(decoded_normal.pause_observed);
+    assert(!decoded_normal.pause_active);
+    assert(decoded_normal.normal_inhibit_baseline_valid);
+    assert(!decoded_normal.inhibit_departure_pending);
+    assert(!decoded_normal.load_transition_active);
+    assert(!decoded_normal.startup_rebaseline_pending);
+
+    const Snapshot loading{true, true, true, false, false, true, true};
+    const auto decoded_loading = decode(encode(loading));
+    assert(decoded_loading.observation_valid);
+    assert(decoded_loading.pause_active);
+    assert(!decoded_loading.normal_inhibit_baseline_valid);
+    assert(decoded_loading.load_transition_active);
+    assert(decoded_loading.startup_rebaseline_pending);
+
+    UpdateWindow window{};
+    window.sequence_before = 12;
+    window.sequence_after = 12;
+    assert(!window.overlapped());
+    window.active_before = 1;
+    assert(window.overlapped());
+    window.active_before = 0;
+    window.active_after = 1;
+    assert(window.overlapped());
+    window.active_after = 0;
+    window.sequence_after = 13;
+    assert(window.overlapped());
+}
+
 void test_scene_view_override_decision() {
     const auto active = RE4XeSSSceneView::decide_size(true, 2560.0f, 1440.0f, true, true, 1706, 960);
     assert(active.override_applied);
@@ -590,6 +628,7 @@ int main() {
     test_phase_transition_and_correlated_first_submit(trace, output_use_token);
     test_mapping_pending_interval_and_active_budgets(trace);
     test_known_loading_native_admission();
+    test_load_state_snapshot_publication_helpers();
     test_scene_view_override_decision();
     test_scene_extent_and_jitter_trace(trace);
     assert(trace.claim_final_summary());

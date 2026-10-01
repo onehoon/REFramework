@@ -28,6 +28,7 @@ public:
         Marker,
         WriterFenceComplete,
         DownstreamFenceComplete,
+        LoadAdmission,
         Skip,
         Count,
     };
@@ -142,6 +143,9 @@ public:
         uint64_t downstream_fence_value{};
         uint64_t cached_completed_value{};
         uint64_t actual_completed_value{};
+        uint64_t load_state_update_sequence_before{};
+        uint64_t load_state_update_sequence_after{};
+        uint64_t load_state_update_overlap_count{};
         uint64_t present_entry_time_us{};
         uint64_t original_present_enter_time_us{};
         uint64_t original_present_return_time_us{};
@@ -172,6 +176,11 @@ public:
         uint32_t thread_id{};
         uint32_t present_entry_thread_id{};
         uint32_t present_return_thread_id{};
+        uint32_t load_state_update_thread_id{};
+        uint32_t load_state_update_active_before{};
+        uint32_t load_state_update_active_after{};
+        uint32_t load_state_flags{};
+        uint32_t load_state_callback_kind{};
         uint32_t bridge_slot{};
         uint32_t writer_method_rva{};
         int32_t result{};
@@ -208,6 +217,9 @@ public:
         bool scene_view_cross_identity_varied{};
         bool scene_view_frame_key_reentered{};
         bool jitter_applied{};
+        bool load_state_update_overlapped{};
+        bool load_state_observation_valid{};
+        bool load_state_admitted{};
         CapturePhase capture_phase{ CapturePhase::PreActive };
         MappingState mapping_state{ MappingState::Unknown };
         RenderContextStage render_context_stage{ RenderContextStage::None };
