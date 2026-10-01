@@ -109,6 +109,7 @@ private:
     void reset_temporal_state(std::string_view reason, bool reset_load_state);
     bool get_display_resolution(xess_2d_t& resolution) const;
     bool is_temporal_active() const;
+    bool load_state_allows_temporal_rendering() const;
 
     std::atomic<UpscalingMode> m_requested_mode{ UpscalingMode::Off };
     std::atomic<uint64_t> m_control_generation{};

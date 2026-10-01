@@ -36,6 +36,7 @@
 #include "REFramework.hpp"
 #include "compatibility/xefg/XeFGCompatibility.hpp"
 #include "mods/re4_xess/RE4XeSSSceneViewDecision.hpp"
+#include "mods/re4_xess/RE4XeSSLoadEligibility.hpp"
 
 namespace {
 
@@ -5401,6 +5402,18 @@ bool RE4XeSS::is_temporal_active() const {
         m_temporal_ready;
 }
 
+bool RE4XeSS::load_state_allows_temporal_rendering() const {
+    return RE4XeSSLoadEligibility::allows_temporal_rendering({
+        m_load_observation_valid,
+        m_pause_previous_valid,
+        m_pause_previous,
+        m_remembered_normal_inhibit_valid,
+        m_inhibit_departure_pending,
+        m_load_transition_active,
+        m_startup_mid_load,
+    });
+}
+
 void RE4XeSS::invalidate_history(std::string_view reason, bool reset_jitter) {
     const bool was_valid = !m_history_invalid || !m_first_valid_frame_reset_pending;
     m_history_invalid = true;
@@ -5830,13 +5843,16 @@ void RE4XeSS::update_load_state() {
 
 void RE4XeSS::on_view_get_size(REManagedObject* scene_view, float* result) {
     const bool temporal_active = is_temporal_active();
+    // A prepared XeSS context does not authorize reduced SceneView rendering
+    // while the already-observed LoadAccessor state forbids a new XeSS frame.
+    const bool load_admitted = load_state_allows_temporal_rendering();
     const float native_width = result != nullptr ? result[0] : 0.0f;
     const float native_height = result != nullptr ? result[1] : 0.0f;
     const auto size_decision = RE4XeSSSceneView::decide_size(
         result != nullptr,
         native_width,
         native_height,
-        temporal_active,
+        temporal_active && load_admitted,
         m_load_observation_valid,
         m_input_resolution.optimal.x,
         m_input_resolution.optimal.y);
@@ -5880,12 +5896,14 @@ void RE4XeSS::on_view_get_size(REManagedObject* scene_view, float* result) {
     RE4XeSSLifetimeTrace::set_reason(
         trace_event,
         override_applied ? "reduced-scene-view-applied" :
+            temporal_active && !load_admitted ? "native-load-window" :
             temporal_active ? "temporal-view-gate-closed" : "native-scene-view");
     lifetime_trace.record(trace_event);
 }
 
 void RE4XeSS::on_camera_get_projection_matrix(REManagedObject* camera, Matrix4x4f* result) {
-    if (!is_temporal_active() || camera == nullptr || result == nullptr) {
+    if (!is_temporal_active() || !load_state_allows_temporal_rendering() ||
+        camera == nullptr || result == nullptr) {
         return;
     }
 
@@ -5943,7 +5961,7 @@ void RE4XeSS::on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* re
         invalidate_history("load-state-observation-unavailable");
         return;
     }
-    if (m_inhibit_departure_pending || m_load_transition_active || m_startup_mid_load) {
+    if (!load_state_allows_temporal_rendering()) {
         invalidate_history("load-history-invalid");
         return;
     }
@@ -6432,7 +6450,7 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         trace_skip("load-state-observation-unavailable");
         return true;
     }
-    if (m_inhibit_departure_pending || m_load_transition_active || m_startup_mid_load) {
+    if (!load_state_allows_temporal_rendering()) {
         invalidate_history("load-history-invalid");
         clear_frame_state();
         trace_skip("load-history-invalid");

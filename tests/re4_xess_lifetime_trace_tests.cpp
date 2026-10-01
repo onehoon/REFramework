@@ -2,6 +2,7 @@
 
 #include "mods/re4_xess/RE4XeSSLifetimeTrace.hpp"
 #include "mods/re4_xess/RE4XeSSSceneViewDecision.hpp"
+#include "mods/re4_xess/RE4XeSSLoadEligibility.hpp"
 
 #include <cassert>
 #include <iostream>
@@ -282,6 +283,66 @@ void test_mapping_pending_interval_and_active_budgets(Trace& trace) {
     assert(summary.dump_windows_suppressed >= 5);
 }
 
+void test_known_loading_native_admission() {
+    using RE4XeSSLoadEligibility::Snapshot;
+    using RE4XeSSLoadEligibility::allows_temporal_rendering;
+
+    // Normal observed, rebaselined gameplay may still bootstrap the first
+    // XeSS frame; bridge.execution_ready is intentionally *not* part of this gate.
+    const Snapshot normal{true, true, false, true, false, false, false};
+    assert(allows_temporal_rendering(normal));
+
+    // The old configuration-ready predicate must NOT shrink a view while
+    // Pause/Inhibit/rebaseline state already guarantees a late LoadHistory skip.
+    const auto verify_native = [](const Snapshot& blocked) {
+        assert(!allows_temporal_rendering(blocked));
+        const auto decision = RE4XeSSSceneView::decide_size(
+            true, 1920.0f, 1080.0f, true && allows_temporal_rendering(blocked),
+            blocked.observation_valid, 1280, 720);
+        assert(!decision.override_applied);
+        // Preserve the actual original get_Size result, not the swapchain extent.
+        assert(decision.effective_width == 1920.0f &&
+            decision.effective_height == 1080.0f);
+    };
+
+    auto blocked = normal;
+    blocked.observation_valid = false;
+    verify_native(blocked);
+
+    blocked = normal;
+    blocked.pause_observed = false;
+    verify_native(blocked);
+
+    blocked = normal;
+    blocked.pause_active = true;
+    verify_native(blocked);
+
+    blocked = normal;
+    blocked.normal_inhibit_baseline_valid = false;
+    verify_native(blocked);
+
+    blocked = normal;
+    blocked.inhibit_departure_pending = true;
+    verify_native(blocked);
+
+    blocked = normal;
+    blocked.load_transition_active = true;
+    verify_native(blocked);
+
+    blocked = normal;
+    blocked.startup_rebaseline_pending = true;
+    verify_native(blocked);
+
+    // Recovery after the original LoadAccessor has observed a complete
+    // rebaseline allows the next XeSS candidate without rewriting the preset.
+    assert(allows_temporal_rendering(normal));
+    const auto recovered = RE4XeSSSceneView::decide_size(
+        true, 1920.0f, 1080.0f, allows_temporal_rendering(normal), true, 1280, 720);
+    assert(recovered.override_applied);
+    assert(recovered.effective_width == 1280.0f &&
+        recovered.effective_height == 720.0f);
+}
+
 void test_scene_view_override_decision() {
     const auto active = RE4XeSSSceneView::decide_size(true, 2560.0f, 1440.0f, true, true, 1706, 960);
     assert(active.override_applied);
@@ -528,6 +589,7 @@ int main() {
     const auto output_use_token = test_output_use_token_issuance_lifecycle();
     test_phase_transition_and_correlated_first_submit(trace, output_use_token);
     test_mapping_pending_interval_and_active_budgets(trace);
+    test_known_loading_native_admission();
     test_scene_view_override_decision();
     test_scene_extent_and_jitter_trace(trace);
     assert(trace.claim_final_summary());
