@@ -204,7 +204,9 @@ public:
         bool input_resolution_valid{};
         bool temporal_active{};
         bool scene_view_override_applied{};
-        bool scene_view_conflict{};
+        bool scene_view_same_identity_changed{};
+        bool scene_view_cross_identity_varied{};
+        bool scene_view_frame_key_reentered{};
         bool jitter_applied{};
         CapturePhase capture_phase{ CapturePhase::PreActive };
         MappingState mapping_state{ MappingState::Unknown };
@@ -237,12 +239,18 @@ public:
         uint64_t active_render_context_overlay_main_resource_matches{};
         uint64_t active_bridge_busy_skips{};
         uint64_t active_temporal_gate_skips{};
-        uint64_t scene_view_size_conflicts{};
-        uint64_t active_scene_view_size_conflicts{};
+        uint64_t scene_view_same_identity_changes{};
+        uint64_t active_scene_view_same_identity_changes{};
+        uint64_t scene_view_cross_identity_variations{};
+        uint64_t active_scene_view_cross_identity_variations{};
         uint64_t scene_view_size_observation_drops{};
         uint64_t active_scene_view_size_observation_drops{};
-        uint64_t scene_view_frame_cache_evictions{};
-        uint64_t active_scene_view_frame_cache_evictions{};
+        uint64_t scene_view_frame_cache_replacements{};
+        uint64_t active_scene_view_frame_cache_replacements{};
+        uint64_t scene_view_frame_key_reentries{};
+        uint64_t active_scene_view_frame_key_reentries{};
+        uint64_t scene_view_evicted_key_history_overwrites{};
+        uint64_t active_scene_view_evicted_key_history_overwrites{};
         uint64_t installed_unmarked{};
         uint64_t installed_unmarked_high_water{};
         uint64_t marked_gpu_incomplete{};
@@ -275,6 +283,7 @@ public:
 
     static constexpr size_t CAPACITY = 4096;
     static constexpr size_t SCENE_VIEW_FRAME_CACHE_CAPACITY = 8;
+    static constexpr size_t SCENE_VIEW_EVICTED_KEY_HISTORY_CAPACITY = 16;
     static constexpr size_t MAX_SCENE_VIEW_OBSERVATIONS_PER_FRAME = 8;
     static constexpr size_t MAX_EVENTS_PER_DUMP = 32;
     static constexpr size_t MAX_DUMP_EVENT_LINES = 512;
@@ -694,6 +703,13 @@ private:
         bool valid{};
     };
 
+    struct EvictedSceneViewFrameKey {
+        uint64_t frame_id{};
+        uint64_t control_generation{};
+        uint64_t device_reset_generation{};
+        bool valid{};
+    };
+
     static SceneViewObservation scene_view_observation(const Event& event) noexcept {
         return SceneViewObservation{
             event.scene_view,
@@ -744,6 +760,33 @@ private:
             left.override_applied != right.override_applied;
     }
 
+    static bool same_scene_view_frame_key(
+        const EvictedSceneViewFrameKey& key,
+        const Event& event) noexcept {
+        return key.valid && key.frame_id == event.frame_id &&
+            key.control_generation == event.control_generation &&
+            key.device_reset_generation == event.device_reset_generation;
+    }
+
+    void remember_evicted_scene_view_frame_key_locked(
+        const SceneViewFrameObservations& frame_state) noexcept {
+        auto& key = m_scene_view_evicted_keys[m_next_scene_view_evicted_key];
+        if (key.valid) {
+            ++m_summary.scene_view_evicted_key_history_overwrites;
+            if (m_active_capture_started) {
+                ++m_summary.active_scene_view_evicted_key_history_overwrites;
+            }
+        }
+        key = EvictedSceneViewFrameKey{
+            frame_state.frame_id,
+            frame_state.control_generation,
+            frame_state.device_reset_generation,
+            true,
+        };
+        m_next_scene_view_evicted_key =
+            (m_next_scene_view_evicted_key + 1) % SCENE_VIEW_EVICTED_KEY_HISTORY_CAPACITY;
+    }
+
     bool admit_scene_view_observation_locked(Event& event) noexcept {
         SceneViewFrameObservations* frame_state{};
         for (auto& candidate : m_scene_view_frame_observations) {
@@ -758,10 +801,11 @@ private:
         if (frame_state == nullptr) {
             frame_state = &m_scene_view_frame_observations[m_next_scene_view_frame_cache];
             if (frame_state->valid) {
-                ++m_summary.scene_view_frame_cache_evictions;
+                ++m_summary.scene_view_frame_cache_replacements;
                 if (m_active_capture_started) {
-                    ++m_summary.active_scene_view_frame_cache_evictions;
+                    ++m_summary.active_scene_view_frame_cache_replacements;
                 }
+                remember_evicted_scene_view_frame_key_locked(*frame_state);
             }
             *frame_state = {};
             frame_state->frame_id = event.frame_id;
@@ -770,16 +814,51 @@ private:
             frame_state->valid = true;
             m_next_scene_view_frame_cache =
                 (m_next_scene_view_frame_cache + 1) % SCENE_VIEW_FRAME_CACHE_CAPACITY;
+
+            for (auto& evicted_key : m_scene_view_evicted_keys) {
+                if (same_scene_view_frame_key(evicted_key, event)) {
+                    event.scene_view_frame_key_reentered = true;
+                    evicted_key.valid = false;
+                    ++m_summary.scene_view_frame_key_reentries;
+                    if (m_active_capture_started) {
+                        ++m_summary.active_scene_view_frame_key_reentries;
+                    }
+                    break;
+                }
+            }
         }
 
         const auto observation = scene_view_observation(event);
-        bool conflict{};
+        bool same_identity_changed{};
+        bool cross_identity_varied{};
+        bool identity_seen{};
         for (size_t index = 0; index < frame_state->observation_count; ++index) {
             const auto& prior = frame_state->observations[index];
             if (same_scene_view_observation(prior, observation)) {
                 return false;
             }
-            conflict = conflict || scene_view_observation_conflicts(prior, observation);
+            if (prior.scene_view == observation.scene_view) {
+                identity_seen = true;
+                same_identity_changed = same_identity_changed ||
+                    scene_view_observation_conflicts(prior, observation);
+                continue;
+            }
+
+            if (identity_seen) {
+                continue;
+            }
+
+            bool prior_identity_seen{};
+            for (size_t prior_index = 0; prior_index < index; ++prior_index) {
+                if (frame_state->observations[prior_index].scene_view == prior.scene_view) {
+                    prior_identity_seen = true;
+                    break;
+                }
+            }
+            if (!prior_identity_seen) {
+                cross_identity_varied = cross_identity_varied ||
+                    scene_view_observation_conflicts(prior, observation);
+            }
         }
 
         if (frame_state->observation_count >= MAX_SCENE_VIEW_OBSERVATIONS_PER_FRAME) {
@@ -791,11 +870,18 @@ private:
         }
 
         frame_state->observations[frame_state->observation_count++] = observation;
-        event.scene_view_conflict = conflict;
-        if (conflict) {
-            ++m_summary.scene_view_size_conflicts;
+        event.scene_view_same_identity_changed = same_identity_changed;
+        event.scene_view_cross_identity_varied = !identity_seen && cross_identity_varied;
+        if (event.scene_view_same_identity_changed) {
+            ++m_summary.scene_view_same_identity_changes;
             if (m_active_capture_started) {
-                ++m_summary.active_scene_view_size_conflicts;
+                ++m_summary.active_scene_view_same_identity_changes;
+            }
+        }
+        if (event.scene_view_cross_identity_varied) {
+            ++m_summary.scene_view_cross_identity_variations;
+            if (m_active_capture_started) {
+                ++m_summary.active_scene_view_cross_identity_variations;
             }
         }
         return true;
@@ -824,6 +910,8 @@ private:
     bool m_pending_present_window_claimed{};
     std::array<SceneViewFrameObservations, SCENE_VIEW_FRAME_CACHE_CAPACITY> m_scene_view_frame_observations{};
     size_t m_next_scene_view_frame_cache{};
+    std::array<EvictedSceneViewFrameKey, SCENE_VIEW_EVICTED_KEY_HISTORY_CAPACITY> m_scene_view_evicted_keys{};
+    size_t m_next_scene_view_evicted_key{};
     uint32_t m_claimed_anomaly_windows{};
     uint64_t m_pending_present_install_id{};
     uint64_t m_pending_present_last_ordinal{};

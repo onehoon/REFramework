@@ -80,6 +80,35 @@ void test_phase_transition_and_correlated_first_submit(Trace& trace, uint64_t ou
     Trace::DumpReservation denied{};
     assert(!trace.reserve_dump(Trace::DumpWindow::PreActive, 32, denied));
 
+    // The first successful install starts active accounting after upstream scene observations.
+    Trace::Event first_scene_view{};
+    first_scene_view.kind = Trace::Kind::SceneViewSize;
+    first_scene_view.frame_id = 98999;
+    first_scene_view.frame_valid = true;
+    first_scene_view.scene_view = 0x9899;
+    first_scene_view.scene_view_native_width = 2560.0f;
+    first_scene_view.scene_view_native_height = 1440.0f;
+    first_scene_view.scene_view_effective_width = 1706.0f;
+    first_scene_view.scene_view_effective_height = 960.0f;
+    first_scene_view.input_width = 1706;
+    first_scene_view.input_height = 960;
+    first_scene_view.display_width = 2560;
+    first_scene_view.display_height = 1440;
+    first_scene_view.input_resolution_valid = true;
+    first_scene_view.temporal_active = true;
+    first_scene_view.scene_view_override_applied = true;
+    first_scene_view.control_generation = 7;
+    first_scene_view.device_reset_generation = 2;
+    assert(trace.record(first_scene_view) != 0);
+
+    Trace::Event first_scene_frame{};
+    first_scene_frame.kind = Trace::Kind::SceneFrame;
+    first_scene_frame.frame_id = first_scene_view.frame_id;
+    first_scene_frame.frame_valid = true;
+    first_scene_frame.control_generation = first_scene_view.control_generation;
+    first_scene_frame.device_reset_generation = first_scene_view.device_reset_generation;
+    assert(trace.record(first_scene_frame) != 0);
+
     Trace::Event submit{};
     submit.kind = Trace::Kind::Submit;
     submit.trace_id = 42;
@@ -125,6 +154,10 @@ void test_phase_transition_and_correlated_first_submit(Trace& trace, uint64_t ou
     assert(summary.installed_unmarked == 1);
     assert(summary.installed_unmarked_high_water == 1);
     assert(summary.active_successful_submissions == 1);
+    assert(summary.pre_active_event_counts[static_cast<size_t>(Trace::Kind::SceneViewSize)] == 1);
+    assert(summary.pre_active_event_counts[static_cast<size_t>(Trace::Kind::SceneFrame)] == 1);
+    assert(summary.active_event_counts[static_cast<size_t>(Trace::Kind::SceneViewSize)] == 0);
+    assert(summary.active_event_counts[static_cast<size_t>(Trace::Kind::SceneFrame)] == 0);
     assert(summary.active_reset_history_submits == 1);
     assert(summary.active_render_context_samples == 1);
     assert(summary.active_render_context_state_matches == 1);
@@ -135,19 +168,23 @@ void test_phase_transition_and_correlated_first_submit(Trace& trace, uint64_t ou
     assert(summary.active_event_counts[static_cast<size_t>(Trace::Kind::Submit)] == 1);
     assert(summary.pre_active_event_counts[static_cast<size_t>(Trace::Kind::Submit)] == 0);
     const auto recent = trace.recent(8);
-    assert(recent.size() == 5);
-    assert(recent[2].kind == Trace::Kind::Submit);
-    assert(recent[2].capture_phase == Trace::CapturePhase::ActiveXeSS);
-    assert(recent[3].kind == Trace::Kind::OutputInstall);
-    assert(recent[3].capture_phase == Trace::CapturePhase::ActiveXeSS);
-    assert(recent[3].install_id == 700);
-    assert(recent[3].output_use_token == output_use_token);
-    assert(recent[3].consumer_evidence == Trace::ConsumerEvidence::ReaderNotObserved);
-    assert(recent[4].kind == Trace::Kind::OverlayRenderContext);
-    assert(recent[4].mapping_state == Trace::MappingState::Unknown);
-    assert(recent[4].render_context_stage == Trace::RenderContextStage::BeforeOriginalOverlayDraw);
-    assert(recent[4].output_use_token == 0);
-    assert(recent[4].consumer_evidence == Trace::ConsumerEvidence::Unknown);
+    assert(recent.size() == 7);
+    assert(recent[2].kind == Trace::Kind::SceneViewSize);
+    assert(recent[2].capture_phase == Trace::CapturePhase::PreActive);
+    assert(recent[3].kind == Trace::Kind::SceneFrame);
+    assert(recent[3].capture_phase == Trace::CapturePhase::PreActive);
+    assert(recent[4].kind == Trace::Kind::Submit);
+    assert(recent[4].capture_phase == Trace::CapturePhase::ActiveXeSS);
+    assert(recent[5].kind == Trace::Kind::OutputInstall);
+    assert(recent[5].capture_phase == Trace::CapturePhase::ActiveXeSS);
+    assert(recent[5].install_id == 700);
+    assert(recent[5].output_use_token == output_use_token);
+    assert(recent[5].consumer_evidence == Trace::ConsumerEvidence::ReaderNotObserved);
+    assert(recent[6].kind == Trace::Kind::OverlayRenderContext);
+    assert(recent[6].mapping_state == Trace::MappingState::Unknown);
+    assert(recent[6].render_context_stage == Trace::RenderContextStage::BeforeOriginalOverlayDraw);
+    assert(recent[6].output_use_token == 0);
+    assert(recent[6].consumer_evidence == Trace::ConsumerEvidence::Unknown);
     assert(trace.claim_first_output_install_window());
     assert(!trace.claim_first_output_install_window());
     assert(trace.claim_first_execute_success_window());
@@ -299,11 +336,20 @@ void test_scene_extent_and_jitter_trace(Trace& trace) {
     assert(trace.record(view_size) != 0);
     assert(trace.record(view_size) == 0); // Exact same-view/value duplicate is suppressed.
 
-    // A distinct SceneView identity in the same frame is retained even when the sizes match.
+    // Stable but different extents for distinct SceneViews are diversity, not same-view change.
     auto second_view = make_view_size(99001, 0x5678);
+    second_view.scene_view_native_width = 1920.0f;
+    second_view.scene_view_native_height = 1080.0f;
+    second_view.scene_view_effective_width = 1280.0f;
+    second_view.scene_view_effective_height = 720.0f;
+    second_view.input_width = 1280;
+    second_view.input_height = 720;
+    second_view.temporal_active = false;
+    second_view.scene_view_override_applied = false;
+    Trace::set_reason(second_view, "stable-native-scene-view");
     assert(trace.record(second_view) != 0);
 
-    // A changed extent for the same view is retained and explicitly marked as a conflict.
+    // A changed extent for the same view is retained and marked as a same-identity change.
     auto changed_extent = view_size;
     changed_extent.scene_view_native_width = 1920.0f;
     changed_extent.scene_view_native_height = 1080.0f;
@@ -313,7 +359,7 @@ void test_scene_extent_and_jitter_trace(Trace& trace) {
     changed_extent.input_height = 720;
     assert(trace.record(changed_extent) != 0);
 
-    // A changed override flag with unchanged dimensions is separately visible and conflict-marked.
+    // A changed override flag with unchanged dimensions is separately visible.
     auto changed_override = changed_extent;
     changed_override.scene_view_override_applied = false;
     Trace::set_reason(changed_override, "temporal-view-gate-closed");
@@ -381,9 +427,29 @@ void test_scene_extent_and_jitter_trace(Trace& trace) {
     dropped_sample.device_reset_generation = 6;
     assert(trace.record(dropped_sample) == 0);
 
-    // Evicting an old frame-key window is also visible instead of silently claiming full coverage.
+    // Sequential frame IDs rotate the fixed cache; rotation alone is not key reentry/loss.
+    const auto before_sequential = trace.summary();
     for (uint64_t frame_id = 99100; frame_id < 99110; ++frame_id) {
         auto sample = make_view_size(frame_id, 0x30000);
+        sample.control_generation = 10;
+        sample.device_reset_generation = 6;
+        assert(trace.record(sample) != 0);
+    }
+    const auto after_sequential = trace.summary();
+    assert(after_sequential.active_scene_view_frame_cache_replacements ==
+        before_sequential.active_scene_view_frame_cache_replacements + 8);
+    assert(after_sequential.active_scene_view_frame_key_reentries ==
+        before_sequential.active_scene_view_frame_key_reentries);
+
+    // Returning an exact evicted key is observed separately from ordinary cache rotation.
+    auto reentered_sample = make_view_size(99100, 0x30001);
+    reentered_sample.control_generation = 10;
+    reentered_sample.device_reset_generation = 6;
+    assert(trace.record(reentered_sample) != 0);
+
+    // The tombstone history is bounded and reports its own overwrite/coverage limit.
+    for (uint64_t frame_id = 99200; frame_id < 99220; ++frame_id) {
+        auto sample = make_view_size(frame_id, 0x40000);
         sample.control_generation = 10;
         sample.device_reset_generation = 6;
         assert(trace.record(sample) != 0);
@@ -402,21 +468,31 @@ void test_scene_extent_and_jitter_trace(Trace& trace) {
             event.scene_view == 0x5678;
     });
     assert(retained_second_view != recent.end());
+    assert(retained_second_view->scene_view_cross_identity_varied);
+    assert(!retained_second_view->scene_view_same_identity_changed);
     const auto retained_changed_extent = std::find_if(recent.begin(), recent.end(), [](const auto& event) {
         return event.kind == Trace::Kind::SceneViewSize && event.frame_id == 99001 &&
             event.scene_view == 0x1234 && event.scene_view_native_width == 1920.0f;
     });
-    assert(retained_changed_extent != recent.end() && retained_changed_extent->scene_view_conflict);
+    assert(retained_changed_extent != recent.end() && retained_changed_extent->scene_view_same_identity_changed);
+    assert(!retained_changed_extent->scene_view_cross_identity_varied);
     const auto retained_changed_override = std::find_if(recent.begin(), recent.end(), [](const auto& event) {
         return event.kind == Trace::Kind::SceneViewSize && event.frame_id == 99001 &&
             event.scene_view == 0x1234 && !event.scene_view_override_applied;
     });
-    assert(retained_changed_override != recent.end() && retained_changed_override->scene_view_conflict);
+    assert(retained_changed_override != recent.end() && retained_changed_override->scene_view_same_identity_changed);
     const auto retained_changed_temporal_state = std::find_if(recent.begin(), recent.end(), [](const auto& event) {
         return event.kind == Trace::Kind::SceneViewSize && event.frame_id == 99001 &&
             event.scene_view == 0x1234 && !event.temporal_active;
     });
-    assert(retained_changed_temporal_state != recent.end() && retained_changed_temporal_state->scene_view_conflict);
+    assert(retained_changed_temporal_state != recent.end() && retained_changed_temporal_state->scene_view_same_identity_changed);
+
+    const auto retained_reentered_key = std::find_if(recent.begin(), recent.end(), [](const auto& event) {
+        return event.kind == Trace::Kind::SceneViewSize && event.frame_id == 99100 &&
+            event.control_generation == 10 && event.device_reset_generation == 6 &&
+            event.scene_view_frame_key_reentered;
+    });
+    assert(retained_reentered_key != recent.end());
 
     const auto retained_scene_frame = find_event(
         Trace::Kind::SceneFrame, skip_frame_id, reduced_view.control_generation, reduced_view.device_reset_generation);
@@ -433,10 +509,14 @@ void test_scene_extent_and_jitter_trace(Trace& trace) {
     assert(retained_reduced_view != recent.end() && retained_reduced_view->scene_view_override_applied);
 
     const auto summary = trace.summary();
-    assert(summary.active_event_counts[static_cast<size_t>(Trace::Kind::SceneViewSize)] - scene_view_count_before == 26);
-    assert(summary.active_scene_view_size_conflicts == before.active_scene_view_size_conflicts + 3);
+    assert(summary.active_event_counts[static_cast<size_t>(Trace::Kind::SceneViewSize)] - scene_view_count_before == 47);
+    assert(summary.active_scene_view_same_identity_changes == before.active_scene_view_same_identity_changes + 3);
+    assert(summary.active_scene_view_cross_identity_variations == before.active_scene_view_cross_identity_variations + 1);
     assert(summary.active_scene_view_size_observation_drops == before.active_scene_view_size_observation_drops + 1);
-    assert(summary.active_scene_view_frame_cache_evictions > before.active_scene_view_frame_cache_evictions);
+    assert(summary.active_scene_view_frame_cache_replacements == before.active_scene_view_frame_cache_replacements + 29);
+    assert(summary.active_scene_view_frame_key_reentries == before.active_scene_view_frame_key_reentries + 1);
+    assert(summary.active_scene_view_evicted_key_history_overwrites >
+        before.active_scene_view_evicted_key_history_overwrites);
     assert(summary.active_event_counts[static_cast<size_t>(Trace::Kind::SceneFrame)] == 1);
 }
 
