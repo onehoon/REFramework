@@ -7540,3 +7540,9 @@ Output ring / reuse or history policy change NOT AUTHORIZED
 Temporal continuity / visual acceptance     NOT ACCEPTED
 PR66                                          KEEP DRAFT/OPEN
 ~~~
+
+## 54. PR66 GPU output consumer identification — 2026-10-01
+
+The read-only evidence report is [RE4_XESS_GPU_OUTPUT_CONSUMER_IDENTIFICATION_EVIDENCE_2026-10-01.md](RE4_XESS_GPU_OUTPUT_CONSUMER_IDENTIFICATION_EVIDENCE_2026-10-01.md). The current same-run software trace proves install `1165` at frame `8192`, a marker candidate for Present `8191` / fence `463`, later completion of that fence value, and a marker-pending skip at frame `8193`. It still does **not** identify a GPU command reading the installed output or prove that the marker follows that read. Capture 30b remains only a candidate draw because its bound SRV/descriptor identity is absent.
+
+No PIX/RenderDoc capture artifact or installed capture executable was available. A bounded static scan of the exact RE4 1.5.9.0 image yielded 1,704 generic indirect-call candidates and no validated path to the captured draw; no address hook or production behavior change was made. The next required evidence is a narrowly filtered GPU capture resolving the actual output resource to its reader, command list, queue, Present, marker, and completed fence. HUD/ESC composition remains unknown. Do not change OutputHandoff, marker/fence, history, quarantine, or output reuse policy; keep PR66 Draft/Open.
