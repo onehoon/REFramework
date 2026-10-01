@@ -647,17 +647,40 @@ RE4XeSSWorker::SubmitResult RE4XeSSWorker::process_submit(SubmitRequest request)
     }
 
     std::string submit_error;
-    const auto submit_result = m_bridge->submit(request.frame, *m_runtime, request.output, submit_error);
+    RE4XeSSD3D12::SubmissionInfo submission_info{};
+    const auto submit_result = m_bridge->submit(
+        request.frame,
+        *m_runtime,
+        request.output,
+        request.control_generation,
+        request.device_reset_generation,
+        submission_info,
+        submit_error);
+    const auto attach_submission_info = [&] (SubmitResult& result) {
+        result.trace_id = request.frame.lifetime_trace_id;
+        result.submit_ordinal = submission_info.submission_ordinal;
+        result.writer_fence_value = submission_info.writer_fence_value;
+        result.bridge_slot = submission_info.slot;
+        result.execute_api_succeeded = submission_info.execute_api_succeeded;
+        result.queue_submitted = submission_info.command_lists_submitted;
+        result.writer_signal_succeeded = submission_info.writer_signal_succeeded;
+    };
     if (submit_result == RE4XeSSD3D12::SubmitResult::Submitted) {
-        return make_submit_result(request, SubmitResult::Status::Submitted);
+        auto result = make_submit_result(request, SubmitResult::Status::Submitted);
+        attach_submission_info(result);
+        return result;
     }
     if (submit_result == RE4XeSSD3D12::SubmitResult::Busy) {
-        return make_submit_result(request, SubmitResult::Status::Busy, std::move(submit_error));
+        auto result = make_submit_result(request, SubmitResult::Status::Busy, std::move(submit_error));
+        attach_submission_info(result);
+        return result;
     }
 
     mark_execution_fault(submit_error.empty() ? m_bridge->failure_reason() : submit_error,
         request.control_generation, request.device_reset_generation);
-    return make_submit_result(request, SubmitResult::Status::Faulted, m_owner_failure_reason);
+    auto result = make_submit_result(request, SubmitResult::Status::Faulted, m_owner_failure_reason);
+    attach_submission_info(result);
+    return result;
 }
 
 RE4XeSSWorker::SubmitResult RE4XeSSWorker::make_submit_result(

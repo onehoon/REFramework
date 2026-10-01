@@ -4,7 +4,7 @@
 **Target:** Resident Evil 4 (2023), Direct3D 12  
 **Game build under investigation:** RE4 `1.5.9.0`, Steam AppID `2050650`, BuildID `22377325`  
 **Date:** 2026-09-26  
-**Last research update:** 2026-09-27  
+**Last research update:** 2026-09-28  
 **Status:** Reverse-engineering phase complete through Capture 30b; production implementation moves to `feature/re4-xess`
 
 ---
@@ -3515,7 +3515,7 @@ No engine-owned command list should be modified.
 
 ### Gate I — XeSS output integration
 
-**Status: NATIVE DISCOVERY CLOSED by Capture 30b; production XeSS output handoff still requires implementation-time validation.**
+**Status (updated 2026-09-30): native discovery is closed; the production XeSS output handoff is implemented and runtime-exercised, but acceptance is incomplete.** Earlier text in this gate describing implementation as wholly pending is superseded by PR66 runtime sections 47–48 below.
 
 Capture 28 proves:
 
@@ -3536,13 +3536,15 @@ Capture 30b closes the remaining native draw-discovery questions:
 - the candidate follows the active swapchain buffer;
 - the Capture 28/30 copy destination remains at observed state `0x0` in this window and is not the proven final screen-output source.
 
-What remains under Gate I is implementation-time validation:
+The latest PR66 capture has eight OutputHandoff install-complete events and public XeSS Execute activity through OptiScaler. This proves that the output resource and engine TargetState handoff reach the live path; an install event alone does not prove the final on-screen pixels or UI composition are correct.
 
-- create and own the XeSS output resource;
-- establish the exact state transitions for the chosen production handoff;
-- feed display-resolution XeSS output into RE4's own post/UI/presentation path without bypassing UI composition;
-- validate resize, fullscreen/Alt+Tab, swapchain recreation, and device reset;
-- verify no new HUD/UI contamination or presentation artifact appears.
+What remains under Gate I is:
+
+- prove the installed output is consumed by the intended downstream GPU submission and map that submission to the eligible Present/queue and its retirement marker;
+- complete D3D12 state/lifetime validation for the handoff output and prove safe retirement;
+- establish sustained temporal output without the current marker-pending reset churn;
+- visually verify final output and preserved UI/HUD;
+- validate resize, fullscreen/Alt+Tab, swapchain recreation, and device reset.
 
 Do not add descriptor-heap tracing preemptively. Reopen descriptor/SRV provenance only if the production implementation produces an ambiguity or contradiction.
 
@@ -4368,3 +4370,3179 @@ valid LoadAccessor snapshot
 ~~~
 
 
+
+
+---
+
+## 24. PR66 handoff checkpoint — LoadAccessor resolved, TargetState creation remains the production blocker
+
+This section supersedes the older statement in Section 23 that the Load Save accessor is the next blocker.
+
+Active PR:
+
+~~~text
+PR #66
+branch: feature/re4-xess-load-state-accessor-diagnostic
+state: Draft / open / unmerged
+~~~
+
+Latest runtime capture used for this checkpoint:
+
+~~~text
+re2_framework_log(10).txt
+log header commit: 88d6714eda4869661335de89ea86298c5fe29512
+branch: feature/re4-xess-load-state-accessor-diagnostic
+build date/time: 2026-09-28 13:30
+game: re4
+~~~
+
+The runtime functionality in this local build includes the TargetState-vtable discovery work represented by the current PR66 development line. Local build stamping may therefore lag the exact remote head; use the runtime behavior as the evidence and Git history as the implementation record.
+
+### 24.1 LoadAccessor is now runtime-proven
+
+The production accessor reaches:
+
+~~~text
+[RE4XeSS][LoadAccessor] stage=Valid
+~~~
+
+with the concrete TDB71 schema:
+
+~~~text
+pause manager:
+    chainsaw.SceneLoadZoneManager
+    get_Instance
+    _Pause
+    System.Boolean
+    managed storage width = 1
+
+situation manager:
+    chainsaw.GameSituationManager
+    get_Instance
+    <InhibitBit>k__BackingField
+    System.UInt64
+    managed storage width = 8
+~~~
+
+Important implementation rule:
+
+> REFramework metadata type size is not the managed primitive storage width.
+
+The runtime must continue deriving Boolean/integral/enum widths from managed primitive identity instead of using the TDB metadata size directly.
+
+### 24.2 Capture 22 load semantics survived production validation
+
+The latest runtime begins while the game is already in a pause/load state:
+
+~~~text
+_Pause = true
+InhibitBit = 0x0
+~~~
+
+No normal gameplay baseline is invented.
+
+Later:
+
+~~~text
+_Pause true -> false
+    -> keep temporal history blocked
+
+InhibitBit 0x0 -> 0xB9
+    -> begin stable post-pause rebaseline
+
+three stable observations
+    -> adopt current normal baseline dynamically
+    -> first valid packet uses resetHistory=true
+~~~
+
+Observed production log:
+
+~~~text
+load pause released; keeping history blocked until a post-pause InhibitBit transition and stable rebaseline
+post-pause InhibitBit transition 0x0->0xb9; beginning stable rebaseline observations
+adopted post-pause InhibitBit baseline=0xb9 after three stable observations
+first valid resetHistory packet
+~~~
+
+0xB9 is evidence from this run only.
+
+Do not hardcode it.
+
+The frozen semantics remain:
+
+- remember the stable gameplay InhibitBit value dynamically;
+- if InhibitBit departs before Pause rises, freeze the remembered normal value and arm load suspicion;
+- Pause=true confirms the load window;
+- Pause=false alone does not resume temporal history;
+- resume only after InhibitBit returns/rebaselines to a stable normal value;
+- the first valid gameplay packet after the load window sets resetHistory=true;
+- startup while Pause=true never invents a baseline;
+- no camera-threshold fallback.
+
+The LoadAccessor is no longer the current blocker.
+
+---
+
+## 25. PR66 TargetState / OutputHandoff reverse-engineering status
+
+The current production blocker is the engine-visible TargetState required by RE4XeSSOutputHandoff.
+
+The following parts are runtime-proven:
+
+~~~text
+first valid temporal packet                 ✅
+RE4 semantic Color/Depth/Velocity packet    ✅
+public XeSS runtime discovery/init           ✅
+stock OptiScaler public XeSS interception    ✅ through init/velocity scale
+create_render_target_view                    ✅
+create_texture                               ✅
+live Overlay main TargetState layout         ✅
+live Overlay main TargetState slot (+0x90)   ✅
+live TargetState vtable anchor               ✅
+create_target_state                          ❌ unresolved
+distinct single-RTV handoff TargetState      ❌
+Worker XeSS submit                           ⏸ blocked before submit
+OptiScaler hk_xessD3D12Execute               0 calls
+OutputHandoff install                        ⏸
+downstream retirement validation             ⏸
+~~~
+
+### 25.1 RE4 RTV resolver is closed
+
+Generic signatures may fail on RE4 1.5.9.0, but the RE4-only validated callsite fallback succeeds.
+
+Stable evidence:
+
+~~~text
+callsite RVA: 0x447AF5A
+resolved target: re4+0x4470470
+runtime log:
+    Found create_render_target_view via RVA 0x447AF5A
+~~~
+
+create_texture also resolves.
+
+Do not reopen the RTV resolver unless new evidence contradicts it.
+
+### 25.2 create_target_state remains intentionally fail-closed
+
+The generic legacy CircularDOF_SceneMipTexture / call-order candidate is not accepted for RE4.
+
+Current behavior remains correct:
+
+~~~text
+Searching for create_target_state
+[Renderer][RE4] TargetState factory is unresolved; refusing the legacy call-order candidate
+TargetState::clone did not produce a distinct single-RTV handoff target
+~~~
+
+Do not convert any diagnostic RVA into a production call until the ABI, ownership, descriptor semantics, and returned object are proven.
+
+### 25.3 Rejected TargetState candidates — do not repeat these experiments
+
+#### Site 2 / re4+0x44C7A27
+
+Paired returns were scalar-like values (0x1EB, 0x5A0) rather than TargetState pointers.
+
+Status:
+
+~~~text
+re4+0x44C7A27 -> rejected as TargetState factory
+~~~
+
+#### Site 1 / re4+0x47212A6
+
+This is a polymorphic vtable + 0x40 dispatch site, not a fixed factory.
+
+Observed dynamic callees from the same callsite included:
+
+~~~text
+re4+0x44742F0
+re4+0x447A540
+re4+0x78F42D0
+re4+0x44AF030
+~~~
+
+Status:
+
+~~~text
+re4+0x47212A6 -> rejected as fixed TargetState factory
+~~~
+
+#### re4+0x78F42D0 return
+
+The return is readable and superficially follows the same coarse 0x40-byte layout:
+
+~~~text
+valid image vtable
+refCount = -2
+numRtv = 1
+display-sized rect = 2560x1440
+~~~
+
+but decisive validation fails:
+
+~~~text
+candidate vtable != live Overlay TargetState vtable
+candidate rect = display extent, not current Overlay target extent
+rtvs[0] = nullptr
+no valid RTV format/dimension/texture
+targetStateLike = false
+~~~
+
+Vtable mismatch alone would not reject a subclass, but numRtv=1 with a null RTV entry means this is not the complete usable TargetState required by OutputHandoff.
+
+Status:
+
+~~~text
+re4+0x78F42D0 return -> rejected as usable live TargetState
+~~~
+
+It may remain a rendering-state/container clue, but must not be wired into create_target_state().
+
+### 25.4 re4+0x4597A0 writer candidate is retired
+
+Static analysis showed a plausible intrusive-pointer style assignment pattern around:
+
+~~~text
+source owner + 0x60
+AddRef incoming
+receiver + 0x90 assignment
+Release previous
+~~~
+
+The initial provenance probe was accidentally coupled to the short TargetStateProbe and only lived for two frames. That lifecycle bug was fixed and a later run observed the candidate for the full 1800-frame bounded window with zero writes.
+
+A final timing test then moved the hook to the core REFramework startup path after integrity bootstrap and before the first render frame.
+
+Required ordering was achieved:
+
+~~~text
+TargetState provenance early arm
+    < Render frame: 1
+~~~
+
+Even with the hook proven active before rendering, the bounded run recorded:
+
+~~~text
+writes = 0
+earlyCaptured = 0
+earlyCorrelated = 0
+~~~
+
+Status:
+
+~~~text
+re4+0x4597A0 -> retired as Overlay main TargetState writer candidate
+~~~
+
+Do not move this hook earlier again.
+
+Do not add it back as an active writer candidate.
+
+---
+
+## 26. Proven live TargetState vtable anchor and latest discovery blocker
+
+The strongest current TargetState reverse-engineering anchor is the real live Overlay main TargetState object.
+
+For the exact validated RE4 1.5.9.0 image:
+
+~~~text
+image base in latest run  = 0x7ff631bd0000
+TargetState vtable RVA    = 0x7B1C148
+expected vtable           = 0x7ff6396ec148
+live TargetState vtable   = 0x7ff6396ec148
+match                     = true
+~~~
+
+The fixed RVA is diagnostic evidence for this exact image identity only.
+
+Do not generalize it to other RE Engine games or unvalidated RE4 builds.
+
+### 26.1 Latest TargetStateVtableProbe result
+
+The new bounded discovery pass starts very early:
+
+~~~text
+[TargetStateVtableProbe] bootstrap-begin
+point=REFramework-constructor-after-integrity
+before-plugin-init=true
+
+[TargetStateVtableProbe] discovery-begin
+imageSize=0xe405000
+checksum=0xdee3479
+vtableRva=0x7b1c148
+~~~
+
+The current full executable-section decoder does not complete:
+
+~~~text
+decode stopped:
+    sectionIndex=0
+    sectionRva=0x1000
+    offset=0xb73860
+
+decode stopped:
+    sectionIndex=7
+    sectionRva=0xe3cb000
+    offset=0x0
+
+discovery-summary:
+    xrefCount=0
+    truncated=false
+    complete=false
+~~~
+
+This is an incomplete scan, not evidence that no vtable xrefs exist.
+
+The current log line:
+
+~~~text
+bootstrap-result discovered=true
+~~~
+
+is misleading because the scan was attempted but not completed and discovered zero xrefs.
+
+### 26.2 Live anchor is correct but incorrectly marked untrusted
+
+Later the real Overlay TargetState proves the anchor:
+
+~~~text
+live-anchor:
+    liveVtable         = expectedVtable
+    match              = true
+    discoveryComplete  = false
+    trusted            = false
+~~~
+
+Current code couples:
+
+~~~text
+live anchor trust
+    = exact live vtable match
+      AND full static xref scan completed
+~~~
+
+That coupling is now the immediate diagnostic blocker.
+
+Because trusted=false, the bounded TargetState probe refuses to arm:
+
+~~~text
+[TargetStateProbe] not armed: live TargetState vtable anchor is untrusted
+~~~
+
+The production handoff then reaches the already-known failure:
+
+~~~text
+create_render_target_view ✅
+create_texture            ✅
+create_target_state       ❌
+TargetState::clone        ❌
+~~~
+
+No xessD3D12Execute is reached.
+
+### 26.3 Required correction already issued on PR66
+
+PR66 comment:
+
+~~~text
+5863592995
+~~~
+
+Required change:
+
+1. keep exact RE4 image identity validation;
+2. keep the validated Overlay slot;
+3. keep readable live TargetState structural validation;
+4. require exact liveVtable == imageBase + 0x7B1C148;
+5. keep existing callsite byte validation before installing any dynamic hook;
+6. do not require full-image xref scan completion merely to trust the read-only live anchor diagnostic.
+
+The static xref scanner must be repaired independently.
+
+Preferred bounded approaches:
+
+~~~text
+A. decode per proven x64 RUNTIME_FUNCTION range from the PE exception directory
+   so one data island/bad range does not terminate the rest of .text;
+
+or
+
+B. candidate-driven RIP-relative reference search
+   -> fully decode/validate only candidate instruction starts
+   -> accept only references resolving exactly to imageBase + 0x7B1C148
+~~~
+
+Do not use blind byte resynchronization solely to force complete=true.
+
+Discovery logging must distinguish:
+
+~~~text
+attempted
+complete
+xrefCount
+truncated
+~~~
+
+rather than reporting discovered=true for an incomplete zero-xref pass.
+
+### 26.4 Next acceptance point
+
+The next runtime capture should first prove:
+
+~~~text
+TargetStateVtableProbe live-anchor:
+    match=true
+    trusted=true
+
+TargetStateProbe:
+    armed
+~~~
+
+Static xref discovery may continue to report incomplete coverage while that diagnostic correction is being validated; it must not silently become production TargetState resolution.
+
+The primary reverse-engineering goal remains:
+
+> Find the actual TargetState allocation/constructor/factory path from the proven live TargetState type, then prove its ABI and ownership contract.
+
+Do not productionize 0x78F42D0, 0x4597A0, or any newly found xref from static evidence alone.
+
+---
+
+## 27. XeSS / OptiScaler teardown note from the latest capture
+
+The latest log reports:
+
+~~~text
+xessDestroyContext returned XeSS result -8
+~~~
+
+XeSS defines -8 as:
+
+~~~text
+XESS_RESULT_ERROR_INVALID_CONTEXT
+~~~
+
+In current stock OptiScaler, hk_xessDestroyContext() returns INVALID_CONTEXT when its internal context map has no entry.
+
+That map is populated on the Execute/CreateDLSSContext path.
+
+This capture never reaches the first xessD3D12Execute, because OutputHandoff fails earlier.
+
+Therefore for the current evidence:
+
+~~~text
+xessDestroyContext -8
+    = downstream teardown symptom
+    != current primary blocker
+~~~
+
+Do not widen PR66 into an XeSS teardown redesign unless this becomes independently reproducible after Execute is actually reached.
+
+---
+
+## 28. External corroboration — DLSS5-Feeder does not change the RE4 architecture
+
+Repository reviewed:
+
+~~~text
+https://github.com/jlrouzies-fr/DLSS5-Feeder
+~~~
+
+That project demonstrates a closely related integration pattern:
+
+~~~text
+synthetic standard NGX/DLSS producer calls
+    -> stock OptiScaler interception
+    -> OptiScaler-selected SR backend
+~~~
+
+This supports the general producer/interceptor design already used here.
+
+It does not solve the current RE4 OutputHandoff problem.
+
+DLSS5-Feeder operates from a ReShade/post-process style boundary and can write the processed result back to the completed frame/backbuffer. It therefore does not need to manufacture an RE Engine TargetState or re-enter RE4 before Overlay/UI.
+
+The RE4 production target is different:
+
+~~~text
+low-resolution RE4 SceneView
+    -> pre-Overlay HDR/PostMain Color + true Depth + true Velocity + true Jitter
+    -> public XeSS producer
+    -> display-resolution SR output
+    -> engine-visible TargetState handoff
+    -> native RE4 Overlay/UI/final output
+    -> Present
+~~~
+
+Therefore:
+
+- keep public XeSS as the RE4 producer contract;
+- do not switch to a synthetic NGX producer merely because DLSS5-Feeder works;
+- do not adopt its final-backbuffer copy as the normal RE4 output architecture;
+- the current blocker remains RE Engine TargetState creation/handoff.
+
+---
+
+## 29. Handoff state — 2026-09-28
+
+A new engineer/session can continue from this exact state.
+
+### Frozen proven facts
+
+~~~text
+RE4-only isolation                         proven
+true pre-Overlay semantic boundary         proven
+Color = HDR/PostMain                       proven
+Depth = Scene::DepthStencilTex             proven, inverted
+Velocity = Scene::VelocityTarget           proven
+MV conversion/sign/scale                   proven
+SceneView render-size control              proven
+jitter injection/history                   proven
+near/far/FOV                               proven
+LoadAccessor                               proven Valid
+Capture 22 load-state semantics            proven in production behavior
+dedicated XeSS worker ownership            proven
+public XeSS -> stock OptiScaler init path  proven
+RTV factory                                proven
+create_texture                             proven
+live Overlay TargetState layout            proven
+Overlay main TargetState slot +0x90        proven
+live TargetState vtable RVA 0x7B1C148      proven for exact RE4 image
+~~~
+
+### Rejected/retired leads
+
+~~~text
+legacy generic create_target_state candidate   rejected for RE4
+0x44C7A27                                     rejected as TargetState factory
+0x47212A6                                     polymorphic dispatch, not fixed factory
+0x78F42D0 return                              rejected as usable TargetState
+0x4597A0                                      retired as Overlay TargetState writer
+direct normal-path XeSS output -> swapchain   rejected architecture
+~~~
+
+### Current blocker
+
+~~~text
+actual RE4 TargetState creator/factory ABI    unknown
+    -> no distinct single-RTV handoff TargetState
+    -> no OutputHandoff install
+    -> no worker XeSS submit
+    -> no hk_xessD3D12Execute
+~~~
+
+The immediately preceding diagnostic blocker is narrower:
+
+~~~text
+live TargetState vtable anchor matches exactly
+but
+static xref scan incomplete
+    -> current code marks anchor untrusted
+    -> TargetStateProbe does not arm
+~~~
+
+### Next action
+
+Implement the narrow PR66 correction from comment 5863592995:
+
+~~~text
+decouple live-anchor trust from full static-xref scan completeness
+repair xref discovery independently
+keep all production paths fail-closed
+~~~
+
+Then collect the next runtime log.
+
+Do not merge PR66 yet.
+
+Do not start XeFG validation yet.
+
+Do not add another broad D3D12 trace.
+
+Do not bypass OutputHandoff by copying XeSS output directly to the swapchain.
+
+The next meaningful milestone is a proven TargetState construction path and a distinct engine-visible single-RTV handoff state.
+
+
+---
+
+## 30. PR66 latest runtime — trust gate fixed and two TargetState-vtable xrefs discovered
+
+Latest runtime evidence:
+
+~~~text
+file: re2_framework_log(20260928-045315).txt
+commit header: a72333a1a9944c156bf947e43cfab9410877867c
+branch: feature/re4-xess-load-state-accessor-diagnostic
+build date/time: 2026-09-28 13:47
+~~~
+
+Important handoff note:
+
+> The local runtime contains diagnostic changes that are not yet fully represented by the current remote source at the same stamped commit.
+
+The runtime clearly uses:
+
+~~~text
+exception-directory / RUNTIME_FUNCTION coverage
+live-anchor trust decoupled from discoveryComplete
+~~~
+
+while the remote source at the stamped commit still reflects the older executable-section scanner / stricter trust gate.
+
+Before the next diagnostic change, preserve and push the exact local implementation that produced this runtime.
+
+### 30.1 Previous trust-gate blocker is resolved
+
+Runtime now proves:
+
+~~~text
+[TargetStateVtableProbe] live-anchor
+    liveVtable=0x7ff6396ec148
+    expectedVtable=0x7ff6396ec148
+    imageIdentityValid=true
+    match=true
+    discoveryComplete=false
+    trusted=true
+~~~
+
+The bounded TargetState probe subsequently arms:
+
+~~~text
+[TargetStateProbe] armed
+    frame=5285
+    isolatedSite=1
+    siteName=RTV owner vcall+0x40 A
+~~~
+
+Therefore:
+
+~~~text
+live TargetState exact match     ✅
+live anchor trusted              ✅
+TargetStateProbe arm             ✅
+full xref scan complete          ❌ not required for trust
+~~~
+
+Do not restore the old rule:
+
+~~~text
+trusted = match && discoveryComplete
+~~~
+
+### 30.2 RUNTIME_FUNCTION discovery found two exact vtable xrefs
+
+The new scanner reports:
+
+~~~text
+coverage=exception-directory-runtime-functions
+functions=508868
+scannedFunctions=507568
+failedFunctions=1300
+scannedBytes=0x74be117
+xrefCount=2
+truncated=false
+complete=false
+~~~
+
+The two positive xrefs are:
+
+~~~text
+xref 0
+    RVA = 0x47C3E0A
+    instruction = LEA rax, [rel imageBase+0x7B1C148]
+    bytes = 48 8D 05 37 83 35 03
+
+xref 1
+    RVA = 0x47D21AF
+    instruction = LEA rax, [rel imageBase+0x7B1C148]
+    bytes = 48 8D 05 92 9F 34 03
+~~~
+
+These are exact decoded RIP-relative references to the proven TargetState vtable.
+
+complete=false means discovery is not exhaustive.
+
+It does not invalidate the two positive xrefs already found.
+
+The two RVAs are now the strongest static leads for the actual TargetState constructor/initializer/destructor/type-use path.
+
+They are not production factory RVAs yet.
+
+### 30.3 Old site-1/provider-return path is exhausted
+
+The old isolated site-1 probe ran again.
+
+The same polymorphic callees appeared, including:
+
+~~~text
+re4+0x44742F0
+re4+0x447A540
+re4+0x78F42D0
+re4+0x44AF030
+~~~
+
+The re4+0x78F42D0 return again validated as unusable:
+
+~~~text
+numRtv=1
+rect=(0,0,2560,1440)
+overlayVtableMatch=false
+rtv0=0
+rtv0Valid=false
+targetStateLike=false
+~~~
+
+This reconfirms the prior rejection.
+
+Do not spend the next runtime capture on the same site-1/provider-return probe.
+
+### 30.4 Production blocker is unchanged
+
+The latest runtime still reaches:
+
+~~~text
+create_render_target_view  ✅
+create_texture             ✅
+create_target_state        ❌ unresolved
+distinct TargetState       ❌
+OutputHandoff install      ❌
+Worker submit              0
+hk_xessD3D12Execute        0
+~~~
+
+Repeated mode changes recreate the public XeSS frontend successfully, but every first valid temporal packet still fails at TargetState cloning/handoff.
+
+The repeated:
+
+~~~text
+xessDestroyContext result -8
+~~~
+
+remains the known downstream INVALID_CONTEXT teardown symptom before first Execute, not the primary blocker.
+
+### 30.5 Next work order
+
+PR66 follow-up comment:
+
+~~~text
+5863746550
+~~~
+
+The next commit should classify only the two discovered vtable xrefs.
+
+For each xref, capture its containing RUNTIME_FUNCTION:
+
+~~~text
+xrefRva
+functionIndex
+functionBeginRva
+functionEndRva
+xrefOffsetWithinFunction
+~~~
+
+and a strictly bounded decoded instruction window around it.
+
+The immediate questions are:
+
+~~~text
+where does the LEA-loaded vtable address flow?
+is it stored to object + 0?
+which register is the candidate object?
+is there a nearby allocation/base-constructor call?
+is there a release/deallocation path?
+does the function return the object?
+are the two xrefs constructor/destructor pairs, overloads, or type-query helpers?
+~~~
+
+Do not dynamically hook both functions yet.
+
+First classify the static contexts, then select the strongest single constructor/initializer candidate for a later bounded read-only dynamic probe.
+
+### 30.6 Diagnostic logging cleanup
+
+The RUNTIME_FUNCTION scan is structurally better because decode failure in one function does not terminate the scan.
+
+However, the latest run emits approximately 1300 individual decode-stopped warnings.
+
+Keep the final counters, but rate-limit individual failure logs to a small fixed number.
+
+Do not change scan semantics merely to suppress warnings.
+
+---
+
+## 31. Handoff state after latest runtime
+
+### Frozen proven facts
+
+~~~text
+LoadAccessor valid                                      proven
+Capture 22 production load behavior                     proven
+TargetState vtable RVA 0x7B1C148                       proven for exact RE4 image
+live-anchor match/trust                                 proven
+RUNTIME_FUNCTION-based bounded scan                     operational
+TargetState vtable xref 0x47C3E0A                      proven exact reference
+TargetState vtable xref 0x47D21AF                      proven exact reference
+TargetStateProbe can arm                                proven
+~~~
+
+### Rejected / retired
+
+~~~text
+legacy generic create_target_state                     rejected
+0x44C7A27                                              rejected factory
+0x47212A6                                              polymorphic dispatch only
+0x78F42D0 return                                       rejected usable TargetState
+0x4597A0                                               retired Overlay writer
+repeating old site-1 provider probe                    exhausted
+~~~
+
+### Current task
+
+~~~text
+classify 0x47C3E0A and 0x47D21AF containing functions
+    -> identify actual vtable store/object flow
+    -> choose strongest constructor/initializer candidate
+    -> only then add one bounded dynamic probe
+~~~
+
+### Current production blocker
+
+~~~text
+actual TargetState creator/factory ABI unknown
+    -> no distinct single-RTV handoff state
+    -> OutputHandoff unavailable
+    -> no XeSS Execute
+~~~
+
+Keep PR66 Draft and unmerged.
+
+
+---
+
+## 32. PR66 14:05 runtime — TargetState xrefs classified
+
+Latest runtime evidence:
+
+~~~text
+file: re2_framework_log(20260928-050834).txt
+commit header: 42c3b66fd5163c331ecb1247e42b25cfc13e9d40
+branch: feature/re4-xess-load-state-accessor-diagnostic
+build date/time: 2026-09-28 14:05
+~~~
+
+The current remote PR66 source subsequently advanced to:
+
+~~~text
+06a50b2572a19ba0f4ff977babd2a786273a8bfe
+Log bounded TargetState vtable xref context
+~~~
+
+and now contains the bounded xref-context scanner represented by this capture.
+
+### 32.1 RUNTIME_FUNCTION scanner acceptance is complete
+
+The scanner still reports incomplete exhaustive coverage:
+
+~~~text
+functions=508868
+scannedFunctions=507568
+failedFunctions=1300
+xrefCount=2
+complete=false
+~~~
+
+but individual decoder failures are now rate-limited correctly:
+
+~~~text
+decodeFailureDetailsLogged=12
+decodeFailureDetailsSuppressed=true
+~~~
+
+The two exact positive vtable xrefs remain valid.
+
+The live anchor also remains correctly trusted independently of full scan completeness:
+
+~~~text
+liveVtable=0x7ff6396ec148
+expectedVtable=0x7ff6396ec148
+imageIdentityValid=true
+match=true
+discoveryComplete=false
+trusted=true
+~~~
+
+### 32.2 Candidate 0 is destructor/deallocation-side evidence
+
+Candidate 0:
+
+~~~text
+functionBeginRva = 0x47C3E00
+functionEndRva   = 0x47C3E58
+xrefRva          = 0x47C3E0A
+~~~
+
+Observed flow:
+
+~~~asm
+LEA  RAX, TargetState_vtable
+MOV  EDI, EDX
+MOV  [RCX], RAX
+MOV  RBX, RCX
+CALL re4+0x446EE30
+TEST DIL, 1
+...
+MOV  RCX, RBX
+TEST DIL, 4
+...
+CALL re4+0x3ACC670
+MOV  RAX, RBX
+~~~
+
+This is strongly consistent with a deleting-destructor/deallocation thunk:
+
+~~~text
+existing object arrives in RCX
+EDX is preserved as destruction flags
+TargetState vtable is restored onto the existing object
+destructor-side work is called
+flags gate a deallocation-like call
+the original object pointer is returned
+~~~
+
+Status:
+
+~~~text
+re4+0x47C3E00 -> retire as TargetState creator/factory lead
+~~~
+
+This RVA remains useful as destructor/ownership evidence only.
+
+Do not dynamically probe it in the next capture.
+
+### 32.3 Candidate 1 is the strongest TargetState creator/factory lead
+
+Candidate 1:
+
+~~~text
+functionBeginRva = 0x47D2180
+functionEndRva   = 0x47D21D2
+xrefRva          = 0x47D21AF
+~~~
+
+Observed flow:
+
+~~~asm
+MOV  EDX, 0xA8
+CALL re4+0x3AB27F0
+MOV  RBX, RAX
+TEST RAX, RAX
+JZ   failure
+
+MOV  RDX, RDI
+MOV  RCX, RAX
+CALL re4+0x446E790
+
+LEA  RAX, TargetState_vtable
+MOV  [RBX], RAX
+MOV  RAX, RBX
+RET
+~~~
+
+This is materially stronger than every previous TargetState candidate.
+
+The function:
+
+~~~text
+requests a fixed 0xA8-byte allocation
+retains the allocated object in RBX
+passes the new object to an initializer/constructor-like call
+installs the exact proven live TargetState vtable into [RBX]
+returns the same object pointer in RAX
+~~~
+
+Current classification:
+
+~~~text
+re4+0x47D2180 -> allocation + initialization wrapper / TargetState creator candidate
+~~~
+
+This is not yet a production create_target_state resolver.
+
+The following remain unproven:
+
+~~~text
+input ABI
+meaning of the argument forwarded through RDI/RDX
+allocator semantics
+initial refcount / ownership transfer
+whether created objects are the same TargetState type instance used by Overlay
+whether descriptor/RTV fields are ready immediately after construction
+safe lifetime contract for OutputHandoff
+~~~
+
+### 32.4 Old site-1 probe is now fully exhausted
+
+The old isolated 0x47212A6 path ran again and reproduced the known re4+0x78F42D0 result:
+
+~~~text
+numRtv=1
+rtv0=null
+overlayVtableMatch=false
+targetStateLike=false
+~~~
+
+No new information was produced.
+
+Do not run the old provider-return probe in the next capture.
+
+### 32.5 Next diagnostic — early 0x47D2180 creator correlation
+
+PR66 work-order comment:
+
+~~~text
+5863904529
+~~~
+
+The next diagnostic must target only re4+0x47D2180.
+
+Arm it at the early REFramework bootstrap point:
+
+~~~text
+REFramework-constructor-after-integrity
+before-plugin-init=true
+~~~
+
+Do not wait for the first valid XeSS frame.
+
+The TargetState used by Overlay may be constructed during renderer initialization.
+
+The probe remains read-only and bounded.
+
+Required real-call observations:
+
+~~~text
+caller RVA / callsite
+effective input registers
+allocation result
+post-initializer object
+post-vtable-store object
+returned object
+TargetState structural snapshot
+RTV/texture identity where readable
+~~~
+
+The most important acceptance is raw pointer correlation:
+
+~~~text
+observed object created by re4+0x47D2180
+        ==
+later live Overlay main TargetState
+~~~
+
+If true, this directly proves that the candidate path creates the live engine TargetState instance class used by Overlay.
+
+If false, preserve the result and compare structure/callers without weakening the criterion.
+
+Also enumerate bounded direct CALL-rel32 references resolving exactly to re4+0x47D2180 so caller-side argument setup can be reconstructed.
+
+### 32.6 Production state remains fail-closed
+
+The latest capture still reaches:
+
+~~~text
+create_render_target_view  ✅
+create_texture             ✅
+create_target_state        ❌ unresolved
+TargetState::clone         ❌
+OutputHandoff              ❌
+xessD3D12Execute           0 calls
+~~~
+
+The repeated xessDestroyContext=-8 remains the known downstream symptom before first Execute.
+
+Do not wire re4+0x47D2180 into production until object identity, ABI, descriptor semantics, and ownership/refcount behavior are runtime-proven.
+
+---
+
+## 33. Handoff state after xref classification
+
+### Proven / strongest evidence
+
+~~~text
+TargetState vtable RVA 0x7B1C148             proven exact-image anchor
+0x47C3E0A vtable xref                        proven
+0x47D21AF vtable xref                        proven
+0x47C3E00 function                           destructor/deallocation-side
+0x47D2180 function                           strongest creator/factory lead
+0x47D2180 allocation size                    0xA8
+0x47D2180 vtable write                       [RBX] = TargetState vtable
+0x47D2180 return                             RAX = RBX
+~~~
+
+### Current task
+
+~~~text
+early read-only observe re4+0x47D2180
+    -> identify real callers and input ABI
+    -> snapshot constructed object
+    -> correlate created object pointer with live Overlay TargetState
+    -> prove ownership/refcount semantics
+~~~
+
+### Current production blocker
+
+~~~text
+actual production-safe TargetState creation ABI not yet proven
+    -> distinct single-RTV handoff state unavailable
+    -> OutputHandoff unavailable
+    -> no XeSS Execute
+~~~
+
+Keep PR66 Draft and unmerged.
+
+
+---
+
+## 34. PR66 14:34 runtime — RE4 TargetState creator proven
+
+Latest runtime evidence:
+
+~~~text
+file: re2_framework_log(20260928-054035).txt
+stamped commit: f99742e77f8b3df4db81bec639110183b967296e
+branch: feature/re4-xess-load-state-accessor-diagnostic
+build date/time: 2026-09-28 14:34
+~~~
+
+The current remote PR66 implementation containing the bounded creator probe is:
+
+~~~text
+27fa92f75b1b4da985749bcd3a2b729b75cf0d9f
+Add bounded RE4 TargetState creator probe
+~~~
+
+The log clearly contains that creator-probe behavior.
+
+Treat the stamped runtime hash as local-build provenance rather than assuming it exactly identifies the pushed source tree.
+
+### 34.1 0x47D2180 executes as a real engine TargetState creator
+
+The early read-only probe successfully observed real engine calls to:
+
+~~~text
+re4+0x47D2180
+~~~
+
+The wrapper behavior is now runtime-proven:
+
+~~~text
+allocation size          0xA8
+allocation result        non-null
+post-initializer object  same allocation
+post-vtable object       same allocation
+returned object          same allocation
+vtable                   exact TargetState vtable
+initial refCount         1
+descriptor               readable
+RTV entries              valid
+Texture backing          valid
+~~~
+
+Two single-RTV examples:
+
+~~~text
+id=1
+    object=0x22feeb96700
+    vtable=0x7ff6396ec148
+    refCount=1
+    numRtv=1
+    rect=3840x2160
+    rtv0 valid
+    format=29
+    dimension=4
+    targetStateLike=true
+
+id=2
+    object=0x22feeb967c0
+    vtable=0x7ff6396ec148
+    refCount=1
+    numRtv=1
+    rect=1920x1088
+    rtv0 valid
+    format=29
+    dimension=4
+    targetStateLike=true
+~~~
+
+The same wrapper also creates valid multi-RTV states:
+
+~~~text
+numRtv=6
+rect sequence includes:
+    256x256
+    128x128
+    64x64
+    32x32
+    16x16
+vtable=exact TargetState vtable
+refCount=1
+valid RTV / Texture objects
+~~~
+
+This upgrades the classification from:
+
+~~~text
+TargetState creator candidate
+~~~
+
+to:
+
+~~~text
+proven RE4 TargetState allocation/construction wrapper
+~~~
+
+for the exact validated RE4 image.
+
+### 34.2 Existing SDK ABI matches the proven wrapper
+
+The existing SDK abstraction in shared/sdk/Renderer.cpp is already:
+
+~~~cpp
+TargetState* (*)(void*, TargetState::Desc*)
+~~~
+
+and invokes the resolved function as:
+
+~~~cpp
+fn(nullptr, desc)
+~~~
+
+The exact RE4 body is compatible with this contract.
+
+Proven local dataflow:
+
+~~~asm
+MOV RDI, RDX          ; preserve incoming Desc*
+MOV ECX, 1
+MOV EDX, 0xA8
+CALL re4+0x3AB27F0   ; allocation
+
+MOV RBX, RAX
+TEST RAX, RAX
+JZ failure
+
+MOV RDX, RDI          ; original Desc*
+MOV RCX, RAX          ; new TargetState
+CALL re4+0x446E790   ; initializer
+
+LEA RAX, TargetState_vtable
+MOV [RBX], RAX
+MOV RAX, RBX
+RET
+~~~
+
+The incoming RCX is not consumed before being overwritten for the allocator call.
+
+The incoming RDX is the descriptor pointer used by the initializer.
+
+Therefore, for this exact image:
+
+~~~text
+existing SDK function-pointer type    compatible
+existing fn(nullptr, desc) shape      compatible
+0x47D2180                              production resolver candidate accepted
+~~~
+
+### 34.3 Previous live-pointer correlation requirement is superseded
+
+The creator probe was configured with:
+
+~~~text
+observationLimit=16
+frameLimit=1800
+~~~
+
+All 16 observations were consumed during early initialization.
+
+It then disarmed:
+
+~~~text
+reason=observation budget reached
+observations=16
+frames=1
+~~~
+
+Only afterward did the first live Overlay state become available.
+
+The later:
+
+~~~text
+matchedObservation=false
+structuralMatches=0
+~~~
+
+therefore does not reject 0x47D2180.
+
+More importantly, raw identity between an arbitrary earlier-created TargetState and the later live Overlay TargetState is not required to prove a generic TargetState creation wrapper.
+
+The wrapper itself has already been observed creating fresh objects with:
+
+~~~text
+exact TargetState vtable
+correct TargetState layout
+refCount=1
+valid RTVs
+valid Texture backing
+multiple descriptor shapes
+~~~
+
+Do not spend another capture merely increasing the creator observation budget to chase Overlay object identity.
+
+### 34.4 Direct caller scan result is provenance-only
+
+Static direct CALL-rel32 enumeration reports:
+
+~~~text
+targetRva=0x47D2180
+callerCount=0
+~~~
+
+while runtime calls arrive with caller return RVAs including:
+
+~~~text
+0x4197775
+0x4523F2E
+~~~
+
+This is consistent with indirect dispatch.
+
+That caller-dispatch detail is not required before using the exact validated function RVA through the already-established SDK ABI.
+
+Return to caller reconstruction only if the production resolver behaves unexpectedly.
+
+### 34.5 Important RE4 RTV-array ownership observation
+
+Every captured TargetState uses an RTV array pointer inside the allocated 0xA8 object.
+
+Examples:
+
+~~~text
+id=1
+    object = 0x22feeb96700
+    rtvs   = 0x22feeb96768
+    delta  = +0x68
+
+id=2
+    object = 0x22feeb967c0
+    rtvs   = 0x22feeb96828
+    delta  = +0x68
+
+id=3
+    object = 0x22fee9b6010
+    rtvs   = 0x22fee9b6078
+    delta  = +0x68
+~~~
+
+Thus the constructed RE4 object does not retain Desc::rtvs as its final array pointer.
+
+It materializes/points to internal RTV storage at object+0x68.
+
+This raises a likely later cleanup issue in TargetState::clone():
+
+~~~text
+temporary cloned_desc.rtvs array
+    -> passed to creator
+    -> creator builds internal object storage
+    -> current clone success path does not release temporary array
+~~~
+
+Do not change this ownership behavior in the same commit as the resolver.
+
+First prove the production resolver and OutputHandoff.
+
+Then separately verify AddRef/copy semantics and safely release the temporary caller-owned array if warranted.
+
+### 34.6 Next implementation — promote exact RE4 resolver
+
+PR66 implementation work order:
+
+~~~text
+5864220846
+~~~
+
+Modify only the RE4 path of:
+
+~~~text
+shared/sdk/Renderer.cpp::create_target_state()
+~~~
+
+For the exact RE4 image, resolve:
+
+~~~text
+creator RVA             0x47D2180
+function range          0x47D2180..0x47D21D2
+TargetState vtable RVA  0x7B1C148
+image size              0x0E405000
+PE checksum             0x0DEE3479
+~~~
+
+Validate the already-proven instruction anchors and relative CALL targets.
+
+On any mismatch:
+
+~~~text
+return nullptr
+~~~
+
+For non-RE4 games, preserve the existing generic resolver unchanged.
+
+Do not introduce a dependency from shared/sdk/Renderer.cpp to mods/re4_xess.
+
+### 34.7 Next runtime acceptance
+
+The next capture should validate production flow:
+
+~~~text
+[Renderer][RE4] Found create_target_state via validated RVA 0x47D2180
+TargetState::clone returns distinct state
+new state has one valid RTV
+OutputHandoff prepare succeeds
+OutputHandoff install succeeds
+worker submit succeeds
+hk_xessD3D12Execute first call is reached
+post-present retirement remains correct
+~~~
+
+If a later stage fails, stop at that newly exposed blocker.
+
+Do not return to broad TargetState provenance diagnostics unless the validated resolver itself fails.
+
+---
+
+## 35. Handoff state after creator proof
+
+### Proven
+
+~~~text
+TargetState vtable RVA 0x7B1C148                  proven exact-image anchor
+0x47C3E00                                        destructor/deallocation-side
+0x47D2180 allocation size                       0xA8
+0x47D2180 descriptor input                      RDX
+0x47D2180 initializer object                    RCX=new allocation
+0x47D2180 final vtable                          exact TargetState vtable
+0x47D2180 returned object                       allocation
+0x47D2180 initial refCount                      1
+0x47D2180 output resources                      valid
+0x47D2180 generic TargetState creator wrapper   proven
+existing SDK factory ABI                        compatible
+~~~
+
+### Current task
+
+~~~text
+wire exact-image RE4 create_target_state resolver
+    -> keep fail-closed validation
+    -> leave non-RE4 path unchanged
+    -> validate TargetState::clone
+    -> advance to OutputHandoff
+~~~
+
+### Deferred ownership follow-up
+
+~~~text
+RE4 constructed TargetState rtvs = object + 0x68
+temporary clone-side Desc::rtvs ownership cleanup requires separate proof
+~~~
+
+### Current production blocker
+
+~~~text
+resolver not yet wired
+    -> TargetState::clone still returns no distinct state
+    -> OutputHandoff unavailable
+    -> no XeSS Execute
+~~~
+
+Keep PR66 Draft and unmerged.
+
+
+---
+
+## 36. PR66 14:57 runtime — production XeSS/OptiScaler path reached
+
+Latest paired runtime evidence:
+
+~~~text
+REFramework:
+    file: re2_framework_log(20260928-055958).txt
+    commit: 088fdbbedff9bf59bcf56618e725fefc1a07a5da
+    branch: feature/re4-xess-load-state-accessor-diagnostic
+    build date/time: 2026-09-28 14:57
+
+OptiScaler:
+    file: OptiScaler(1).log
+    version: 10.0.0-dev
+    commit: 44cfee4d
+~~~
+
+The current remote PR66 implementation subsequently advanced to:
+
+~~~text
+1d9bb7774d9c05c33bce45842d1e8cf225638c4d
+~~~
+
+and contains the exact-image RE4 TargetState resolver exercised by this capture.
+
+### 36.1 Exact RE4 create_target_state resolver is runtime-proven
+
+The runtime reports:
+
+~~~text
+Searching for create_target_state
+[Renderer][RE4] Found create_target_state via validated RVA 0x47d2180
+~~~
+
+The first handoff immediately proceeds to:
+
+~~~text
+cloned display handoff TargetState
+worker submit
+bridge initialization
+xessD3D12Execute result=SUCCESS
+Overlay handoff install
+post-Overlay handoff confirmation
+downstream retirement marker
+~~~
+
+Concrete first accepted frame:
+
+~~~text
+frame=6423
+input=1969x1107
+output=2560x1440
+resetHistory=true
+beforeState=COMMON
+afterState=0xC0
+result=SUCCESS
+~~~
+
+The installed handoff is a display-resolution engine-visible TargetState and remains installed through the post-Overlay observation.
+
+This closes the previous TargetState production blocker.
+
+Current status:
+
+~~~text
+create_render_target_view                  proven
+create_texture                             proven
+create_target_state RVA 0x47D2180          proven production resolver
+TargetState::clone                         proven
+display-resolution cloned output           proven
+worker submit                              proven
+public xessD3D12Execute                    proven
+Overlay install                            proven
+post-Overlay survival                      proven
+downstream post-Present marker             proven
+~~~
+
+### 36.2 Stock OptiScaler public-XeSS interception is runtime-proven
+
+The paired OptiScaler log shows the REFramework producer entering the stock public XeSS interception path:
+
+~~~text
+hk_xessD3D12CreateContext
+hk_xessGetOptimalInputResolution
+    output=2560x1440
+    optimal input=1969x1107
+hk_xessD3D12Init
+hk_xessSetVelocityScale
+    x=984.5
+    y=-553.5
+hk_xessD3D12Execute
+~~~
+
+During evaluation, OptiScaler reports all required temporal inputs:
+
+~~~text
+Color exist
+MotionVectors exist
+Output exist
+Depth exist
+Executing!!
+~~~
+
+Therefore the intended high-level bridge contract is now demonstrated in a real run:
+
+~~~text
+RE4
+    -> custom REFramework public XeSS producer
+    -> stock OptiScaler libxess interception
+    -> OptiScaler upscaler feature evaluation
+    -> engine-visible display-resolution TargetState
+    -> native Overlay path
+~~~
+
+No private REF <-> OptiScaler ABI was required.
+
+### 36.3 New timing issue — next pre-Overlay can precede the previous post-Present marker
+
+The first newly exposed handoff issue is callback ordering, not TargetState creation.
+
+Frame 6426:
+
+~~~text
+14:59:23.040 Execute frame=6426 result=SUCCESS
+14:59:23.040 installed handoff
+14:59:23.040 post-Overlay observation confirms handoff
+14:59:23.049 restored handoff without its post-Present marker
+14:59:23.049 Reset reason=output-handoff-unavailable
+14:59:23.062 downstream retirement marker queued value=4
+14:59:23.062 delayed-marker settlement queued
+14:59:23.071 Reset reason=producer-context-unavailable
+~~~
+
+Frame 6429 reproduces the same ordering.
+
+Interpretation:
+
+~~~text
+next pre-Overlay callback
+    can arrive before
+post-Present callback for the previous installed handoff
+~~~
+
+The current OutputHandoff safety behavior itself is correct:
+
+~~~text
+restore original Overlay state
+do not reuse the handoff while marker is pending
+wait for the real post-Present path to signal the downstream fence
+~~~
+
+The problem is severity propagation.
+
+The same-generation MissingMarker state currently becomes owner/context unavailability and forces producer reconfiguration even though the marker arrives only milliseconds later.
+
+### 36.4 MissingMarker must become a transient skipped-frame state
+
+PR66 follow-up work order:
+
+~~~text
+5864421040
+~~~
+
+Required behavior:
+
+~~~text
+same generation + post-Present marker pending
+    -> restore original Overlay state
+    -> no new XeSS submit/install
+    -> no CPU/GPU wait
+    -> preserve worker/XeSS context
+    -> preserve control generation
+    -> invalidate temporal history only
+    -> next accepted frame uses resetHistory=true
+~~~
+
+Do not signal the retirement marker early.
+
+The marker must remain on the real post-Present path.
+
+Do not weaken the current rule that prevents reuse while the previous downstream consumer lifetime is unproven.
+
+Only change the caller's interpretation of:
+
+~~~text
+RetirementStatus::MissingMarker
+~~~
+
+from producer-unavailable/fault severity to transient frame skip.
+
+### 36.5 Sustained execution exposes a new public-XeSS exception
+
+After the path runs successfully for many frames, the worker reports:
+
+~~~text
+14:59:24.915
+[RE4XeSS][Worker] RE4XeSS worker terminated an operation after an unhandled exception
+[RE4XeSS][Failure] output handoff quarantined: Unknown exception in the RE4XeSS worker
+[RE4XeSS][Reset] reason=xess-execute-fault
+~~~
+
+The paired OptiScaler log immediately before that point reports:
+
+~~~text
+14:59:24.914708 hk_xessD3D12Execute
+14:59:24.914778 XeSSFeatureDx12::EvaluateInternal
+14:59:24.914784 Input Resolution: 1969x1107
+14:59:24.914788 Color exist
+14:59:24.914794 MotionVectors exist
+14:59:24.914799 Output exist
+14:59:24.914803 Depth exist
+14:59:24.914824 Executing!!
+~~~
+
+The temporal correlation strongly narrows the failure to:
+
+~~~text
+public xessD3D12Execute interception/evaluation
+or immediately beneath that call
+~~~
+
+It does not yet prove which OptiScaler/XeSS backend component throws.
+
+No backend-specific root cause should be claimed from this capture alone.
+
+### 36.6 Current exception handling is safe but too coarse
+
+Current worker architecture catches the exception outside the complete request:
+
+~~~text
+process_request()
+    -> process_submit()
+        -> RE4XeSSD3D12::submit()
+            -> record_and_submit()
+                -> RE4XeSSRuntime::execute()
+                    -> m_functions.d3d12_execute(...)
+~~~
+
+An unknown exception therefore reaches the outer worker catch.
+
+The outer catch safely:
+
+~~~text
+marks terminal fault
+quarantines bridge
+quarantines runtime
+quarantines output handoff
+does not attempt unsafe recovery
+~~~
+
+Keep that fail-closed behavior.
+
+The next diagnostic must move the observation boundary closer to the exact public API call.
+
+Add bounded:
+
+~~~text
+api-enter
+api-return
+api-threw-std-exception
+api-threw-unknown
+~~~
+
+metadata around:
+
+~~~cpp
+m_functions.d3d12_execute(...)
+~~~
+
+including:
+
+~~~text
+frame
+slot
+submission sequence
+worker thread
+control generation
+device-reset generation
+command list
+Color
+Depth
+converted MV
+Output
+input/output extents
+resetHistory
+~~~
+
+If the public call throws, do not continue recording/close/submit the current command list as if the API completed.
+
+Keep the generation quarantined.
+
+Do not add same-process automatic retry in this diagnostic step.
+
+### 36.7 Retire completed TargetState discovery probes from the normal path
+
+The exact production resolver no longer depends on:
+
+~~~text
+full RUNTIME_FUNCTION TargetState-vtable xref scan
+early TargetStateCreatorProbe hooks
+old provider-return probes
+~~~
+
+The latest startup still scans approximately:
+
+~~~text
+508868 RUNTIME_FUNCTION entries
+~~~
+
+and arms creator hooks despite the factory already being proven and productionized.
+
+Remove these heavy diagnostics from the normal RE4 XeSS startup path or require an explicit diagnostic/debug opt-in.
+
+Keep the exact-image resolver validation in shared/sdk/Renderer.cpp.
+
+This is cleanup/isolation, not a change to the proven factory contract.
+
+### 36.8 Clone temporary RTV ownership remains deferred
+
+The successful handoff run demonstrates that the constructed cloned TargetState and its native resource survive repeated use.
+
+Earlier evidence still shows:
+
+~~~text
+TargetState::Desc::rtvs == object + 0x68
+~~~
+
+for RE4 constructed states.
+
+The temporary clone-side Desc::rtvs allocation may therefore be releasable after construction, but do not combine that ownership change with the current marker/exception stabilization.
+
+Validate ownership separately after the live producer path is stable.
+
+---
+
+## 37. Handoff state after first end-to-end producer execution
+
+### Proven end-to-end
+
+~~~text
+semantic Color / Depth / Velocity inputs             proven
+public XeSS context/init                             proven
+validated RE4 TargetState creator                    proven
+display-resolution cloned TargetState                proven
+worker-side XeSS command recording                   proven
+stock OptiScaler hk_xessD3D12Execute                 proven
+OptiScaler sees Color/MV/Depth/Output                 proven
+XeSS Execute success                                 proven repeatedly
+engine-visible Overlay install                       proven
+post-Overlay handoff survival                        proven
+downstream retirement marker                         proven
+~~~
+
+### Current stabilization tasks
+
+~~~text
+1. treat same-generation MissingMarker as transient skip
+   without XeSS context/bridge reconfiguration
+
+2. localize the synchronous exception at/under
+   public xessD3D12Execute while preserving quarantine safety
+
+3. retire completed TargetState discovery probes
+   from normal startup
+~~~
+
+### Current production blocker
+
+~~~text
+TargetState creation is no longer the blocker.
+
+Current blocker:
+    sustained public XeSS execution eventually throws an unknown exception
+    -> worker terminal quarantine
+    -> producer stops
+~~~
+
+### Not yet ready
+
+~~~text
+long-duration SR stability                 not proven
+mode-change stability after live Execute   not proven
+XeFG validation                            not started for this production path
+clone temporary-array ownership cleanup    deferred
+~~~
+
+Do not start XeFG validation until the SR/output-handoff path survives sustained execution without terminal quarantine.
+
+Keep PR66 Draft and unmerged.
+
+
+---
+
+## 38. PR66 15:17 runtime — public XeSS exception boundary proven
+
+Latest paired capture:
+
+~~~text
+REFramework:
+    file: re2_framework_log(20260928-062039).txt
+    stamped commit: 23550b91e80c4361e733788a8610ac74c4fbfa9a
+    branch: feature/re4-xess-load-state-accessor-diagnostic
+    build time: 2026-09-28 15:17
+
+OptiScaler:
+    file: OptiScaler(2).log
+    version: 10.0.0-dev
+    commit: 44cfee4d
+~~~
+
+Current remote PR66 head at analysis time:
+
+~~~text
+5cd612303ee9e9efe778f4cf47913fde66aa7ff9
+Handle delayed XeSS retirement and execute faults
+~~~
+
+PR66 follow-up work order:
+
+~~~text
+5864651645
+~~~
+
+### 38.1 Previous delayed-marker context churn is no longer reproduced
+
+The run repeatedly reaches:
+
+~~~text
+restored handoff without its post-Present marker
+queued delayed-marker settlement
+same control generation continues
+next XeSS submit succeeds
+resumed handoff after marker settlement
+~~~
+
+Example:
+
+~~~text
+frame 6040:
+    marker missing at restore
+    delayed marker value=25 settles
+
+frame 6041:
+    controlGeneration=1
+    resetGeneration=0
+    same output generation
+    api-return result=0
+    Execute result=SUCCESS
+    handoff resumes
+~~~
+
+The capture contains no:
+
+~~~text
+output-handoff-unavailable
+producer-context-unavailable
+~~~
+
+reset cascade.
+
+This is the intended operational result.
+
+The explicit WaitingForPostPresentMarker branch is still retained as the fail-safe for a longer scheduling delay.
+
+In this capture, marker settlement occurred between restore and prepare, so that explicit wait branch was not itself exercised.
+
+Do not make further lifecycle changes from this capture.
+
+### 38.2 Execute-boundary diagnostics now prove the exception is inside the public call
+
+The first producer submission:
+
+~~~text
+frame=6016
+slot=0
+submission=1
+input=853x480
+output=2560x1440
+resetHistory=true
+api-enter
+api-return result=0
+Execute result=SUCCESS
+~~~
+
+The run continues successfully through repeated submissions.
+
+The terminal failure is:
+
+~~~text
+frame=6216
+slot=0
+submission=201
+workerThread=18040
+controlGeneration=1
+resetGeneration=0
+commandList=0x1b2109107b0
+color=0x1b1724915a0
+depth=0x1b172493250
+convertedMV=0x1b21090fd10
+originalMV=0x1b172496220
+output=0x1b16bb21650
+input=853x480
+outputExtent=2560x1440
+resetHistory=false
+api-exception kind=unknown
+~~~
+
+Critically:
+
+~~~text
+api-enter exists
+api-return does not exist
+api-exception follows immediately
+~~~
+
+Therefore the exception escapes directly from:
+
+~~~cpp
+m_functions.d3d12_execute(m_context, command_list, &params)
+~~~
+
+and is not caused by REFramework work after the call.
+
+The following stages are excluded for this failure:
+
+~~~text
+restore-velocity ResourceBarrier
+output-finish ResourceBarrier
+GraphicsCommandList::Close
+ExecuteCommandLists
+CommandQueue::Signal
+~~~
+
+### 38.3 Paired OptiScaler log narrows the failure to its native XeSS backend call
+
+At the same failure timestamp, OptiScaler reports:
+
+~~~text
+15:20:06.266202 hk_xessD3D12Execute
+15:20:06.266234 NVSDK_NGX_D3D12_EvaluateFeature
+15:20:06.266272 XeSSFeatureDx12::EvaluateInternal
+15:20:06.266278 Input Resolution: 853x480
+15:20:06.266283 Color exist
+15:20:06.266290 MotionVectors exist
+15:20:06.266295 Output exist
+15:20:06.266299 Depth exist
+15:20:06.266304 AutoExposure enabled
+15:20:06.266321 Executing!!
+~~~
+
+No normal OptiScaler XeSS error-result log follows.
+
+At OptiScaler commit 44cfee4d, this log occurs immediately before:
+
+~~~cpp
+xessResult = XeSSProxy::D3D12Execute()(_xessContext, InCommandList, &params);
+~~~
+
+Therefore the current strongest boundary is:
+
+~~~text
+REFramework public xessD3D12Execute call
+    -> OptiScaler hk_xessD3D12Execute
+        -> NVSDK_NGX_D3D12_EvaluateFeature
+            -> XeSSFeatureDx12::EvaluateInternal
+                -> XeSSProxy::D3D12Execute
+                    -> exception escapes before normal return
+~~~
+
+This still does not identify which binary owns the faulting instruction.
+
+Possible owners remain:
+
+~~~text
+OptiScaler glue
+native Intel XeSS
+graphics driver
+another dependency reached by native XeSS
+~~~
+
+Do not assign root cause until the exception address/module is captured.
+
+### 38.4 Cross-run timing suggests a repeatable ~2-second / ~200-submit failure
+
+Previous capture:
+
+~~~text
+mode: Ultra Quality
+input: 1969x1107
+first successful Execute: 14:59:22.858
+unknown exception:        14:59:24.915
+elapsed:                  ~2.06 s
+~~~
+
+Current capture:
+
+~~~text
+mode: Ultra Performance
+input: 853x480
+first Execute api-enter:  15:20:04.148
+unknown exception:        15:20:06.266
+elapsed:                  ~2.12 s
+failing submission:       201
+~~~
+
+This is a strong reproducibility clue.
+
+It lowers the likelihood that the failure is specific to one XeSS quality mode or one input resolution.
+
+Do not add a frame-count or time-based workaround.
+
+### 38.5 Next diagnostic target — native exception identity
+
+The current kind=unknown classification is no longer sufficient.
+
+The next PR66 diagnostic must capture, without swallowing or translating the exception:
+
+~~~text
+exception code
+ExceptionAddress
+ContextRecord RIP
+faulting module
+module RVA
+ExceptionFlags
+NumberParameters
+~~~
+
+For access violation:
+
+~~~text
+ExceptionInformation[0] = read/write/execute
+ExceptionInformation[1] = target virtual address
+~~~
+
+Implementation boundary:
+
+~~~text
+m_functions.d3d12_execute(...)
+~~~
+
+Use a narrow Windows/MSVC-only observation filter.
+
+Requirements:
+
+~~~text
+no process-wide VEH
+no worker-wide _set_se_translator
+no recovery
+no retry
+no logging/allocation from inside the filter
+copy POD only
+return EXCEPTION_CONTINUE_SEARCH
+log captured information from the existing catch path
+~~~
+
+The existing outer worker quarantine remains the final safety net.
+
+### 38.6 Remaining CreateRenderTargetViewProbe should leave normal production execution
+
+The TargetState/xref/creator diagnostics are absent from this capture and are no longer normal-path dependencies.
+
+However, CreateRenderTargetViewProbe still arms and produces captures.
+
+Its production questions are already closed:
+
+~~~text
+RE4 RTV factory             proven
+R11G11B10_FLOAT RTV         proven
+TargetState clone           proven
+display handoff output      proven
+repeated live use           proven
+~~~
+
+The normal pre-Overlay call to:
+
+~~~cpp
+CreateRenderTargetViewProbe::instance().ensure(...)
+~~~
+
+is diagnostic-only and its result is ignored.
+
+Remove it from the normal path or require an explicit diagnostic opt-in.
+
+Do not modify the actual create_render_target_view resolver.
+
+### 38.7 Current safety behavior remains correct
+
+If the public call throws:
+
+~~~text
+do not continue command recording
+do not close the interrupted list
+do not submit it
+do not signal its fence
+quarantine bridge
+quarantine XeSS runtime
+quarantine output handoff
+do not wait
+do not retry same context
+~~~
+
+Current PR66 behavior already follows this policy.
+
+---
+
+## 39. Handoff state after exact execute-boundary localization
+
+### Proven
+
+~~~text
+TargetState factory/resolver                         proven
+TargetState clone / OutputHandoff                    proven
+stock OptiScaler public-XeSS interception            proven
+repeated public XeSS success                         proven
+same-generation delayed marker recovery              operationally proven
+exception occurs inside public xessD3D12Execute      proven
+OptiScaler reaches native XeSS backend call          proven
+post-call REFramework D3D12 stages not at fault      proven for terminal exception
+~~~
+
+### Current single diagnostic objective
+
+~~~text
+capture native exception code + faulting address/module/RVA
+~~~
+
+### Current production blocker
+
+~~~text
+sustained public XeSS execution
+    -> approximately 2.1 seconds / approximately 200 submits
+    -> exception escapes native backend path
+    -> terminal quarantine
+~~~
+
+### Deferred
+
+~~~text
+automatic recovery after exception       deferred
+clone temporary RTV-array cleanup        deferred
+XeFG production validation               deferred
+~~~
+
+Do not begin XeFG validation until sustained SR survives beyond the reproducible failure window.
+
+Keep PR66 Draft and unmerged.
+
+
+---
+
+## 40. PR66 native exception identity — 2026-09-28 16:10 paired capture
+
+This section **supersedes the faulting-module-unknown checkpoint in Sections 38–39**.
+The earlier observations remain valid historical evidence, but the 16:10 capture
+establishes the faulting instruction's module and the native exception identity.
+
+Paired logs:
+
+~~~text
+REFramework:
+    re2_framework_log(20260928-071122).txt
+    reported source stamp: fa05355903a1b9e9e16b5e45c5c28feb0512a96b
+    branch: feature/re4-xess-load-state-accessor-diagnostic
+    build time: 2026-09-28 15:37
+
+OptiScaler:
+    OptiScaler(3).log
+    v10.0.0-dev, commit 44cfee4d
+    binary build: 20260926_090919
+~~~
+
+PR66 HEAD at review:
+
+~~~text
+75c93f2374254e7b91d59df73a78d6ad41ded9d1
+Capture native XeSS execute exceptions
+~~~
+
+The runtime has the narrow native SEH diagnostics introduced in that HEAD, while
+the file's reported source stamp predates it. Record the discrepancy; do not
+treat the logged stamp alone as proof of the executable's precise source commit.
+
+PR66 next-step work order:
+
+~~~text
+5865230623
+~~~
+
+### 40.1 Fault is an access violation at a game-directory OptiScaler-proxy instruction
+
+Exact REFramework failure:
+
+~~~text
+16:10:50.150
+[RE4XeSS][Execute] native-exception
+frame=8343
+workerThread=12256
+controlGeneration=1
+resetGeneration=0
+slot=7
+submission=200
+commandList=0x1e3b9503840
+color=0x1e2ef06c8a0
+depth=0x1e2ef06a260
+convertedMV=0x1e3914110f0
+originalMV=0x1e2ef071520
+output=0x1e2d95a2b90
+input=853x480
+outputExtent=2560x1440
+resetHistory=false
+code=0xc0000005
+ExceptionAddress=0x7ffda8e0256f
+Rip=0x7ffda8e0256f
+module=E:\SteamLibrary\steamapps\common\RESIDENT EVIL 4  BIOHAZARD RE4\dxgi.dll
+moduleRVA=0x21256f
+ExceptionFlags=0x0
+NumberParameters=2
+accessKind=write
+targetAddress=0xc
+~~~
+
+Immediate aftermath:
+
+~~~text
+api-exception kind=unknown
+worker unhandled exception
+output handoff quarantined
+reason=xess-execute-fault
+reason=producer-faulted
+reason=worker-control-fault
+~~~
+
+This is a Windows access violation attempting to write address 0xC, i.e.
+a near-null write.
+
+The reported module is the **game-directory** dxgi.dll, not
+C:\Windows\System32\dxgi.dll and not libxess.dll.
+
+The paired OptiScaler log independently records:
+
+~~~text
+CheckWorkingMode OptiScaler working as dxgi.dll, system dll loaded
+~~~
+
+Thus the faulting **instruction** is in the OptiScaler DXGI proxy image.
+
+This does **not** yet prove where the bad pointer originated or which source
+component owns the underlying defect. The instruction may run in response to
+an invalid argument, a stale object, or an internally generated invalid state.
+
+The next action must map the *exact locally used* dxgi.dll image at RVA 0x21256f
+to its containing function, instruction operand, and callers.
+
+### 40.2 Paired OptiScaler trace stops at the intercepted XeSS evaluation boundary
+
+Last visible paired OptiScaler trace:
+
+~~~text
+16:10:50.141073 MenuHdrCheck Output HDR: false, UI Mode: LinearHDR
+16:10:50.141073+ hk_xessD3D12Execute
+16:10:50.141115 NVSDK_NGX_D3D12_EvaluateFeature
+16:10:50.141162 XeSSFeatureDx12::EvaluateInternal
+16:10:50.141171 Input Resolution: 853x480
+16:10:50.141176 Color exist
+16:10:50.141185 MotionVectors exist
+16:10:50.141191 Output exist
+16:10:50.141198 Depth exist
+16:10:50.141204 AutoExposure enabled
+16:10:50.141225 Executing!!
+16:10:50.150    REFramework native exception, dxgi.dll+0x21256f
+~~~
+
+At OptiScaler commit 44cfee4d, the Executing!! log immediately precedes:
+
+~~~cpp
+xessResult = XeSSProxy::D3D12Execute()(_xessContext, InCommandList, &params);
+~~~
+
+However, the last printed stage is **not** a faulting-instruction stack trace.
+Do not conclude from it that Intel's native XeSS DLL contains the fault.
+
+The faulting RIP is in the game-directory OptiScaler dxgi.dll. A debugger or
+exact-binary symbol/disassembly mapping is required to learn how control
+returned/re-entered that module.
+
+An OptiInput/Menu reentry also appears at 16:10:50.128, immediately preceding
+the last visible XeSS evaluation, but temporal proximity alone does not
+establish causality; do not modify overlay or input hooks from this observation.
+
+### 40.3 Failure timing recurs across three captures, but is not a fixed-count proof
+
+~~~text
+Capture 1 / 14:59 / Ultra Quality / 1969x1107:
+    first successful Execute: 14:59:22.858
+    terminal exception:        14:59:24.915
+    elapsed:                   ~2.06 s
+    submission:                not instrumented
+
+Capture 2 / 15:20 / Ultra Performance / 853x480:
+    first api-enter:           15:20:04.148
+    terminal exception:        15:20:06.266
+    elapsed:                   ~2.12 s
+    failing submission:        201
+
+Capture 3 / 16:10 / Ultra Performance / 853x480:
+    first api-enter:           16:10:48.041
+    terminal exception:        16:10:50.150
+    elapsed:                   ~2.11 s
+    failing submission:        200
+~~~
+
+This is a strong timing/submission reproducibility clue, not proof of
+a literal 200-frame trigger or of a specific backend implementation bug.
+
+Do not introduce frame-count workarounds or change XeSS temporal logic based on
+the timing alone.
+
+### 40.4 Cleanup and lifecycle checks in the new run
+
+The commit associated with the runtime removes the normal-path call to:
+
+~~~cpp
+CreateRenderTargetViewProbe::instance().ensure(...)
+~~~
+
+The REFramework log contains no:
+
+~~~text
+[RE4XeSS][RTVProbe]
+[RE4XeSS][TargetStateCreatorProbe]
+[RE4XeSS][TargetStateVtableProbe]
+~~~
+
+This meets the immediate goal of removing historical diagnostic hook activity
+from the normal producer execution path; it is not a standalone performance
+claim.
+
+Delayed post-Present markers are still recorded, including:
+
+~~~text
+frame 8143 -> delayed settlement value 1
+frame 8216 -> delayed settlement value 73
+frame 8290 -> delayed settlement value 147
+~~~
+
+The capture has no observed output-handoff-unavailable or
+producer-context-unavailable cascade before the terminal native exception.
+
+The producer continues on the same control/device-reset generation until
+the exception.
+
+The fault then correctly triggers terminal quarantine. Subsequent quality
+changes do not silently recreate the uncertain generation.
+
+### 40.5 Required next investigation: exact-image symbolization / original exception context
+
+Investigate the exact file used during capture:
+
+~~~text
+E:\SteamLibrary\steamapps\common\RESIDENT EVIL 4  BIOHAZARD RE4\dxgi.dll
+OptiScaler 44cfee4d / build 20260926_090919
+RVA 0x21256f
+~~~
+
+Resolve with the matching PDB/build map, or disassemble that exact binary:
+
+~~~text
+containing function/source line if symbols available
+faulting instruction and operand
+register/pointer producing the write to 0xC
+call-site chain, including whether control passed through a XeSS callback
+object lifetime at the failure
+~~~
+
+A debugger first-chance exception context/stack before C++ unwinding is the
+preferred additional artifact.
+
+If symbols and debugger are unavailable, an optional tightly bounded change
+may copy the key integer registers from ContextRecord to an existing POD
+observation inside the *already installed narrow SEH filter*; log only after
+entering the outer C++ catch. No broad exception handler is justified.
+
+Do not use an RVA from another OptiScaler build to label this one.
+
+Do not make speculative changes to:
+
+~~~text
+Color/Depth/Velocity resource barriers
+TargetState construction
+OutputHandoff retirement
+XeSS worker thread ownership
+OptiScaler selection/routing
+XeFG or D3D12Hook lifecycle
+~~~
+
+Do not add a private REF–OptiScaler interface.
+
+The faulting *module* is now attributed to the OptiScaler proxy, but
+the *root cause and correct ownership of a source change* remain unproven.
+If symbolization points to an OptiScaler function, investigate the smallest
+appropriate upstream/fork fix separately, retaining unmodified stock
+OptiScaler as the production integration target.
+
+---
+
+## 41. Current RE4 XeSS production handoff after first native AV attribution
+
+~~~text
+TargetState factory / cloning            PROVEN
+public XeSS / stock OptiScaler routing   PROVEN
+engine-visible OutputHandoff             PROVEN
+delayed-marker same-generation recovery  OBSERVED
+historical RTV diagnostic removal        VERIFIED IN LOG
+native exception identity                0xC0000005 write to 0xC
+faulting instruction's module            game-directory OptiScaler dxgi.dll
+faulting instruction RVA                 0x21256f
+faulting source function / pointer origin UNKNOWN
+sustained XeSS SR stability              BLOCKED
+XeFG validation                          DEFERRED
+~~~
+
+Next mandatory acceptance:
+
+~~~text
+map exact dxgi.dll+0x21256f instruction/callers
+establish bad-pointer provenance before any behavioral fix
+retain terminal fail-closed quarantine
+validate a justified change with >300 successful XeSS submissions
+~~~
+
+Keep PR66 Draft, Open, and unmerged.
+
+
+---
+
+## 42. PR66 quality-transition OutputHandoff checkpoint — 2026-09-28 16:24
+
+This supersedes the immediate next-task ordering in Section 41, **not** its historical OptiScaler native AV evidence.
+
+Paired capture: REFramework re2_framework_log(20260928-072521).txt (reported build 15:37 / stamped fa05355903a1b9e9e16b5e45c5c28feb0512a96b) and OptiScaler(4).log (44cfee4d). Current PR66 code at review: 425bcb7419619674a8d2fac405d155d1d89c1728. The logged source stamp does not reliably identify all local changes.
+
+Evidence:
+
+~~~text
+16:24:53.544  last successful public XeSS API return, frame 7374, submission 118
+16:24:53.552  requested mode Quality -> Ultra Quality, control generation change
+16:24:53.599  OutputHandoff restore quarantines: unexpected Overlay TargetState
+16:24:53.632  mode-change reset follows
+~~~
+
+118 api-enter and 118 api-return result=0; no native-exception or api-exception. The same OutputHandoff quarantine line then repeats 2,192 times until 16:25:07.881. OptiScaler stops receiving new XeSS Execute requests at the last accepted frame. Earlier delayed post-Present markers still settle.
+
+Source predicate: RE4XeSSOutputHandoff::restore() sees the same Overlay layer but a main TargetState that is neither the installed handoff nor its saved original. The actual third pointer and owner were not logged. request_mode() changes mode/control generation but does not itself assign Overlay main state. Restore precedes retirement/control dispatch, so this failure prevents ordinary mode-change service.
+
+PR66 work-order comment **5865417657**: add first-failure pointer/Overlay identity, saved/handoff/template state, installed frame, control/device generation and marker-retirement state; bracket the mode request and next pre-Overlay restore with bounded telemetry; suppress repeat logging while keeping quarantine intact. Do not replace the unknown third state, clear installed bookkeeping, release retained output, or synthesize downstream lifetime completion.
+
+This is a separate **quality-change OutputHandoff ownership blocker**, observed at 118 successful submits before the independently unresolved approximately 200-submission OptiScaler dxgi.dll+0x21256f native write AV.
+
+### Current handoff
+
+~~~text
+TargetState creator/clone and public XeSS interception     proven
+Quality -> Ultra Quality transition                        blocked on third TargetState
+Mode-change failure spam                                   2,192 repeats
+Third pointer/write ownership                              unknown
+OptiScaler native AV                                       not encountered in this run; still unresolved
+XeFG validation                                            deferred
+~~~
+
+Next: classify the third pointer from one bounded capture while preserving fail-closed ownership. After quality-transition stability, separately retest sustained >300-submission SR and investigate the exact OptiScaler binary AV. Keep PR66 Draft/Open/unmerged.
+
+
+---
+
+## 43. 16:49 capture — repeated OptiScaler dxgi native AV with first-chance GPRs
+
+This checkpoint follows Section 42. The previous 16:24 quality-transition identity
+failure and this native OptiScaler-proxy AV are independent unresolved tracks.
+The new capture reaches the native AV *before* attempting a live in-flight
+quality-mode change, so it cannot validate the Section 42 fix.
+
+### 43.1 Exact paired inputs
+
+~~~text
+REFramework: re2_framework_log(20260928-075010).txt
+  log stamp:  a9bd0b59cefde15317a774602b14a67548c2145e
+  branch:     feature/re4-xess-load-state-accessor-diagnostic
+  build time: 2026-09-28 11:26
+OptiScaler: OptiScaler(5).log
+  v10.0.0-dev 44cfee4d, built 20260926_090919
+  proxy mode: game-directory dxgi.dll
+PR66 remote HEAD when reviewed:
+  0be6550ddc865dafc09fa3bbb0295a5c530203ed
+PR66 follow-up comment:
+  5865784530
+~~~
+
+Do not equate the logged local hash stamp to the current remote PR66 tree.
+
+### 43.2 Native fault at submission 205, same module/RVA as earlier
+
+~~~text
+first public Execute call     16:49:29.124  frame=7300  submission=1
+last reported native fault    16:49:31.223  frame=7505  submission=205
+workerThread                  16860
+controlGeneration             1
+resetGeneration               0
+slot                          4
+input                         1969x1107
+output                        2560x1440
+resetHistory                  false
+
+ExceptionCode                 0xC0000005
+ExceptionAddress / RIP        0x7ffda6a4256f
+module                        <game directory>\dxgi.dll (OptiScaler proxy)
+moduleRVA                     0x21256f
+accessKind                    write
+targetAddress                 0xc
+GPRValid                      true
+
+RAX                           0x0
+RCX                           0x5cf6782388b50000
+RDX                           0x1f6f8945890
+R8                            0x0
+R9                            0x35094ce0
+R10                           0xec359125e7c0067
+R11                           0x6919c17fb0
+RSP                           0x6919c18200
+RBP                           0x6919c18300
+~~~
+
+The exact OptiScaler proxy module RVA, exception code and near-null
+write target match the prior Section 40 native exception attribution.
+This is a reproducible instruction-location signature.
+
+RAX=0 is *additional context*, not proof of the instruction operand
+or object provenance. Only disassembly of the exact captured dxgi.dll
+can establish whether the failing store is [rax+0xc], another register,
+or an indirect calculation.
+
+First Execute to fault is approximately 2.10 seconds. Similar timing
+across captures is not proof of a 200-submit gate, timer or periodic
+cleanup path.
+
+### 43.3 The 128-line normal Execute budget is not the submit count
+
+~~~text
+REFramework logged api-enter                        128
+REFramework logged api-return result=0              128
+REFramework last normal verbose submission          128
+REFramework terminal exceptional submission         205
+OptiScaler hk_xessD3D12Execute                      205
+OptiScaler XeSSFeatureDx12::EvaluateInternal
+  Executing!!                                       202
+~~~
+
+The source has MAX_EXECUTE_API_LOGS=128; it intentionally omits later
+ordinary api-enter/api-return entries. The terminal submission=205
+is therefore consistent with the OptiScaler 205 intercepts. Do not
+misread the absent 129–204 verbose entries as failed calls, and do
+not claim 205 confirmed successful backend executions.
+
+OptiScaler last Execute/Executing trace is at 16:49:31.221, directly
+before REFramework records the native exception at 16:49:31.223.
+No successful public XeSS result is logged for submission 205.
+
+### 43.4 Other working paths and fail-closed behavior
+
+The observed early installed Overlay identities agree:
+
+~~~text
+Overlay layer             0x1f4e5250800
+installed handoff state   0x1f4e4b453a0
+saved original state      0x1f4ccc98210
+~~~
+
+Delayed downstream-marker settlements occurred for restored frames
+7303, 7381, and 7460 (values 4, 81 and 160, respectively).
+
+This capture shows no Section 42 unexpected third-TargetState error,
+but **does not exercise healthy-generation Quality -> Ultra Quality**:
+it begins Off -> Ultra Quality and later changes quality only *after*
+the native worker exception.
+
+Following the AV:
+
+~~~text
+16:49:31.223 api-exception kind=unknown
+16:49:31.224 worker exception termination
+16:49:31.224 output handoff quarantined once
+16:49:31.233 producer-faulted reset
+16:49:33.876 Ultra Quality -> Balanced, controlGeneration=2
+16:49:35.643 Balanced -> Ultra Quality Plus, controlGeneration=3
+16:49:36.960 Ultra Quality Plus -> Performance, controlGeneration=4
+~~~
+
+Subsequent marker snapshots keep the output generation retained with
+retirementRequested=true and bridgeWriterUncertain=true; the worker
+is not automatically restarted. Avoid claiming the old output has
+retired based solely on markerPending=false or installed=false.
+
+### 43.5 Required next proof and minimal engineering gate
+
+PR66 comment 5865784530 requires:
+
+1. Identify/hash the **actual game-directory** OptiScaler dxgi.dll
+   for the 44cfee4d / 20260926_090919 build.
+2. Disassemble the exact faulting instruction around RVA 0x21256f,
+   with matching symbols or build map when available.
+3. Capture a first-chance stack if available, and trace the producing
+   pointer through OptiScaler, XeSS->NGX translation and incoming
+   REF resource/callback ownership. Do not assign fault causality
+   from module identity alone.
+4. Only then apply the smallest justified patch in the actual
+   owner, if any. The supported contract remains stock OptiScaler.
+5. Separately verify a live healthy-generation Quality ->
+   Ultra Quality mode change for the Section 42 third-state case,
+   then sustained >300-submission XeSS SR for this native AV.
+
+The OptiScaler log also records MenuCommon::Init re-entry around
+16:49:31.204, before the failure; this is **temporal correlation
+only**, not proven causation.
+
+Preserve the current narrow EXCEPTION_CONTINUE_SEARCH observer,
+quarantined GPU-resource lifetimes, public XeSS frontend, no
+direct swapchain output, and unchanged XeFG/D3D12Hook integration.
+Do not add unproven GPU barriers or retries.
+
+---
+
+## 44. Handoff after the 16:49 capture
+
+~~~text
+Engine TargetState creator and normal Overlay handoff    PROVEN
+Public XeSS -> stock OptiScaler                          PROVEN through prior returns
+Last logged normal public Execute                        128
+Last known attempted public Execute                      205 (native AV)
+GPRs of exact faulting context                           CAPTURED
+Exact OptiScaler game-directory fault RVA                0x21256f
+Underlying pointer producer / faulting instruction       NOT YET IDENTIFIED
+Section 42 healthy mode-change identity regression       NOT TESTED HERE
+Sustained XeSS SR beyond ~200 submissions                BLOCKED
+XeFG production validation                               DEFERRED
+~~~
+
+PR66 remains Draft / Open / unmerged.
+
+
+---
+
+## 45. Exact OptiScaler DXGI binary disassembly — internal global slot confirmed
+
+**Supersedes only the “faulting instruction / immediate pointer source UNKNOWN” wording in Sections 43–44.** The earlier 16:49 capture, pending OutputHandoff quality-switch investigation, and sustained-SR blocker remain valid.
+
+Evidence was posted to [PR66 issue comment 5865873929](https://github.com/onehoon/REFramework/pull/66#issuecomment-5865873929) following exact-binary disassembly of the game-directory OptiScaler proxy from the 16:49 paired capture.
+
+### 45.1 Pinned binary identity
+
+~~~text
+File: <RE4 game directory>\dxgi.dll
+SHA-256:
+  60E6FB52F924C1C47ED7ECE4B19B747112FA09C2492F323E558E30957196C2B8
+
+OptiScaler log:
+  v10.0.0-dev
+  commit 44cfee4d
+  build 20260926_090919
+
+PE32+ x64
+Preferred image base: 0x180000000
+SizeOfImage:          0x18AB000
+File size:            25,743,872 bytes
+Debug-directory timestamp: 2026-09-26 09:12:09Z
+~~~
+
+The local analysis did not find a matching PDB alongside the DLL. The local OptiScaler checkout also did not contain the log-reported 44cfee4d revision. **The upstream GitHub commit 44cfee4d436857742a9bf71bbe81396ec9989715 exists**, but its source alone does not prove a newly built PDB matches the captured optimized DLL. Match the PDB GUID/Age (or reproduce the crash using the *new* PDB-matched DLL) before assigning source lines to the original RVA.
+
+### 45.2 Faulting instruction and pointer provenance: proven
+
+Windows exception from the 16:49 capture:
+
+~~~text
+exception code: 0xC0000005
+faulting module RVA: 0x21256F
+first-chance RAX: 0x0
+access: WRITE
+effective address: 0xC
+~~~
+
+The exact file's .pdata places RVA 0x21256F within:
+
+~~~text
+RUNTIME_FUNCTION: [0x2124C0, 0x212949)
+~~~
+
+Disassembly of the **captured file**, not an assumed rebuilt binary:
+
+~~~asm
+; RVA 0x212568, bytes 48 8B 05 49 FC 63 01:
+mov rax, qword ptr [rip+0x163fc49] ; module global at dxgi.dll+0x18521B8
+
+; RVA 0x21256F, bytes 83 48 0C 10:
+or dword ptr [rax+0xC], 0x10
+~~~
+
+With RAX=0, the faulting operand resolves to WRITE 0xC exactly. This eliminates uncertainty over the **faulting instruction and immediate pointer source**.
+
+The pointer was loaded independently from OptiScaler's module-global slot at RVA 0x18521B8, **not directly from incoming RCX/RDX/R8**. However, this observation does **not** establish what owns or initializes that slot, or whether its source state originally came from a REF-provided object/callback.
+
+### 45.3 Static caller and slot writer evidence
+
+~~~text
+immediate direct caller:
+  CALL at dxgi.dll+0x1D1945 -> dxgi.dll+0x2124C0
+
+caller RCX source:
+  separate module-global slot dxgi.dll+0x1845FA8
+
+faulting target pointer source:
+  module-global slot dxgi.dll+0x18521B8
+
+observed static stores to the target global:
+  dxgi.dll+0x20CF06
+  dxgi.dll+0x20CF17
+  dxgi.dll+0x20D6C1
+~~~
+
+These are concrete static program relationships. They do not explain why the target slot is null at submission 205; no valid C++ symbol/ownership label has yet been assigned.
+
+Recommended next evidence:
+
+1. Match the exact captured binary to its original PDB/build map; if absent, fetch upstream source at commit 44cfee4d, build ReleaseDebug and reproduce with the **new matched binary+PDB** (do not symbolicate the old RVA using the new PDB without a match).
+2. In a first-chance debugger session, inspect the target global at +0x18521B8, its stores and the caller at +0x1D1945, and capture the pre-unwind stack and relevant object lifetime.
+3. Determine whether the slot was never initialized, cleared by a teardown/transition, or points to an external object that was invalidated. Do not label any of these alternatives as established yet.
+4. Make only the smallest owner-correct source fix once a responsible source symbol/lifecycle path is proven. Keep stock-OptiScaler public XeSS compatibility as the target.
+
+### 45.4 Scope of next REFramework work
+
+The PR66 code should **not** add a null check, bypass, recovery retry, fabricated XeSS success, D3D12 resource-state change, or output-lifetime relaxation merely to mask this exact OptiScaler-internal dereference.
+
+No REFramework source change, test DLL, code commit, or push was made by the exact-binary analysis step. PR66 remained Draft/Open; head at that checkpoint was 2ae09f78c70a18719d854de2e0ea61fe1c6f09c3.
+
+Maintain these as **two independent pending gates**:
+
+~~~text
+A. sustained public XeSS SR:
+   OptiScaler dxgi.dll+0x21256F
+   0xC0000005 WRITE 0xC
+   internal global +0x18521B8 is null
+   owner/source lifecycle still UNKNOWN
+
+B. live healthy-generation Quality -> Ultra Quality:
+   same-Overlay unexpected third TargetState
+   origin and safe retirement still UNKNOWN
+
+XeFG production validation: DEFERRED
+~~~
+
+
+---
+
+## 46. PR66 paired 00/01 transition instrumentation — 2026-09-28
+
+Follow-up source: [PR66 comment 5866997374](https://github.com/onehoon/REFramework/pull/66#issuecomment-5866997374), paired RE4 captures `ETS2ATS/RE4/ref opti/00` and `01`. Logged build stamps (`REF a9bd0b59`, OptiScaler fork `d7f64081`, `20260928_175724`) are runtime metadata, not verified binary hashes.
+
+`00` remained stable in Balanced: the capture reports 2,656 OptiScaler evaluations and 128 initial successful REF public XeSS Execute returns, with no OutputHandoff mismatch/quarantine/native Execute AV. In `01`, Balanced -> Ultra Quality Plus was requested at 18:03:21.206; the next pre-Overlay restore at 18:03:21.257 observed an unexpected third TargetState on the same Overlay and latched hard quarantine. The last confirmed post-Overlay handoff was frame 8795; the reported cached retirement completion was zero while the last signal was 750. These observations do not identify who wrote the third pointer.
+
+Static audit at PR66 source head `239565e91eb9cd217a290606eede202870356e1b` found the Overlay getter returns a reference to its intrusive TargetState slot (`shared/sdk/Renderer.hpp:468-470`). The two direct REF writes in RE4 XeSS are limited to `RE4XeSSOutputHandoff::restore()` and `install()`; remaining getter uses in the feature path inspect/observe the state. `request_mode()` does not write it. This does not establish whether RE Engine or another module performs the third write. The new bounded transition event includes the exact slot address/offset; a debugger data-write breakpoint and call stack are still required if callback-boundary events do not expose the writer.
+
+PR66 now adds only bounded evidence collection: monotonic transition event sequence/timestamp and mode/device/frame/thread/identity/ownership flags; first-mismatch cached versus actual nonblocking fence completion; and cumulative XeSS success checkpoints at 256, 512, 1024, 2048 and subsequent powers of two, preserving the detailed first 128 calls and bounded per-generation transition detail. It never waits on the GPU or changes handoff ownership, quarantine, markers, or resource pins.
+
+~~~text
+Balanced steady-state (>300 REF XeSS success returns)       NOT YET VALIDATED
+Balanced -> Ultra Quality Plus writer attribution           UNKNOWN
+TargetState owner-correct fix                                NOT APPLIED (evidence insufficient)
+Quarantine safety                                            PRESERVED
+Off/On and Load Save after transition                        NOT YET VALIDATED
+PR66                                                        Draft / Open / unmerged
+~~~
+
+The local test bundle `artifacts/pr66-output-transition-239565e9/` was built RelWithDebInfo/x64 from base HEAD `239565e91eb9cd217a290606eede202870356e1b` plus uncommitted instrumentation:
+
+~~~text
+dinput8.dll SHA-256  489D8C82F112150919CC4C37BA09B35C09A742F1B40E0BAE27D26A547716C959
+dinput8.pdb SHA-256  F4B6F0EAA1B6D340B6D20107522905D7FD1598767CB81A28AD5C079CDC525FBA
+PDB GUID / Age      {8FC16AE4-E113-459E-A432-DB6E89E9B617} / 2
+Symbol check        PASS (private symbols, line records, globals, type info)
+~~~
+
+The REF embedded stamp identifies only its base commit; use the DLL hash and matching PDB identity as the exact build identity. Next evidence must capture the first TargetState write if callback provenance remains ambiguous. Do not infer success from OptiScaler `Upscaling done` counts, write back/adopt the third object, clear quarantine, synthesize a post-Present marker, or release retained resources early. Keep the OptiScaler native AV investigation independent. The >300-success run, mode transition, Off/On and Load Save sequences are still unvalidated.
+
+## 47. PR66 Phase A lifetime trace — source status, runtime gate pending
+
+PR66 follow-up work order: [comment 5884381727](https://github.com/onehoon/REFramework/pull/66#issuecomment-5884381727). This change implements bounded, read-only Phase A tracing only. It is enabled only for RE4 + D3D12 while REFramework Debug Log is enabled. The trace keeps a fixed 4,096-event ring, emits at most 32 compact dumps, checkpoints every 512 Present callbacks or 1,024 successful submits, and includes anomaly-triggered skip dumps.
+
+Captured identities originate at their owning boundaries and are carried forward: Scene/pre-Overlay/post-Overlay ordinals and overlap epoch; trace, submit, bridge-slot, writer-fence, output-generation and monotonic install IDs; Overlay/TargetState/output identities; Present/Present1 ordinal, swapchain/source, caller/return TIDs, active queue identity/type, original-call timing/result and callback suppression; and downstream marker Signal value plus cached and actual nonblocking fence values. `UINT64_MAX` is recorded as invalid completion/device-removal evidence, never as completion. Successful XeSS submit accounting separates API return, command-list submission, Signal success, and writer-fence completion. `PostOverlayObservation`, Present callback adjacency, timestamps, and a successful Signal explicitly remain **not GPU-reader proof**.
+
+### Gate A status
+
+~~~text
+Source instrumentation/build: implemented; x64 Release build succeeded from base `3291ca246b8eb96f7475183293daea64479269b5` plus this Phase-A source diff; PE machine `0x8664`; `dinput8.dll` SHA-256 `AF5F6977CBEE2B19E22CC7ABB5351C62DAECDAA112149745FA364B61F8F8622C`.
+CTest: no tests are registered in this build tree.
+Matching PDB: not produced by this Release build; the adjacent PDB is older and must not be used to symbolize this DLL.
+Runtime capture with the new trace: pending user RE4 + OptiScaler test.
+Actual RE4 downstream consumer command submissions identified: NOT YET PROVEN.
+Installed output -> consumer submissions -> eligible Present/queue -> its marker: NOT YET PROVEN.
+OutputHandoff reuse policy / quarantine / marker semantics / history invalidation: unchanged.
+Output TargetState ring: NOT IMPLEMENTED; blocked until Gate A passes.
+PR66: Draft / Open / unmerged.
+~~~
+
+The trace deliberately does not install a process-wide `ExecuteCommandLists` hook. Current callback-boundary observations cannot identify which engine command submission actually reads a given output; adding such a hook without a narrower validated RE4 boundary would exceed the evidence and scope. Use the new runtime trace to establish callback/Present/fence order first. If the consumer-to-Present relation remains ambiguous, investigate a bounded RE4-specific read-only submission boundary on this PR; do not infer FIFO use from timestamps and do not change output reuse rules until that relation and queue ordering are proven.
+
+### PR66 quality-transition TargetState chain update (2026-09-30)
+
+PR66 adds bounded, allocation-free history for completed verified RE4 Overlay writer transactions so a `handoff -> A -> B` sequence is reconciled as one causal chain rather than requiring the last transaction alone to clear the original handoff. It requires contiguous observed store sequence, exact Overlay/slot and control/device/mode identity, same writer thread, validated clear/replacement sites, current terminal pointer, and a stable snapshot tied to the live store sequence. The chain is consumed once; overflow, missing/interleaved stores, stale evidence, or any mismatch still quarantines. The engine-installed TargetState is never overwritten and existing writer/downstream fence, retirement, and quarantine behavior is unchanged.
+
+Standalone deterministic writer-chain tests and a local x64 Release build pass. Quality-change runtime validation that XeSS Execute resumes after the chained replacement remains pending; PR66 is still Draft/Open/unmerged. Output-ring and marker-pending behavior are not changed by this update.
+
+## 48. PR66 latest paired runtime status — 2026-09-30 21:04–21:05 KST
+
+This section supersedes the pending-runtime statements in sections 46–47 and the earlier writer-chain checkpoint above where those statements describe current status. It does not rewrite their historical evidence.
+
+### Capture identity and transition result
+
+The tested PR #66 source HEAD was `a5e36fca710042fb366a4833e14c3a9c0c15eb87`, matching the local branch and remote PR HEAD at review. The paired logs are:
+
+~~~text
+build-load-accessor/runtime-test-20260930/re2_framework_log.txt.run1
+build-load-accessor/runtime-test-20260930/OptiScaler.log.run1
+~~~
+
+The PR is Draft/Open/unmerged. Its Build PR check completed successfully in run `36711929572`.
+
+The user changed modes through Off -> Performance -> Balanced -> Ultra Quality Plus -> Performance -> Ultra Quality Plus -> Native AA -> Ultra Performance -> Ultra Quality. REF logged eight `OutputTransition phase=install-complete` records. It accepted two verified `handoff -> A -> B` writer chains, at control generations 2 and 6. Each acceptance matched the same live Overlay and `+0x90` slot, contiguous writer store sequence, expected generation/mode and terminal pointer; REF left the engine's terminal TargetState in the slot and retired only the displaced handoff through existing fence gates. This confirms the chain reconciliation on two observed transitions only; it does not imply every quality transition required or exercised a multi-transaction chain.
+
+OptiScaler logged 1,120 `hk_xessD3D12Execute` entries. REF independently reached `cumulativeSuccess=1024 cumulativeFailure=0` at its Execute checkpoint. These are API invocation/checkpoint totals, not proof of the same number of uninterrupted displayed frames.
+
+### Temporal and OutputHandoff result
+
+The run recorded 921 `output-handoff-marker-pending` history resets and 16 `pre-overlay-temporal-gate-invalid` resets. The marker-pending path continues to skip submissions and invalidate temporal history as designed; these counts represent an outstanding production continuity issue, not a logging-only issue. A sustained low-reset session is not accepted. Controlled Off/On, Load Save, resize/fullscreen, and long-session tests also remain pending.
+
+### Phase A Gate A remains blocked
+
+The latest run exercised the bounded LifetimeTrace, but it still did not establish the causal chain required before changing output reuse policy:
+
+~~~text
+installed output
+    -> actual downstream consumer command submission / queue
+    -> eligible Present on that queue
+    -> marker Signal and fence completion for that output
+~~~
+
+Evidence and diagnostic gap:
+
+- The OutputTransition `post-present-marker-attempt` records still report `frameKnown=false`; there is no explicit frame/install token joining the callback to the installed output.
+- The emitted LifetimeTrace event samples contain `present`, `post-present-callback`, `pre-overlay`, `post-overlay-observation`, and `skip` kinds. No `submit`, `output-install`, or `marker` kind is present in the emitted event records.
+- LifetimeTrace checkpoint summary counters for installed/unmarked outputs, successful submit classes, marker skips/completions, and mapping ambiguities remain zero, while the separate OutputTransition stream records eight completed installs and the regular reset logs record marker-pending skips.
+- Consequently the current capture proves neither downstream consumer submission identity nor which Present/marker retires a particular installed output. Callback adjacency, timestamps, successful XeSS API calls, and a queue Signal are not substitutes for that proof.
+
+This is both a still-unmet correlation gate and a diagnostic coverage discrepancy to resolve in read-only instrumentation. The narrow next step is to make the per-install Submit/OutputInstall/Marker events and summary classification visible and carry an explicit validated install/frame token through the eligible Present and marker path; if that still cannot identify the real consumer submission, investigate a bounded RE4-specific read-only submission boundary. Do not add a process-wide `ExecuteCommandLists` hook without a validated boundary.
+
+### Implementation-order decision
+
+~~~text
+Writer-chain reconciliation       runtime-observed twice; broader matrix pending
+Phase A exact consumer/marker map  NOT PROVEN; instrumentation correlation gap remains
+Phase B bounded output ring        NOT IMPLEMENTED; do not start before Gate A
+Phase C temporal continuity        NOT ACCEPTED; reset churn remains high
+PR66                              Draft / Open / unmerged
+XeFG                              OFF and out of scope for this SR capture
+~~~
+
+## 49. PR66 phase-aware lifetime capture — active gameplay reached, Present ownership still unproven
+
+This section supersedes the Phase-A diagnostic-gap conclusion in §48 for the new paired capture only. It does not alter the historical 21:04–21:05 capture or authorize an OutputHandoff lifetime change.
+
+### Capture identity
+
+~~~text
+RE4 run                    2026-09-30 22:09:29–22:11:51 KST
+REF embedded base          a5e36fca710042fb366a4833e14c3a9c0c15eb87
+REF test DLL SHA-256        3C5CA779B421A6B970A3BD552A354F69BC73908AC0716D1531315A053C91956E
+OptiScaler                  v0.9.5-pre4 / a556a639 / 20260929_135800
+Paired logs                 build-load-accessor/runtime-test-phase-aware-20260930-2211/
+PR66                        Draft / Open / unmerged
+~~~
+
+OptiScaler recorded 817 `hk_xessD3D12Execute` calls and 817 `Upscaling done: true` records. The REF log contains active-phase Submit, OutputInstall, OutputRestore, PostPresentCallback, Marker, Skip and downstream-fence-complete events, with IDs and queue/fence data. Thus the previous “no active dump was emitted” diagnosis is no longer current for this run: the phase-aware capture reached active XeSS gameplay and emitted bounded windows. The earlier 32-dump exhaustion was genuine for the older capture, not evidence that its in-memory recorder had stopped.
+
+At the 22:11:32.577 mode-transition window, active counters were 429 successful submits/installs, 269 successful submissions with `resetHistory`, 160 continuous submissions, 269 skips (264 marker-pending and 5 temporal-gate), and 428 queued markers. These are the counters at that checkpoint, not whole-session frame totals. Across the paired log, the separate visible reset records reached 559 marker-pending and 12 temporal-gate events. The marker-pending path therefore still causes real skipped submissions/history invalidation; this is not just diagnostic noise.
+
+### Observed frame-to-marker sequence
+
+The bounded capture includes an active `frame=31068`, `trace=30677`, `install_id=428` submit/install, followed by a PostPresent callback and queued downstream marker carrying the same `install_id=428`, `present=31066`, and downstream fence value 141. The subsequent `frame=31069` boundary observes fence 141 complete and restores the output before another submit. This is an **inferred candidate** association only: the event explicitly says `marker-queued-different-present-ordinal`, no downstream consumer command submission was observed, and the lifetime trace's active mapping counters remain `proven=0`. A timestamp, callback adjacency, shared install ID, or successful queue Signal does not prove that Present 31066 read output 428.
+
+The first active output also shows the continuity stall directly: after the initial successful install at frame 30370, frame 30371 reaches pre-Overlay while the marker is pending and is skipped; the marker is queued later. The active dump budget preserved the first install/execute, first marker-pending, first queued marker, periodic, and mode-transition windows. Ten window records are present; nine dump windows emitted event lines, one later request was suppressed by the class budget. The capture contains quality/Off transitions while active, but it does not satisfy sustained temporal-continuity acceptance.
+
+### Diagnostic follow-up and gate
+
+The captured build's active window summary did not print the already-maintained `installed_unmarked_high_water` (nor current unmarked/marked-incomplete counts). The follow-up source now includes those three values in each bounded window and the independent one-shot lifecycle summary. This formatting addition has not yet been runtime-captured. The paired REF log also ends without a `[LifetimeTrace] lifecycle-summary` line, so runtime emission of the shutdown summary remains unverified; do not interpret the missing line as zero counters.
+
+The follow-up source and this status update pass `git diff --check`; the standalone lifetime-trace tests and existing writer-chain tests both pass. A new Release x64 `dinput8.dll` is built at `build-load-accessor/bin/REFramework/dinput8.dll`, PE machine `0x8664`, SHA-256 `837D34B8A7025332F6E77F5C2A1D6BAD03EF8C9C6143725F58B8537C35CBC5E0`. It is installed in the RE4 directory after confirming no `re4.exe` was running; the prior phase-aware DLL was preserved as `dinput8.dll.phase-aware-pre-summary-fields-20260930.bak`. Runtime validation of the added counters and normal-exit summary is still pending. Per the test-before-push workflow, this source change has not been committed or pushed yet.
+
+~~~text
+Phase-aware active capture         OBSERVED
+OutputInstall / Restore / Marker   OBSERVED
+Frame N -> N+1 marker-pending     OBSERVED; submission skipped and history invalidated
+Active output high-water printed  PENDING NEXT RUNTIME CAPTURE
+Present -> actual downstream read  NOT PROVEN
+Output -> reader -> Present -> marker -> GPU-complete chain NOT PROVEN
+Bounded output ring               NOT IMPLEMENTED; blocked on ownership proof and overlap evidence
+Temporal continuity               NOT ACCEPTED; marker-pending churn remains
+XeFG                              OFF and out of scope
+~~~
+
+Do not accept a ring design from the candidate mapping above. Next runtime evidence must include the new high-water field and lifecycle summary from a normal game exit (if that shutdown path invokes the Mod destructor), while preserving explicit `unknown / inferred-candidate / proven` labels. If consumer identity is still unknown, continue with a narrowly bounded, read-only RE4 submission-boundary investigation; do not add a process-wide command-list hook or change reuse, marker, fence, quarantine, or history-reset policy.
+
+Do not relax marker-pending behavior, suppress the associated history reset, accept an unverified TargetState, clear quarantine, or release retained output early to improve counters. Output-ring sizing and implementation remain downstream of Gate A evidence. PR66 must stay Draft until the writer-transition and independent lifetime/temporal safety gates pass.
+
+## 51. PR66 paired active capture — 2026-09-30 22:53–22:54 KST
+
+The paired logs are preserved in `build-load-accessor/runtime-test-phase-aware-20260930-2253/`. The run used the delivered PR66 test DLL, and the REF log independently confirms the exact file hash:
+
+~~~text
+REF PR/base stamp         a5e36fca710042fb366a4833e14c3a9c0c15eb87
+REF DLL SHA-256           8C7C37FC58D7D36BB5AB6A409D53F373BCC6E2392543698DE7EB24F5E6CF4CA1
+OptiScaler                v0.9.5-pre4 / a556a639 / 20260929_135800
+OptiScaler XeSS Execute   819; Upscaling done: true 819
+REF log SHA-256           D5368DFBEA6FA935FD584E68273E763677430A2DE41AD6C9289B810ACA50FE52
+OptiScaler log SHA-256    2BE7B9C743A7E4D2AA809922ADD33577E3EF3B9CD91A018745F4D28F8803C37D
+PR66                      Draft / Open / unmerged
+~~~
+
+The runtime identity line exactly matches the delivered DLL SHA. The capture contains active `Submit`, `OutputInstall`, `OutputRestore`, `PostPresentCallback`, `Marker`, `Skip`, and downstream-fence completion events, so phase-aware instrumentation is working in active gameplay. At the 22:54:11.121 checkpoint, the active counters were 530 successful submits/installs, 320 reset-history submits, 210 continuous submits, 318 skips (308 marker-pending and 10 temporal-gate), 529 queued markers, `installedUnmarked=1`, unmarked-output high-water 1, `markedGpuIncomplete=0`, and mapping counts unknown=530 / inferred-candidate=1,058 / proven=0. At the preceding 22:54:05.492 checkpoint, `markedGpuIncomplete=1`. These are checkpoint values, not whole-run final totals. Across the visible REF log, there are 538 `output-handoff-marker-pending` resets and 20 `pre-overlay-temporal-gate-invalid` resets; both are real submission/history disruptions, not log-only counters.
+
+The bounded frame sequence at the end of the active trace demonstrates the exact marker-late ordering:
+
+~~~text
+frame 12393 / trace 11889 / submit 90 -> OutputInstall install 529; writer fence 90
+frame 12394 / trace 11890 enters pre-Overlay
+install 529 restores with reason=restore-marker-pending; frame 12394 skips with output-handoff-marker-pending
+PostPresent callback observes install 529 and Present ordinal 12392
+marker queues downstream fence 90, labeled inferred-candidate / different-present-ordinal
+frame 12395 enters pre-Overlay
+then the trace observes actual downstream GetCompletedValue=90
+~~~
+
+The candidate association is explicit: current bookkeeping associates Present 12392 and fence 90 with `install_id=529`. That does **not** prove Present 12392 submitted or consumed a GPU read of output 529. Producer submit/install and the observed Present/marker carry the same Direct queue identity, and the actual fence completion is distinct from the cached value; however, no downstream reader command submission/resource-use edge is recorded. Therefore the marker can currently certify only completion of work ordered before its Signal on that queue, not that a particular output was read. Gate A remains blocked and no ring/reuse/lifetime change is authorized.
+
+Two first-divergence records were emitted as pending and each resolved to an accepted verified two-transaction engine writer chain (control generations 2 and 8). OptiScaler execute calls continued after each resolution: 622 were logged after the first acceptance and 289 after the second, for 819 total. The run logged no `OutputHandoffMismatch` or `hardQuarantined=true`; this validates the observed chain scenarios only, not every transition. No writer ownership or quarantine rule was relaxed.
+
+The log contains bounded checkpoint summaries but no `[LifetimeTrace] lifecycle-summary`; it also has no `REFramework shutting down...` record, so the `RE4XeSS` destructor summary was not observed. Do not interpret its absence as zero counts. The trace ring had recorded 9,319 active events at the last snapshot and overwritten 5,223; its retained sample is intentionally bounded. The full capture ends with configuration save/cleanup lines, but the available logs do not establish the process-exit mechanism.
+
+~~~text
+Active trace event coverage             PASS
+Runtime REF DLL identity                PASS (embedded SHA matches delivered DLL)
+Verified writer-chain wording/resolution PASS (2 pending -> accepted/resolved)
+Execute resumes after observed chains   PASS (OptiScaler calls continue)
+Marker-pending N -> N+1 skip/reset       CONFIRMED
+Output -> actual downstream reader      NOT PROVEN
+Eligible Present -> exact reader marker NOT PROVEN
+Whole-run final summary/high-water      NOT OBSERVED
+Output ring / lifetime policy change    NOT AUTHORIZED
+Temporal continuity                    NOT ACCEPTED
+~~~
+
+This capture closes the active-event and writer-chain wording runtime checks, but not the consumer ownership proof. Continue with a narrow, read-only downstream submission/resource-use correlation; do not add a process-wide `ExecuteCommandLists` hook, infer ownership from queue identity or callback adjacency, or change marker, fence, reuse, quarantine, or history-reset behavior. Keep PR66 Draft/Open.
+
+## 50. PR66 next paired active capture — Gate A ordering reproduced, ownership still unknown
+
+Capture files preserved under `build-load-accessor/runtime-test-phase-aware-20260930-2225/`.
+
+~~~text
+Run window                 2026-09-30 22:25:24–22:26:25 KST (log timestamps)
+REF embedded base stamp    a5e36fca710042fb366a4833e14c3a9c0c15eb87
+REF DLL identified SHA-256 837D34B8A7025332F6E77F5C2A1D6BAD03EF8C9C6143725F58B8537C35CBC5E0
+OptiScaler                 v0.9.5-pre4 / a556a639 / 20260929_135800
+OptiScaler Execute         986; Upscaling done: true 986
+PR66                       Draft / Open / unmerged
+~~~
+
+The hash above identifies the delivered test artifact correlated with this run; the REF runtime log itself contains the embedded base commit/build stamp, not a self-computed DLL SHA. The next delivery remains separately identified by its artifact SHA before runtime use.
+
+### Active counters and actual frame ordering
+
+The new phase-aware output now contains the previously missing high-water fields. At the last emitted mode-transition snapshot (`22:25:59.855`), LifetimeTrace reports 422 active successful submits/installs, 249 `resetHistory` submits, 173 continuous submits, 248 skips (245 marker-pending and 3 temporal-gate), 422 queued markers, `installedUnmarkedHighWater=1`, `mappingUnknown=422`, `mappingCandidate=844`, and `mappingProven=0`. These are snapshot counters at that timestamp, not a whole-run terminal summary. The full visible REF log contains 577 marker-pending resets and 22 temporal-gate resets; no `[LifetimeTrace] lifecycle-summary` was emitted, so the final session totals/high-water cannot be asserted.
+
+The earliest active sequence establishes the skip ordering without changing policy: `frame=9408 / trace=9005 / install=1` submits and installs; the next `frame=9409 / trace=9006` reaches pre-Overlay, finds the previous output's marker pending, restores only under the existing gate, and skips the submission. Later, PostPresent callback `present=9406` queues a marker for `install=1`, downstream fence 1. A later sample shows the same pattern around frames 10078–10079; actual `GetCompletedValue` is logged separately from the cached completion value. This confirms a real marker-pending skip/reset, but not that Present 9406 consumed output 1: install-time Present identity is unknown and the marker says `different-present-ordinal`.
+
+At the last active snapshot, unmarked-output high-water is one. That is not sufficient to size or authorize a ring because the output-to-reader/Present association remains candidate-only and the final summary is absent. The fixed event store retained 4,096 of 6,559 active events at the last snapshot (2,463 active events overwritten); nine of ten bounded dump windows emitted event lines and one request was suppressed. Active submit/install/marker/skip events are now present, so the former pre-active dump starvation is resolved for this capture.
+
+### Quality transitions and writer-provenance log correction
+
+The run logged eight mode requests and seven new XeSS context/init sequences, including a gameplay Off (`mode token 0`) followed by re-enable. Four quality transitions were accepted as verified `chainLength=2` engine writer replacements. However, each was preceded by an error-level `HandoffProvenance first-divergence; writer=unknown` line, followed by the successful chain acceptance. This is diagnostic severity/causal-reporting noise, not evidence that the accepted transitions failed; the raw pre-acceptance pointer/sample evidence must remain available.
+
+The next narrow diagnostic change will report the initial divergence as pending validation, then emit a sequence-linked resolved record only when the same Overlay, slot, generations, and terminal pointer match an accepted verified writer chain. Unverified third-object restore failures must continue to emit errors and quarantine. No TargetState ownership, writer acceptance, retirement, marker, fence, quarantine, or history-reset policy changes are allowed.
+
+### Gate decision
+
+~~~text
+Phase-aware active capture and bounded windows    PASS
+Frame N -> N+1 marker-pending skip/reset          OBSERVED
+Separate cached vs actual fence completion        OBSERVED
+High-water at emitted checkpoint                 1 (not proven whole-run maximum)
+Verified quality writer chains                   4 accepted; diagnostic wording follow-up needed
+Actual downstream reader -> eligible Present     NOT PROVEN
+Output ring                                       NOT AUTHORIZED / NOT IMPLEMENTED
+Final independent lifecycle summary              NOT OBSERVED in this process log
+Temporal continuity                              NOT ACCEPTED; 577 marker resets / 22 gate resets
+~~~
+
+The post-capture source changes only the pending/resolved provenance wording and sequence link, and adds a one-shot SHA-256 log of the REF module file when RE4 debug logging is enabled. A Release x64 DLL passed local lifetime-trace/writer-chain tests and PE identity validation (`0x8664`), then was installed with the previous DLL backed up after confirming no `re4.exe` was running:
+
+~~~text
+New test DLL SHA-256  8C7C37FC58D7D36BB5AB6A409D53F373BCC6E2392543698DE7EB24F5E6CF4CA1
+Previous DLL SHA-256  837D34B8A7025332F6E77F5C2A1D6BAD03EF8C9C6143725F58B8537C35CBC5E0
+Backup                 dinput8.dll.pre-provenance-resolution-sha-log-20260930.bak
+Runtime validation     PENDING; do not commit/push before reviewing paired logs
+~~~
+
+Keep PR66 Draft and do not change output lifetime rules until the actual reader/queue/Present ownership edge is proven.
+
+## 52. PR66 Overlay callback RenderContext probe — bounded source diagnostics; runtime skipped
+
+The local-only RenderContext probe is retained as a bounded, read-only boundary observation, with its callback stages corrected to match the actual hook control flow. `Hooks.cpp`'s `LAYER_HOOK_BODY` calls every pre-callback, invokes the original layer draw only when all pre-callbacks return true, and then invokes every post-callback regardless. Consequently the second sample is named `post-overlay-callback-original-status-unknown`; it must not be described as “after original draw” unless a separate observation proves that the original call ran.
+
+For each sample, the trace records the immutable `install_id` correlation value, frame and generation, Overlay identity, installed handoff TargetState/resource, borrowed RenderContext identity, its current TargetState/native resource, and the Overlay main TargetState/native resource observed at the same callback boundary. The event includes an explicit stage and separate equality flags for (a) the installed output and (b) the Overlay main target. `RenderContext::get_render_target()` is the existing SDK accessor reading the current TargetState pointer at `RenderContext + 0x98`; it is sampled synchronously while the hook callback is active. Only opaque `uintptr_t` values are retained; no COM reference is added and no pointer is dereferenced after the callback.
+
+This evidence is intentionally limited to the callback's current render-target state. It does not identify an SRV/descriptor binding, a command list, a downstream reader, or a GPU submission. A match is not a consumer proof; a mismatch does not establish that the installed output was not read later. The existing `install_id` remains a legacy correlation identity used by candidate diagnostics; it is not the reader token. When lifetime tracing is enabled, a separate immutable `output_use_token` is issued in the authoritative OutputInstall event and starts at `consumerEvidence=reader-not-observed` (meaning no reader has yet been observed at install time, not that no later read occurs). A dedicated issuer helper is used by OutputHandoff and deterministic tests: only successful traced installs receive a nonzero token, safe generation retirement clears the active association without resetting the cumulative sequence, and failed or untraced installs do not publish a new token. The token is deliberately not copied to RenderContext, Present, or marker events. No verified reader exists yet to consume/propagate it exactly once.
+
+Capture 30b narrows the next static/runtime boundary to the unique final-window `DrawInstanced(3,1,0,0)` on the last engine DIRECT submission before Present, but the capture did not record the draw's descriptor/SRV resource identity. The repository has no existing command-list identity/SRV observer at that site. The installed executable was read-only identified as RE4 `1.5.9.0`, SHA-256 `A1082B154105FAC7CA22668FFC1C99A8BFC9F1B945439276C556EDEA7597A5B7`; no address-based observer was added. Global D3D12 interception, guessed offsets, and guessed game addresses remain disallowed. The next safe investigation is to locate a specific RE4-owned binding/draw call path for this exact image, or use a narrowly filtered GPU capture that can observe the exact XeSS output resource and its submission; until then the consumer, Present, and marker relationship remains unknown.
+
+The source/build identity and fresh local DLL SHA-256 are recorded in the PR #66 follow-up comment after this diagnostic build. This turn intentionally skipped game execution as requested. The source build and deterministic tests do not satisfy Gate A.
+
+~~~text
+Per-install output-use token issued only at OutputInstall          SOURCE/BUILD/TEST VALIDATED; no reader propagation
+Pre-original callback RenderContext + Overlay-main comparison     SOURCE/BUILD/TEST VALIDATED; game capture skipped
+Post-overlay callback stage semantics                          VALIDATED FROM Hooks.cpp; original-call outcome unknown
+Exact downstream draw/dispatch/copy reading XeSS output       NOT OBSERVED
+Reader command list -> DIRECT queue submission                 NOT PROVEN
+Present -> exact consumer -> marker -> GPU completion           NOT PROVEN
+Output ring / lifetime-policy change                            NOT AUTHORIZED
+Temporal continuity                                             NOT ACCEPTED
+~~~
+
+## 53. PR66 visual-flicker follow-up — frame extent/jitter correlation added; runtime pending
+
+The September 30 paired capture reports visible UI flicker, but contains no pixel/frame evidence that identifies the affected layer. Do not label it a proven RE4 HUD, REF menu, or OptiScaler menu defect. The source does confirm a frame-wide coherency risk: temporal mode can override SceneView to reduced input dimensions and inject/advance jitter before pre-Overlay later skips XeSS output because the single output's post-Present marker is pending. That makes a reduced-resolution/jittered scene without a new XeSS output a plausible visual-flicker contributor; it does not prove which image route or UI layer was presented.
+
+The bounded debug-only LifetimeTrace retains up to eight distinct `scene-view-size` observations for each `(scene frame, control generation, device-reset generation)` key across a fixed eight-slot rotating cache. Exact same-view/same-value repeats are suppressed. A new SceneView identity is retained even when its stable dimensions differ from other views; that is reported separately as `sceneViewCrossIdentityVaried`, not as a same-view temporal conflict. Only a changed observation for an identity already seen in the same key is marked `sceneViewSameIdentityChanged`. Per-key sample overflow is counted separately. Replacing a key in the fixed frame cache is ordinary `sceneViewCacheReplacements`/rotation, not evidence of a lost frame. A separate 16-key tombstone history flags an exact recently evicted key that later re-enters (`sceneViewFrameKeyReentered`); tombstone-history overwrites are counted separately, so reentry detection is explicitly bounded rather than claimed complete. The event contains the getter's native/effective sizes, opaque SceneView identity, separate observation flags, and input/display extents; `scene-frame` contains input/display extents and applied centered-Halton jitter. A pure size-decision helper shared by `on_view_get_size()` and deterministic tests verifies the existing active/native/load-gate/input-extent conditions. These observations can be joined only by validated scene-frame and generation; they are not authoritative proof of final render extent, UI ownership, displayed pixels, or GPU output consumption. The diagnostic does not change sizing, jitter, execute, install, marker, fence, reset, quarantine, or reuse behavior.
+
+Capture accounting starts at the first successful `OutputInstall`. The corresponding successful `Submit` is backfilled into the active counters by `trace_id`, but `SceneViewSize` and `SceneFrame` events already recorded earlier in that same frame remain pre-active. Therefore active SceneView/jitter totals intentionally exclude the upstream events preceding the first install; they must not be used to infer that a native-size getter or jitter sample was absent.
+
+Existing RenderContext boundary samples continue to report their explicit callback stage and Overlay-main state, but they are not GPU read evidence. The repo still has no validated RE4-owned binding/draw site that observes the actual output SRV/resource on a command list, nor a proven final compositor route. No global DX12 hook or guessed game address was added. Present/install matching remains candidate-only; `consumerEvidence` stays Unknown unless a real reader observer is established.
+
+Runtime reproduction and matched frame captures are pending; game execution was intentionally skipped. Next capture should distinguish native baseline, steady XeSS On, and a marker-pending skip, with game HUD and each optional overlay separately visible/hidden. The new trace should correlate SceneView native/effective extent and jitter with Submit/Skip/OutputInstall/Restore and existing Present/fence observations. A narrowly filtered GPU capture or independently validated RE4 reader path is still needed to establish actual output consumption and the final presented image. Do not implement a fallback switch, output ring, reader association, or marker/history policy change before that evidence.
+
+~~~text
+Frame extent/jitter correlation             SOURCE/BUILD/TEST VALIDATED; runtime capture pending
+UI layer identity / pixel flicker           NOT PROVEN
+SceneView reduced+jitter then no new output  SOURCE-CONFIRMED RISK; visual causality unproven
+Actual output SRV/draw consumer              NOT OBSERVED
+Present -> consumer -> marker -> completion  NOT PROVEN
+Output ring / reuse or history policy change NOT AUTHORIZED
+Temporal continuity / visual acceptance     NOT ACCEPTED
+PR66                                          KEEP DRAFT/OPEN
+~~~
+
+## 54. PR66 GPU output consumer identification — 2026-10-01
+
+The read-only evidence report is [RE4_XESS_GPU_OUTPUT_CONSUMER_IDENTIFICATION_EVIDENCE_2026-10-01.md](RE4_XESS_GPU_OUTPUT_CONSUMER_IDENTIFICATION_EVIDENCE_2026-10-01.md). The current same-run software trace proves install `1165` at frame `8192`, a marker candidate for Present `8191` / fence `463`, later completion of that fence value, and a marker-pending skip at frame `8193`. It still does **not** identify a GPU command reading the installed output or prove that the marker follows that read. Capture 30b remains only a candidate draw because its bound SRV/descriptor identity is absent.
+
+No PIX/RenderDoc capture artifact or installed capture executable was available. A bounded static scan of the exact RE4 1.5.9.0 image yielded 1,704 generic indirect-call candidates and no validated path to the captured draw; no address hook or production behavior change was made. The next required evidence is a narrowly filtered GPU capture resolving the actual output resource to its reader, command list, queue, Present, marker, and completed fence. HUD/ESC composition remains unknown. Do not change OutputHandoff, marker/fence, history, quarantine, or output reuse policy; keep PR66 Draft/Open.
