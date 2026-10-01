@@ -187,6 +187,7 @@ private:
     std::optional<uint64_t> m_last_scene_callback_frame{};
 
     sdk::renderer::layer::Scene* m_cached_scene{};
+    std::atomic<uintptr_t> m_cached_primary_camera_identity{};
     std::optional<uint64_t> m_cached_scene_frame{};
     float m_cached_jitter_x{};
     float m_cached_jitter_y{};

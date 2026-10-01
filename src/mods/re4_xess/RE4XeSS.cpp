@@ -72,6 +72,69 @@ RenderContextTargetSnapshot snapshot_render_context_target(void* render_context)
     return snapshot;
 }
 
+struct OverlayMainTargetSnapshot {
+    uintptr_t state{};
+    uintptr_t resource{};
+    bool valid{};
+};
+
+OverlayMainTargetSnapshot snapshot_overlay_main_target(
+    sdk::renderer::layer::Overlay* layer) noexcept {
+    OverlayMainTargetSnapshot snapshot{};
+    if (layer == nullptr) {
+        return snapshot;
+    }
+
+    const auto& target_state = layer->get_main_target_state();
+    snapshot.state = reinterpret_cast<uintptr_t>(target_state.get());
+    if (target_state != nullptr) {
+        snapshot.resource = reinterpret_cast<uintptr_t>(target_state->get_native_resource_d3d12());
+    }
+    snapshot.valid = true;
+    return snapshot;
+}
+
+void capture_texture_trace_fields(
+    ID3D12Resource* resource,
+    uintptr_t& identity,
+    uint32_t& width,
+    uint32_t& height,
+    uint32_t& format) noexcept {
+    if (resource == nullptr) {
+        return;
+    }
+
+    identity = reinterpret_cast<uintptr_t>(resource);
+    const auto desc = resource->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        desc.Width > (std::numeric_limits<uint32_t>::max)() ||
+        desc.Height > (std::numeric_limits<uint32_t>::max)()) {
+        return;
+    }
+    width = static_cast<uint32_t>(desc.Width);
+    height = static_cast<uint32_t>(desc.Height);
+    format = static_cast<uint32_t>(desc.Format);
+}
+
+void capture_scene_resource_trace_fields(
+    RE4XeSSLifetimeTrace::Event& event,
+    sdk::renderer::layer::Scene* scene) noexcept {
+    if (scene == nullptr) {
+        return;
+    }
+
+    event.primary_scene = reinterpret_cast<uintptr_t>(scene);
+    capture_texture_trace_fields(
+        scene->get_post_main_target_d3d12(), event.color_resource,
+        event.color_width, event.color_height, event.color_format);
+    capture_texture_trace_fields(
+        scene->get_depth_stencil_d3d12(), event.depth_resource,
+        event.depth_width, event.depth_height, event.depth_format);
+    capture_texture_trace_fields(
+        scene->get_motion_vectors_d3d12(), event.velocity_resource,
+        event.velocity_width, event.velocity_height, event.velocity_format);
+}
+
 constexpr std::array<const char*, 8> UPSCALING_MODE_LABELS{
     "Off",
     "Native AA",
@@ -223,6 +286,7 @@ const char* lifetime_trace_kind_name(RE4XeSSLifetimeTrace::Kind kind) noexcept {
     case Kind::SceneFrame: return "scene-frame";
     case Kind::SceneViewSize: return "scene-view-size";
     case Kind::PreOverlay: return "pre-overlay";
+    case Kind::OutputPrepare: return "output-prepare";
     case Kind::Submit: return "submit";
     case Kind::OutputInstall: return "output-install";
     case Kind::OverlayRenderContext: return "overlay-render-context";
@@ -269,9 +333,22 @@ const char* lifetime_trace_render_context_stage_name(
     RE4XeSSLifetimeTrace::RenderContextStage stage) noexcept {
     using Stage = RE4XeSSLifetimeTrace::RenderContextStage;
     switch (stage) {
+    case Stage::AfterRestoreBeforeOutputDecision: return "after-restore-before-output-decision";
     case Stage::BeforeOriginalOverlayDraw: return "pre-original-overlay-draw";
     case Stage::PostOverlayCallbackOriginalStatusUnknown: return "post-overlay-callback-original-status-unknown";
     case Stage::None: return "none";
+    }
+    return "unknown";
+}
+
+const char* lifetime_trace_output_prepare_name(
+    RE4XeSSLifetimeTrace::OutputPrepareResult result) noexcept {
+    using Result = RE4XeSSLifetimeTrace::OutputPrepareResult;
+    switch (result) {
+    case Result::NotAttempted: return "not-attempted";
+    case Result::Ready: return "ready";
+    case Result::WaitingForPostPresentMarker: return "waiting-for-post-present-marker";
+    case Result::Failed: return "failed";
     }
     return "unknown";
 }
@@ -320,7 +397,7 @@ void dump_re4_xess_lifetime_trace(
     const auto summary = trace.summary();
     const auto events = trace.recent(reservation.event_count);
     const auto bounded_reason = reason.substr(0, 64);
-    spdlog::info("[RE4XeSS][LifetimeTrace] window reason={} class={} window={} phase={} selected={} retained={} preActiveEvents={} activeEvents={} preActiveOverwritten={} activeOverwritten={} activeInstalls={} activeUnmarked={} activeUnmarkedHighWater={} activeMarkedGpuIncomplete={} activeExecuteSuccess={} activeMarkerQueued={} activeResetHistory={} activeContinuous={} activeSkips={} activeMarkerPendingSkips={} activeBridgeBusySkips={} activeTemporalGateSkips={} activeSceneViewSizeSamples={} sceneViewSameIdentityChanges={} sceneViewCrossIdentityVariations={} sceneViewDrops={} sceneViewCacheReplacements={} sceneViewKeyReentries={} sceneViewEvictedKeyHistoryOverwrites={} activeSceneViewSameIdentityChanges={} activeSceneViewCrossIdentityVariations={} activeSceneViewDrops={} activeSceneViewCacheReplacements={} activeSceneViewKeyReentries={} activeSceneViewEvictedKeyHistoryOverwrites={} activeSceneJitterFrames={} activeRenderContextSamples={} activeRenderContextStateMatches={} activeRenderContextResourceMatches={} activeRenderContextOverlayMainStateMatches={} activeRenderContextOverlayMainResourceMatches={} activeMapUnknown={} activeMapCandidate={} activeMapProven={} dumpRequests={} dumpEmitted={} dumpSuppressed={} eventLinesReserved={} eventLinesEmitted={} bytesReserved={} allEvents={}",
+    spdlog::info("[RE4XeSS][LifetimeTrace] window reason={} class={} window={} phase={} selected={} retained={} preActiveEvents={} activeEvents={} preActiveOverwritten={} activeOverwritten={} activeInstalls={} activeUnmarked={} activeUnmarkedHighWater={} activeMarkedGpuIncomplete={} activeExecuteSuccess={} activeMarkerQueued={} activeResetHistory={} activeContinuous={} activeSkips={} activeMarkerPendingSkips={} reducedJitterMarkerPending={} activeBridgeBusySkips={} activeTemporalGateSkips={} activeSceneViewSizeSamples={} sceneViewSameIdentityChanges={} sceneViewCrossIdentityVariations={} sceneViewDrops={} sceneViewCacheReplacements={} sceneViewKeyReentries={} sceneViewEvictedKeyHistoryOverwrites={} activeSceneViewSameIdentityChanges={} activeSceneViewCrossIdentityVariations={} activeSceneViewDrops={} activeSceneViewCacheReplacements={} activeSceneViewKeyReentries={} activeSceneViewEvictedKeyHistoryOverwrites={} activeSceneJitterFrames={} activeRenderContextSamples={} activeRenderContextStateMatches={} activeRenderContextResourceMatches={} activeRenderContextOverlayMainStateMatches={} activeRenderContextOverlayMainResourceMatches={} activeMapUnknown={} activeMapCandidate={} activeMapProven={} dumpRequests={} dumpEmitted={} dumpSuppressed={} eventLinesReserved={} eventLinesEmitted={} bytesReserved={} allEvents={}",
         bounded_reason,
         lifetime_trace_dump_window_name(window),
         reservation.index,
@@ -341,6 +418,7 @@ void dump_re4_xess_lifetime_trace(
         static_cast<unsigned long long>(summary.active_continuous_submits),
         static_cast<unsigned long long>(summary.active_skipped_submits),
         static_cast<unsigned long long>(summary.active_marker_pending_skips),
+        static_cast<unsigned long long>(summary.reduced_jitter_marker_pending_skips),
         static_cast<unsigned long long>(summary.active_bridge_busy_skips),
         static_cast<unsigned long long>(summary.active_temporal_gate_skips),
         static_cast<unsigned long long>(summary.active_event_counts[static_cast<size_t>(RE4XeSSLifetimeTrace::Kind::SceneViewSize)]),
@@ -373,8 +451,9 @@ void dump_re4_xess_lifetime_trace(
         static_cast<unsigned long long>(summary.dump_bytes_reserved),
         static_cast<unsigned long long>(summary.total_events));
 
+    size_t emitted_event_lines{};
     for (const auto& event : events) {
-        spdlog::info("[RE4XeSS][LifetimeTrace] seq={} us={} phase={} kind={} trace={} install={} outputUseToken={} consumerEvidence={} frame={} frameValid={} sceneView=0x{:x} sceneViewSizeNative={}x{} sceneViewSizeEffective={}x{} temporalActive={} sceneViewOverride={} loadFlags=0x{:x} loadObserved={} loadPublishedEligible={} loadEffectiveAdmitted={} loadUpdateOverlapped={} loadOverlapResetPending={} loadUpdateSequence={}->{} loadUpdateActive={}->{} sceneViewSameIdentityChanged={} sceneViewCrossIdentityVaried={} sceneViewFrameKeyReentered={} xessInput={}x{} display={}x{} inputResolutionValid={} jitterApplied={} jitterPixels=({}, {}) jitterPhase={}/{} sceneOrd={} callbackOrd={} overlapEpoch={} submit={} present={} relatedPresent={} outputGen={} controlGen={} deviceGen={} bridgeSlot={} writerFence={} downstreamFence={} cachedCompleted={} cachedValid={} actualCompleted={} actualValid={} writerTxn={} writerInvocation={} writerSeq={} clearSeq={}->{} replacementSeq={}->{} writerRva=0x{:x} presentTimes={}::{}/{} output=0x{:x} targetState=0x{:x} renderContext=0x{:x} contextStage={} contextTargetState=0x{:x} contextTargetResource=0x{:x} contextSampleValid={} contextStateMatch={} contextResourceMatch={} overlayMainState=0x{:x} overlayMainResource=0x{:x} contextOverlayMainStateMatch={} contextOverlayMainResourceMatch={} overlay=0x{:x} swapchain=0x{:x} device=0x{:x} queue=0x{:x} queueType={} queueTypeValid={} tid={} presentTids={}->{} presentSource={} present1={} presentReturned={} callbacksSuppressed={} originalSkipped={} result=0x{:08x} apiOk={} queueSubmitted={} markerQueued={} resetHistory={} mappingState={} mappingAmbiguous={} reason={}",
+        spdlog::info("[RE4XeSS][LifetimeTrace] seq={} us={} phase={} kind={} trace={} install={} outputUseToken={} consumerEvidence={} frame={} frameValid={} sceneView=0x{:x} sceneViewSizeNative={}x{} sceneViewSizeEffective={}x{} temporalActive={} sceneViewOverride={} loadFlags=0x{:x} loadObserved={} loadPublishedEligible={} loadEffectiveAdmitted={} loadUpdateOverlapped={} loadOverlapResetPending={} loadUpdateSequence={}->{} loadUpdateActive={}->{} sceneViewSameIdentityChanged={} sceneViewCrossIdentityVaried={} sceneViewFrameKeyReentered={} xessInput={}x{} display={}x{} inputResolutionValid={} jitterApplied={} jitterPixels=({}, {}) jitterPhase={}/{} sceneOrd={} callbackOrd={} overlapEpoch={} submit={} present={} relatedPresent={} outputGen={}/{} controlGen={} deviceGen={} modeToken={} bridgeSlot={} writerFence={} downstreamFence={} cachedCompleted={} cachedValid={} actualCompleted={} actualValid={} writerTxn={} writerInvocation={} writerSeq={} clearSeq={}->{} replacementSeq={}->{} writerRva=0x{:x} presentTimes={}::{}/{} output=0x{:x} targetState=0x{:x} renderContext=0x{:x} contextStage={} contextTargetState=0x{:x} contextTargetResource=0x{:x} contextSampleValid={} contextStateMatch={} contextResourceMatch={} overlayMainState=0x{:x} overlayMainResource=0x{:x} contextOverlayMainStateMatch={} contextOverlayMainResourceMatch={} overlay=0x{:x} swapchain=0x{:x} device=0x{:x} queue=0x{:x} queueType={} queueTypeValid={} tid={} presentTids={}->{} presentSource={} present1={} presentReturned={} callbacksSuppressed={} originalSkipped={} result=0x{:08x} apiOk={} queueSubmitted={} markerQueued={} resetHistory={} mappingState={} mappingAmbiguous={} reason={}",
             static_cast<unsigned long long>(event.sequence),
             static_cast<unsigned long long>(event.timestamp_us),
             lifetime_trace_phase_name(event.capture_phase),
@@ -422,8 +501,10 @@ void dump_re4_xess_lifetime_trace(
             static_cast<unsigned long long>(event.present_ordinal),
             static_cast<unsigned long long>(event.related_present_ordinal),
             static_cast<unsigned long long>(event.output_generation),
+            static_cast<unsigned long long>(event.output_generation_after),
             static_cast<unsigned long long>(event.control_generation),
             static_cast<unsigned long long>(event.device_reset_generation),
+            event.mode_token,
             event.bridge_slot,
             static_cast<unsigned long long>(event.writer_fence_value),
             static_cast<unsigned long long>(event.downstream_fence_value),
@@ -477,8 +558,62 @@ void dump_re4_xess_lifetime_trace(
             lifetime_trace_mapping_name(event.mapping_state),
             event.mapping_ambiguous,
             event.reason.data());
+        ++emitted_event_lines;
+
+        const bool has_detail = event.primary_scene != 0 || event.primary_camera != 0 ||
+            event.color_resource != 0 || event.depth_resource != 0 || event.velocity_resource != 0 ||
+            event.output_prepare_result != RE4XeSSLifetimeTrace::OutputPrepareResult::NotAttempted ||
+            event.overlay_target_snapshot_valid;
+        if (has_detail) {
+            spdlog::info("[RE4XeSS][LifetimeTraceDetail] seq={} frame={} frameValid={} scene=0x{:x} camera=0x{:x} color=0x{:x}/{}x{}/fmt{} depth=0x{:x}/{}x{}/fmt{} velocity=0x{:x}/{}x{}/fmt{} output=0x{:x}/{}x{}/fmt{} prepare={} modeToken={} handoffInstalled={}/{} retirement={}/{} markerPending={}/{} outputGen={}/{} install={} outputUseToken={} targetState=0x{:x} overlayTargetPre=0x{:x}/0x{:x} overlayTargetPost=0x{:x}/0x{:x} renderContext=0x{:x}/0x{:x}/0x{:x} contextStage={} originalOverlayOutcome={}",
+                static_cast<unsigned long long>(event.sequence),
+                static_cast<unsigned long long>(event.frame_id),
+                event.frame_valid,
+                event.primary_scene,
+                event.primary_camera,
+                event.color_resource,
+                event.color_width,
+                event.color_height,
+                event.color_format,
+                event.depth_resource,
+                event.depth_width,
+                event.depth_height,
+                event.depth_format,
+                event.velocity_resource,
+                event.velocity_width,
+                event.velocity_height,
+                event.velocity_format,
+                event.output_resource,
+                event.output_width,
+                event.output_height,
+                event.output_format,
+                lifetime_trace_output_prepare_name(event.output_prepare_result),
+                event.mode_token,
+                event.handoff_installed,
+                event.handoff_installed_after,
+                event.handoff_retirement_status,
+                event.handoff_retirement_status_after,
+                event.handoff_marker_pending,
+                event.handoff_marker_pending_after,
+                static_cast<unsigned long long>(event.output_generation),
+                static_cast<unsigned long long>(event.output_generation_after),
+                static_cast<unsigned long long>(event.install_id),
+                static_cast<unsigned long long>(event.output_use_token),
+                event.target_state,
+                event.overlay_main_target_state,
+                event.overlay_main_target_resource,
+                event.overlay_post_target_state,
+                event.overlay_post_target_resource,
+                event.render_context,
+                event.render_context_target_state,
+                event.render_context_target_resource,
+                lifetime_trace_render_context_stage_name(event.render_context_stage),
+                event.render_context_stage == RE4XeSSLifetimeTrace::RenderContextStage::PostOverlayCallbackOriginalStatusUnknown
+                    ? "unknown" : "not-applicable");
+            ++emitted_event_lines;
+        }
     }
-    trace.note_dump_emitted(reservation, events.size());
+    trace.note_dump_emitted(reservation, emitted_event_lines);
 }
 
 void log_re4_xess_lifetime_summary() {
@@ -493,7 +628,7 @@ void log_re4_xess_lifetime_summary() {
         return active ? summary.active_event_counts[index] : summary.pre_active_event_counts[index];
     };
     using Kind = RE4XeSSLifetimeTrace::Kind;
-    spdlog::info("[RE4XeSS][LifetimeTrace] lifecycle-summary activeStarted={} recorded={} retained={} overwritten={} preActiveEvents={} preScene={} preOverlay={} preSkip={} activeEvents={} activeScene={} activeSceneViewSizeSamples={} sceneViewSameIdentityChanges={} sceneViewCrossIdentityVariations={} sceneViewDrops={} sceneViewCacheReplacements={} sceneViewKeyReentries={} sceneViewEvictedKeyHistoryOverwrites={} activeSceneViewSameIdentityChanges={} activeSceneViewCrossIdentityVariations={} activeSceneViewDrops={} activeSceneViewCacheReplacements={} activeSceneViewKeyReentries={} activeSceneViewEvictedKeyHistoryOverwrites={} activeJitterFrames={} activePreOverlay={} activeSubmit={} activeInstall={} activeOverlayContextSamples={} activeOverlayContextStateMatches={} activeOverlayContextResourceMatches={} activeOverlayContextOverlayMainStateMatches={} activeOverlayContextOverlayMainResourceMatches={} installedUnmarked={} installedUnmarkedHighWater={} markedGpuIncomplete={} activeRestore={} activeModeChange={} activePostPresent={} activeMarker={} activeSkip={} activeExecuteSuccess={} activeResetHistory={} activeContinuous={} activeMarkerPendingSkip={} activeBridgeBusySkip={} activeTemporalGateSkip={} activeMapUnknown={} activeMapCandidate={} activeMapProven={} preOverwritten={} activeOverwritten={} dumpRequests={} dumpEmitted={} dumpSuppressed={} eventLinesReserved={} eventLinesEmitted={} bytesReserved={} activeGameplayDumpEmitted={}",
+    spdlog::info("[RE4XeSS][LifetimeTrace] lifecycle-summary activeStarted={} recorded={} retained={} overwritten={} preActiveEvents={} preScene={} preOverlay={} preSkip={} activeEvents={} activeScene={} activeSceneViewSizeSamples={} sceneViewSameIdentityChanges={} sceneViewCrossIdentityVariations={} sceneViewDrops={} sceneViewCacheReplacements={} sceneViewKeyReentries={} sceneViewEvictedKeyHistoryOverwrites={} activeSceneViewSameIdentityChanges={} activeSceneViewCrossIdentityVariations={} activeSceneViewDrops={} activeSceneViewCacheReplacements={} activeSceneViewKeyReentries={} activeSceneViewEvictedKeyHistoryOverwrites={} activeJitterFrames={} activePreOverlay={} activeSubmit={} activeInstall={} activeOverlayContextSamples={} activeOverlayContextStateMatches={} activeOverlayContextResourceMatches={} activeOverlayContextOverlayMainStateMatches={} activeOverlayContextOverlayMainResourceMatches={} installedUnmarked={} installedUnmarkedHighWater={} markedGpuIncomplete={} activeRestore={} activeModeChange={} activePostPresent={} activeMarker={} activeSkip={} activeExecuteSuccess={} activeResetHistory={} activeContinuous={} activeMarkerPendingSkip={} reducedJitterMarkerPending={} activeBridgeBusySkip={} activeTemporalGateSkip={} activeMapUnknown={} activeMapCandidate={} activeMapProven={} preOverwritten={} activeOverwritten={} dumpRequests={} dumpEmitted={} dumpSuppressed={} eventLinesReserved={} eventLinesEmitted={} bytesReserved={} activeGameplayDumpEmitted={}",
         summary.active_capture_started,
         static_cast<unsigned long long>(summary.total_events),
         static_cast<unsigned long long>(summary.retained_events),
@@ -538,6 +673,7 @@ void log_re4_xess_lifetime_summary() {
         static_cast<unsigned long long>(summary.active_reset_history_submits),
         static_cast<unsigned long long>(summary.active_continuous_submits),
         static_cast<unsigned long long>(summary.active_marker_pending_skips),
+        static_cast<unsigned long long>(summary.reduced_jitter_marker_pending_skips),
         static_cast<unsigned long long>(summary.active_bridge_busy_skips),
         static_cast<unsigned long long>(summary.active_temporal_gate_skips),
         static_cast<unsigned long long>(summary.active_mapping_unknown),
@@ -5475,10 +5611,16 @@ void RE4XeSS::request_mode(UpscalingMode mode) {
         event.frame_valid = installed.installed_frame != 0;
         event.present_ordinal = installed.installed_present_ordinal;
         event.output_generation = installed.output_generation;
+        event.output_generation_after = installed.output_generation;
+        event.mode_token = static_cast<int32_t>(mode);
         event.control_generation = control_generation;
         event.device_reset_generation = m_device_reset_generation.load(std::memory_order_acquire);
         event.output_resource = installed.output_resource;
         event.target_state = installed.target_state;
+        event.handoff_installed = installed.installed;
+        event.handoff_installed_after = installed.installed;
+        event.handoff_marker_pending = installed.marker_pending;
+        event.handoff_marker_pending_after = installed.marker_pending;
         event.overlay = installed.overlay;
         event.thread_id = request_thread_id;
         event.result = static_cast<int32_t>(old_mode);
@@ -5642,6 +5784,7 @@ void RE4XeSS::invalidate_history(std::string_view reason, bool reset_jitter) {
 
 void RE4XeSS::clear_frame_state() {
     m_cached_scene = nullptr;
+    m_cached_primary_camera_identity.store(0, std::memory_order_release);
     m_cached_scene_frame.reset();
     m_cached_jitter_x = 0.0f;
     m_cached_jitter_y = 0.0f;
@@ -6357,6 +6500,8 @@ void RE4XeSS::on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* re
 
     m_next_jitter_sample = (m_next_jitter_sample + 1) % m_jitter_phase_count;
     m_cached_scene = layer;
+    m_cached_primary_camera_identity.store(
+        reinterpret_cast<uintptr_t>(primary_camera), std::memory_order_release);
     m_cached_scene_frame = frame_id;
     m_cached_jitter_x = jitter_x;
     m_cached_jitter_y = jitter_y;
@@ -6368,6 +6513,9 @@ void RE4XeSS::on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* re
         trace_event.kind = RE4XeSSLifetimeTrace::Kind::SceneFrame;
         trace_event.frame_id = frame_id;
         trace_event.frame_valid = true;
+        trace_event.primary_scene = reinterpret_cast<uintptr_t>(layer);
+        trace_event.primary_camera = reinterpret_cast<uintptr_t>(primary_camera);
+        capture_scene_resource_trace_fields(trace_event, layer);
         trace_event.scene_ordinal = m_scene_lifetime_ordinal.fetch_add(1, std::memory_order_relaxed) + 1;
         trace_event.control_generation = m_control_generation.load(std::memory_order_acquire);
         trace_event.device_reset_generation = m_device_reset_generation.load(std::memory_order_acquire);
@@ -6600,6 +6748,70 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
     }
 
     const auto handoff_before_service = m_output_handoff.snapshot();
+    if (trace_enabled) {
+        const auto overlay_main = snapshot_overlay_main_target(layer);
+        const auto context_target = snapshot_render_context_target(render_context);
+        RE4XeSSLifetimeTrace::Event boundary_event{};
+        boundary_event.kind = RE4XeSSLifetimeTrace::Kind::OverlayRenderContext;
+        boundary_event.trace_id = trace_id;
+        boundary_event.frame_id = trace_frame_id;
+        boundary_event.frame_valid = trace_frame_valid;
+        boundary_event.callback_ordinal = callback_ordinal;
+        boundary_event.overlap_epoch = overlap_epoch;
+        boundary_event.output_generation = handoff_before_service.output_generation;
+        boundary_event.output_generation_after = handoff_before_service.output_generation;
+        boundary_event.mode_token = static_cast<int32_t>(requested_mode);
+        boundary_event.install_id = handoff_before_service.installed
+            ? handoff_before_service.install_id : 0;
+        boundary_event.output_resource = handoff_before_service.installed
+            ? handoff_before_service.output_resource : 0;
+        boundary_event.target_state = overlay_main.state;
+        boundary_event.overlay_main_target_state = overlay_main.state;
+        boundary_event.overlay_main_target_resource = overlay_main.resource;
+        boundary_event.overlay_target_snapshot_valid = overlay_main.valid;
+        boundary_event.primary_scene = cached_scene_frame == trace_frame_id
+            ? reinterpret_cast<uintptr_t>(m_cached_scene) : 0;
+        boundary_event.primary_camera = boundary_event.primary_scene != 0
+            ? m_cached_primary_camera_identity.load(std::memory_order_acquire) : 0;
+        boundary_event.handoff_installed = handoff_before_service.installed;
+        boundary_event.handoff_marker_pending = handoff_before_service.marker_pending;
+        boundary_event.handoff_installed_after = handoff_before_service.installed;
+        boundary_event.handoff_marker_pending_after = handoff_before_service.marker_pending;
+        boundary_event.handoff_retirement_status = static_cast<uint32_t>(handoff_before_service.retirement);
+        boundary_event.handoff_retirement_status_after = static_cast<uint32_t>(handoff_before_service.retirement);
+        boundary_event.downstream_fence_value = handoff_before_service.last_signaled_fence_value;
+        boundary_event.cached_completed_value = handoff_before_service.last_completed_fence_value;
+        boundary_event.cached_completed_value_valid = handoff_before_service.has_generation;
+        boundary_event.render_context_stage =
+            RE4XeSSLifetimeTrace::RenderContextStage::AfterRestoreBeforeOutputDecision;
+        boundary_event.render_context = context_target.context;
+        boundary_event.render_context_target_state = context_target.target_state;
+        boundary_event.render_context_target_resource = context_target.target_resource;
+        boundary_event.render_context_sample_valid = context_target.valid;
+        boundary_event.render_context_target_state_matches_overlay_main =
+            context_target.target_state != 0 && context_target.target_state == overlay_main.state;
+        boundary_event.render_context_target_resource_matches_overlay_main =
+            context_target.target_resource != 0 && context_target.target_resource == overlay_main.resource;
+        boundary_event.overlay = reinterpret_cast<uintptr_t>(layer);
+        boundary_event.swapchain = present_diagnostics.swapchain;
+        boundary_event.device = present_diagnostics.device;
+        boundary_event.queue = present_diagnostics.command_queue;
+        boundary_event.command_queue_type = present_diagnostics.command_queue_type;
+        boundary_event.command_queue_type_valid = present_diagnostics.command_queue_type_valid;
+        boundary_event.present_ordinal = present_is_current() ? present_diagnostics.ordinal : 0;
+        boundary_event.present_valid = present_is_current();
+        boundary_event.thread_id = callback_thread_id;
+        boundary_event.control_generation = control_generation;
+        boundary_event.device_reset_generation = reset_generation;
+        set_load_state_trace_fields(
+            boundary_event, load_window, load_effective_admitted, load_overlap_reset_pending);
+        RE4XeSSLifetimeTrace::set_reason(
+            boundary_event,
+            handoff_before_service.installed
+                ? "pre-overlay-handoff-still-installed-after-restore"
+                : "pre-overlay-after-restore-before-output-decision");
+        lifetime_trace.record(boundary_event);
+    }
     if (handoff_before_service.has_generation &&
         (control_generation != m_output_handoff_control_generation ||
             reset_generation != m_output_handoff_device_reset_generation)) {
@@ -6907,13 +7119,110 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
         control_result.snapshot.bridge_device_removed,
         output,
         handoff_error);
+    if (trace_enabled) {
+        const auto handoff = m_output_handoff.snapshot();
+        const auto overlay_main = snapshot_overlay_main_target(layer);
+        const auto context_target = snapshot_render_context_target(render_context);
+        RE4XeSSLifetimeTrace::Event prepare_event{};
+        prepare_event.kind = RE4XeSSLifetimeTrace::Kind::OutputPrepare;
+        prepare_event.trace_id = trace_id;
+        prepare_event.frame_id = packet.frame_id;
+        prepare_event.frame_valid = true;
+        prepare_event.callback_ordinal = callback_ordinal;
+        prepare_event.scene_ordinal = m_scene_lifetime_ordinal.load(std::memory_order_acquire);
+        prepare_event.output_generation = handoff.output_generation;
+        prepare_event.output_generation_after = handoff.output_generation;
+        prepare_event.install_id = handoff.install_id;
+        prepare_event.mode_token = static_cast<int32_t>(requested_mode);
+        prepare_event.related_present_ordinal = handoff.installed_present_ordinal;
+        prepare_event.control_generation = control_generation;
+        prepare_event.device_reset_generation = reset_generation;
+        prepare_event.primary_scene = reinterpret_cast<uintptr_t>(scene);
+        prepare_event.primary_camera = m_cached_primary_camera_identity.load(std::memory_order_acquire);
+        prepare_event.output_resource = output.resource != nullptr
+            ? reinterpret_cast<uintptr_t>(output.resource) : handoff.output_resource;
+        prepare_event.target_state = handoff.target_state;
+        capture_texture_trace_fields(color, prepare_event.color_resource,
+            prepare_event.color_width, prepare_event.color_height, prepare_event.color_format);
+        capture_texture_trace_fields(depth, prepare_event.depth_resource,
+            prepare_event.depth_width, prepare_event.depth_height, prepare_event.depth_format);
+        capture_texture_trace_fields(velocity, prepare_event.velocity_resource,
+            prepare_event.velocity_width, prepare_event.velocity_height, prepare_event.velocity_format);
+        capture_texture_trace_fields(output.resource, prepare_event.output_resource,
+            prepare_event.output_width, prepare_event.output_height, prepare_event.output_format);
+        prepare_event.input_width = packet.render_width;
+        prepare_event.input_height = packet.render_height;
+        prepare_event.display_width = packet.display_width;
+        prepare_event.display_height = packet.display_height;
+        prepare_event.input_resolution_valid = m_input_resolution_valid;
+        prepare_event.jitter_applied = true;
+        prepare_event.jitter_x_pixels = packet.jitter_x_pixels;
+        prepare_event.jitter_y_pixels = packet.jitter_y_pixels;
+        prepare_event.handoff_installed = handoff.installed;
+        prepare_event.handoff_marker_pending = handoff.marker_pending;
+        prepare_event.handoff_installed_after = handoff.installed;
+        prepare_event.handoff_marker_pending_after = handoff.marker_pending;
+        prepare_event.handoff_retirement_status = static_cast<uint32_t>(handoff.retirement);
+        prepare_event.handoff_retirement_status_after = static_cast<uint32_t>(handoff.retirement);
+        prepare_event.downstream_fence_value = handoff.last_signaled_fence_value;
+        prepare_event.cached_completed_value = handoff.last_completed_fence_value;
+        prepare_event.cached_completed_value_valid = handoff.has_generation;
+        prepare_event.overlay = reinterpret_cast<uintptr_t>(layer);
+        prepare_event.overlay_main_target_state = overlay_main.state;
+        prepare_event.overlay_main_target_resource = overlay_main.resource;
+        prepare_event.overlay_target_snapshot_valid = overlay_main.valid;
+        prepare_event.render_context_stage =
+            RE4XeSSLifetimeTrace::RenderContextStage::AfterRestoreBeforeOutputDecision;
+        prepare_event.render_context = context_target.context;
+        prepare_event.render_context_target_state = context_target.target_state;
+        prepare_event.render_context_target_resource = context_target.target_resource;
+        prepare_event.render_context_sample_valid = context_target.valid;
+        prepare_event.render_context_target_state_matches_overlay_main =
+            context_target.target_state != 0 && context_target.target_state == overlay_main.state;
+        prepare_event.render_context_target_resource_matches_overlay_main =
+            context_target.target_resource != 0 && context_target.target_resource == overlay_main.resource;
+        prepare_event.swapchain = present_diagnostics.swapchain;
+        prepare_event.device = reinterpret_cast<uintptr_t>(control_request.device.Get());
+        prepare_event.queue = reinterpret_cast<uintptr_t>(control_request.queue.Get());
+        prepare_event.command_queue_type = control_request.queue != nullptr
+            ? static_cast<int32_t>(control_request.queue->GetDesc().Type) : -1;
+        prepare_event.command_queue_type_valid = control_request.queue != nullptr;
+        prepare_event.thread_id = callback_thread_id;
+        prepare_event.present_ordinal = present_is_current() ? present_diagnostics.ordinal : 0;
+        prepare_event.present_valid = present_is_current();
+        prepare_event.output_prepare_result = handoff_prepare_result == RE4XeSSOutputHandoff::PrepareResult::Ready
+            ? RE4XeSSLifetimeTrace::OutputPrepareResult::Ready
+            : handoff_prepare_result == RE4XeSSOutputHandoff::PrepareResult::WaitingForPostPresentMarker
+                ? RE4XeSSLifetimeTrace::OutputPrepareResult::WaitingForPostPresentMarker
+                : RE4XeSSLifetimeTrace::OutputPrepareResult::Failed;
+        prepare_event.result = static_cast<int32_t>(handoff_prepare_result);
+        set_load_state_trace_fields(
+            prepare_event, load_window, load_effective_admitted, load_overlap_reset_pending);
+        RE4XeSSLifetimeTrace::set_reason(
+            prepare_event,
+            handoff_prepare_result == RE4XeSSOutputHandoff::PrepareResult::Ready
+                ? "output-prepare-ready"
+                : handoff_prepare_result == RE4XeSSOutputHandoff::PrepareResult::WaitingForPostPresentMarker
+                    ? "output-prepare-waiting-for-post-present-marker"
+                    : "output-prepare-failed");
+        lifetime_trace.record(prepare_event);
+    }
     if (handoff_prepare_result != RE4XeSSOutputHandoff::PrepareResult::Ready) {
         if (handoff_prepare_result == RE4XeSSOutputHandoff::PrepareResult::WaitingForPostPresentMarker) {
             invalidate_history("output-handoff-marker-pending");
             clear_frame_state();
             trace_skip("output-handoff-marker-pending");
-            if (lifetime_trace.claim_anomaly_window(
-                    RE4XeSSLifetimeTrace::AnomalyWindow::FirstMarkerPending)) {
+            if (lifetime_trace.claim_first_reduced_jitter_marker_pending_window(
+                    packet.frame_id, control_generation, reset_generation)) {
+                // Consume the generic one-shot too, so only one first-marker anomaly is emitted.
+                (void)lifetime_trace.claim_anomaly_window(
+                    RE4XeSSLifetimeTrace::AnomalyWindow::FirstMarkerPending);
+                dump_re4_xess_lifetime_trace(
+                    "first-reduced-jitter-marker-pending",
+                    32,
+                    RE4XeSSLifetimeTrace::DumpWindow::Anomaly);
+            } else if (lifetime_trace.claim_anomaly_window(
+                           RE4XeSSLifetimeTrace::AnomalyWindow::FirstMarkerPending)) {
                 dump_re4_xess_lifetime_trace(
                     "first-output-handoff-marker-pending",
                     32,
@@ -7002,6 +7311,8 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
     submit_event.submit_ordinal = submit_result.submit_ordinal;
     submit_event.present_ordinal = present_is_current() ? present_diagnostics.ordinal : 0;
     submit_event.output_generation = handoff_after_submit.output_generation;
+    submit_event.output_generation_after = handoff_after_submit.output_generation;
+    submit_event.mode_token = static_cast<int32_t>(requested_mode);
     submit_event.control_generation = submit_result.control_generation;
     submit_event.device_reset_generation = submit_result.device_reset_generation;
     submit_event.bridge_slot = submit_result.bridge_slot;
@@ -7125,10 +7436,16 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
             context_event.callback_ordinal = callback_ordinal;
             context_event.present_ordinal = present_is_current() ? present_diagnostics.ordinal : 0;
             context_event.output_generation = installed.output_generation;
+            context_event.mode_token = installed.installed_mode_token;
             context_event.control_generation = control_generation;
             context_event.device_reset_generation = reset_generation;
             context_event.output_resource = installed.output_resource;
             context_event.target_state = installed.target_state;
+            context_event.primary_scene = reinterpret_cast<uintptr_t>(scene);
+            context_event.primary_camera = m_cached_primary_camera_identity.load(std::memory_order_acquire);
+            capture_scene_resource_trace_fields(context_event, scene);
+            context_event.handoff_installed = installed.installed;
+            context_event.handoff_marker_pending = installed.marker_pending;
             context_event.render_context = context_target.context;
             context_event.render_context_target_state = context_target.target_state;
             context_event.render_context_target_resource = context_target.target_resource;
@@ -7139,6 +7456,7 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
                 context_target.target_resource != 0 && context_target.target_resource == installed.output_resource;
             context_event.overlay_main_target_state = overlay_main_state;
             context_event.overlay_main_target_resource = overlay_main_resource;
+            context_event.overlay_target_snapshot_valid = true;
             context_event.render_context_target_state_matches_overlay_main =
                 context_target.target_state != 0 && context_target.target_state == overlay_main_state;
             context_event.render_context_target_resource_matches_overlay_main =
@@ -7301,19 +7619,12 @@ void RE4XeSS::on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* 
     };
     const auto before_observation = trace_enabled ? m_output_handoff.snapshot()
         : RE4XeSSOutputHandoff::Snapshot{};
-    uintptr_t overlay_main_state_before_observation{};
-    uintptr_t overlay_main_resource_before_observation{};
-    if (trace_enabled && before_observation.installed) {
-        const auto& overlay_main_before_observation = layer->get_main_target_state();
-        overlay_main_state_before_observation = reinterpret_cast<uintptr_t>(overlay_main_before_observation.get());
-        if (overlay_main_before_observation != nullptr) {
-            overlay_main_resource_before_observation = reinterpret_cast<uintptr_t>(
-                overlay_main_before_observation->get_native_resource_d3d12());
-        }
-    }
-    const auto context_target = trace_enabled && before_observation.installed
-        ? snapshot_render_context_target(render_context)
-        : RenderContextTargetSnapshot{};
+    const auto overlay_main_before_observation = trace_enabled
+        ? snapshot_overlay_main_target(layer) : OverlayMainTargetSnapshot{};
+    const auto context_target = trace_enabled
+        ? snapshot_render_context_target(render_context) : RenderContextTargetSnapshot{};
+    const auto* renderer = trace_enabled ? sdk::renderer::get_renderer() : nullptr;
+    const auto render_frame = renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
     const auto writer_witness_chain =
         TargetStateFactoryProbe::instance().confirmed_overlay_writer_witness_chain();
     m_output_handoff.observe_overlay(
@@ -7322,18 +7633,30 @@ void RE4XeSS::on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* 
         writer_witness_chain);
     if (trace_enabled) {
         const auto after_observation = m_output_handoff.snapshot();
+        const auto overlay_main_after_observation = snapshot_overlay_main_target(layer);
         RE4XeSSLifetimeTrace::Event event{};
         event.kind = RE4XeSSLifetimeTrace::Kind::PostOverlayObservation;
         event.trace_id = before_observation.installed_trace_id;
-        event.install_id = before_observation.install_id;
-        event.frame_id = before_observation.installed_frame;
-        event.frame_valid = before_observation.installed_trace_id != 0;
+        event.install_id = before_observation.installed ? before_observation.install_id : 0;
+        event.frame_id = render_frame.has_value()
+            ? static_cast<uint64_t>(*render_frame)
+            : before_observation.installed ? before_observation.installed_frame : 0;
+        event.frame_valid = render_frame.has_value() ||
+            (before_observation.installed && before_observation.installed_trace_id != 0);
         event.callback_ordinal = callback_ordinal;
         event.present_ordinal = present_valid ? present.ordinal : 0;
         event.related_present_ordinal = before_observation.installed_present_ordinal;
         event.output_generation = before_observation.output_generation;
-        event.control_generation = before_observation.installed_control_generation;
-        event.device_reset_generation = before_observation.installed_device_reset_generation;
+        event.output_generation_after = after_observation.output_generation;
+        event.mode_token = before_observation.installed
+            ? before_observation.installed_mode_token
+            : static_cast<int32_t>(m_requested_mode.load(std::memory_order_acquire));
+        event.control_generation = before_observation.installed
+            ? before_observation.installed_control_generation
+            : m_control_generation.load(std::memory_order_acquire);
+        event.device_reset_generation = before_observation.installed
+            ? before_observation.installed_device_reset_generation
+            : m_device_reset_generation.load(std::memory_order_acquire);
         if (writer_witness_chain.count > 0) {
             const auto& writer_witness = writer_witness_chain.entries[writer_witness_chain.count - 1];
             event.writer_sequence = writer_witness.sequence;
@@ -7349,8 +7672,22 @@ void RE4XeSS::on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* 
                 writer_witness.re4_image_identity_verified;
         }
         event.downstream_fence_value = before_observation.last_signaled_fence_value;
-        event.output_resource = before_observation.output_resource;
-        event.target_state = reinterpret_cast<uintptr_t>(layer->get_main_target_state().get());
+        event.cached_completed_value = before_observation.last_completed_fence_value;
+        event.cached_completed_value_valid = before_observation.has_generation;
+        event.output_resource = before_observation.installed ? before_observation.output_resource : 0;
+        event.target_state = overlay_main_after_observation.state;
+        event.overlay_main_target_state = overlay_main_before_observation.state;
+        event.overlay_main_target_resource = overlay_main_before_observation.resource;
+        event.overlay_post_target_state = overlay_main_after_observation.state;
+        event.overlay_post_target_resource = overlay_main_after_observation.resource;
+        event.overlay_target_snapshot_valid = overlay_main_before_observation.valid &&
+            overlay_main_after_observation.valid;
+        event.handoff_installed = before_observation.installed;
+        event.handoff_marker_pending = before_observation.marker_pending;
+        event.handoff_retirement_status = static_cast<uint32_t>(before_observation.retirement);
+        event.handoff_installed_after = after_observation.installed;
+        event.handoff_marker_pending_after = after_observation.marker_pending;
+        event.handoff_retirement_status_after = static_cast<uint32_t>(after_observation.retirement);
         event.render_context_stage = RE4XeSSLifetimeTrace::RenderContextStage::PostOverlayCallbackOriginalStatusUnknown;
         event.render_context = context_target.context;
         event.render_context_target_state = context_target.target_state;
@@ -7360,12 +7697,10 @@ void RE4XeSS::on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* 
             context_target.target_state == before_observation.target_state;
         event.render_context_target_resource_matches_output = context_target.target_resource != 0 &&
             context_target.target_resource == before_observation.output_resource;
-        event.overlay_main_target_state = overlay_main_state_before_observation;
-        event.overlay_main_target_resource = overlay_main_resource_before_observation;
         event.render_context_target_state_matches_overlay_main = context_target.target_state != 0 &&
-            context_target.target_state == overlay_main_state_before_observation;
+            context_target.target_state == overlay_main_before_observation.state;
         event.render_context_target_resource_matches_overlay_main = context_target.target_resource != 0 &&
-            context_target.target_resource == overlay_main_resource_before_observation;
+            context_target.target_resource == overlay_main_before_observation.resource;
         event.overlay = reinterpret_cast<uintptr_t>(layer);
         event.swapchain = present.swapchain;
         event.device = present.device;
@@ -7384,7 +7719,7 @@ void RE4XeSS::on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* 
         event.original_present_skipped = present.original_call_skipped;
         event.mapping_ambiguous = before_observation.installed;
         const bool state_matches_handoff = before_observation.installed &&
-            event.target_state == before_observation.target_state;
+            overlay_main_before_observation.state == before_observation.target_state;
         RE4XeSSLifetimeTrace::set_reason(event,
             !before_observation.installed ? "overlay-observed-no-installed-output" :
             !context_target.valid ? "post-overlay-callback-render-context-null-original-status-unknown" :

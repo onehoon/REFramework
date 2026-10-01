@@ -140,6 +140,7 @@ void test_phase_transition_and_correlated_first_submit(Trace& trace, uint64_t ou
     context_sample.render_context_target_resource = 0x2000;
     context_sample.overlay_main_target_state = 0x1000;
     context_sample.overlay_main_target_resource = 0x2000;
+    context_sample.handoff_installed = true;
     context_sample.render_context_sample_valid = true;
     context_sample.render_context_target_state_matches_output = true;
     context_sample.render_context_target_resource_matches_output = true;
@@ -262,7 +263,7 @@ void test_mapping_pending_interval_and_active_budgets(Trace& trace) {
     assert(!trace.reserve_dump(Trace::DumpWindow::Anomaly, 32, denied));
     for (int i = 0; i < 2; ++i) complete_reservation(trace, Trace::DumpWindow::ModeTransition);
     assert(!trace.reserve_dump(Trace::DumpWindow::ModeTransition, 32, denied));
-    complete_reservation(trace, Trace::DumpWindow::Periodic);
+    for (int i = 0; i < 6; ++i) complete_reservation(trace, Trace::DumpWindow::Periodic);
     assert(!trace.reserve_dump(Trace::DumpWindow::Periodic, 32, denied));
     assert(trace.claim_anomaly_window(Trace::AnomalyWindow::FirstMarkerPending));
     assert(!trace.claim_anomaly_window(Trace::AnomalyWindow::FirstMarkerPending));
@@ -272,10 +273,10 @@ void test_mapping_pending_interval_and_active_budgets(Trace& trace) {
     assert(!trace.claim_anomaly_window(Trace::AnomalyWindow::WriterOrFenceFailure));
 
     summary = trace.summary();
-    assert(summary.dump_windows_emitted == 16);
-    assert(summary.dump_event_lines_reserved == 512);
+    assert(summary.dump_windows_emitted == 21);
+    assert(summary.dump_event_lines_reserved == 1344);
     assert(summary.dump_bytes_reserved <= Trace::MAX_DUMP_BYTES);
-    assert(summary.active_gameplay_dump_emitted == 14);
+    assert(summary.active_gameplay_dump_emitted == 19);
     assert(summary.mapping_inferred_candidates == 3);
     assert(summary.active_mapping_inferred_candidates == 3);
     assert(summary.mapping_proven == 0);
@@ -578,6 +579,13 @@ void test_scene_extent_and_jitter_trace(Trace& trace) {
     pending_skip.device_reset_generation = reduced_view.device_reset_generation;
     Trace::set_reason(pending_skip, "output-handoff-marker-pending");
     assert(trace.record(pending_skip) != 0);
+    assert(trace.claim_first_reduced_jitter_marker_pending_window(
+        skip_frame_id, reduced_view.control_generation, reduced_view.device_reset_generation));
+    assert(!trace.claim_first_reduced_jitter_marker_pending_window(
+        skip_frame_id, reduced_view.control_generation, reduced_view.device_reset_generation));
+    const auto mismatch_summary = trace.summary();
+    assert(mismatch_summary.reduced_jitter_marker_pending_skips ==
+        before.reduced_jitter_marker_pending_skips + 1);
 
     // The per-frame sample set is fixed; overflow is explicit in the summary.
     constexpr uint64_t capped_frame_id = 99003;
@@ -669,6 +677,7 @@ void test_scene_extent_and_jitter_trace(Trace& trace) {
     assert(retained_scene_frame->consumer_evidence == Trace::ConsumerEvidence::Unknown);
     assert(retained_skip != recent.end());
     assert(std::strcmp(retained_skip->reason.data(), "output-handoff-marker-pending") == 0);
+    assert(retained_skip->reduced_jitter_marker_pending_mismatch);
     const auto retained_reduced_view = find_event(
         Trace::Kind::SceneViewSize, skip_frame_id, reduced_view.control_generation, reduced_view.device_reset_generation);
     assert(retained_reduced_view != recent.end() && retained_reduced_view->scene_view_override_applied);
@@ -683,6 +692,45 @@ void test_scene_extent_and_jitter_trace(Trace& trace) {
     assert(summary.active_scene_view_evicted_key_history_overwrites >
         before.active_scene_view_evicted_key_history_overwrites);
     assert(summary.active_event_counts[static_cast<size_t>(Trace::Kind::SceneFrame)] == 1);
+
+    // Do not classify a marker-pending skip unless reduced sizing and jitter match
+    // the exact same frame and generation.
+    const auto record_scene_and_marker_skip = [&](uint64_t frame_id,
+                                                  uint64_t view_control,
+                                                  uint64_t scene_control,
+                                                  bool reduced,
+                                                  bool jitter) {
+        auto view = make_view_size(frame_id, static_cast<uintptr_t>(0x80000 + frame_id));
+        view.control_generation = view_control;
+        if (!reduced) {
+            view.scene_view_override_applied = false;
+            view.scene_view_effective_width = view.scene_view_native_width;
+            view.scene_view_effective_height = view.scene_view_native_height;
+        }
+        assert(trace.record(view) != 0);
+
+        Trace::Event scene{};
+        scene.kind = Trace::Kind::SceneFrame;
+        scene.frame_id = frame_id;
+        scene.frame_valid = true;
+        scene.control_generation = scene_control;
+        scene.device_reset_generation = view.device_reset_generation;
+        scene.jitter_applied = jitter;
+        assert(trace.record(scene) != 0);
+
+        Trace::Event skip{};
+        skip.kind = Trace::Kind::Skip;
+        skip.frame_id = frame_id;
+        skip.frame_valid = true;
+        skip.control_generation = view_control;
+        skip.device_reset_generation = view.device_reset_generation;
+        Trace::set_reason(skip, "output-handoff-marker-pending");
+        assert(trace.record(skip) != 0);
+        assert(!trace.recent(1).front().reduced_jitter_marker_pending_mismatch);
+    };
+    record_scene_and_marker_skip(99301, 10, 10, false, true);
+    record_scene_and_marker_skip(99302, 10, 10, true, false);
+    record_scene_and_marker_skip(99303, 10, 11, true, true);
 }
 
 } // namespace

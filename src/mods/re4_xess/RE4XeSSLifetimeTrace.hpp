@@ -17,6 +17,7 @@ public:
         SceneFrame,
         SceneViewSize,
         PreOverlay,
+        OutputPrepare,
         Submit,
         OutputInstall,
         OverlayRenderContext,
@@ -46,8 +47,16 @@ public:
 
     enum class RenderContextStage : uint8_t {
         None,
+        AfterRestoreBeforeOutputDecision,
         BeforeOriginalOverlayDraw,
         PostOverlayCallbackOriginalStatusUnknown,
+    };
+
+    enum class OutputPrepareResult : uint8_t {
+        NotAttempted,
+        Ready,
+        WaitingForPostPresentMarker,
+        Failed,
     };
 
     enum class ConsumerEvidence : uint8_t {
@@ -131,6 +140,7 @@ public:
         uint64_t present_ordinal{};
         uint64_t related_present_ordinal{};
         uint64_t output_generation{};
+        uint64_t output_generation_after{};
         uint64_t control_generation{};
         uint64_t device_reset_generation{};
         uint64_t writer_sequence{};
@@ -153,6 +163,18 @@ public:
         uint32_t input_height{};
         uint32_t display_width{};
         uint32_t display_height{};
+        uint32_t color_width{};
+        uint32_t color_height{};
+        uint32_t color_format{};
+        uint32_t output_width{};
+        uint32_t output_height{};
+        uint32_t output_format{};
+        uint32_t depth_width{};
+        uint32_t depth_height{};
+        uint32_t depth_format{};
+        uint32_t velocity_width{};
+        uint32_t velocity_height{};
+        uint32_t velocity_format{};
         uint32_t jitter_sample_index{};
         uint32_t jitter_phase_count{};
         float scene_view_native_width{};
@@ -164,11 +186,18 @@ public:
         uintptr_t output_resource{};
         uintptr_t target_state{};
         uintptr_t scene_view{};
+        uintptr_t primary_scene{};
+        uintptr_t primary_camera{};
+        uintptr_t color_resource{};
+        uintptr_t depth_resource{};
+        uintptr_t velocity_resource{};
         uintptr_t render_context{};
         uintptr_t render_context_target_state{};
         uintptr_t render_context_target_resource{};
         uintptr_t overlay_main_target_state{};
         uintptr_t overlay_main_target_resource{};
+        uintptr_t overlay_post_target_state{};
+        uintptr_t overlay_post_target_resource{};
         uintptr_t overlay{};
         uintptr_t swapchain{};
         uintptr_t device{};
@@ -181,12 +210,16 @@ public:
         uint32_t load_state_update_active_after{};
         uint32_t load_state_flags{};
         uint32_t load_state_callback_kind{};
+        uint32_t handoff_retirement_status{};
+        uint32_t handoff_retirement_status_after{};
         uint32_t bridge_slot{};
         uint32_t writer_method_rva{};
         int32_t result{};
         int32_t present_source{};
+        int32_t mode_token{};
         int32_t command_queue_type{ -1 };
         Kind kind{ Kind::Skip };
+        OutputPrepareResult output_prepare_result{ OutputPrepareResult::NotAttempted };
         bool frame_valid{};
         bool present_valid{};
         bool present_returned{};
@@ -202,6 +235,12 @@ public:
         bool marker_queued{};
         bool mapping_ambiguous{};
         bool render_context_sample_valid{};
+        bool handoff_installed{};
+        bool handoff_marker_pending{};
+        bool handoff_installed_after{};
+        bool handoff_marker_pending_after{};
+        bool overlay_target_snapshot_valid{};
+        bool reduced_jitter_marker_pending_mismatch{};
         bool render_context_target_state_matches_output{};
         bool render_context_target_resource_matches_output{};
         bool render_context_target_state_matches_overlay_main{};
@@ -246,6 +285,7 @@ public:
         uint64_t active_marker_queued{};
         uint64_t active_output_installs{};
         uint64_t active_marker_pending_skips{};
+        uint64_t reduced_jitter_marker_pending_skips{};
         uint64_t active_render_context_samples{};
         uint64_t active_render_context_state_matches{};
         uint64_t active_render_context_resource_matches{};
@@ -300,8 +340,8 @@ public:
     static constexpr size_t SCENE_VIEW_EVICTED_KEY_HISTORY_CAPACITY = 16;
     static constexpr size_t MAX_SCENE_VIEW_OBSERVATIONS_PER_FRAME = 8;
     static constexpr size_t MAX_EVENTS_PER_DUMP = 32;
-    static constexpr size_t MAX_DUMP_EVENT_LINES = 512;
-    static constexpr size_t MAX_DUMP_BYTES = 1'100'000;
+    static constexpr size_t MAX_DUMP_EVENT_LINES = 1344;
+    static constexpr size_t MAX_DUMP_BYTES = 2'200'000;
 
     static RE4XeSSLifetimeTrace& instance() noexcept {
         static RE4XeSSLifetimeTrace trace{};
@@ -332,6 +372,12 @@ public:
         if (event.kind == Kind::SceneViewSize && event.frame_valid &&
             !admit_scene_view_observation_locked(event)) {
             return 0;
+        }
+        if (event.kind == Kind::Skip &&
+            std::strcmp(event.reason.data(), "output-handoff-marker-pending") == 0 &&
+            has_reduced_jittered_scene_frame_locked(event)) {
+            event.reduced_jitter_marker_pending_mismatch = true;
+            ++m_summary.reduced_jitter_marker_pending_skips;
         }
         if (event.kind == Kind::OutputInstall) {
             const bool starting_active_capture = !m_active_capture_started;
@@ -390,7 +436,8 @@ public:
             ++m_summary.pre_active_events;
             ++m_summary.pre_active_event_counts[static_cast<size_t>(event.kind)];
         }
-        if (event.capture_phase == CapturePhase::ActiveXeSS && event.render_context_sample_valid) {
+        if (event.capture_phase == CapturePhase::ActiveXeSS && event.handoff_installed &&
+            event.render_context_sample_valid) {
             ++m_summary.active_render_context_samples;
             if (event.render_context_target_state_matches_output) {
                 ++m_summary.active_render_context_state_matches;
@@ -563,6 +610,28 @@ public:
         return true;
     }
 
+    bool claim_first_reduced_jitter_marker_pending_window(
+        uint64_t frame_id,
+        uint64_t control_generation,
+        uint64_t device_reset_generation) noexcept {
+        std::lock_guard lock{ m_mutex };
+        if (!m_active_capture_started || m_first_reduced_jitter_marker_window_claimed) {
+            return false;
+        }
+        for (size_t offset = 0; offset < m_size; ++offset) {
+            const auto index = (m_next + CAPACITY - 1 - offset) % CAPACITY;
+            const auto& event = m_events[index];
+            if (event.kind == Kind::Skip && event.reduced_jitter_marker_pending_mismatch &&
+                event.frame_valid && event.frame_id == frame_id &&
+                event.control_generation == control_generation &&
+                event.device_reset_generation == device_reset_generation) {
+                m_first_reduced_jitter_marker_window_claimed = true;
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool note_pending_present(uint64_t install_id, uint64_t present_ordinal) noexcept {
         std::lock_guard lock{ m_mutex };
         if (!m_active_capture_started || install_id == 0 || present_ordinal == 0) {
@@ -588,10 +657,10 @@ public:
 
     bool reserve_dump(DumpWindow window, size_t requested_events, DumpReservation& reservation) noexcept {
         constexpr std::array<uint32_t, static_cast<size_t>(DumpWindow::Count)> WINDOW_LIMITS{
-            2, 5, 6, 2, 1,
+            2, 5, 6, 2, 6,
         };
-        constexpr uint32_t MAX_DUMP_WINDOWS = 16;
-        constexpr size_t MAX_EVENT_LINE_BYTES = 2048;
+        constexpr uint32_t MAX_DUMP_WINDOWS = 21;
+        constexpr size_t MAX_EVENT_LINE_BYTES = 3072;
         constexpr size_t MAX_WINDOW_HEADER_BYTES = 1024;
         std::lock_guard lock{ m_mutex };
         ++m_summary.dump_requests;
@@ -607,7 +676,8 @@ public:
         }
 
         auto event_count = (std::min)(requested_events, MAX_EVENTS_PER_DUMP);
-        event_count = (std::min)(event_count, MAX_DUMP_EVENT_LINES - m_dump_event_lines_reserved);
+        const auto lines_available = MAX_DUMP_EVENT_LINES - m_dump_event_lines_reserved;
+        event_count = (std::min)(event_count, lines_available / 2);
         const auto bytes_available = MAX_DUMP_BYTES - m_dump_bytes_reserved;
         if (bytes_available <= MAX_WINDOW_HEADER_BYTES) {
             ++m_summary.dump_windows_suppressed;
@@ -623,7 +693,7 @@ public:
         ++m_dump_window_counts[index];
         ++m_dump_windows_reserved;
         const auto estimated_bytes = MAX_WINDOW_HEADER_BYTES + event_count * MAX_EVENT_LINE_BYTES;
-        m_dump_event_lines_reserved += event_count;
+        m_dump_event_lines_reserved += event_count * 2;
         m_dump_bytes_reserved += estimated_bytes;
         m_summary.dump_event_lines_reserved = m_dump_event_lines_reserved;
         m_summary.dump_bytes_reserved = m_dump_bytes_reserved;
@@ -640,7 +710,7 @@ public:
     void note_dump_emitted(const DumpReservation& reservation, size_t event_lines) noexcept {
         std::lock_guard lock{ m_mutex };
         ++m_summary.dump_windows_emitted;
-        m_summary.dump_event_lines_emitted += (std::min)(event_lines, reservation.event_count);
+        m_summary.dump_event_lines_emitted += (std::min)(event_lines, reservation.event_count * 2);
         if (reservation.active_phase) {
             ++m_summary.active_gameplay_dump_emitted;
         }
@@ -723,6 +793,35 @@ private:
         uint64_t device_reset_generation{};
         bool valid{};
     };
+
+    bool has_reduced_jittered_scene_frame_locked(const Event& skip) const noexcept {
+        if (!skip.frame_valid) {
+            return false;
+        }
+
+        bool reduced_scene_view{};
+        bool jitter_applied{};
+        for (size_t offset = 0; offset < m_size; ++offset) {
+            const auto index = (m_next + CAPACITY - 1 - offset) % CAPACITY;
+            const auto& candidate = m_events[index];
+            if (!candidate.frame_valid || candidate.frame_id != skip.frame_id ||
+                candidate.control_generation != skip.control_generation ||
+                candidate.device_reset_generation != skip.device_reset_generation) {
+                continue;
+            }
+            if (candidate.kind == Kind::SceneViewSize && candidate.scene_view_override_applied &&
+                (candidate.scene_view_effective_width < candidate.scene_view_native_width ||
+                    candidate.scene_view_effective_height < candidate.scene_view_native_height)) {
+                reduced_scene_view = true;
+            } else if (candidate.kind == Kind::SceneFrame && candidate.jitter_applied) {
+                jitter_applied = true;
+            }
+            if (reduced_scene_view && jitter_applied) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     static SceneViewObservation scene_view_observation(const Event& event) noexcept {
         return SceneViewObservation{
@@ -922,6 +1021,7 @@ private:
     bool m_first_mapping_window_claimed{};
     bool m_final_summary_emitted{};
     bool m_pending_present_window_claimed{};
+    bool m_first_reduced_jitter_marker_window_claimed{};
     std::array<SceneViewFrameObservations, SCENE_VIEW_FRAME_CACHE_CAPACITY> m_scene_view_frame_observations{};
     size_t m_next_scene_view_frame_cache{};
     std::array<EvictedSceneViewFrameKey, SCENE_VIEW_EVICTED_KEY_HISTORY_CAPACITY> m_scene_view_evicted_keys{};
