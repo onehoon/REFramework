@@ -203,6 +203,7 @@ set(csharp-api_SOURCES
 	"REFrameworkNET/Attributes/MethodHook.cpp"
 	"REFrameworkNET/Attributes/Plugin.cpp"
 	"REFrameworkNET/Callbacks.cpp"
+	"REFrameworkNET/ConsoleWindow.cpp"
 	"REFrameworkNET/Field.cpp"
 	"REFrameworkNET/ManagedObject.cpp"
 	"REFrameworkNET/Method.cpp"
@@ -229,6 +230,7 @@ set(csharp-api_SOURCES
 	"REFrameworkNET/Attributes/Plugin.hpp"
 	"REFrameworkNET/Callbacks.hpp"
 	"REFrameworkNET/Collections.hpp"
+	"REFrameworkNET/ConsoleWindow.hpp"
 	"REFrameworkNET/Field.hpp"
 	"REFrameworkNET/IObject.hpp"
 	"REFrameworkNET/IProxyable.hpp"
@@ -591,7 +593,7 @@ endif()
 # Target: CSharpAPITestRE9
 if(REFRAMEWORK_REF_ASSEMBLIES_EXIST_RE9) # build-csharp-test-re9
 	set(CSharpAPITestRE9_SOURCES
-		"test/Test/TestRE9.cs"
+		"test/Test/ZombieSpawner.cs"
 		cmake.toml
 	)
 

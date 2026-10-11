@@ -8,6 +8,7 @@
 #include "SystemString.hpp"
 #include "NativePool.hpp"
 #include "PluginManager.hpp"
+#include "ConsoleWindow.hpp"
 
 using namespace System;
 using namespace System::IO;
@@ -170,6 +171,43 @@ namespace REFrameworkNET {
         }
     }
 
+    System::String^ PluginManager::GetSettingsPath() {
+        const auto settings_path = std::filesystem::current_path() / "reframework" / "plugins" / "REFramework.NET.settings.json";
+        return gcnew System::String(settings_path.wstring().c_str());
+    }
+
+    // Called before the API is initialized (from reframework_plugin_initialize), so no API::Log* here
+    void PluginManager::LoadSettings() {
+        auto path = GetSettingsPath();
+
+        if (!File::Exists(path)) {
+            return;
+        }
+
+        try {
+            auto jsonDocument = JsonDocument::Parse(File::ReadAllText(path));
+            JsonElement value;
+
+            if (jsonDocument->RootElement.TryGetProperty("ShowConsole", value)) {
+                s_show_console = value.GetBoolean();
+            }
+        } catch (Exception^ ex) {
+            System::Console::WriteLine("Error reading " + path + ": " + ex->Message);
+        }
+    }
+
+    void PluginManager::SaveSettings() {
+        auto path = GetSettingsPath();
+        auto settings = gcnew Dictionary<System::String^, bool>();
+        settings->Add("ShowConsole", s_show_console);
+
+        try {
+            File::WriteAllText(path, JsonSerializer::Serialize(settings));
+        } catch (Exception^ ex) {
+            REFrameworkNET::API::LogError("Error writing " + path + ": " + ex->Message);
+        }
+    }
+
     void PluginManager::GenerateReferenceAssemblies(List<System::Reflection::Assembly^>^ deps) {
         REFrameworkNET::API::LogInfo("Generating reference assemblies...");
 
@@ -277,6 +315,9 @@ namespace REFrameworkNET {
         }
 
         PluginManager::s_initialized = true;
+
+        // Statics are per load context; reload the settings in this one
+        LoadSettings();
 
         auto self = System::Reflection::Assembly::GetExecutingAssembly();
 
@@ -737,22 +778,7 @@ namespace REFrameworkNET {
                     continue;
                 }
 
-                auto path = state->script_path;
                 REFrameworkNET::API::LogInfo("Attempting to initiate first phase unload of " + state->script_path);
-
-				// Look for the PluginExitPoint attribute in the assembly
-                for each (Type ^ t in assem->GetTypes()) {
-                    auto methods = t->GetMethods(System::Reflection::BindingFlags::Static | System::Reflection::BindingFlags::Public | System::Reflection::BindingFlags::NonPublic);
-
-                    for each (System::Reflection::MethodInfo^ method in methods) {
-                        array<Object^>^ attributes = method->GetCustomAttributes(REFrameworkNET::Attributes::PluginExitPoint::typeid, true);
-
-                        if (attributes->Length > 0) {
-                            REFrameworkNET::API::LogInfo("Unloading plugin by calling " + method->Name + " in " + t->FullName);
-                            method->Invoke(nullptr, nullptr);
-                        }
-                    }
-				}
 
                 state->Unload();
             }
@@ -844,6 +870,11 @@ namespace REFrameworkNET {
 
             Hexa::NET::ImGui::ImGui::Checkbox("Auto Reload", s_auto_reload_plugins);
 
+            if (Hexa::NET::ImGui::ImGui::Checkbox("Show Console Window", s_show_console)) {
+                SaveSettings();
+                ConsoleWindow::SetVisible(s_show_console);
+            }
+
             if (Hexa::NET::ImGui::ImGui::TreeNode("Debug Stats")) {
                 if (Hexa::NET::ImGui::ImGui::TreeNode("Garbage Collection")) {
                     REFrameworkNET::GarbageCollectionDisplay::Render();
@@ -896,8 +927,38 @@ namespace REFrameworkNET {
         Hexa::NET::ImGui::ImGui::PopID();
     }
 
+    void PluginManager::PluginState::InvokePluginExitPoints() {
+        if (assembly == nullptr) {
+            return;
+        }
+
+        for each (Type ^ type in assembly->GetTypes()) {
+            auto methods = type->GetMethods(System::Reflection::BindingFlags::Static | System::Reflection::BindingFlags::Public |
+                                            System::Reflection::BindingFlags::NonPublic);
+
+            for each (System::Reflection::MethodInfo ^ method in methods) {
+                array<Object ^> ^ attributes = method->GetCustomAttributes(REFrameworkNET::Attributes::PluginExitPoint::typeid, true);
+
+                if (attributes->Length > 0) {
+                    REFrameworkNET::API::LogInfo("Unloading plugin by calling " + method->Name + " in " + type->FullName);
+                    method->Invoke(nullptr, nullptr);
+                }
+            }
+        }
+    }
+
     void PluginManager::PluginState::Unload() {
         if (load_context != nullptr) {
+        try {
+            InvokePluginExitPoints();
+        } catch (System::Exception ^ e) {
+            REFrameworkNET::API::LogError("Failed to invoke PluginExitPoint for " + script_path + ": " + e->Message);
+        } catch (const std::exception& e) {
+            REFrameworkNET::API::LogError("Failed to invoke PluginExitPoint for " + script_path + ": " + gcnew System::String(e.what()));
+        } catch (...) {
+            REFrameworkNET::API::LogError("Unknown exception caught while invoking PluginExitPoint for " + script_path);
+        }
+
             ManagedObject::ShuttingDown = true;
             ManagedObject::CleanupKnownCaches();
 
