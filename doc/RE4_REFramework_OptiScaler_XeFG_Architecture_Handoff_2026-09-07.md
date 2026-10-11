@@ -1,3 +1,5 @@
+> **Superseded (2026-09-26):** This document describes an earlier direct REF↔OptiScaler ABI / modified-OptiScaler architecture and is retained only for historical context. The current production architecture uses a standard XeSS D3D12 producer entirely inside this REFramework fork with unmodified upstream OptiScaler. See `doc/RE4_XESS_BRIDGE_ARCHITECTURE_AND_RE_STATUS_2026-09-26.md` for the active source of truth.
+
 # RE4 × REFramework × OptiScaler × XeFG Architecture Handoff
 
 **Date:** 2026-09-07  
