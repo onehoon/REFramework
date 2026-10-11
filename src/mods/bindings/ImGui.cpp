@@ -1484,7 +1484,7 @@ std::optional<Vector2f> world_to_screen(sol::object world_pos_object) {
         return std::nullopt;
     }
 
-    if (sdk::GameIdentity::get().is_re9()) {
+    if (sdk::GameIdentity::get().tdb_ver() >= 81) {
         return sdk::renderer::world_to_screen_matrix(Vector3f{world_pos});
     }
 
