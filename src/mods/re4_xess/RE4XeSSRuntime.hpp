@@ -44,10 +44,23 @@ public:
         float velocity_scale_y{};
     };
 
+    struct ExecuteDiagnostics {
+        uint64_t trace_id{};
+        uint64_t frame_id{};
+        uint64_t control_generation{};
+        uint64_t device_reset_generation{};
+        uint64_t submission_sequence{};
+        uint32_t bridge_slot{};
+        uint32_t output_width{};
+        uint32_t output_height{};
+        ID3D12Resource* original_velocity{};
+    };
+
     bool initialize_sr(const InitSignature& signature, std::string& error);
     bool execute(
         ID3D12GraphicsCommandList* command_list,
         const xess_d3d12_execute_params_t& params,
+        const ExecuteDiagnostics& diagnostics,
         std::string& error);
     void shutdown() noexcept;
     void quarantine() noexcept;
@@ -112,6 +125,8 @@ private:
     std::filesystem::path m_selected_path{};
     std::optional<xess_version_t> m_runtime_version{};
     std::atomic<DWORD> m_owner_thread_id{};
+    uint64_t m_execute_detail_control_generation{};
+    uint32_t m_execute_transition_detail_count{};
     bool m_sr_initialized{};
     bool m_quarantined{};
 };

@@ -28,4 +28,5 @@ struct RE4XeSSFrame {
 
     bool reset_history{};
     uint64_t frame_id{};
+    uint64_t lifetime_trace_id{};
 };

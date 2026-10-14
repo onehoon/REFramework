@@ -34,6 +34,30 @@ public:
 		XeFGInternal,
 	};
 
+	struct PresentDiagnosticsSnapshot {
+		uint64_t ordinal{};
+		uintptr_t swapchain{};
+		uintptr_t device{};
+		uintptr_t command_queue{};
+		uint32_t entry_thread_id{};
+		uint32_t return_thread_id{};
+		uint64_t entry_time_us{};
+		uint64_t original_call_enter_time_us{};
+		uint64_t original_call_return_time_us{};
+		uint64_t post_present_callback_ordinal{};
+		int32_t command_queue_type{ -1 };
+		HRESULT result{ E_PENDING };
+		SwapchainSource source{ SwapchainSource::Native };
+		bool active{};
+		bool returned{};
+		bool result_valid{};
+		bool present1{};
+		bool render_callbacks_suppressed{};
+		bool original_call_skipped{};
+		bool original_call_invoked{};
+		bool command_queue_type_valid{};
+	};
+
 	typedef std::function<void(D3D12Hook&)> OnPresentFn;
 	typedef std::function<void(D3D12Hook&)> OnResizeBuffersFn;
     typedef std::function<void(D3D12Hook&)> OnResizeTargetFn;
@@ -109,6 +133,18 @@ public:
 
     uint64_t get_present_entry_count() const {
         return m_present_entry_count.load(std::memory_order_relaxed);
+    }
+
+    void set_present_diagnostics_enabled(bool enabled) noexcept {
+        m_present_diagnostics_enabled.store(enabled, std::memory_order_release);
+    }
+
+    PresentDiagnosticsSnapshot get_present_diagnostics_snapshot() const noexcept {
+        if (!m_present_diagnostics_enabled.load(std::memory_order_acquire)) {
+            return {};
+        }
+        std::lock_guard lock{ m_present_diagnostics_mutex };
+        return m_present_diagnostics;
     }
 
     int64_t get_last_present_age_ms() const noexcept;
@@ -222,6 +258,10 @@ protected:
     bool m_ignore_next_present{false};
     std::atomic<uint64_t> m_present_entry_count{0};
     std::atomic<std::chrono::steady_clock::rep> m_last_present_entry_ticks{0};
+    std::atomic<bool> m_present_diagnostics_enabled{};
+    std::atomic<uint64_t> m_post_present_callback_count{};
+    mutable std::mutex m_present_diagnostics_mutex{};
+    PresentDiagnosticsSnapshot m_present_diagnostics{};
     void* m_last_logged_present_swapchain{ nullptr };
     void* m_last_logged_present_target{ nullptr };
     bool m_last_logged_present_phase_1{ true };

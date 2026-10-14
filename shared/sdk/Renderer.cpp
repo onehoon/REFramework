@@ -1,4 +1,7 @@
 #include <algorithm>
+#include <cstring>
+#include <initializer_list>
+#include <optional>
 
 #include <spdlog/spdlog.h>
 
@@ -6,6 +9,7 @@
 #include <utility/Module.hpp>
 
 #include "Application.hpp"
+#include "GameIdentity.hpp"
 #include "RETypeDB.hpp"
 #include "RETypes.hpp"
 #include "SceneManager.hpp"
@@ -1286,11 +1290,163 @@ ConstantBuffer* create_constant_buffer(void* desc) {
 - 0x4C CircularDOF_NearCOCFilteredHQ
 - 0x3F CircularDOF_SceneMipTexture
 */
+namespace {
+using CreateTargetStateFn = TargetState* (*)(void*, TargetState::Desc*);
+
+constexpr uint32_t RE4_TARGET_STATE_CREATOR_RVA = 0x47D2180;
+constexpr uint32_t RE4_TARGET_STATE_CREATOR_END_RVA = 0x47D21D2;
+constexpr uint32_t RE4_TARGET_STATE_VTABLE_RVA = 0x7B1C148;
+constexpr uint32_t RE4_IMAGE_SIZE = 0x0E405000;
+constexpr uint32_t RE4_IMAGE_CHECKSUM = 0x0DEE3479;
+
+bool matches_image_bytes(uintptr_t image_base, uint32_t rva, std::initializer_list<uint8_t> expected) {
+    return std::memcmp(reinterpret_cast<const void*>(image_base + rva), expected.begin(), expected.size()) == 0;
+}
+
+bool re4_creator_call_targets(uintptr_t image_base, uint32_t call_rva, uint32_t target_rva) {
+    if (!matches_image_bytes(image_base, call_rva, { 0xE8 })) {
+        return false;
+    }
+
+    int32_t displacement{};
+    std::memcpy(&displacement, reinterpret_cast<const void*>(image_base + call_rva + 1), sizeof(displacement));
+    const auto resolved_rva = static_cast<int64_t>(call_rva) + 5 + displacement;
+    return resolved_rva == target_rva;
+}
+
+bool is_re4_creator_executable_range(uintptr_t image_base, const IMAGE_NT_HEADERS64* nt) {
+    constexpr uint32_t range_size = RE4_TARGET_STATE_CREATOR_END_RVA - RE4_TARGET_STATE_CREATOR_RVA;
+    const auto* section = IMAGE_FIRST_SECTION(const_cast<IMAGE_NT_HEADERS64*>(nt));
+    const auto section_table_rva = reinterpret_cast<uintptr_t>(section) - image_base;
+    const auto section_table_size = static_cast<size_t>(nt->FileHeader.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER);
+    if (section_table_rva > RE4_IMAGE_SIZE || section_table_size > RE4_IMAGE_SIZE - section_table_rva) {
+        return false;
+    }
+
+    for (uint16_t index = 0; index < nt->FileHeader.NumberOfSections; ++index) {
+        const auto& candidate = section[index];
+        if ((candidate.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) {
+            continue;
+        }
+
+        const auto section_size = std::max(candidate.Misc.VirtualSize, candidate.SizeOfRawData);
+        const auto section_begin = candidate.VirtualAddress;
+        const auto section_end = static_cast<uint64_t>(section_begin) + section_size;
+        if (RE4_TARGET_STATE_CREATOR_RVA >= section_begin &&
+            static_cast<uint64_t>(RE4_TARGET_STATE_CREATOR_RVA) + range_size <= section_end) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool has_re4_creator_runtime_function(uintptr_t image_base, const IMAGE_NT_HEADERS64* nt) {
+    const auto& exception_directory = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (exception_directory.VirtualAddress == 0 || exception_directory.Size == 0 ||
+        exception_directory.Size % sizeof(RUNTIME_FUNCTION) != 0 ||
+        exception_directory.VirtualAddress > RE4_IMAGE_SIZE ||
+        exception_directory.Size > RE4_IMAGE_SIZE - exception_directory.VirtualAddress) {
+        return false;
+    }
+
+    const auto* entries = reinterpret_cast<const RUNTIME_FUNCTION*>(image_base + exception_directory.VirtualAddress);
+    size_t first = 0;
+    size_t last = exception_directory.Size / sizeof(RUNTIME_FUNCTION);
+    while (first < last) {
+        const auto middle = first + (last - first) / 2;
+        const auto& entry = entries[middle];
+        if (RE4_TARGET_STATE_CREATOR_RVA < entry.BeginAddress) {
+            last = middle;
+        } else if (RE4_TARGET_STATE_CREATOR_RVA >= entry.EndAddress) {
+            first = middle + 1;
+        } else {
+            return entry.BeginAddress == RE4_TARGET_STATE_CREATOR_RVA &&
+                entry.EndAddress == RE4_TARGET_STATE_CREATOR_END_RVA;
+        }
+    }
+
+    return false;
+}
+
+CreateTargetStateFn resolve_re4_target_state_creator() {
+    const auto executable = utility::get_executable();
+    if (executable == nullptr) {
+        spdlog::warn("[Renderer][RE4] TargetState factory validation failed: executable module unavailable");
+        return nullptr;
+    }
+
+    const auto image_base = reinterpret_cast<uintptr_t>(executable);
+    const auto module_size = utility::get_module_size(executable);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image_base);
+    if (!module_size || *module_size != RE4_IMAGE_SIZE || dos->e_magic != IMAGE_DOS_SIGNATURE ||
+        dos->e_lfanew <= 0 || dos->e_lfanew > 0x100000) {
+        spdlog::warn("[Renderer][RE4] TargetState factory validation failed: invalid DOS header");
+        return nullptr;
+    }
+
+    if (static_cast<uint32_t>(dos->e_lfanew) > RE4_IMAGE_SIZE - sizeof(IMAGE_NT_HEADERS64)) {
+        spdlog::warn("[Renderer][RE4] TargetState factory validation failed: NT header outside image");
+        return nullptr;
+    }
+
+    const auto nt_address = image_base + static_cast<uint32_t>(dos->e_lfanew);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(nt_address);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+        nt->FileHeader.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64) ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+        nt->OptionalHeader.SizeOfImage != RE4_IMAGE_SIZE || nt->OptionalHeader.CheckSum != RE4_IMAGE_CHECKSUM ||
+        nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXCEPTION ||
+        RE4_TARGET_STATE_CREATOR_END_RVA > nt->OptionalHeader.SizeOfImage ||
+        RE4_TARGET_STATE_VTABLE_RVA >= nt->OptionalHeader.SizeOfImage) {
+        spdlog::warn("[Renderer][RE4] TargetState factory validation failed: RE4 1.5.9.0 image fingerprint mismatch");
+        return nullptr;
+    }
+
+    if (!is_re4_creator_executable_range(image_base, nt) || !has_re4_creator_runtime_function(image_base, nt)) {
+        spdlog::warn("[Renderer][RE4] TargetState factory validation failed: creator function range mismatch");
+        return nullptr;
+    }
+
+    const bool bytes_valid =
+        matches_image_bytes(image_base, 0x47D2180, { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20,
+            0x48, 0x8B, 0xFA, 0xB9, 0x01, 0x00, 0x00, 0x00 }) &&
+        matches_image_bytes(image_base, 0x47D2192, { 0xBA, 0xA8, 0x00, 0x00, 0x00 }) &&
+        re4_creator_call_targets(image_base, 0x47D2197, 0x3AB27F0) &&
+        matches_image_bytes(image_base, 0x47D219C, { 0x48, 0x8B, 0xD8, 0x48, 0x85, 0xC0, 0x74, 0x23 }) &&
+        matches_image_bytes(image_base, 0x47D21A4, { 0x48, 0x8B, 0xD7, 0x48, 0x8B, 0xC8 }) &&
+        re4_creator_call_targets(image_base, 0x47D21AA, 0x446E790) &&
+        matches_image_bytes(image_base, 0x47D21AF, { 0x48, 0x8D, 0x05, 0x92, 0x9F, 0x34, 0x03 }) &&
+        matches_image_bytes(image_base, 0x47D21B6, { 0x48, 0x89, 0x03, 0x48, 0x8B, 0xC3 }) &&
+        matches_image_bytes(image_base, 0x47D21BC, { 0x48, 0x8B, 0x5C, 0x24, 0x30, 0x48, 0x83, 0xC4, 0x20, 0x5F, 0xC3 }) &&
+        matches_image_bytes(image_base, 0x47D21C7, { 0x48, 0x8B, 0x5C, 0x24, 0x30, 0x48, 0x83, 0xC4, 0x20, 0x5F, 0xC3 });
+    if (!bytes_valid) {
+        spdlog::warn("[Renderer][RE4] TargetState factory validation failed: creator instruction anchors mismatch");
+        return nullptr;
+    }
+
+    int32_t vtable_displacement{};
+    std::memcpy(&vtable_displacement, reinterpret_cast<const void*>(image_base + 0x47D21B2), sizeof(vtable_displacement));
+    const auto vtable_address = static_cast<int64_t>(0x47D21B6) + vtable_displacement;
+    if (vtable_address != RE4_TARGET_STATE_VTABLE_RVA) {
+        spdlog::warn("[Renderer][RE4] TargetState factory validation failed: TargetState vtable target mismatch");
+        return nullptr;
+    }
+
+    spdlog::info("[Renderer][RE4] Found create_target_state via validated RVA 0x{:x}", RE4_TARGET_STATE_CREATOR_RVA);
+    return reinterpret_cast<CreateTargetStateFn>(image_base + RE4_TARGET_STATE_CREATOR_RVA);
+}
+}
+
 TargetState* create_target_state(TargetState::Desc* desc) {
     static auto fn = []() -> TargetState* (*)(void*, TargetState::Desc*) {
         spdlog::info("Searching for create_target_state");
 
         const auto game = utility::get_executable();
+        if (sdk::GameIdentity::get().is_re4()) {
+            return resolve_re4_target_state_creator();
+        }
+
         const auto string = utility::scan_string(game, "CircularDOF_SceneMipTexture");
 
         if (!string) {
@@ -1300,8 +1456,8 @@ TargetState* create_target_state(TargetState::Desc* desc) {
 
         const auto string_ref = utility::scan_displacement_reference(game, *string);
 
-            spdlog::error("Failed to find create_target_state (no string ref)");
         if (!string_ref) {
+            spdlog::error("Failed to find create_target_state (no string ref)");
             return nullptr;
         }
 
@@ -1335,6 +1491,10 @@ TargetState* create_target_state(TargetState::Desc* desc) {
 
         return nullptr;
     }();
+
+    if (fn == nullptr) {
+        return nullptr;
+    }
 
     return fn(nullptr, desc);
 }
@@ -1427,7 +1587,15 @@ Texture* create_texture(Texture::Desc* desc) {
         return result;
     }();
 
+    if (fn == nullptr) {
+        return nullptr;
+    }
+
     static auto renderer = sdk::renderer::get_renderer();
+    if (renderer == nullptr || renderer->get_device() == nullptr) {
+        return nullptr;
+    }
+
     return fn(renderer->get_device(), desc);
 }
 
@@ -1478,8 +1646,10 @@ E8 ? ? ? ?                                    call    create_render_target_view
 48 8B D8                                      mov     rbx, rax
 4C 89 BF F0 04 00 00                          mov     [rdi+4F0h], r15
 */
-RenderTargetView* create_render_target_view(sdk::renderer::RenderResource* resource, void* desc) {
-    static auto fn = []() -> RenderTargetView* (*)(void*, sdk::renderer::RenderResource* resource, void*) {
+using CreateRenderTargetViewFn = RenderTargetView* (*)(void*, sdk::renderer::RenderResource*, void*);
+
+static CreateRenderTargetViewFn get_create_render_target_view_fn() {
+    static auto fn = []() -> CreateRenderTargetViewFn {
         spdlog::info("Searching for create_render_target_view");
 
         const auto game = utility::get_executable();
@@ -1496,6 +1666,73 @@ RenderTargetView* create_render_target_view(sdk::renderer::RenderResource* resou
                 return result;
             }
 
+            if (sdk::GameIdentity::get().is_re4()) {
+                const auto module_size = utility::get_module_size(game);
+                const auto module_base = reinterpret_cast<uintptr_t>(game);
+                const auto module_end = module_size ? module_base + *module_size : module_base;
+
+                const auto find_unique_ref = [&](const char* label, const char* pattern) -> std::optional<uintptr_t> {
+                    const auto match = utility::scan(game, pattern);
+                    if (!match) {
+                        spdlog::debug("[Renderer][RE4] create_render_target_view signature miss: {}", label);
+                        return std::nullopt;
+                    }
+
+                    if (!module_size || module_end < module_base || *match < module_base || *match >= module_end) {
+                        spdlog::warn("[Renderer][RE4] executable bounds unavailable for signature uniqueness check: {}", label);
+                        return std::nullopt;
+                    }
+
+                    if (const auto duplicate = utility::scan(*match + 1, module_end - (*match + 1), pattern)) {
+                        spdlog::warn("[Renderer][RE4] create_render_target_view signature is ambiguous: {} first=0x{:x} second=0x{:x}",
+                            label, *match, *duplicate);
+                        return std::nullopt;
+                    }
+
+                    return match;
+                };
+
+                const auto resolve_re4_callsite = [&](const char* label, const char* pattern, size_t displacement_offset) -> CreateRenderTargetViewFn {
+                    const auto callsite = find_unique_ref(label, pattern);
+                    if (!callsite) {
+                        return nullptr;
+                    }
+
+                    const auto target = utility::calculate_absolute(*callsite + displacement_offset);
+                    constexpr size_t thunk_signature_size = 24;
+                    constexpr auto thunk_signature =
+                        "48 8B 0D ? ? ? ? 48 85 C9 75 07 48 8B 0D ? ? ? ? E9 ? ? ? ?";
+
+                    if (!module_size || *module_size < thunk_signature_size || target < module_base ||
+                        target - module_base > *module_size - thunk_signature_size) {
+                        spdlog::warn("[Renderer][RE4] create_render_target_view target is outside the executable image: {} target=0x{:x}",
+                            label, target);
+                        return nullptr;
+                    }
+
+                    const auto thunk = utility::scan(target, thunk_signature_size, thunk_signature);
+                    if (!thunk || *thunk != target) {
+                        spdlog::warn("[Renderer][RE4] create_render_target_view target failed thunk validation: {} target=0x{:x}",
+                            label, target);
+                        return nullptr;
+                    }
+
+                    spdlog::info("[Renderer][RE4] Found create_render_target_view via {}: {:x}", label, target);
+                    return reinterpret_cast<CreateRenderTargetViewFn>(target);
+                };
+
+                // RE4 1.5.9.0 call-site signatures. Both resolve to the
+                // singleton-loading thunk, which supplies the receiver before
+                // tail-calling the render-target-view factory body.
+                if (const auto result = resolve_re4_callsite("RVA 0x447AF5A", "49 8B CC 44 89 AD D0 06 00 00 E8 ? ? ? ?", 11)) {
+                    return result;
+                }
+
+                if (const auto result = resolve_re4_callsite("RVA 0x44AD6AD", "49 8B CC C7 44 24 20 3D 00 00 00 E8 ? ? ? ?", 12)) {
+                    return result;
+                }
+            }
+
             spdlog::error("Failed to find create_render_target_view (no ref)");
             return nullptr;
         }
@@ -1505,6 +1742,15 @@ RenderTargetView* create_render_target_view(sdk::renderer::RenderResource* resou
 
         return result;
     }();
+
+    return fn;
+}
+
+RenderTargetView* create_render_target_view(sdk::renderer::RenderResource* resource, void* desc) {
+    const auto fn = get_create_render_target_view_fn();
+    if (fn == nullptr) {
+        return nullptr;
+    }
 
     return fn(nullptr, resource, desc);
 }
@@ -1621,6 +1867,10 @@ Texture* Texture::clone() {
 }
 
 sdk::intrusive_ptr<RenderTargetView> RenderTargetView::clone() {
+    if (get_create_render_target_view_fn() == nullptr) {
+        return nullptr;
+    }
+
     auto tex = this->get_texture_d3d12();
 
     if (tex == nullptr) {
@@ -1631,6 +1881,10 @@ sdk::intrusive_ptr<RenderTargetView> RenderTargetView::clone() {
 }
 
 sdk::intrusive_ptr<RenderTargetView> RenderTargetView::clone(uint32_t new_width, uint32_t new_height) {
+    if (get_create_render_target_view_fn() == nullptr) {
+        return nullptr;
+    }
+
     auto tex = this->get_texture_d3d12();
 
     if (tex == nullptr) {
@@ -1699,39 +1953,72 @@ sdk::intrusive_ptr<TargetState>& RenderTargetView::get_target_state_d3d12() cons
     return *(sdk::intrusive_ptr<TargetState>*)((uintptr_t)this + detail::rtv_size());
 }
 
+namespace {
+void release_cloned_target_state_rtvs(TargetState::Desc& desc) {
+    if (desc.rtvs == nullptr) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < desc.num_rtv; ++i) {
+        desc.rtvs[i].reset();
+    }
+
+    sdk::memory::deallocate(desc.rtvs);
+    desc.rtvs = nullptr;
+}
+}
+
 sdk::intrusive_ptr<TargetState> TargetState::clone() const {
     auto cloned_desc = get_desc();
 
     if (cloned_desc.num_rtv > 0) {
-        cloned_desc.rtvs = (decltype(cloned_desc.rtvs))sdk::memory::allocate(cloned_desc.num_rtv * sizeof(void*));
+        cloned_desc.rtvs = (decltype(cloned_desc.rtvs))sdk::memory::allocate(
+            cloned_desc.num_rtv * sizeof(*cloned_desc.rtvs));
+        if (cloned_desc.rtvs == nullptr) {
+            return nullptr;
+        }
 
         for (auto i = 0; i < cloned_desc.num_rtv; ++i) {
             auto rtv = get_rtv(i);
 
             if (rtv == nullptr) {
-                continue;
+                release_cloned_target_state_rtvs(cloned_desc);
+                return nullptr;
             }
 
             cloned_desc.rtvs[i] = rtv->clone();
+            if (cloned_desc.rtvs[i] == nullptr) {
+                release_cloned_target_state_rtvs(cloned_desc);
+                return nullptr;
+            }
         }
     } else {
         cloned_desc.rtvs = nullptr;
     }
 
-    return sdk::renderer::create_target_state(&cloned_desc);
+    auto* cloned_state = sdk::renderer::create_target_state(&cloned_desc);
+    if (cloned_state == nullptr) {
+        release_cloned_target_state_rtvs(cloned_desc);
+    }
+    return cloned_state;
 }
 
 sdk::intrusive_ptr<TargetState> TargetState::clone(const std::vector<std::array<uint32_t, 2>>& new_dimensions) const {
     auto cloned_desc = get_desc();
 
     if (cloned_desc.num_rtv > 0) {
-        cloned_desc.rtvs = (decltype(cloned_desc.rtvs))sdk::memory::allocate(cloned_desc.num_rtv * sizeof(void*), true);
+        cloned_desc.rtvs = (decltype(cloned_desc.rtvs))sdk::memory::allocate(
+            cloned_desc.num_rtv * sizeof(*cloned_desc.rtvs), true);
+        if (cloned_desc.rtvs == nullptr) {
+            return nullptr;
+        }
 
         for (auto i = 0; i < cloned_desc.num_rtv; ++i) {
             auto rtv = get_rtv(i);
 
             if (rtv == nullptr) {
-                continue;
+                release_cloned_target_state_rtvs(cloned_desc);
+                return nullptr;
             }
 
             if (i < new_dimensions.size()) {
@@ -1744,12 +2031,21 @@ sdk::intrusive_ptr<TargetState> TargetState::clone(const std::vector<std::array<
             } else {
                 cloned_desc.rtvs[i] = rtv->clone();
             }
+
+            if (cloned_desc.rtvs[i] == nullptr) {
+                release_cloned_target_state_rtvs(cloned_desc);
+                return nullptr;
+            }
         }
     } else {
         cloned_desc.rtvs = nullptr;
     }
 
-    return sdk::renderer::create_target_state(&cloned_desc);
+    auto* cloned_state = sdk::renderer::create_target_state(&cloned_desc);
+    if (cloned_state == nullptr) {
+        release_cloned_target_state_rtvs(cloned_desc);
+    }
+    return cloned_state;
 }
 
 void*& layer::Output::get_present_state() {
