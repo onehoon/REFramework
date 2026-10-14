@@ -1,5 +1,7 @@
 # RE4 XeSS — REA Installation, Local Codex MCP Setup, and Targeted Reverse-Engineering Work Order
 
+> **2026-10-14 execution override:** The initial REA 6.4.0 + Windows Ghidra attempt reached full-image auto-analysis and timed out before returning a function. **Do not repeat the original Phase S -> first analyze_function workflow unchanged.** Follow [RE4_XESS_REA_GHIDRA_RECOVERY_WORK_ORDER_2026-10-14.md](RE4_XESS_REA_GHIDRA_RECOVERY_WORK_ORDER_2026-10-14.md) first: PE/RVA bytes -> Ghidra direct -noanalysis persistent project -> one bounded function. The research questions below remain valid; the original execution sequence is superseded until recovery passes.
+
 **Date:** 2026-10-14  
 **Repository:** https://github.com/onehoon/REFramework  
 **Work-order location / requested branch:** feature/re4-xess / doc  
