@@ -13,6 +13,7 @@
 #include "RE4XeSSLoadEligibility.hpp"
 #include "RE4XeSSLifetimeTrace.hpp"
 #include "RE4XeSSOutputHandoff.hpp"
+#include "RE4XeSSSceneViewDecision.hpp"
 #include "RE4XeSSWorker.hpp"
 
 class RE4XeSS final : public Mod {
@@ -148,6 +149,7 @@ private:
     std::string m_last_invalid_config_token{};
     RE4XeSSWorker m_worker{};
     RE4XeSSOutputHandoff m_output_handoff{};
+    RE4XeSSSceneView::MarkerPendingFrameGate m_marker_pending_frame_gate{};
     mutable std::mutex m_producer_snapshot_mutex{};
     ProducerSnapshot m_producer_snapshot{};
     mutable std::mutex m_pending_worker_fault_mutex{};

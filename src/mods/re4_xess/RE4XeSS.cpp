@@ -6200,6 +6200,19 @@ void RE4XeSS::on_view_get_size(REManagedObject* scene_view, float* result) {
     const bool load_observation_valid = load_window.state.observation_valid;
     const float native_width = result != nullptr ? result[0] : 0.0f;
     const float native_height = result != nullptr ? result[1] : 0.0f;
+    const auto* renderer = sdk::renderer::get_renderer();
+    const auto frame = renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
+    const bool output_marker_pending = m_output_handoff.output_marker_pending_snapshot();
+    if (output_marker_pending) {
+        if (frame) {
+            m_marker_pending_frame_gate.block(static_cast<uint64_t>(*frame));
+        } else {
+            m_marker_pending_frame_gate.block_without_frame();
+        }
+    }
+    const bool marker_pending_for_frame = frame
+        ? m_marker_pending_frame_gate.is_blocked(static_cast<uint64_t>(*frame))
+        : output_marker_pending || m_marker_pending_frame_gate.has_unframed_block();
 
     auto size_decision = RE4XeSSSceneView::decide_size(
         result != nullptr,
@@ -6208,7 +6221,8 @@ void RE4XeSS::on_view_get_size(REManagedObject* scene_view, float* result) {
         temporal_active && load_admitted,
         load_observation_valid,
         m_input_resolution.optimal.x,
-        m_input_resolution.optimal.y);
+        m_input_resolution.optimal.y,
+        !marker_pending_for_frame);
 
     // Revalidate an actual reduced-size candidate immediately before writing
     // the getter result. This is an optimistic, nonblocking check; it is not a
@@ -6222,7 +6236,8 @@ void RE4XeSS::on_view_get_size(REManagedObject* scene_view, float* result) {
             false,
             load_observation_valid,
             m_input_resolution.optimal.x,
-            m_input_resolution.optimal.y);
+            m_input_resolution.optimal.y,
+            !marker_pending_for_frame);
     }
     const bool override_applied = size_decision.override_applied;
 
@@ -6236,6 +6251,7 @@ void RE4XeSS::on_view_get_size(REManagedObject* scene_view, float* result) {
     const bool update_overlap = load_window.overlapped() || overlap_reset_pending;
     const auto admission_reason = update_overlap
         ? "load-state-update-overlapped"
+        : marker_pending_for_frame ? "output-handoff-marker-pending-native-frame"
         : !load_observation_valid ? "observation-unavailable"
             : !load_admitted ? "native-load-window"
             : override_applied ? "reduced-scene-view-applied"
@@ -6254,8 +6270,6 @@ void RE4XeSS::on_view_get_size(REManagedObject* scene_view, float* result) {
         return;
     }
 
-    const auto* renderer = sdk::renderer::get_renderer();
-    const auto frame = renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
     if (!frame) {
         return;
     }
@@ -6284,6 +6298,7 @@ void RE4XeSS::on_view_get_size(REManagedObject* scene_view, float* result) {
     RE4XeSSLifetimeTrace::set_reason(
         trace_event,
         override_applied ? "reduced-scene-view-applied" :
+            marker_pending_for_frame ? "output-handoff-marker-pending-native-frame" :
             update_overlap ? "load-state-update-overlapped" :
             temporal_active && !load_admitted ? "native-load-window" :
             temporal_active ? "temporal-view-gate-closed" : "native-scene-view");
@@ -6404,6 +6419,15 @@ void RE4XeSS::on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* re
     }
 
     const auto frame_id = static_cast<uint64_t>(*frame);
+    if (m_output_handoff.output_marker_pending_snapshot()) {
+        m_marker_pending_frame_gate.block(frame_id);
+    }
+    if (m_marker_pending_frame_gate.is_blocked(frame_id)) {
+        m_last_scene_callback_frame = frame_id;
+        invalidate_history("output-handoff-marker-pending");
+        clear_frame_state();
+        return;
+    }
     if (m_last_scene_callback_frame && *m_last_scene_callback_frame == frame_id) {
         return;
     }
@@ -7008,6 +7032,21 @@ bool RE4XeSS::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, vo
 
     const auto* renderer = sdk::renderer::get_renderer();
     const auto frame = renderer != nullptr ? renderer->get_render_frame() : std::nullopt;
+    const bool output_marker_pending = m_output_handoff.output_marker_pending_snapshot();
+    if (output_marker_pending) {
+        if (frame) {
+            m_marker_pending_frame_gate.block(static_cast<uint64_t>(*frame));
+        } else {
+            m_marker_pending_frame_gate.block_without_frame();
+        }
+    }
+    if (m_marker_pending_frame_gate.consume(
+            frame ? static_cast<uint64_t>(*frame) : RE4XeSSSceneView::MarkerPendingFrameGate::INVALID_FRAME)) {
+        invalidate_history("output-handoff-marker-pending");
+        clear_frame_state();
+        trace_skip("output-handoff-marker-pending-native-frame");
+        return true;
+    }
     if (!frame || !m_cached_scene || !m_cached_scene_frame ||
         *m_cached_scene_frame != static_cast<uint64_t>(*frame)) {
         invalidate_history("pre-overlay-primary-scene-frame-missing");
