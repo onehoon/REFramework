@@ -236,7 +236,6 @@ bool RE4XeSSOutputHandoff::restore(
             m_installed_overlay = nullptr;
             m_retirement_requested = true;
             m_missing_marker = m_marker_pending;
-            publish_marker_pending_snapshot_locked();
             m_retirement_status = m_marker_pending
                 ? RetirementStatus::MissingMarker
                 : RetirementStatus::Draining;
@@ -297,7 +296,6 @@ bool RE4XeSSOutputHandoff::restore(
                 m_installed_overlay = nullptr;
                 m_retirement_requested = true;
                 m_missing_marker = m_marker_pending;
-                publish_marker_pending_snapshot_locked();
                 m_retirement_status = m_marker_pending
                     ? RetirementStatus::MissingMarker
                     : RetirementStatus::Draining;
@@ -630,7 +628,6 @@ bool RE4XeSSOutputHandoff::restore(
         restored_marker_pending = m_marker_pending;
         if (m_marker_pending) {
             m_missing_marker = true;
-            publish_marker_pending_snapshot_locked();
             m_retirement_status = RetirementStatus::MissingMarker;
             if (m_failure_reason.empty()) {
                 m_failure_reason = "The previous installed handoff frame has no post-Present retirement marker yet";
@@ -1051,7 +1048,6 @@ RE4XeSSOutputHandoff::RetirementStatus RE4XeSSOutputHandoff::poll_retirement(
             m_hard_quarantined = false;
             m_bridge_writer_uncertain = false;
             m_marker_pending = false;
-            publish_marker_pending_snapshot_locked();
             m_installed = false;
             m_installed_snapshot.store(false, std::memory_order_release);
             m_installed_overlay = nullptr;
@@ -1086,7 +1082,6 @@ RE4XeSSOutputHandoff::RetirementStatus RE4XeSSOutputHandoff::poll_retirement(
                     release = true;
                 } else if (m_marker_pending || m_last_signaled_retirement_value == 0) {
                     m_missing_marker = true;
-                    publish_marker_pending_snapshot_locked();
                     status = RetirementStatus::MissingMarker;
                 } else if (m_retirement_fence == nullptr) {
                     m_hard_quarantined = true;
@@ -1196,7 +1191,6 @@ RE4XeSSOutputHandoff::PrepareResult RE4XeSSOutputHandoff::prepare(
             !m_bridge_writer_uncertain && !m_device_removed && !waiting_for_marker;
         if (waiting_for_marker) {
             m_missing_marker = true;
-            publish_marker_pending_snapshot_locked();
             m_retirement_status = RetirementStatus::MissingMarker;
             if (!m_marker_wait_logged && m_delayed_marker_log_count < 8) {
                 m_marker_wait_logged = true;
@@ -1294,7 +1288,6 @@ RE4XeSSOutputHandoff::PrepareResult RE4XeSSOutputHandoff::prepare(
     m_downstream_use_seen = false;
     m_marker_pending = false;
     m_missing_marker = false;
-    m_output_marker_pending_snapshot.store(false, std::memory_order_release);
     m_marker_wait_logged = false;
     m_marker_recovery_pending = false;
     m_hard_quarantined = false;
@@ -1463,7 +1456,6 @@ bool RE4XeSSOutputHandoff::install(
     m_downstream_use_seen = true;
     m_marker_pending = true;
     m_missing_marker = false;
-    publish_marker_pending_snapshot_locked();
     m_installed_snapshot.store(true, std::memory_order_release);
     m_retirement_status = RetirementStatus::Active;
     m_failure_reason.clear();
@@ -1736,7 +1728,6 @@ void RE4XeSSOutputHandoff::on_post_present(
     m_last_signaled_retirement_value = value;
     m_marker_pending = false;
     m_missing_marker = false;
-    publish_marker_pending_snapshot_locked();
     m_marker_wait_logged = false;
     if (settled_missing_marker) {
         m_marker_recovery_pending = true;
@@ -2071,7 +2062,6 @@ void RE4XeSSOutputHandoff::release_generation() noexcept {
         m_retirement_status = RetirementStatus::NoGeneration;
         m_marker_pending = false;
         m_missing_marker = false;
-        publish_marker_pending_snapshot_locked();
         m_retirement_requested = false;
         m_failure_reason.clear();
         handoff_state = std::move(m_handoff_state);

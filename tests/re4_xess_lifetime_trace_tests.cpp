@@ -465,30 +465,9 @@ void test_scene_view_override_decision() {
     assert(!invalid_input_extent.override_applied);
     assert(invalid_input_extent.effective_width == 2560.0f && invalid_input_extent.effective_height == 1440.0f);
 
-    const auto output_unavailable = RE4XeSSSceneView::decide_size(
-        true, 2560.0f, 1440.0f, true, true, 1706, 960, false);
-    assert(!output_unavailable.override_applied);
-    assert(output_unavailable.effective_width == 2560.0f && output_unavailable.effective_height == 1440.0f);
-
     const auto missing_result = RE4XeSSSceneView::decide_size(false, 0.0f, 0.0f, true, true, 1706, 960);
     assert(!missing_result.override_applied);
     assert(missing_result.effective_width == 0.0f && missing_result.effective_height == 0.0f);
-
-    RE4XeSSSceneView::MarkerPendingFrameGate gate{};
-    assert(!gate.is_blocked(RE4XeSSSceneView::MarkerPendingFrameGate::INVALID_FRAME));
-    assert(!gate.consume(RE4XeSSSceneView::MarkerPendingFrameGate::INVALID_FRAME));
-    gate.block(100);
-    assert(gate.is_blocked(100));
-    assert(!gate.is_blocked(101));
-    assert(gate.consume(100));
-    assert(!gate.is_blocked(100));
-    assert(!gate.consume(100));
-
-    gate.block_without_frame();
-    assert(gate.is_blocked(101));
-    assert(gate.consume(101));
-    assert(!gate.has_unframed_block());
-    assert(!gate.is_blocked(101));
 }
 
 void test_scene_extent_and_jitter_trace(Trace& trace) {

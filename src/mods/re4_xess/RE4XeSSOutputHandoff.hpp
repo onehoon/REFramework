@@ -131,9 +131,6 @@ public:
         const ObservationContext& observation,
         const re4_xess::EngineWriterWitnessChain& writer_witness_chain);
     bool identity_mismatch_latched() const noexcept;
-    bool output_marker_pending_snapshot() const noexcept {
-        return m_output_marker_pending_snapshot.load(std::memory_order_acquire);
-    }
     Snapshot snapshot() const;
 
 private:
@@ -260,7 +257,6 @@ private:
     bool m_downstream_use_seen{};
     bool m_marker_pending{};
     bool m_missing_marker{};
-    std::atomic<bool> m_output_marker_pending_snapshot{};
     bool m_marker_wait_logged{};
     bool m_marker_recovery_pending{};
     bool m_hard_quarantined{};
@@ -294,10 +290,4 @@ private:
     RetirementStatus m_retirement_status{ RetirementStatus::NoGeneration };
     mutable std::mutex m_retirement_mutex{};
     std::string m_failure_reason{};
-
-    void publish_marker_pending_snapshot_locked() noexcept {
-        m_output_marker_pending_snapshot.store(
-            m_marker_pending || m_missing_marker,
-            std::memory_order_release);
-    }
 };
