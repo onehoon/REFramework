@@ -322,22 +322,31 @@ void HookManager::create_jitted_facilitator(std::unique_ptr<HookManager::HookedF
     };
     
     const auto num_params = fn->get_num_params();
+    const auto param_modifiers = fn->get_param_modifiers();
+
+    auto is_float_type = [](sdk::RETypeDefinition* t) {
+        const auto name = t->get_full_name();
+        return name == "System.Single" || name == "System.Double";
+    };
+
+    // Only by-value floats travel in XMM; out/ref/pointer floats are pointers in the integer registers.
+    auto is_float_arg = [&](uint32_t i) {
+        if (i >= num_params) {
+            return false;
+        }
+
+        if (i < param_modifiers.size() && param_modifiers[i] != sdk::REMethodDefinition::ParamModifier::None) {
+            return false;
+        }
+
+        return is_float_type(arg_tys[i]);
+    };
 
     // +2 for buffer params to fix possible corruption.
     for (auto i = 0u; i < num_params + HIDDEN_ARGUMENT_COUNT; ++i) {
-        auto is_float = false;
-
-        if (i < num_params) {
-            auto arg_ty = arg_tys[i];
-
-            if (arg_ty->get_full_name() == "System.Single") {
-                is_float = true;
-            }
-        }
-
         const auto args_offset = args_start_offset + (i * 8);
 
-        save_arg(args_offset, is_float);
+        save_arg(args_offset, is_float_arg(i));
     }
 
 
@@ -413,19 +422,9 @@ void HookManager::create_jitted_facilitator(std::unique_ptr<HookManager::HookedF
 
     // +2 for buffer params to fix possible corruption.
     for (auto i = 0u; i < num_params + HIDDEN_ARGUMENT_COUNT; ++i) {
-        auto is_float = false;
-
-        if (i < num_params) {
-            auto arg_ty = arg_tys[i];
-
-            if (arg_ty->get_full_name() == "System.Single") {
-                is_float = true;
-            }
-        }
-
         auto args_offset = args_start_offset + (i * 8);
         
-        restore_arg(args_offset, is_float);
+        restore_arg(args_offset, is_float_arg(i));
     }
 
     // Call original function.
@@ -465,7 +464,7 @@ void HookManager::create_jitted_facilitator(std::unique_ptr<HookManager::HookedF
     constexpr auto ret_val_offset = offsetof(HookedFn::HookStorage, ret_val);
     //a.lea(rcx, ptr(r10, ret_val_offset));
 
-    auto is_ret_ty_float = hook->ret_ty->get_full_name() == "System.Single";
+    auto is_ret_ty_float = is_float_type(hook->ret_ty);
 
     if (is_ret_ty_float) {
         a.movq(ptr(r10, ret_val_offset), xmm0);
