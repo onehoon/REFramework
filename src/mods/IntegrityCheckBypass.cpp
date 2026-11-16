@@ -1,8 +1,6 @@
-#include <algorithm>
-#include <array>
-#include <cwchar>
-#include <limits>
 #include <unordered_map>
+#include <cwchar>
+#include <algorithm>
 #include <unordered_set>
 #include <shared_mutex>
 #include <iomanip>
@@ -33,297 +31,6 @@ struct IntegrityCheckPattern {
     std::string pat{};
     uint32_t offset{};
 };
-
-namespace {
-
-constexpr size_t kAntiDebugEntrySize = 32;
-
-enum class AntiDebugRedirectKind {
-    DirectE9,
-    IndirectFF25,
-};
-
-struct AntiDebugRedirectSnapshot {
-    AntiDebugRedirectKind kind{};
-    uintptr_t target{};
-    uintptr_t pointer_slot{};
-    size_t instruction_length{};
-    std::array<uint8_t, kAntiDebugEntrySize> observed_entry{};
-    MEMORY_BASIC_INFORMATION target_region{};
-};
-
-bool is_readable_protection(const DWORD protection) {
-    if (protection == 0 || (protection & PAGE_GUARD) != 0) {
-        return false;
-    }
-
-    switch (protection & 0xFF) {
-    case PAGE_READONLY:
-    case PAGE_READWRITE:
-    case PAGE_WRITECOPY:
-    case PAGE_EXECUTE_READ:
-    case PAGE_EXECUTE_READWRITE:
-    case PAGE_EXECUTE_WRITECOPY:
-        return true;
-    default:
-        return false;
-    }
-}
-
-bool is_executable_protection(const DWORD protection) {
-    if (protection == 0 || (protection & PAGE_GUARD) != 0) {
-        return false;
-    }
-
-    switch (protection & 0xFF) {
-    case PAGE_EXECUTE:
-    case PAGE_EXECUTE_READ:
-    case PAGE_EXECUTE_READWRITE:
-    case PAGE_EXECUTE_WRITECOPY:
-        return true;
-    default:
-        return false;
-    }
-}
-
-bool add_uintptr(const uintptr_t base, const uintptr_t offset, uintptr_t& result) {
-    if (offset > std::numeric_limits<uintptr_t>::max() - base) {
-        return false;
-    }
-
-    result = base + offset;
-    return true;
-}
-
-bool subtract_uintptr(const uintptr_t base, const uintptr_t offset, uintptr_t& result) {
-    if (offset > base) {
-        return false;
-    }
-
-    result = base - offset;
-    return true;
-}
-
-bool resolve_relative_target(const uintptr_t instruction, const size_t instruction_length, const int32_t relative, uintptr_t& target) {
-    uintptr_t next_instruction{};
-    if (!add_uintptr(instruction, instruction_length, next_instruction)) {
-        return false;
-    }
-
-    if (relative >= 0) {
-        return add_uintptr(next_instruction, static_cast<uintptr_t>(relative), target);
-    }
-
-    return subtract_uintptr(next_instruction, static_cast<uintptr_t>(-(static_cast<int64_t>(relative))), target);
-}
-
-bool is_readable_range(const void* address, const size_t size) {
-    if (size == 0) {
-        return true;
-    }
-
-    const auto start = reinterpret_cast<uintptr_t>(address);
-    if (start == 0 || size > std::numeric_limits<uintptr_t>::max() - start) {
-        return false;
-    }
-
-    auto current = start;
-    auto remaining = size;
-    while (remaining != 0) {
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (VirtualQuery(reinterpret_cast<LPCVOID>(current), &mbi, sizeof(mbi)) != sizeof(mbi)) {
-            return false;
-        }
-
-        const auto region_start = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-        if (mbi.RegionSize == 0 || region_start > current || mbi.RegionSize > std::numeric_limits<uintptr_t>::max() - region_start) {
-            return false;
-        }
-
-        const auto region_end = region_start + mbi.RegionSize;
-        if (mbi.State != MEM_COMMIT || !is_readable_protection(mbi.Protect) || current >= region_end) {
-            return false;
-        }
-
-        const auto available = region_end - current;
-        if (available >= remaining) {
-            return true;
-        }
-
-        remaining -= available;
-        current = region_end;
-    }
-
-    return true;
-}
-
-bool safe_read(const void* address, void* destination, const size_t size) {
-    if (address == nullptr || destination == nullptr || size == 0 || !is_readable_range(address, size)) {
-        return false;
-    }
-
-    SIZE_T bytes_read{};
-    return ReadProcessMemory(GetCurrentProcess(), address, destination, size, &bytes_read) != FALSE && bytes_read == size;
-}
-
-std::optional<MEMORY_BASIC_INFORMATION> query_target_region(const uintptr_t target) {
-    if (target == 0) {
-        return std::nullopt;
-    }
-
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (VirtualQuery(reinterpret_cast<LPCVOID>(target), &mbi, sizeof(mbi)) != sizeof(mbi)) {
-        return std::nullopt;
-    }
-
-    const auto region_start = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-    if (mbi.RegionSize == 0 || region_start > target || mbi.RegionSize > std::numeric_limits<uintptr_t>::max() - region_start) {
-        return std::nullopt;
-    }
-
-    const auto region_end = region_start + mbi.RegionSize;
-    if (target >= region_end || mbi.State != MEM_COMMIT || mbi.Type != MEM_PRIVATE || !is_executable_protection(mbi.Protect)) {
-        return std::nullopt;
-    }
-
-    return mbi;
-}
-
-bool same_region_identity(const MEMORY_BASIC_INFORMATION& expected, const MEMORY_BASIC_INFORMATION& current) {
-    return current.BaseAddress == expected.BaseAddress &&
-        current.AllocationBase == expected.AllocationBase &&
-        current.RegionSize == expected.RegionSize &&
-        current.State == expected.State &&
-        current.Type == expected.Type &&
-        current.Protect == expected.Protect;
-}
-
-bool same_target_region(const MEMORY_BASIC_INFORMATION& expected, const uintptr_t target) {
-    const auto current = query_target_region(target);
-    return current && same_region_identity(expected, *current);
-}
-
-std::optional<AntiDebugRedirectSnapshot> resolve_anti_debug_redirect(void* entry, const std::array<uint8_t, kAntiDebugEntrySize>& observed_entry) {
-    const auto entry_address = reinterpret_cast<uintptr_t>(entry);
-    AntiDebugRedirectSnapshot snapshot{};
-    snapshot.observed_entry = observed_entry;
-
-    if (observed_entry[0] == 0xE9) {
-        int32_t relative{};
-        std::memcpy(&relative, observed_entry.data() + 1, sizeof(relative));
-
-        if (!resolve_relative_target(entry_address, 5, relative, snapshot.target)) {
-            return std::nullopt;
-        }
-
-        snapshot.kind = AntiDebugRedirectKind::DirectE9;
-        snapshot.instruction_length = 5;
-    } else if (observed_entry[0] == 0xFF && observed_entry[1] == 0x25) {
-        int32_t relative{};
-        std::memcpy(&relative, observed_entry.data() + 2, sizeof(relative));
-
-        if (!resolve_relative_target(entry_address, 6, relative, snapshot.pointer_slot) ||
-            !safe_read(reinterpret_cast<const void*>(snapshot.pointer_slot), &snapshot.target, sizeof(snapshot.target))) {
-            return std::nullopt;
-        }
-
-        snapshot.kind = AntiDebugRedirectKind::IndirectFF25;
-        snapshot.instruction_length = 6;
-    } else {
-        return std::nullopt;
-    }
-
-    snapshot.target_region = query_target_region(snapshot.target).value_or(MEMORY_BASIC_INFORMATION{});
-    if (snapshot.target_region.BaseAddress == nullptr) {
-        return std::nullopt;
-    }
-
-    return snapshot;
-}
-
-bool same_redirect(const AntiDebugRedirectSnapshot& expected, const AntiDebugRedirectSnapshot& actual) {
-    return expected.kind == actual.kind &&
-        expected.target == actual.target &&
-        expected.pointer_slot == actual.pointer_slot &&
-        expected.instruction_length == actual.instruction_length;
-}
-
-bool neutralize_redirect_target(void* entry, const AntiDebugRedirectSnapshot& expected) {
-    std::array<uint8_t, kAntiDebugEntrySize> current_entry{};
-    if (!safe_read(entry, current_entry.data(), current_entry.size()) || current_entry != expected.observed_entry) {
-        return false;
-    }
-
-    const auto current_redirect = resolve_anti_debug_redirect(entry, current_entry);
-    if (!current_redirect || !same_redirect(expected, *current_redirect) ||
-        !same_target_region(expected.target_region, current_redirect->target)) {
-        return false;
-    }
-
-    const auto target_region = query_target_region(current_redirect->target);
-    if (!target_region || !same_region_identity(expected.target_region, *target_region)) {
-        return false;
-    }
-
-    const auto start = target_region->BaseAddress;
-    DWORD old_protection{};
-    if (!VirtualProtect(start, target_region->RegionSize, PAGE_EXECUTE_READWRITE, &old_protection)) {
-        return false;
-    }
-
-    std::memset(start, 0xC3, target_region->RegionSize);
-    const auto flush_succeeded = FlushInstructionCache(GetCurrentProcess(), start, target_region->RegionSize) != FALSE;
-
-    DWORD restored_protection{};
-    const auto protection_restore_succeeded = VirtualProtect(start, target_region->RegionSize, old_protection, &restored_protection) != FALSE;
-    return flush_succeeded && protection_restore_succeeded;
-}
-
-bool restore_entry_if_unchanged(void* entry, const std::vector<uint8_t>& original, const std::array<uint8_t, kAntiDebugEntrySize>& expected_entry) {
-    constexpr SIZE_T restore_size = kAntiDebugEntrySize;
-    if (original.size() < restore_size) {
-        return false;
-    }
-
-    std::array<uint8_t, restore_size> original_entry{};
-    std::copy_n(original.begin(), restore_size, original_entry.begin());
-
-    std::array<uint8_t, kAntiDebugEntrySize> current_entry{};
-    if (!safe_read(entry, current_entry.data(), current_entry.size()) || current_entry != expected_entry) {
-        return false;
-    }
-
-    DWORD old_protection{};
-    if (!VirtualProtect(entry, restore_size, PAGE_EXECUTE_READWRITE, &old_protection)) {
-        return false;
-    }
-
-    std::copy(original_entry.begin(), original_entry.end(), reinterpret_cast<uint8_t*>(entry));
-    const auto flush_succeeded = FlushInstructionCache(GetCurrentProcess(), entry, restore_size) != FALSE;
-
-    DWORD restored_protection{};
-    const auto protection_restore_succeeded = VirtualProtect(entry, restore_size, old_protection, &restored_protection) != FALSE;
-    if (flush_succeeded && protection_restore_succeeded) {
-        return true;
-    }
-
-    // Roll back only if the bytes are still the ones written by this transaction.
-    DWORD rollback_old_protection{};
-    if (VirtualProtect(entry, restore_size, PAGE_EXECUTE_READWRITE, &rollback_old_protection)) {
-        std::array<uint8_t, restore_size> after_failure{};
-        if (safe_read(entry, after_failure.data(), after_failure.size()) && after_failure == original_entry) {
-            std::copy(expected_entry.begin(), expected_entry.end(), reinterpret_cast<uint8_t*>(entry));
-            FlushInstructionCache(GetCurrentProcess(), entry, restore_size);
-        }
-
-        DWORD ignored_protection{};
-        VirtualProtect(entry, restore_size, old_protection, &ignored_protection);
-    }
-
-    return false;
-}
-
-}
 
 std::shared_ptr<IntegrityCheckBypass> s_integrity_check_bypass_instance{nullptr};
 
@@ -868,6 +575,69 @@ void* IntegrityCheckBypass::renderer_create_blas_hook(void* a1, void* a2, void* 
     return s_renderer_create_blas_hook->get_original<decltype(renderer_create_blas_hook)>()(a1, a2, a3, a4, a5);
 }
 
+// This is used to nuke the heap allocated code that causes crashes
+// when debuggers are attached and other integrity checks.
+// They happen to be in the same (heap allocated) executable section, so we can just
+// replace every byte with a RET instruction.
+void IntegrityCheckBypass::nuke_heap_allocated_code(uintptr_t addr) {
+    // Get the base of the memory region.
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi)) == 0) {
+        spdlog::error("[IntegrityCheckBypass]: VirtualQuery failed!");
+        return;
+    }
+    
+    // Get the end of the memory region.
+    const auto start = (uintptr_t)mbi.BaseAddress;
+    const auto end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+
+    std::scoped_lock _{s_nuked_regions_mutex};
+
+    if (s_nuked_regions_restored) {
+        spdlog::info("[IntegrityCheckBypass]: Process is exiting, not nuking heap allocated code at 0x{:X}", start);
+        return;
+    }
+
+    spdlog::info("[IntegrityCheckBypass]: Nuking heap allocated code at 0x{:X} - 0x{:X}", start, end);
+
+    // Keep the original bytes (once per region) so restore_nuked_heap_allocated_code can put them back at exit.
+    const auto already_nuked = std::any_of(s_nuked_regions.begin(), s_nuked_regions.end(), [start](const NukedRegion& r) { return r.start == start; });
+
+    if (!already_nuked) {
+        s_nuked_regions.push_back(NukedRegion{start, std::vector<uint8_t>((uint8_t*)start, (uint8_t*)end)});
+    }
+
+    // Fix the protection of the memory region.
+    ProtectionOverride po{(void*)start, mbi.RegionSize, PAGE_EXECUTE_READWRITE};
+
+    // Replace every single byte with a RET (C3) instruction.
+    std::memset((void*)start, 0xC3, mbi.RegionSize);
+
+    spdlog::info("[IntegrityCheckBypass]: Nuked heap allocated code at 0x{:X}", start);
+}
+
+// The nuked region is not only code: in DD2 it is the .text section of the anti-tamper module that the game maps
+// by hand, and that module's atexit callback reads data from it. With the region full of C3 bytes the callback
+// dereferences 0xC3C3C3C3C3C3C3C3 and the game exits with an access violation (#1895). Called from the CRT exit hook,
+// before the atexit table runs; after this, the region is never nuked again.
+void IntegrityCheckBypass::restore_nuked_heap_allocated_code() {
+    std::scoped_lock _{s_nuked_regions_mutex};
+
+    if (s_nuked_regions_restored) {
+        return;
+    }
+
+    s_nuked_regions_restored = true;
+
+    for (const auto& region : s_nuked_regions) {
+        ProtectionOverride po{(void*)region.start, region.original.size(), PAGE_EXECUTE_READWRITE};
+        std::memcpy((void*)region.start, region.original.data(), region.original.size());
+        FlushInstructionCache(GetCurrentProcess(), (void*)region.start, region.original.size());
+
+        spdlog::info("[IntegrityCheckBypass]: Restored nuked heap allocated code at 0x{:X} ({} bytes)", region.start, region.original.size());
+    }
+}
+
 void IntegrityCheckBypass::anti_debug_watcher() try {
     static const auto ntdll = GetModuleHandleW(L"ntdll.dll");
     static const auto dbg_ui_remote_breakin = ntdll != nullptr ? GetProcAddress(ntdll, "DbgUiRemoteBreakin") : nullptr;
@@ -889,19 +659,37 @@ void IntegrityCheckBypass::anti_debug_watcher() try {
         std::copy_n((uint8_t*)dbg_ui_remote_breakin + original_dbg_ui_remote_breakin_bytes->size(), 32 - original_dbg_ui_remote_breakin_bytes->size(), std::back_inserter(*original_dbg_ui_remote_breakin_bytes));
     }
 
-    std::array<uint8_t, kAntiDebugEntrySize> observed_entry{};
-    if (!safe_read(dbg_ui_remote_breakin, observed_entry.data(), observed_entry.size()) ||
-        std::equal(observed_entry.begin(), observed_entry.end(), original_dbg_ui_remote_breakin_bytes->begin())) {
-        return;
-    }
+    const uint64_t* first_8_bytes = (uint64_t*)dbg_ui_remote_breakin;
+    const uint8_t* first_8_bytes_ptr = (uint8_t*)dbg_ui_remote_breakin;
 
-    const auto redirect = resolve_anti_debug_redirect(dbg_ui_remote_breakin, observed_entry);
-    if (!redirect || !neutralize_redirect_target(dbg_ui_remote_breakin, *redirect)) {
-        return;
-    }
+    if (*(uint64_t*)original_dbg_ui_remote_breakin_bytes->data() != *first_8_bytes) {
+        spdlog::info("[IntegrityCheckBypass]: DbgUiRemoteBreakin was hooked, restoring original bytes.");
 
-    if (restore_entry_if_unchanged(dbg_ui_remote_breakin, *original_dbg_ui_remote_breakin_bytes, observed_entry)) {
-        spdlog::info("[IntegrityCheckBypass]: Restored DbgUiRemoteBreakin after validated payload neutralization.");
+        if (first_8_bytes_ptr[0] == 0xE9) {
+            spdlog::info("[IntegrityCheckBypass]: DbgUiRemoteBreakin was directly hooked, resolving...");
+            const auto resolved_jmp = utility::calculate_absolute((uintptr_t)dbg_ui_remote_breakin + 1);
+            const auto is_heap_allocated = utility::get_module_within(resolved_jmp).value_or(nullptr) == nullptr;
+
+            if (is_heap_allocated && !IsBadReadPtr((void*)resolved_jmp, 32)) {
+                spdlog::info("[IntegrityCheckBypass]: Nuking heap allocated code at 0x{:X}", resolved_jmp);
+                nuke_heap_allocated_code(resolved_jmp);
+            }
+        } else if (first_8_bytes_ptr[0] == 0xFF && first_8_bytes_ptr[1] == 0x25) {
+            spdlog::info("[IntegrityCheckBypass]: DbgUiRemoteBreakin was indirectly hooked, resolving...");
+            const auto resolved_ptr = utility::calculate_absolute((uintptr_t)dbg_ui_remote_breakin + 2);
+            const auto resolved_jmp = *(uintptr_t*)resolved_ptr;
+            const auto is_heap_allocated = utility::get_module_within(resolved_jmp).value_or(nullptr) == nullptr;
+
+            if (is_heap_allocated && !IsBadReadPtr((void*)resolved_jmp, 32)) {
+                spdlog::info("[IntegrityCheckBypass]: Nuking heap allocated code at 0x{:X}", resolved_jmp);
+                nuke_heap_allocated_code(resolved_jmp);
+            }
+        }
+        
+        ProtectionOverride _{dbg_ui_remote_breakin, original_dbg_ui_remote_breakin_bytes->size(), PAGE_EXECUTE_READWRITE};
+        std::copy(original_dbg_ui_remote_breakin_bytes->begin(), original_dbg_ui_remote_breakin_bytes->end(), (uint8_t*)dbg_ui_remote_breakin);
+
+        spdlog::info("[IntegrityCheckBypass]: Restored DbgUiRemoteBreakin.");
     }
 } catch (const std::exception& e) {
     spdlog::error("[IntegrityCheckBypass]: Exception in anti_debug_watcher: {}", e.what());
@@ -2796,6 +2584,38 @@ void* IntegrityCheckBypass::rtl_exit_user_process_hook(uint32_t code) {
     // It calls something that's heap allocated but no longer exists, and it crashes.
     TerminateProcess(GetCurrentProcess(), code);
     return nullptr;
+}
+
+void IntegrityCheckBypass::hook_crt_exit() {
+    spdlog::info("[IntegrityCheckBypass]: Hooking CRT exit...");
+
+    // The games use the shared UCRT; its exit() runs the atexit table before ExitProcess.
+    const auto ucrtbase = GetModuleHandleW(L"ucrtbase.dll");
+
+    if (ucrtbase == nullptr) {
+        spdlog::info("[IntegrityCheckBypass]: ucrtbase.dll is not loaded, not hooking exit");
+        return;
+    }
+
+    const auto crt_exit = GetProcAddress(ucrtbase, "exit");
+
+    if (crt_exit == nullptr) {
+        spdlog::error("[IntegrityCheckBypass]: Could not find ucrtbase!exit!");
+        return;
+    }
+
+    s_crt_exit_hook = std::make_unique<FunctionHookMinHook>(crt_exit, &crt_exit_hook);
+    if (!s_crt_exit_hook->create()) {
+        spdlog::error("[IntegrityCheckBypass]: Could not hook ucrtbase!exit!");
+        return;
+    }
+
+    spdlog::info("[IntegrityCheckBypass]: Hooked CRT exit!");
+}
+
+void IntegrityCheckBypass::crt_exit_hook(int code) {
+    restore_nuked_heap_allocated_code();
+    s_crt_exit_hook->get_original<decltype(crt_exit_hook)>()(code);
 }
 
 #pragma region Custom PAK directory loading
